@@ -1,0 +1,17 @@
+f = figure(69);
+upper = subplot(211);
+main = plot([0, 1, 2], [0, 1, 0]);
+box_on = box("on");
+box_toggle = box();
+box_off = box("off");
+lower = subplot(212);
+plot([0, 1], [1, 0]);
+lower_box_initial = get(lower, 'Box');
+box(upper, 'on');
+upper_box_after_target_on = get(upper, 'Box');
+lower_box_after_target_on = get(lower, 'Box');
+box(lower);
+lower_box_after_toggle = get(lower, 'Box');
+box(upper, true);
+upper_box_after_logical = get(upper, 'Box');
+current = gcf();

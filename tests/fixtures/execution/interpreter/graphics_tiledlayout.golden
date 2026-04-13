@@ -1,0 +1,6 @@
+workspace
+  ax1 = 1001
+  ax2 = 1002
+  f = 12
+  t = 12
+  top_xlim = [0, 2]

@@ -1,0 +1,31 @@
+workspace
+  caught_depth = 1
+  caught_id = "MATC:Demo"
+  caught_is_mexception = true
+  caught_kind = 'MException'
+  caught_msg = "explicit boom"
+  caught_top = "<script>"
+  cell_ok = true
+  cells = {1, 2}
+  default_depth = 1
+  default_id = "MATC:UserError"
+  default_msg = "fallback boom"
+  default_top = "<script>"
+  double_ok = true
+  err = struct{cause={}, identifier="MATC:Demo", message="explicit boom", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  err2 = struct{cause={}, identifier="MATC:UserError", message="fallback boom", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  fh = @sum
+  handle_ok = true
+  kind_fh = 'function_handle'
+  kind_labels = 'string'
+  kind_logicals = 'logical'
+  kind_meta = 'struct'
+  kind_numbers = 'double'
+  labels = ["1", "2", "3"]
+  logical_ok = true
+  logicals = [true, true]
+  meta = struct{name="alpha"}
+  numbers = [1, 2, 3]
+  status = "caught"
+  string_ok = true
+  struct_ok = true

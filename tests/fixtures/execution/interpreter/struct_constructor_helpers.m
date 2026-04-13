@@ -1,0 +1,9 @@
+a = struct('name', "alpha", 'value', 3);
+b = struct('name', {"alpha", "beta"}, 'value', {1, 2}, 'flag', true);
+c = [b.name];
+d = [b.value];
+e = [b.flag];
+f = fieldnames(b);
+g = isfield(b, 'name');
+h = rmfield(b, "value");
+i = [h.name];

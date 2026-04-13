@@ -1,0 +1,70 @@
+workspaces
+  Function id=0 parent=None name=None
+  Function id=1 parent=Some(0) name=Some("outer")
+  Function id=2 parent=Some(1) name=Some("helper")
+  Function id=3 parent=Some(0) name=Some("localonly")
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+  FunctionBody id=1 parent=Some(0) workspace=1
+  FunctionBody id=2 parent=Some(1) workspace=2
+  FunctionBody id=3 parent=Some(0) workspace=3
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  outer kind=function scope=0 workspace=0 binding=None
+  localonly kind=function scope=0 workspace=0 binding=None
+  ans kind=variable scope=1 workspace=1 binding=Some(1)
+  helper kind=function scope=1 workspace=1 binding=None
+  x kind=parameter scope=1 workspace=1 binding=Some(2)
+  y kind=output scope=1 workspace=1 binding=Some(3)
+  sum kind=variable scope=1 workspace=1 binding=Some(4)
+  helper kind=variable scope=1 workspace=1 binding=Some(5)
+  a kind=variable scope=1 workspace=1 binding=Some(6)
+  b kind=variable scope=1 workspace=1 binding=Some(7)
+  c kind=variable scope=1 workspace=1 binding=Some(8)
+  d kind=variable scope=1 workspace=1 binding=Some(9)
+  e kind=variable scope=1 workspace=1 binding=Some(10)
+  f kind=variable scope=1 workspace=1 binding=Some(11)
+  g kind=variable scope=1 workspace=1 binding=Some(12)
+  ans kind=variable scope=2 workspace=2 binding=Some(13)
+  v kind=parameter scope=2 workspace=2 binding=Some(14)
+  z kind=output scope=2 workspace=2 binding=Some(15)
+  ans kind=variable scope=3 workspace=3 binding=Some(16)
+  v kind=parameter scope=3 workspace=3 binding=Some(17)
+  z kind=output scope=3 workspace=3 binding=Some(18)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  ans id=1 storage=local owner_symbol=3 owner_scope=1 owner_workspace=1 shared=false
+  x id=2 storage=local owner_symbol=5 owner_scope=1 owner_workspace=1 shared=false
+  y id=3 storage=local owner_symbol=6 owner_scope=1 owner_workspace=1 shared=false
+  sum id=4 storage=local owner_symbol=7 owner_scope=1 owner_workspace=1 shared=false
+  helper id=5 storage=local owner_symbol=8 owner_scope=1 owner_workspace=1 shared=false
+  a id=6 storage=local owner_symbol=9 owner_scope=1 owner_workspace=1 shared=false
+  b id=7 storage=local owner_symbol=10 owner_scope=1 owner_workspace=1 shared=false
+  c id=8 storage=local owner_symbol=11 owner_scope=1 owner_workspace=1 shared=false
+  d id=9 storage=local owner_symbol=12 owner_scope=1 owner_workspace=1 shared=false
+  e id=10 storage=local owner_symbol=13 owner_scope=1 owner_workspace=1 shared=false
+  f id=11 storage=local owner_symbol=14 owner_scope=1 owner_workspace=1 shared=false
+  g id=12 storage=local owner_symbol=15 owner_scope=1 owner_workspace=1 shared=false
+  ans id=13 storage=local owner_symbol=16 owner_scope=2 owner_workspace=2 shared=false
+  v id=14 storage=local owner_symbol=17 owner_scope=2 owner_workspace=2 shared=false
+  z id=15 storage=local owner_symbol=18 owner_scope=2 owner_workspace=2 shared=false
+  ans id=16 storage=local owner_symbol=19 owner_scope=3 owner_workspace=3 shared=false
+  v id=17 storage=local owner_symbol=20 owner_scope=3 owner_workspace=3 shared=false
+  z id=18 storage=local owner_symbol=21 owner_scope=3 owner_workspace=3 shared=false
+references
+  x role=value resolution=workspace_value symbol=Some(5) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(2) capture=none
+  x role=value resolution=workspace_value symbol=Some(5) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(2) capture=none
+  helper role=value resolution=workspace_value symbol=Some(8) kind=variable scope=Some(1) workspace=Some(1) binding=Some(5) capture=none
+  helper role=call_target resolution=workspace_value symbol=Some(8) kind=variable scope=Some(1) workspace=Some(1) binding=Some(5) capture=none
+  sum role=call_target resolution=workspace_value symbol=Some(7) kind=variable scope=Some(1) workspace=Some(1) binding=Some(4) capture=none
+  helper role=function_handle_target resolution=nested_function symbol=Some(4) kind=function scope=Some(1) workspace=Some(1) binding=None capture=none
+  sum role=function_handle_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  zeros role=call_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  localonly role=call_target resolution=file_function symbol=Some(2) kind=function scope=Some(0) workspace=Some(0) binding=None capture=none
+  a role=value resolution=workspace_value symbol=Some(9) kind=variable scope=Some(1) workspace=Some(1) binding=Some(6) capture=none
+  b role=value resolution=workspace_value symbol=Some(10) kind=variable scope=Some(1) workspace=Some(1) binding=Some(7) capture=none
+  c role=value resolution=workspace_value symbol=Some(11) kind=variable scope=Some(1) workspace=Some(1) binding=Some(8) capture=none
+  v role=value resolution=workspace_value symbol=Some(17) kind=parameter scope=Some(2) workspace=Some(2) binding=Some(14) capture=none
+  v role=value resolution=workspace_value symbol=Some(20) kind=parameter scope=Some(3) workspace=Some(3) binding=Some(17) capture=none
+captures
+diagnostics

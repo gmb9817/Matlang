@@ -1,0 +1,16 @@
+workspace
+  bottom = 1002
+  current = 73
+  f = 73
+  heat = 2002
+  heat_limits = [50, 500, -1, 11]
+  heat_x = [100, 200, 400]
+  heat_y = [2, 8]
+  img = 2001
+  limits_after = [5, 65, -15, 45]
+  limits_before = [0, 40, 0, 20]
+  top = 1001
+  x_after = [20, 50]
+  x_before = [10, 30]
+  y_after = [0, 30]
+  y_before = [5, 15]

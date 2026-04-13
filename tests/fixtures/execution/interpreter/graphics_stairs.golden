@@ -1,0 +1,8 @@
+workspace
+  current = 57
+  f = 57
+  legend_handle = 57
+  stairs_default_x = 2002
+  stairs_main = 2001
+  x_bounds = [0, 3]
+  y_bounds = [0, 9]

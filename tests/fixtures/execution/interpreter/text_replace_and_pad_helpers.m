@@ -1,0 +1,14 @@
+a = replaceBefore("pre<mid>post", '<', "X");
+b = replaceAfter('pre<mid>post', ">", 'Y');
+c = pad('ab', 5);
+d = pad("ab", 5, 'left');
+e = pad('ab', 5, "both");
+f = replaceAfter(replaceBefore("left|mid|right", '|', "L"), '|', "R");
+g = replaceBefore("James Maxwell", 7, "Clerk ");
+h = replaceAfter(["Edgar Allen Poe"; "Louisa May Alcott"], [12; 11], [" Jr."; " Sr."]);
+i = replaceBetween(["Edgar Allen Poe"; "Louisa May Alcott"], [7; 8], [11; 10], ["A."; "M."]);
+j = replaceBetween("Hello, world!", "w", "d", "Mars", "Boundaries", "inclusive");
+k = replaceBetween("Hello, world!", 7, 13, "Mars", "Boundaries", "exclusive");
+l = pad(["a"; "bbb"]);
+m = pad("3.44", 7, "left", "0");
+n = pad({'a', 'bbb'}, '.');

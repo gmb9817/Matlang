@@ -1,0 +1,13 @@
+s.name = "alpha";
+s.inner.flag = true;
+idx = 2;
+s(idx).name = "beta";
+s(idx).inner.flag = false;
+x(2) = 5;
+c{1} = 9;
+a = s.name;
+b = s.inner.flag;
+d = x;
+e = c{1};
+f = s(idx).name;
+g = s;

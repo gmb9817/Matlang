@@ -1,0 +1,18 @@
+workspace
+  a(:,:,1) = [1, 2 ; 3, 4]
+  a(:,:,2) = [5, 60 ; 7, 80]
+  a_head = [3, 7, 4]
+  a_last_col = [6 ; 8]
+  a_page2 = [5, 60 ; 7, 80]
+  a_tail = [5, 2, 6]
+  cells(:,:,1) = {10, 20 ; 30, 40}
+  cells(:,:,2) = {50, 600 ; 70, 800}
+  cells_last_col = {60 ; 80}
+  cells_page2 = {50, 600 ; 70, 800}
+  s(:,:,1) = [struct{x=1}]
+  s(:,:,2) = [struct{x=22}]
+  s_page2 = struct{x=22}
+  s_value = 2
+  txt = 'helXY'
+  txt_after = 'helXY'
+  txt_tail = 'ell'

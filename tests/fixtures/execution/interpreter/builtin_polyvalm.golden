@@ -1,0 +1,6 @@
+workspace
+  cayley_zero = [0, 0 ; 0, 0]
+  char_poly = [1, 0, 1]
+  complex_matrix_eval = [2, 0 ; 0, 2]
+  const_eval = [5, 0 ; 0, 5]
+  upper_eval = [6, 8 ; 0, 6]

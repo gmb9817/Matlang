@@ -1,0 +1,10 @@
+workspace
+  old1 = 'on'
+  old2 = 'off'
+  old3 = 'on'
+  pause_handle = @pause
+  state0 = 'on'
+  state1 = 'off'
+  state2 = 'on'
+  state3 = 'off'
+  state4 = 'on'

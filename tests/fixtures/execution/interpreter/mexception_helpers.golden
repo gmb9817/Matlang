@@ -1,0 +1,16 @@
+workspace
+  base = struct{cause={}, identifier="MATC:Base", message="base boom", stack=[]}
+  base_id = "MATC:Base"
+  base_is_mexception = true
+  base_is_struct = true
+  base_kind = 'MException'
+  caught_cause_count = 1
+  caught_cause_id = "MATC:Leaf"
+  caught_id = "MATC:Base"
+  caught_is_mexception = true
+  caught_kind = 'MException'
+  combined = struct{cause={struct{cause={}, identifier="MATC:Leaf", message="leaf boom", stack=[]}}, identifier="MATC:Base", message="base boom", stack=[]}
+  combined_cause_count = 1
+  combined_cause_id = "MATC:Leaf"
+  err = struct{cause={struct{cause={}, identifier="MATC:Leaf", message="leaf boom", stack=[]}}, identifier="MATC:Base", message="base boom", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  leaf = struct{cause={}, identifier="MATC:Leaf", message="leaf boom", stack=[]}

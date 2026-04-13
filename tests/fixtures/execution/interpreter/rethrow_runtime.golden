@@ -1,0 +1,10 @@
+workspace
+  err = struct{cause={}, identifier="MATC:Inner", message="inner boom", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  inner_id = "MATC:Inner"
+  inner_top = "<script>"
+  outer = struct{cause={}, identifier="MATC:Inner", message="inner boom", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  outer_depth = 1
+  outer_id = "MATC:Inner"
+  outer_msg = "inner boom"
+  outer_top = "<script>"
+  status = "rethrown"

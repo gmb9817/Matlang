@@ -1,0 +1,13 @@
+module FunctionFile scope=0 workspace=0
+  function package_and_closure scope=1 workspace=1 captures=[]
+    inputs [binding(name=obj kind=parameter binding=2 storage=local), binding(name=x kind=parameter binding=3 storage=local)]
+    outputs [binding(name=y kind=output binding=4 storage=local)]
+    assign [binding(name=f kind=variable binding=5 storage=local)] = handle(callable(name=pkg.helper semantic=external_function_candidate final=package_function package=pkg))
+    assign [binding(name=g kind=variable binding=7 storage=local)] = anon(scope=2 workspace=2 captures=[capture(name=x binding=3 access=read from_scope=1 from_workspace=1)] params=[binding(name=z kind=parameter binding=6 storage=local)] body=binary(Add, value(name=z resolution=workspace_value binding=6 kind=parameter), value(name=x resolution=workspace_value binding=3 kind=parameter capture=read)))
+    assign [binding(name=a kind=variable binding=8 storage=local)] = call(callable(name=pkg.helper semantic=external_function_candidate final=package_function package=pkg), [value(name=x resolution=workspace_value binding=3 kind=parameter)])
+    assign [binding(name=b kind=variable binding=9 storage=local)] = call_expr(field(value(name=obj resolution=workspace_value binding=2 kind=parameter), helper), [number(1)])
+    assign [binding(name=y kind=output binding=4 storage=local)] = call(callable(name=inner semantic=nested_function final=nested_function symbol=3 kind=function), [value(name=a resolution=workspace_value binding=8 kind=variable)])
+    function inner scope=3 workspace=3 captures=[capture(name=x binding=3 access=read from_scope=1 from_workspace=1)]
+      inputs [binding(name=step kind=parameter binding=11 storage=local)]
+      outputs [binding(name=out kind=output binding=12 storage=local)]
+      assign [binding(name=out kind=output binding=12 storage=local)] = binary(Add, value(name=x resolution=workspace_value binding=3 kind=parameter capture=read), value(name=step resolution=workspace_value binding=11 kind=parameter))

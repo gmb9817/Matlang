@@ -1,0 +1,13 @@
+f = figure(38);
+t = tiledlayout(2, 1);
+ax1 = nexttile();
+plot([0, 1, 2], [0, 1, 4]);
+title("Top Tile");
+subtitle("Top Detail");
+ax2 = nexttile();
+bar([1, 2, 3], [3, 1, 2]);
+title("Bottom Tile");
+other = figure(39);
+plot([0, 1], [1, 0]);
+sgtitle(f, "Overview");
+current = gcf();

@@ -1,0 +1,138 @@
+workspace
+  a = "alpha"
+  aa = 4
+  ab = 6
+  abs_posix = "/tmp/file"
+  abs_win = "\tmp\file"
+  ac = "-1:3"
+  ad = "+1:3"
+  ae = "-1ms"
+  af = "+1ms"
+  ag = 4
+  ah = 0.25
+  ai = "./tmp/file"
+  aj = 4
+  ak = 0.25
+  al = "/tmp/file"
+  am = "\tmp\file"
+  an = "value(1,2)"
+  ao = "nested{1,2}"
+  ap = "cell(1,[2,3])"
+  aq = "matrix([1,2;3,4])"
+  ar = 2
+  as = [6, 7]
+  at = 2
+  au = [6, 7]
+  av = 2
+  aw = 8
+  ax = 2
+  ay = 8
+  az = 2
+  b = '"beta"'
+  ba = 7
+  bb = 2
+  bc = 7
+  bd = 12
+  be = 12
+  bf = 36
+  bg = 36
+  bh = "*.txt"
+  bi = 10
+  bj = 25
+  bk = 25
+  bl = """two words"".txt"
+  bm = "'two words'.m"
+  bn = "'two words',suffix"
+  bo = "key=""a;b"";tail"
+  bp = "value(1,""a,b"",3)"
+  bq = "note='%literal comment text%'"
+  br = "prefix""two words""suffix"
+  bs = 2.5
+  bt = 0.4
+  bu = 2.5
+  bv = 0.4
+  c = true
+  ca = 2
+  cb = [6, 7]
+  cc = 2
+  cd = 8
+  ce = 10
+  cf = 10
+  cg = 25
+  ch = 25
+  ci = 5
+  cj = 20
+  ck = 100
+  cl = 5
+  cm = 20
+  cn = 100
+  co = 5
+  cp = 20
+  cq = 100
+  cr = 5
+  cs = 20
+  ct = 100
+  cu = 2.5
+  cv = 10
+  cw = 25
+  cx = 2.5
+  cy = 10
+  cz = 25
+  d = false
+  da = 2.5
+  db = 10
+  dc = 25
+  dd = 2.5
+  de = 10
+  df = 25
+  dg = """two words"""
+  dh = "'two words'"
+  di = """a,b"""
+  div_base = 8
+  divisor = 2
+  dj = """a;b"""
+  dk = "key=""a""""b"""
+  dm = "alpha == beta"
+  dn = "alpha ~= beta"
+  do = "alpha <= beta"
+  dotted_base = struct{helper=5}
+  dotted_div = 2
+  dotted_rhs = struct{items=[1, 2], value=3}
+  dp = "alpha >= beta"
+  dq = "alpha < beta"
+  dr = "alpha > beta"
+  ds = "alpha && beta"
+  dt = "alpha || beta"
+  du = "alpha"
+  e = "pkg.sub"
+  f = "folder/file.txt"
+  foo = struct{bar=2}
+  foo_cells = {2}
+  foo_values = [2, 4]
+  g = "name-value"
+  h = "1:3"
+  i = "-flag"
+  j = "./tmp/file"
+  k = "@helper"
+  l = "../rel"
+  m = true
+  mul_base = 6
+  mul_rhs = 2
+  n = false
+  o = "alpha"
+  p = "beta"
+  postfix_base = 10
+  q = "name=value"
+  r = "alpha==beta"
+  rhs_struct = struct{items=[1, 2], value=3}
+  s = "lower<=upper"
+  sign_base = 5
+  t = "left~=right"
+  target_cell = {"beta"}
+  target_struct = struct{name="alpha"}
+  u = "opt&&flag"
+  v = "opt||flag"
+  w = "key=""two words"""
+  x = "key='two words'"
+  y = "name=value"
+  z = "alphabeta"

@@ -1,0 +1,12 @@
+workspace
+  id0 = ''
+  id1 = 'MATC:FmtWarn'
+  id2 = 'MATC:HandleWarn'
+  id3 = ''
+  msg0 = 'plain warning'
+  msg1 = 'value=7'
+  msg2 = 'state=ready'
+  msg3 = ''
+  query_handle = @lastwarn
+  single = 'state=ready'
+  warn_handle = @warning

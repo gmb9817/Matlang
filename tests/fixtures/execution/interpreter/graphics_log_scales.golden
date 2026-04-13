@@ -1,0 +1,8 @@
+workspace
+  current = 41
+  f = 41
+  h1 = 2001
+  h2 = 2002
+  h3 = 2003
+  x_limits = [1, 100]
+  y_limits = [0.1, 10]

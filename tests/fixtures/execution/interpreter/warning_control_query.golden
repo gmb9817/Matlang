@@ -1,0 +1,18 @@
+workspace
+  id1 = ''
+  id2 = 'MATC:Only'
+  id3 = 'MATC:Only'
+  id4 = 'MATC:Specific'
+  msg1 = ''
+  msg2 = 'allowed=7'
+  msg3 = 'allowed=7'
+  msg4 = 'live'
+  state0 = struct{identifier='all', state='on'}
+  state1 = struct{identifier='all', state='off'}
+  state2 = struct{identifier='all', state='off'}
+  state3 = struct{identifier='all', state='off'}
+  state4 = struct{identifier='all', state='on'}
+  state5 = struct{identifier='MATC:Specific', state='off'}
+  state_id0 = struct{identifier='MATC:Only', state='on'}
+  state_id1 = struct{identifier='MATC:Other', state='off'}
+  warning_handle = @warning

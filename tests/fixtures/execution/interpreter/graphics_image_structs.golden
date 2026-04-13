@@ -1,0 +1,17 @@
+workspace
+  alpha = 1
+  alpha_mapping = 'none'
+  cdata(:,:,1) = [1, 0 ; 0, 1]
+  cdata(:,:,2) = [0, 1 ; 0, 1]
+  cdata(:,:,3) = [0, 0 ; 1, 1]
+  f = 76
+  img = 2001
+  kind = 'image'
+  mapping = 'direct'
+  parent = 1001
+  props = struct{AlphaData=1, AlphaDataMapping='none', CData=[1, 0 ; 0, 0], CDataMapping='direct', Color=[0, 0, 0], DisplayName='', EdgeColor=[0, 0, 0], LineStyle='-', LineWidth=2.5, Marker='none', MarkerEdgeColor='auto', MarkerFaceColor='none', MarkerSize=5, Parent=1001, Type='image', Visible='on', XData=[10, 30], YData=[5, 15]}
+  rgb(:,:,1) = [1, 0 ; 0, 1]
+  rgb(:,:,2) = [0, 1 ; 0, 1]
+  rgb(:,:,3) = [0, 0 ; 1, 1]
+  xdata = [10, 30]
+  ydata = [5, 15]

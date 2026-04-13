@@ -1,0 +1,11 @@
+workspace
+  current_after_one = 61
+  current_is_new = true
+  f1 = 60
+  f1_alive = false
+  f1_visible_before_close = 'off'
+  f2 = 61
+  f2_alive = false
+  f2_style_before_close = 'docked'
+  status_all = 1
+  status_one = 1

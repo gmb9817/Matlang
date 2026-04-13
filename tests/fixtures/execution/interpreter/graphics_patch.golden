@@ -1,0 +1,13 @@
+workspace
+  cyan_patch = [2002]
+  f = 43
+  fill_face = [0, 0.8, 0.8]
+  fill_handle = 2002
+  found_patch = [2001, 2002]
+  patch_parent = 1001
+  poly = 2001
+  poly_edge = [1, 0, 0]
+  poly_face = [1, 0, 0]
+  poly_type = 'patch'
+  updated_edge = [0, 0, 1]
+  updated_face = 'none'

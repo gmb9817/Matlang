@@ -1,0 +1,63 @@
+codegen
+  backend = bytecode
+  functions = 1
+  instructions = 47
+  anonymous_functions = 0
+  nested_functions = 0
+  max_temps = 40
+  max_labels = 0
+
+verification
+  ok = true
+  functions_checked = 1
+  issues = 0
+
+bytecode module backend=bytecode unit_kind=Script entry=<script>
+function <script> role=script_entry params=[] outputs=[] captures=[] temps=40 labels=0
+  t0 = const number(10)
+  t1 = const number(20)
+  t2 = matrix 1x2 [t0, t1]
+  t3 = const number(30)
+  t4 = const number(40)
+  t5 = matrix 1x2 [t3, t4]
+  t6 = cell 1x2 [t2, t5]
+  store cells#1 <- t6
+  t9 = const number(2)
+  t10 = load cells#1
+  t11 = index_list brace t10 [:]
+  [t7, t8] = call t11 (t9)
+  store a#2 <- t7
+  store b#3 <- t8
+  t12 = load cells#1
+  t13 = index_list brace t12 [:]
+  t14 = const number(1)
+  t15 = index_list paren t13 [t14]
+  t16 = matrix_list rows=[1] [t15]
+  store row#4 <- t16
+  t18 = const string("score")
+  t19 = const number(1)
+  t20 = const number(2)
+  t21 = matrix 1x2 [t19, t20]
+  [t17] = call struct [semantic=BuiltinFunction final=BuiltinFunction] (t18, t21)
+  t23 = const string("score")
+  t24 = const number(3)
+  t25 = const number(4)
+  t26 = matrix 1x2 [t24, t25]
+  [t22] = call struct [semantic=BuiltinFunction final=BuiltinFunction] (t23, t26)
+  t27 = cell 1x2 [t17, t22]
+  store nested#5 <- t27
+  t30 = const number(2)
+  t31 = load nested#5
+  t32 = index_list brace t31 [:]
+  t33 = field_list t32.score
+  [t28, t29] = call t33 (t30)
+  store c#6 <- t28
+  store d#7 <- t29
+  t34 = load nested#5
+  t35 = index_list brace t34 [:]
+  t36 = field_list t35.score
+  t37 = const number(1)
+  t38 = index_list paren t36 [t37]
+  t39 = matrix_list rows=[1] [t38]
+  store scores#8 <- t39
+  return []

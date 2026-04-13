@@ -1,0 +1,24 @@
+workspace
+  a = 10
+  b = 20
+  c = 30
+  cells = {10, 20, 30}
+  column = {'east', 'west'}
+  copy = {10, 20, 30}
+  d = 20
+  e = 30
+  g = 'east'
+  h = 'west'
+  labels = {'north', 'east' ; 'south', 'west'}
+  matrix_cells = {1, 2 ; 0, 0}
+  p = 'north'
+  plain_deal_cells = {10, 20}
+  q = 'south'
+  r = 'east'
+  row = [10, 20, 30]
+  s = 'west'
+  tableau = [10, 20, 30 ; 10, 20, 30]
+  updated = {100, 200, 300}
+  x = 10
+  y = 20
+  z = 30

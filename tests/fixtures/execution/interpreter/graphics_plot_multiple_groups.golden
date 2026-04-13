@@ -1,0 +1,17 @@
+workspace
+  f = 51
+  f3 = 52
+  h = [2001, 2002]
+  h3 = [2003, 2004]
+  line2_x = [0, 1, 2]
+  line2_y = [1, 0, 1]
+  markers = {'none', '^'}
+  markers3 = {'s', 'd'}
+  styles = {'--', 'none'}
+  styles3 = {':', '-.'}
+  widths = {4, 4}
+  widths3 = {2, 2}
+  x = [0, 1, 2]
+  y1 = [0, 1, 0]
+  y2 = [1, 0, 1]
+  z2 = [3, 2, 1]

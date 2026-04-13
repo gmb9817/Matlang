@@ -1,0 +1,27 @@
+f = figure(51);
+top_axes = subplot(211);
+curve = plot([0, 1, 2], [0, 1, 0]);
+xticks([0, 1, 2]);
+yticks([0, 0.5, 1]);
+default_x = xticklabels();
+custom_x = xticklabels(["zero" "mid" "two"]);
+query_x = xticklabels();
+custom_y = yticklabels({'low', 'half', 'high'});
+query_y = yticklabels();
+hidden_y = yticklabels([]);
+empty_y = yticklabels();
+
+bottom_axes = subplot(212);
+surface = surf([0, 1, 0; 1, 2, 1; 0, 1, 0]);
+view([45, 20]);
+zticks([-2, 0, 2]);
+default_z = zticklabels();
+custom_z = zticklabels(["floor" "center" "peak"]);
+query_z = zticklabels();
+target_top_x = xticklabels(top_axes);
+xticklabels(top_axes, ["left" "mid" "right"]);
+target_top_x_after_set = xticklabels(top_axes);
+target_bottom_z = zticklabels(bottom_axes);
+zticklabels(bottom_axes, ["low" "mid" "high"]);
+target_bottom_z_after_set = zticklabels(bottom_axes);
+current = gcf();

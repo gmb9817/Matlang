@@ -1,0 +1,12 @@
+workspace
+  base = struct{cause={}, identifier="MATC:Base", message="value=5", stack=[]}
+  caught = "MATC:Base"
+  cause = struct{cause={}, identifier="MATC:Cause", message="cause text", stack=[]}
+  cause_count = 1
+  combined = struct{cause={struct{cause={}, identifier="MATC:Cause", message="cause text", stack=[]}}, identifier="MATC:Base", message="value=5", stack=[]}
+  err = struct{cause={struct{cause={}, identifier="MATC:Cause", message="cause text", stack=[]}}, identifier="MATC:Base", message="value=5", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  err2 = struct{cause={struct{cause={}, identifier="MATC:Cause", message="cause text", stack=[]}}, identifier="MATC:Base", message="value=5", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  report = 'MATC:Base: value=5
+Caused by:
+  MATC:Cause: cause text'
+  rethrown = "MATC:Base"

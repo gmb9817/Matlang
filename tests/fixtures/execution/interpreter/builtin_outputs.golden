@@ -1,0 +1,12 @@
+workspace
+  a = 7
+  b = 8
+  c = 3
+  c3 = 9
+  d = "same"
+  dims = [2, 3]
+  e = "same"
+  empty = true
+  n = 6
+  r = 2
+  x = [1, 2, 3 ; 4, 5, 6]

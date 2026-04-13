@@ -1,0 +1,9 @@
+workspace
+  cumtrapz_default = [0, 1.5, 4, 7.5]
+  cumtrapz_dim2 = [0, 1.5 ; 0, 4.5 ; 0, 7.5]
+  cumtrapz_dim3 = [0, 0 ; 0, 0 ; 0, 0]
+  cumtrapz_xy = [0, 0.5, 3, 23]
+  trapz_default = 7.5
+  trapz_dim2 = [1.5 ; 4.5 ; 7.5]
+  trapz_dim3 = [0, 0 ; 0, 0 ; 0, 0]
+  trapz_xy = 23

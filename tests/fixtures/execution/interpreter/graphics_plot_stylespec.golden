@@ -1,0 +1,10 @@
+workspace
+  arc = 2002
+  arc_color = [0, 0, 1]
+  arc_marker = 's'
+  arc_style = ':'
+  curve = 2001
+  curve_color = [1, 0, 0]
+  curve_marker = 'o'
+  curve_style = '--'
+  f = 49

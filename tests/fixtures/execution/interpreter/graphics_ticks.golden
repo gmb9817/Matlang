@@ -1,0 +1,22 @@
+workspace
+  bottom_axes = 1002
+  current = 49
+  curve = 2001
+  default_x = [0, 0.5, 1, 1.5, 2]
+  default_y = [0, 0.25, 0.5, 0.75, 1]
+  default_z = [0, 0.5, 1, 1.5, 2]
+  empty_x = []
+  f = 49
+  hidden_x = []
+  manual_x = [0, 1, 2]
+  manual_y = [0, 0.5, 1]
+  manual_z = [-2, 0, 2]
+  query_z = [-2, 0, 2]
+  surface = 2002
+  target_bottom_z = [-2, 0, 2]
+  target_bottom_z_after_set = [-1, 1]
+  target_top_x = []
+  target_top_x_after_set = [0, 2]
+  target_top_y = [0, 0.5, 1]
+  target_top_y_after_set = [0, 1]
+  top_axes = 1001

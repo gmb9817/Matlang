@@ -1,0 +1,24 @@
+workspace
+  f = 64
+  h = 2001
+  h3 = 2002
+  h3_cdata = [0.5, 0, 0.5]
+  h3_edge = 'none'
+  h3_face = 'flat'
+  h3_marker = 'o'
+  h3_size = 49
+  h3_type = 'scatter'
+  h3_z = [1, 2, 3]
+  h_cdata = [1, 0, 0 ; 0, 1, 0 ; 0, 0, 1]
+  h_cdata_updated = [10, 20, 30]
+  h_edge = 'none'
+  h_face = 'flat'
+  h_marker = 'o'
+  h_size = [36, 64, 100]
+  h_size_updated = [49, 81, 121]
+  h_type = 'scatter'
+  h_x = [0, 1, 2]
+  h_y = [0, 1, 0]
+  x = [0, 1, 2]
+  y = [0, 1, 0]
+  z = [1, 2, 3]

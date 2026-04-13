@@ -1,0 +1,9 @@
+workspace
+  cb = 25
+  current = 25
+  f = 25
+  legend_handle = 25
+  mesh_one = 2001
+  mesh_two = 2002
+  scale_one = [0, 2]
+  z = [0, 1, 0 ; 1, 2, 1 ; 0, 1, 0]

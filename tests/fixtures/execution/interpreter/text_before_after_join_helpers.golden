@@ -1,0 +1,14 @@
+workspace
+  a = "pre"
+  b = 'post'
+  c = {"left/right"}
+  d = "a|b|c"
+  e = "beta"
+  f = ["left/up", "right/down"]
+  g = "a b c"
+  h = ["Edgar" ; "Louisa"]
+  i = ["Poe" ; "Alcott"]
+  j = {'pre', 'alpha'}
+  k = {'Poe' ; 'Alcott'}
+  l = {'X<mid>post', 'X<beta>gamma'}
+  m = {'pre<mid>Y', 'alpha<beta>gY'}

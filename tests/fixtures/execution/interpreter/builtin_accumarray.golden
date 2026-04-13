@@ -1,0 +1,7 @@
+workspace
+  expanded = [2 ; 0 ; 4 ; 0]
+  filled = [5 ; -1 ; 2 ; -1]
+  maxed = [5 ; 3 ; 0 ; 7]
+  meaned = [15, -9 ; -9, 40]
+  one_d = [40 ; 20 ; 40]
+  two_d = [10, 30 ; 0, 60]

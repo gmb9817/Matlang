@@ -1,0 +1,22 @@
+workspace
+  ax = 1001
+  ax_box = 'off'
+  ax_labels = ["lo", "hi"]
+  ax_props = struct{Box='off', CLim=[0, 1], Children=[2001], Colorbar='off', Colormap='parula', Grid='off', Hold='off', Legend=[], Parent=47, Position=[0.2, 0.2, 0.4, 0.3], Title='', Type='axes', View=[-37.5, 30], Visible='on', XLabel='', XLim=[0, 2], XScale='linear', XTick=[0, 2], XTickAngle=0, XTickLabel={'lo', 'hi'}, YLabel='', YLim=[0, 1], YScale='linear', YTick=[0, 0.25, 0.5, 0.75, 1], YTickAngle=0, YTickLabel=["0", "0.25", "0.5", "0.75", "1"], ZLabel='', ZLim=[0, 1], ZTick=[0, 0.25, 0.5, 0.75, 1], ZTickAngle=0, ZTickLabel=["0", "0.25", "0.5", "0.75", "1"]}
+  ax_xlim = [0, 2]
+  copy = 2003
+  f = 47
+  fig_mode = 'manual'
+  fig_orientation = 'landscape'
+  fig_position = [0.9999999999999999, 1.9999999999999998, 3, 3.9999999999999996]
+  fig_props = struct{PaperOrientation="landscape", PaperPosition=[1, 2, 3, 4], PaperPositionMode="manual", PaperType="a4", PaperUnits="centimeters"}
+  fig_type = 'a4'
+  fig_units = 'centimeters'
+  line_color = [1, 0, 0]
+  line_handle = 2002
+  line_marker = 'o'
+  line_props = struct{Color=[1, 0, 0], DisplayName='', EdgeColor=[0.8392156862745098, 0.15294117647058825, 0.1568627450980392], LineStyle='--', LineWidth=2.5, Marker='o', MarkerEdgeColor='auto', MarkerFaceColor='none', MarkerSize=5, Parent=1001, Type='line', Visible='on', XData=[0, 1, 2], YData=[0, 1, 0]}
+  line_style = '--'
+  shared = struct{Color=[1, 0, 0], DisplayName='', EdgeColor=[1, 0, 0], LineStyle='--', LineWidth=3, Marker='o', MarkerEdgeColor='auto', MarkerFaceColor='none', MarkerSize=5, Parent=1001, Type='line', Visible='off', XData=[0, 1, 2], YData=[0, 1, 0]}
+  shared_visible = {'off', 'off'}
+  shared_width = {3, 3}

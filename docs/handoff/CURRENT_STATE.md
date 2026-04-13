@@ -1,0 +1,249 @@
+# Current State
+
+> Future AI: start with `docs/handoff/FUTURE_ONLY.md` before reading this file. This file is now archival/deep-context material, not the shortest path to the remaining work.
+
+## Repository State
+
+- the current repository-plan bring-up is effectively complete: every planned source crate now has real implementation, the parse -> semantics -> HIR -> optimize -> codegen -> artifact/bundle -> execute -> interop pipeline is live, and full `cargo test --workspace` passes in the supported MSVC environment
+- master planning document exists
+- repository skeleton exists
+- architecture/spec/handoff documents have been seeded
+- Rust workspace manifests exist
+- placeholder crate entrypoints exist
+- the core Release 0.1 language/runtime specs have moved past placeholder status
+- `cargo check --workspace` passes
+- frontend crate now has source/span, diagnostics, AST skeleton, parser API placeholder, and lexer/token scaffolding
+- frontend parser now handles core expressions, assignments, function definitions, matrix/cell literals, and function-handle syntax
+- frontend parser now also handles `if`/`elseif`/`else`, `switch`/`case`/`otherwise`, `try`/`catch`, `for`, `while`, and `end`-delimited blocks
+- frontend parser now accepts package-qualified function handles like `@pkg.helper`
+- frontend parser now accepts whitespace-separated columns inside matrix and cell literals, so `[a b; c d]` and `{1 2; 3 4}` parse without comma separators
+- frontend parser now has a broader command-form baseline for statement-position calls and assignment right-hand sides, lowering whitespace-delimited raw command chunks into text literal arguments so forms like `x = string alpha`, `strcmp pkg.sub pkg.sub`, `string folder/file.txt`, `string name-value`, `string 1:3`, `string -flag`, `string ./tmp/file`, `string @helper`, and `string ../rel` parse as real callable forms instead of syntax errors, the current parser/execution path now also accepts comma-separated command arguments like `strcmp alpha, alpha` without falling out of command mode, and package-qualified command targets like `pkg.helper alpha` now lower through the existing dotted-call/package-resolution path instead of remaining a command-form syntax hole
+- frontend parser now records local/nested functions inside function bodies
+- fixture-based parser golden tests exist under `tests/fixtures/frontend/parser` with integration test wiring in `src/frontend/tests/parser_golden.rs`, including `switch` coverage
+- semantics binder now uses separate value and function namespaces, so workspace variables can shadow visible functions without destroying function-handle resolution
+- semantics binding now classifies identifier uses more deeply as workspace values, nested functions, file functions, builtin functions, external function candidates, or unresolved values
+- semantics binder now records explicit binding records for variable-like symbols, including storage class and whether a binding becomes shared with closures
+- semantics binder now records capture access modes (`read`, `write`, `read_write`) so nested/shared mutation behavior is explicit instead of inferred from a flat capture list
+- anonymous-function and nested-function binding now produce richer reference metadata including resolved symbol kind, declaring scope/workspace, binding id, and capture access
+- bare value-position identifiers no longer incorrectly resolve visible function symbols; only call-target and function-handle contexts resolve function namespaces
+- nested-function assignment still reuses outer bindings when a matching outer value binding already exists, but that reuse is now surfaced through binding/capture metadata
+- global declarations now share binding identity across workspaces by name instead of acting like unrelated local declarations
+- global bindings are no longer implicitly captured through lexical ancestor lookup; a workspace must declare `global` itself to access the shared global binding
+- persistent declarations now share binding identity by defining function workspace, and nested functions can capture outer persistent bindings as shared read/write state
+- `persistent` declarations in script workspaces now produce a semantic diagnostic instead of silently behaving like normal locals
+- resolver crate now performs filesystem-backed function discovery across the source directory, `private/` directories, explicit `MATC_PATH` search roots, and package directories
+- resolver crate now has unit coverage for current-directory lookup, builtin shadowing by local files, private-function precedence, stable search-path order, package lookup, and env-var path loading
+- semantics crate now owns a second-stage final reference resolution pass backed by the resolver crate, producing `resolved_references` for call targets and function-handle targets
+- final semantic reference results now distinguish builtin retention vs current-directory/private/search-path/package file resolution, including builtin shadowing by local files
+- semantics binder now recognizes dotted call targets like `pkg.helper(x)` as package-qualified function candidates when the root name is not a resolvable workspace value, avoiding false unbound `pkg` diagnostics
+- semantics binder still preserves value-space behavior for dotted applies like `obj.helper(x)` when `obj` is a workspace value, so package qualification does not erase field/index semantics
+- IR crate now has a real first HIR data model plus an AST+semantics lowering pass that preserves function/script structure, binding-aware values, callable-resolution metadata, nested function captures, anonymous-function captures, and current control-flow statements
+- optimizer crate now has a real first HIR optimization pipeline with constant folding, range folding, arithmetic identity cleanup, constant `if`/`switch` simplification, empty-loop elimination, optimization summaries, unit tests, golden fixtures, and CLI inspection support via `matc optimize`
+- codegen crate now has a real first bytecode-style backend emitter with stable function naming, instruction rendering, temp/label accounting, summary rendering, verifier support, anonymous/nested-function emission, assignment/index/field lowering, and backend golden fixtures
+- codegen/backend lowering now also preserves lvalue-root identity explicitly for assignment targets through a dedicated bytecode `load-lvalue` path, so backend lowering no longer loses writeback identity for indexed/field lvalues during later VM stores
+- platform crate now has a real serialized backend packaging layer with both single-module bytecode artifacts and dependency-aware bytecode bundles, including stable text formats, parser/serializer helpers, dependency-path extraction, explicit packaged module ids, filesystem load/save APIs, roundtrip tests, and CLI-facing artifact/bundle support instead of only placeholder summaries
+- interop crate now has a real first workspace snapshot layer with a stable text format, full runtime-value encode/decode support for scalars/matrices/cells/structs/function handles, filesystem read/write APIs, runtime roundtrip tests, and CLI-facing workspace export/inspection support instead of only placeholder summaries
+- interop workspace snapshots now also roundtrip text values, including char arrays and string scalars, and now roundtrip first-class logical values as well instead of only numeric/container/function-handle data
+- runtime crate now has a first executable value layer with scalars, first-class logical values, text values (char arrays and string scalars), matrices, cell arrays, scalar structs, path-aware function handles, runtime errors, and stable workspace/value rendering
+- the current runtime/value model now also supports a practical first string-array baseline through matrices whose elements are string scalars, and the stdlib/execution path now treats those matrices as vectorized text inputs/outputs for a growing subset of text helpers instead of forcing everything back to scalar text or cells
+- the current runtime/execution path now also supports a practical first struct-array baseline through matrices whose elements are struct scalars, including vectorized field reads, nested field reads, scalar-expansion or matching-shape field assignment across struct arrays, and bytecode-parity for nested missing-field creation during assignment
+- execution now also supports indexed struct-element and nested indexed-field updates in both interpreter and bytecode VM paths for the current subset, so lvalues like `s(2).name = "BETA"` and `s(idx).inner.flag = false` write back through the full root binding instead of collapsing into temporary copies
+- bytecode execution now also supports lazy struct construction on predeclared-but-uninitialized lvalue roots such as function output bindings, so output-struct materialization via field assignment survives codegen, artifact roundtrip, and VM execution
+- execution now also supports implicit root growth for the current assignment subset in both interpreter and bytecode VM paths: bare field-root writes can materialize structs, `()` writes can grow empty numeric arrays, `{}` writes can grow empty cells, and scalar structs can expand into struct arrays through indexed field assignment
+- execution now also supports a stronger comma-separated-list slice in both interpreter and bytecode VM paths: cell-content selections like `c{:}`, `c{2:3}`, and `c{:, 2}` can expand in multi-assignment, function-call argument, and literal-construction contexts; struct-array field reads like `s.name` / `s.value` now expand the same way in those list contexts instead of only collapsing back to matrix values; forwarded field chains on list-producing expressions such as `cells{:}.score` and `nested{:}.inner.score` now continue to expand through later field access instead of collapsing too early; forwarded cell-content chains like `groups{:}{:}` and `matrix_cells{:}{:, 2}` now recurse through later brace indexing instead of falling back to the scalar-only path; and forwarded paren/index chains like `cells{:}(2)` and `nested{:}.score(1)` now carry list expansion through later `()` indexing in both interpreter and bytecode/codegen paths instead of truncating to the first value
+- semantics builtin classification now tracks the broader implemented stdlib surface instead of only the original narrow numeric/core list, so calls like `sort`, `diag`, `repmat`, `linspace`, `flip`, cumulative helpers, `unique`, `num2str`, `compose`, `islogical`, and the growing text-helper surface are recognized as builtin functions during semantic binding instead of falling through to generic external-candidate classification
+- semantics builtin classification now also covers the first explicit error/reflection/warning slice, so `error`, `warning`, `lastwarn`, `class`, and `isa` resolve as builtin functions during semantic binding instead of generic external-candidate calls
+- semantics binder now also recognizes bare value-position `true` / `false` references as builtin logical values instead of unbound identifiers, so the language surface can use MATLAB-style logical constants without forcing call syntax
+- semantics binder now also treats assignment-target roots as binding sites through nested lvalue chains, so bare script forms like `s.field = ...`, `x(2) = ...`, and `c{1} = ...` declare real workspace bindings instead of producing `SEM002` on the root identifier
+- semantics binder now also binds `try`/`catch` catch identifiers as real workspace variables in the surrounding script/function scope, so caught error values lower through semantics/HIR like normal variables instead of being parser-only syntax
+- stdlib crate now has a broader builtin slice covering numeric/container helpers (`zeros`, `ones`, `eye`, `sum`, `prod`, `max`, `min`, `mean`, `any`, `all`, `nnz`, `find`, `length`, `numel`, `ndims`, `isempty`, `size`, `deal`, `reshape`, `transpose`, `diag`, `repmat`, `linspace`, `flip`, `cumsum`, `cumprod`, `unique`, `sort`, `horzcat`, `vertcat`, `cat`, `num2cell`, `cell2mat`, `struct`) plus text/struct/helper builtins (`char`, `string`, `ischar`, `isstring`, `islogical`, `class`, `isa`, `error`, `strcmp`, `strlength`, `contains`, `num2str`, `compose`, `upper`, `lower`, `startsWith`, `endsWith`, `append`, `erase`, `replace`, `strcat`, `split`, `strip`, `strjoin`, `join`, `extractBefore`, `extractAfter`, `extractBetween`, `replaceBefore`, `replaceAfter`, `replaceBetween`, `pad`, `isfield`, `fieldnames`, `rmfield`)
+- stdlib text coverage now also includes `splitlines`, `strtrim`, and `deblank`, and the existing text helpers (`string`, `isstring`, `strcmp`, `strlength`, `contains`, `upper`, `lower`, `startsWith`, `endsWith`, `append`, `erase`, `replace`, `strcat`, `strip`, `strjoin`, `join`, `extract*`, `replace*`, `pad`) now vectorize over the current string-array baseline using scalar expansion / matching-shape behavior for the implemented subset
+- stdlib struct helpers (`isstruct`, `isfield`, `fieldnames`, `rmfield`) now also operate on the current struct-array baseline instead of only scalar structs
+- the `struct` builtin now supports both the zero-argument form and first real field/value pair forms, including cell-driven struct-array construction with scalar expansion across non-cell field values
+- stdlib now also supports MATLAB-style logical constructors `true` and `false` in both zero-argument scalar form and one/two-dimension matrix-constructor forms for the current subset
+- stdlib builtin outputs are now richer for the current subset: `max` and `min` now support `[value, index]` output forms, `find` now supports `[row, col]` output form, `sort` now supports `[sorted, index]` output form for the default ascending/current-dimension subset, and `unique` now supports `[values, first_index]` output form for the current numeric subset
+- predicate/comparison execution now produces first-class logical results instead of numeric `0/1` placeholders, and logical values now render as `true` / `false`, flow through builtin text conversion (`string`, `compose` `%s`), participate in indexing via scalar coercion, and survive workspace snapshot export/import
+- codegen and bytecode execution now treat builtin logical values as constants instead of trying to load them as workspace bindings, so bare `true` / `false` work with the full source -> HIR -> bytecode pipeline rather than only the direct interpreter path
+- execution now treats char arrays as real indexable/assignable row-vector data in both the interpreter and bytecode VM, including `()` reads, scalar/range/vector replacement, assignment-driven growth with space fill, and deletion via empty assignment for the current row-vector subset
+- the shared linear indexed-assignment planner now preserves existing extents instead of shrinking arrays to the highest assigned index, so matrix/cell/char linear assignment behaves much more realistically for in-bounds updates
+- execution crate now has both a first HIR interpreter and a first bytecode VM path for script units and function files; the bytecode VM now matches the full current interpreter fixture suite, can execute already-serialized bytecode artifacts loaded from disk, and can resolve packaged external dependencies from serialized bytecode bundles via explicit bundle module ids before falling back to the filesystem
+- execution now supports a first real `try`/`catch` baseline in both interpreter and bytecode VM paths, including catch-variable materialization as a struct-like runtime error value with `identifier` and `message` fields, plus backend/codegen support for protected regions through bytecode `push_try` / `store_last_error`
+- runtime errors now also support explicit user-defined identifiers/messages through builtin `error(...)`, first rethrow semantics through builtin `rethrow(...)`, and the current runtime surface now exposes first reflection helpers through `class(...)` and `isa(...)`
+- caught runtime errors now materialize as richer struct-like values with `cause`, `identifier`, `message`, and `stack`, where `stack` is now preserved across frame unwinding and ordered innermost-first for the current interpreter/bytecode subset
+- the error/reflection surface now has a stronger first `MException`-style baseline: builtin `MException(...)`, `addCause(...)`, `getReport(...)`, `throw(...)`, `rethrow(...)`, and `throwAsCaller(...)` all work for the current subset, cause chains survive through catches, `class(err)` now reports `'MException'`, `isa(err, "MException")` now succeeds while `isa(err, "struct")` remains a compatibility alias for the current struct-backed representation, `MException(...)` now also supports formatted message forms like `MException("MATC:Fmt", "x=%d", 7)`, `getReport(err)` now renders a deterministic char-array summary with message/stack/cause text and supports the current `"basic"` / `"extended"` mode subset, and `error(...)` now supports formatted message forms like `error("MATC:Fmt", "x=%d", 7)` and `error("value=%s", "ok")`
+- struct-backed `MException` values now also support the current method-style helper subset in both interpreter and bytecode VM paths, so calls like `err.getReport("basic")`, `err.addCause(cause)`, `err.throw()`, `err.rethrow()`, and `err.throwAsCaller()` lower and execute through the same builtin/error surface instead of requiring only free-function forms
+- the warning/reflection surface now also has a first shared-state baseline: builtin `warning(...)` supports the current message, identifier/message, and formatted-message forms; builtin `lastwarn()` now returns the shared last warning as char text with optional identifier output or explicit state reset/update via `lastwarn(msg)` / `lastwarn(msg, id)`; and both direct builtin calls plus `@warning` / `@lastwarn` handle calls now share that warning state across interpreter and bytecode VM execution
+- warning state-control/query now also works for the current `all` plus per-identifier subset, so `warning("on"|"off"|"query", ...)` can enable/disable/query shared warning state, identifier-specific overrides can supersede the global state for the current subset, and suppressed warnings no longer update `lastwarn`
+- `matc` CLI now supports `parse`, `check`, `lower`, and `run`, where `run` executes the current interpreter slice for scripts and function files and accepts scalar CLI args for function-file entrypoints
+- `matc` CLI now also supports `optimize`, `codegen`, `package-bytecode`, `inspect-bytecode`, `bundle-bytecode`, `inspect-bundle`, `run-bytecode`, `run-artifact`, and `run-bundle`, so the optimized backend can be emitted, verified, serialized, reloaded, inspected, executed from disk, and packaged with transitive external function dependencies
+- `matc` CLI now also supports `export-workspace` and `inspect-workspace`, so executed source files, bytecode artifacts, and bytecode bundles can be exported as serialized workspace snapshots and inspected later
+- fixture-based parser goldens now also cover package-qualified references, whitespace-separated matrix/cell literals, broader command-form parsing, and `try`/`catch` blocks under `tests/fixtures/frontend/parser`
+- fixture-based semantics golden tests now cover baseline binding, closure capture, namespace shadowing/function precedence, capture-mode escalation, `switch` traversal, `try`/`catch` catch binding, combined global/persistent behavior, package-qualified references, and whitespace-separated matrix/cell literals under `tests/fixtures/semantics/binder`
+- fixture-based semantics golden tests now also cover builtin logical values, including bare value-position `true` / `false` plus callable `true(...)` / `false(...)` constructor forms under `tests/fixtures/semantics/binder`
+- fixture-based semantics golden tests now also cover implicit assignment-root binding under `implicit_assignment_roots`, including bare field roots plus `()` / `{}` lvalue roots that now declare workspace bindings instead of erroring
+- fixture-based semantics golden tests now also cover builtin reflection/error classification under `error_and_reflection`, including `class`, `isa`, and explicit `error(...)` inside `try`/`catch`
+- fixture-based HIR golden tests now exist under `tests/fixtures/ir/hir`, covering package-qualified callable lowering, anonymous/nested closure capture lowering, builtin-call lowering, `switch`, `try`/`catch`, and whitespace-separated matrix literals
+- fixture-based optimizer golden tests now exist under `tests/fixtures/optimizer/hir`, covering constant control-flow cleanup, literal range folding, arithmetic identity cleanup, and empty-loop elimination
+- fixture-based codegen golden tests now exist under `tests/fixtures/codegen/bytecode`, covering control flow, `try`/`catch` lowering, nested/anonymous functions, dynamic handle calls, cell/index lowering, field stores, script entry emission, and verifier output
+- fixture-based codegen golden tests now also cover the new comma-separated-list bytecode lowering under `comma_separated_codegen`, `comma_separated_forwarded_cells_codegen`, and `comma_separated_forwarded_paren_codegen`, including `index_list`, `field_list`, `split_list`, nested spread-forwarding across brace indexing, and later `()` indexing over list-producing targets
+- fixture-based interpreter goldens now exist under `tests/fixtures/execution/interpreter`, covering builtin-driven script execution, loops/conditionals, matrix indexing, function-file nested capture, local/anonymous handles, resolver-backed external calls, cell indexing/handles, `end`-aware indexing and indexed assignment, `:` full-slice reads/writes, matrix/cell growth during assignment, numeric index-array selection/assignment, first-class logical results and logical indexing, deletion via empty assignment, cell subarray assignment, external/package function handles, both local/external `global`/`persistent` runtime behavior, local/external/package multi-output call behavior, builtin output behavior, text literals, command-form calls including the current comma-separated command-argument subset, `try`/`catch` runtime recovery, char-array indexing/growth/delete, struct field/handle behavior, struct helper builtins, reduction/search helpers, ordering/shape helpers, sequence/accumulation helpers, text case/prefix/suffix/append helpers, text transform helpers, text join/between helpers, text before/after helpers, text replace/pad helpers, text formatting helpers, dedicated logical value-model helpers, and linear-assignment extent preservation
+- fixture-based interpreter and bytecode-VM goldens now also cover explicit user-error raising, rethrow propagation, runtime reflection, and current stack semantics under `error_and_reflection`, `rethrow_runtime`, and `function_stack_trace`, including `error(identifier, message)`, default-identifier `error(message)`, `rethrow(err)`, `class(...)`, `isa(...)`, and innermost-first stack traces across script/function-file catches
+- fixture-based interpreter and bytecode-VM goldens now also cover the stronger `MException` helper surface plus formatted/reporting `error(...)` forms under `mexception_helpers`, `mexception_formatting_runtime`, `throw_as_caller_runtime`, `error_formatting_runtime`, and `get_report_runtime`, including `MException(...)`, `addCause(...)`, formatted `MException(...)` messages, `getReport(...)`, `getReport(..., "basic")`, `throw(...)`, `throwAsCaller(...)`, `class(err) == 'MException'`, `isa(err, "MException")`, current `%d` / `%f` / `%g` / `%s` format-driven error messages, and report text that includes stack/cause summaries
+- fixture-based interpreter and bytecode-VM goldens now also cover the first string-array/text-matrix baseline, including vectorized text transforms/search helpers, string-matrix conversion, split returning string-array output, row-wise `join` over text matrices, and `strtrim` / `deblank` under `text_array_helpers`
+- fixture-based interpreter and bytecode-VM goldens now also cover the first struct-array baseline under `struct_array_helpers`, including vectorized field reads, nested field reads, fieldnames/rmfield/isfield over struct arrays, scalar-expansion plus shape-matched assignment across struct matrices, indexed struct-element writes under `indexed_struct_assignment`, and lazy output-struct field materialization under `undefined_struct_root_assignment`
+- fixture-based interpreter and bytecode-VM goldens now also cover `struct(...)` constructor forms under `struct_constructor_helpers`, including scalar struct construction plus cell-driven struct-array expansion
+- fixture-based interpreter and bytecode-VM goldens now also cover implicit root growth under `implicit_root_growth`, including `s.field`, `x(2)`, `c{1}`, and current scalar-struct expansion into a struct array via indexed field assignment
+- fixture-based interpreter and bytecode-VM goldens now also cover the stronger comma-separated-list slice under `comma_separated_cells`, `comma_separated_struct_fields`, `comma_separated_forwarded_fields`, `comma_separated_forwarded_cells`, and `comma_separated_forwarded_paren`, including cell-content expansion into multi-assignment/function-call arguments/literal construction, struct-array field expansion into direct multi-assignment/`deal(...)`/literal construction, forwarded field access over list-producing expressions like `cells{:}.score` and `nested{:}.inner.score`, forwarded brace-index chains like `groups{:}{:}` and `matrix_cells{:}{:, 2}`, and later `()` indexing over those list-producing expressions like `cells{:}(2)` and `nested{:}.score(1)`
+- fixture-based semantics golden tests now also cover warning builtin classification under `warning_and_lastwarn`, including direct `warning(...)` / `lastwarn()` calls plus `@warning` / `@lastwarn` function-handle targets resolving as builtins
+- fixture-based interpreter and bytecode-VM goldens now also cover the new warning-state baseline under `warning_and_lastwarn`, including plain warnings, formatted warnings, function-handle warning calls, one/two-output `lastwarn`, and explicit warning-state reset
+- fixture-based interpreter goldens now also cover bare `true` / `false` builtin-value execution and callable `true(...)` / `false(...)` logical constructor forms under `logical_builtin_forms`
+- fixture-based bytecode-VM golden tests now exist in `src/execution/tests/bytecode_vm_golden.rs`, reusing the full current execution fixture surface to check backend/runtime parity across builtins, loops/conditionals, `try`/`catch`, nested capture, local handles, external resolution, builtin outputs, struct fields, slice/growth/delete/index behavior, multi-output calls, logical builtin-value behavior, ordering/shape helpers, sequence/accumulation helpers, text helper behavior, text transform helpers, text join/between helpers, text before/after helpers, text replace/pad helpers, text formatting helpers, and `global`/`persistent` runtime behavior; representative artifact roundtrip execution coverage now lives there as well
+- platform integration tests now exist in `src/platform/tests/bytecode_artifact.rs`, covering artifact and bundle encode/decode roundtrips, read/write roundtrips, dependency-path extraction, bundle-id target rewriting, and invalid-header rejection against real compiled bytecode modules
+- interop integration tests now exist in `src/interop/tests/workspace_snapshot.rs`, covering workspace snapshot encode/decode roundtrips, file roundtrips, invalid-header rejection, and snapshot roundtrips for a real executed fixture workspace
+- repo-local helpers `scripts/cargo-msvc.cmd` and `scripts/cargo-msvc.ps1` now exist to run cargo commands through `VsDevCmd.bat` from a normal shell, with the `.cmd` wrapper being the most reliable entry point for arbitrary cargo flags
+- frontend tests type-check with `cargo check -p matlab-frontend --tests`
+- semantics tests type-check with `cargo check -p matlab-semantics --tests`
+- CLI type-checks with `cargo check -p matc`
+- full `cargo test --workspace` now passes when launched through the Visual Studio developer environment (`VsDevCmd.bat`)
+
+## Session Validation
+
+Ran successfully in this session:
+- `C:\Users\UserK\.cargo\bin\cargo.exe check --workspace`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-frontend --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-semantics --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-resolver --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-ir --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-optimizer --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-codegen --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-execution --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-stdlib --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-platform --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matlab-interop --tests`
+- `C:\Users\UserK\.cargo\bin\cargo.exe check -p matc`
+- `cmd.exe /c "call \"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat\" -arch=x64 >nul && ... cargo test --workspace"`
+- `.\scripts\cargo-msvc.cmd test --workspace`
+- `.\scripts\cargo-msvc.cmd test -p matlab-codegen --test bytecode_golden`
+- `.\scripts\cargo-msvc.cmd test -p matlab-stdlib --lib`
+- `.\scripts\cargo-msvc.cmd test -p matlab-execution --test bytecode_vm_golden`
+- `.\scripts\cargo-msvc.cmd test -p matlab-execution --test interpreter_golden`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\comma_separated_cells.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\comma_separated_struct_fields.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- codegen tests\fixtures\codegen\bytecode\comma_separated_codegen.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\text_array_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\text_array_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\struct_array_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\struct_array_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\struct_constructor_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\struct_constructor_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\indexed_struct_assignment.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\indexed_struct_assignment.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\undefined_struct_root_assignment.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\undefined_struct_root_assignment.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\implicit_root_growth.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\implicit_root_growth.m`
+- `.\scripts\cargo-msvc.cmd test -p matlab-interop --test workspace_snapshot`
+- `.\scripts\cargo-msvc.cmd test -p matlab-platform --test bytecode_artifact`
+- `.\scripts\cargo-msvc.cmd test -p matlab-optimizer --test optimizer_golden`
+- `.\scripts\cargo-msvc.cmd test -p matlab-semantics --test binder_golden`
+- `.\scripts\cargo-msvc.cmd test -p matlab-ir --test hir_golden`
+- `.\scripts\cargo-msvc.cmd test -p matlab-codegen --test bytecode_golden`
+- `.\scripts\cargo-msvc.cmd test -p matlab-execution --test interpreter_golden comma_separated_forwarded_cells_fixture_matches_golden -- --exact --nocapture`
+- `.\scripts\cargo-msvc.cmd test -p matlab-execution --test bytecode_vm_golden comma_separated_forwarded_cells_fixture_matches_golden -- --exact --nocapture`
+- `.\scripts\cargo-msvc.cmd test -p matlab-codegen --test bytecode_golden comma_separated_forwarded_cells_fixture_matches_golden -- --exact --nocapture`
+- `.\scripts\cargo-msvc.cmd test -p matlab-semantics --test binder_golden warning_and_lastwarn_fixture_matches_golden -- --exact --nocapture`
+- `.\scripts\cargo-msvc.cmd test -p matlab-execution --test interpreter_golden warning_and_lastwarn_fixture_matches_golden -- --exact --nocapture`
+- `.\scripts\cargo-msvc.cmd test -p matlab-execution --test bytecode_vm_golden warning_and_lastwarn_fixture_matches_golden -- --exact --nocapture`
+- `.\scripts\cargo-msvc.cmd test -p matlab-execution --test interpreter_golden comma_separated_forwarded_paren_fixture_matches_golden -- --exact --nocapture`
+- `.\scripts\cargo-msvc.cmd test -p matlab-execution --test bytecode_vm_golden comma_separated_forwarded_paren_fixture_matches_golden -- --exact --nocapture`
+- `.\scripts\cargo-msvc.cmd test -p matlab-codegen --test bytecode_golden comma_separated_forwarded_paren_fixture_matches_golden -- --exact --nocapture`
+- `.\scripts\cargo-msvc.cmd run -p matc -- codegen tests\fixtures\codegen\bytecode\control_flow_codegen.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- codegen tests\fixtures\codegen\bytecode\handles_and_nested_codegen.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- codegen tests\fixtures\codegen\bytecode\index_and_field_codegen.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- codegen tests\fixtures\codegen\bytecode\comma_separated_forwarded_cells_codegen.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- package-bytecode tests\fixtures\execution\interpreter\builtin_switch.m target\artifact-smoke\builtin_switch.matbc`
+- `.\scripts\cargo-msvc.cmd run -p matc -- inspect-bytecode target\artifact-smoke\builtin_switch.matbc`
+- `.\scripts\cargo-msvc.cmd run -p matc -- bundle-bytecode tests\fixtures\execution\interpreter\external_resolution.m target\bundle-smoke\external_resolution.matpkg`
+- `.\scripts\cargo-msvc.cmd run -p matc -- inspect-bundle target\bundle-smoke\external_resolution.matpkg`
+- `.\scripts\cargo-msvc.cmd run -p matc -- export-workspace tests\fixtures\execution\interpreter\builtin_switch.m target\interop-smoke\builtin_switch.matws`
+- `.\scripts\cargo-msvc.cmd run -p matc -- inspect-workspace target\interop-smoke\builtin_switch.matws`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\builtin_switch.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\external_resolution.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-artifact target\artifact-smoke\builtin_switch.matbc`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bundle target\bundle-smoke\external_resolution.matpkg`
+- `.\scripts\cargo-msvc.cmd run -p matc -- optimize tests\fixtures\optimizer\hir\constant_control_flow.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- optimize tests\fixtures\optimizer\hir\range_and_identity.m`
+- `.\scripts\cargo-msvc.cmd test -p matlab-execution --test interpreter_golden`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\builtin_switch.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\slice_indexing_and_assignment.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\growth_indexing_and_assignment.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\vector_indexing_and_assignment.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\deletion_assignment.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\logical_indexing.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\loops_and_conditionals.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\matrix_indexing.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\command_form_text.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\text_indexing_and_search.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\ordering_and_shape_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\sequence_and_accumulation_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\text_case_and_concat_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\text_transform_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\text_join_and_between_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\text_before_after_join_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\text_replace_and_pad_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\text_format_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\logical_value_model.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\logical_builtin_forms.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\struct_field_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\linear_assignment_preserves_extent.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\ordering_and_shape_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\sequence_and_accumulation_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\text_case_and_concat_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\text_transform_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\text_join_and_between_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\text_before_after_join_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\text_replace_and_pad_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\text_format_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\logical_value_model.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\logical_builtin_forms.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- parse tests\fixtures\frontend\parser\try_catch.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- check tests\fixtures\semantics\binder\try_catch.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- lower tests\fixtures\ir\hir\try_catch_flow.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- codegen tests\fixtures\codegen\bytecode\try_catch_codegen.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\try_catch_runtime.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\try_catch_runtime.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- check tests\fixtures\semantics\binder\error_and_reflection.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\error_and_reflection.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\error_and_reflection.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- check tests\fixtures\semantics\binder\mexception_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\mexception_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\throw_as_caller_runtime.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\mexception_helpers.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\throw_as_caller_runtime.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\error_formatting_runtime.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\error_formatting_runtime.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run tests\fixtures\execution\interpreter\get_report_runtime.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\get_report_runtime.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- run-bytecode tests\fixtures\execution\interpreter\warning_and_lastwarn.m`
+- `.\scripts\cargo-msvc.cmd run -p matc -- codegen tests\fixtures\codegen\bytecode\comma_separated_forwarded_paren_codegen.m`
+- `powershell -ExecutionPolicy Bypass -File .\scripts\cargo-msvc.ps1 test --workspace`
+
+Additional successful targeted test runs in the MSVC developer environment:
+- `cargo test -p matlab-frontend --lib`
+- `cargo test -p matlab-frontend --test parser_golden`
+- `cargo test -p matlab-semantics --lib`
+- `cargo test -p matlab-semantics --test binder_golden`
+- `cargo test -p matlab-resolver --lib`
+
+## Fixed Decisions Already Made
+
+- project direction is compiler-first
+- repository is modular by subsystem
+- CLI-first workflow takes priority over GUI work
+- Release 0.1 is a subset-focused delivery
+- implementation language default is Rust unless superseded by a future ADR
+- initial crate topology has been mapped to major architecture modules
+
+## Current Priority
+
+The original repository plan is now in effectively-finished territory: the repo has a real end-to-end pipeline from parse -> semantics -> HIR -> optimizer -> verified codegen -> serialized backend artifact/bundle -> bytecode execution -> serialized workspace snapshot export for a meaningful subset of scripts and function files, and the supported full-workspace test path is green. The best leverage has shifted from subsystem bring-up to post-plan MATLAB fidelity and breadth: deeper struct/cell comma-separated-list semantics, richer logical/string/struct array behavior, broader builtins, fuller command-form ambiguity handling, and then stronger backend/interop depth such as richer manifests, real MAT-file support, debug tooling, artifact evolution/versioning, and eventual native/backend handoff.

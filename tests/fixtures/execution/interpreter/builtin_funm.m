@@ -1,0 +1,17 @@
+a = funm([1 0; 0 2], "exp");
+[b, c] = funm([1 0; 0 4], "log");
+d = funm([0 1; -1 0], "sin");
+e = funm([0 1; -1 0], "cos");
+f = funm([1 0; 0 2], "sinh");
+g = funm([1 0; 0 2], "cosh");
+h = funm([1 0; 0 2], "exp");
+i = funm([1 0; 0 4], @sqrt);
+j = funm([0 1; -1 0], @tan);
+k = funm([1 0; 0 2], @tanh);
+l = funm([0 0; 0 1], @asin);
+m = funm([1 0; 0 2], @acosh);
+n = funm([0 1; 0 0], @atanh);
+o = funm([0 1; -1 0], @sec);
+p = funm([1 0; 0 2], @coth);
+q = funm([1 0; 0 2], @asec);
+r = funm([1 0; 0 0.5], @asech);

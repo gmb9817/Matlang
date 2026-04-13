@@ -1,0 +1,14 @@
+workspace
+  a = 'l'
+  b = 'lph'
+  c = 'aa'
+  d = 'alpha'
+  q = 'aYZ'
+  s = 'aZpha'
+  t = 'xyz'
+  u = 'ac'
+  v = true
+  w = false
+  x = 8
+  y = true
+  z = true

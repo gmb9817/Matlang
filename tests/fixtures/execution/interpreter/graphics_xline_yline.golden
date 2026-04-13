@@ -1,0 +1,8 @@
+workspace
+  current = 37
+  curve = 2001
+  f = 37
+  hy = 2003
+  vx = 2002
+  x_limits = [0, 2]
+  y_limits = [0, 1]

@@ -1,0 +1,1173 @@
+# MATLAB Reimplementation Master Plan
+
+Document status: Draft v1 + repo status refresh (2026-04-07)
+Primary language of document: English for AI handoff
+Project mode: Modular, compiler-first, handoff-friendly
+
+==================================================
+0. Current Repository Reality (2026-04-07)
+==================================================
+
+This file started as a full bring-up plan. The repository is now materially past the original
+"empty skeleton / phase-0-to-phase-4" stage.
+
+Current reality:
+- The end-to-end path exists:
+  - lexer / parser / AST / diagnostics
+  - semantics / resolution
+  - HIR
+  - early optimizer
+  - bytecode codegen
+  - platform artifact and bundle packaging
+  - interpreter
+  - bytecode VM
+  - workspace snapshot interop
+  - current MAT-file-backed `save` / `load` subset
+  - native Windows figure host plus headless SVG export path
+- The repository is now firmly in post-plan fidelity/breadth work rather than initial scaffolding work.
+- The supported green validation path is:
+  - `.\scripts\cargo-msvc.cmd test --workspace`
+
+What is materially complete already:
+- project foundation and repo structure
+- front-end MVP
+- semantics MVP for a meaningful MATLAB subset
+- interpreter bring-up
+- first runtime core
+- first HIR / lowering / verifier pipeline
+- first bytecode backend and shared-runtime execution path
+- first compiler artifact / bundle path
+- workspace snapshot interop path
+- broad first standard-library baseline
+- broad first plotting/figure baseline, including native viewer support
+- first session/workspace tooling baseline (`clear`, `clearvars`, `who`, `whos`, `tic`, `toc`, `save`, `load`)
+
+What remains the highest-value work now:
+- deeper runtime/value-model fidelity:
+  - complex numbers (first scalar/arithmetic/suffix-literal baseline now exists, but broader parity remains)
+  - more-than-2D arrays
+  - copy-on-write and richer array semantics
+  - fuller indexing / shape / logical behavior
+- graphics/property and UI fidelity beyond the current SVG/native-viewer baseline
+- command-form fidelity and harder command-vs-expression ambiguity
+- classdef / object-model work
+- broader MAT-file / MEX / packaging maturity
+- dedicated performance/stabilization work
+
+==================================================
+1. Mission
+==================================================
+
+Goal:
+Reimplement a MATLAB-compatible language system as a modular project whose final build artifact can act as a MATLAB compiler and execution platform.
+
+Primary objective:
+- Compile and execute a large, practical subset of MATLAB source code.
+- Preserve MATLAB-like language semantics where compatibility matters.
+- Keep the architecture decomposed enough that many AIs or human contributors can work independently.
+
+Core assumption:
+- This project is not trying to clone every MATLAB toolbox on day one.
+- The first serious deliverable is a compiler + runtime + standard library core.
+- GUI-heavy desktop features, Simulink, App Designer, and niche toolboxes are later phases unless explicitly promoted.
+
+Compatibility baseline for planning:
+- Core MATLAB language
+- Scripts
+- Functions
+- Anonymous functions
+- Function handles
+- Basic classdef
+- Numeric arrays
+- Logical arrays
+- Char/string support
+- Structs
+- Cell arrays
+- Indexing semantics
+- Control flow
+- File/module/package resolution
+- Core math library
+
+Final vision:
+- A source-compatible compiler toolchain for MATLAB-like code
+- An execution runtime
+- A conformance suite
+- A modular codebase that can continue evolving into broader MATLAB compatibility
+
+==================================================
+2. Non-Negotiable Architectural Rules
+==================================================
+
+- Every major subsystem must be independently testable.
+- No giant "misc" modules.
+- Every module must have:
+  - a clear ownership boundary
+  - a README or spec file
+  - a public API boundary
+  - unit tests
+  - integration expectations
+- The parser must not know runtime implementation details.
+- The optimizer must operate on IR, not AST hacks.
+- Runtime semantics must be centralized, not reimplemented ad hoc across compiler stages.
+- Standard library compatibility must live above the runtime core.
+- Experimental features must be isolated behind flags.
+- Compatibility decisions must be written down in spec documents.
+- If a behavior differs from MATLAB, the difference must be explicit and tested.
+
+==================================================
+3. Product Strategy
+==================================================
+
+The project will be built in layers:
+
+1. Language front-end
+2. Semantic analysis
+3. Intermediate representations
+4. Optimization pipeline
+5. Runtime system
+6. Standard library
+7. Code generation and execution
+8. Compatibility and packaging
+9. Tooling and conformance infrastructure
+
+The first usable system should be:
+- headless
+- command-line driven
+- batch compile capable
+- able to run nontrivial `.m` programs
+
+Desktop IDE parity is not a phase-1 requirement.
+
+==================================================
+4. Explicit Non-Goals For Early Phases
+==================================================
+
+Do not block early progress on:
+- full MATLAB desktop UX
+- figure/window system parity
+- Simulink
+- GUIDE/App Designer parity
+- GPU acceleration
+- distributed computing
+- full toolbox parity
+- full MEX ABI compatibility
+- JIT sophistication beyond the minimum needed for performance milestones
+
+These may be designed for, but not required for phase-1 completion.
+
+==================================================
+5. Canonical Repository Layout
+==================================================
+
+Recommended root structure:
+
+/docs
+  /architecture
+  /compatibility
+  /decisions
+  /roadmap
+  /handoff
+
+/spec
+  /language
+  /runtime
+  /ir
+  /stdlib
+  /tooling
+
+/tools
+  /build
+  /codegen
+  /format
+  /test-harness
+  /perf
+  /release
+
+/bootstrap
+  /samples
+  /golden
+  /fixtures
+
+/src
+  /frontend
+    /lexer
+    /parser
+    /ast
+    /source-map
+    /diagnostics
+  /resolver
+    /names
+    /imports
+    /packages
+    /path-search
+  /semantics
+    /types
+    /inference
+    /shape-analysis
+    /attributes
+    /workspace-model
+  /ir
+    /hir
+    /mir
+    /lir
+    /passes
+    /serialization
+  /optimizer
+    /canonicalize
+    /constant-fold
+    /dead-code
+    /shape
+    /loop
+    /memory
+    /inlining
+  /runtime
+    /core
+    /memory
+    /arrays
+    /numeric
+    /complex
+    /strings
+    /structs
+    /cells
+    /objects
+    /function-handles
+    /io
+    /errors
+    /gc-or-refcount
+  /stdlib
+    /core
+    /math
+    /matrix
+    /elementwise
+    /strings
+    /struct
+    /cell
+    /filesystem
+    /time
+  /execution
+    /interpreter
+    /bytecode
+    /jit
+    /aot
+  /codegen
+    /bytecode
+    /c-backend
+    /llvm-backend
+    /linking
+  /interop
+    /mat-file
+    /ffi
+    /mex-compat
+  /platform
+    /os
+    /path
+    /env
+  /cli
+    /driver
+    /commands
+    /config
+
+/tests
+  /unit
+  /integration
+  /conformance
+  /compatibility
+  /perf
+  /regression
+  /fuzz
+
+/benchmarks
+  /micro
+  /macro
+  /real-world
+
+/third_party
+
+/out
+
+==================================================
+6. Required Core Deliverables
+==================================================
+
+The project is not "real" until these outputs exist:
+
+- `matc` compiler CLI
+- `matrun` execution CLI or equivalent runtime launcher
+- standard runtime library
+- standard library package
+- conformance test harness
+- benchmark suite
+- compatibility matrix document
+- language specification subset document
+
+Current repo reality for these deliverables:
+- `matc` compiler CLI exists
+- equivalent runtime launch paths exist via `matc run`, `run-bytecode`, `run-artifact`, and `run-bundle`
+- runtime library exists
+- standard library exists
+- conformance/golden fixture infrastructure exists
+- bytecode artifact and bundle path exists
+- workspace snapshot interop exists
+- current MAT-file-backed `save` / `load` subset exists
+- native figure-window plus headless export path exists
+- benchmark/documentation/compatibility-matrix maturity still lags implementation depth
+
+Phase-1 release artifact target:
+- compile `.m` source into either:
+  - bytecode plus runtime package, or
+  - native executable plus runtime library, or
+  - C/LLVM intermediate output plus link step
+
+Compiler mode options:
+- parse only
+- type/semantic check only
+- IR dump
+- optimized IR dump
+- bytecode codegen / package / inspect
+- run source
+- run bytecode / artifact / bundle
+- workspace export / inspection
+
+==================================================
+7. Language Semantics That Must Be Designed Up Front
+==================================================
+
+These are not implementation details. They are project-defining contracts.
+
+[ ] 1-based indexing
+[ ] column-major array semantics
+[ ] copy-on-write behavior
+[ ] scalar expansion / broadcasting policy
+[~] complex number behavior (first scalar/arithmetic/suffix-literal subset exists)
+[ ] NaN / Inf semantics
+[ ] numeric promotion rules
+[ ] integer overflow policy
+[ ] colon operator semantics
+[ ] linear indexing semantics
+[ ] logical indexing semantics
+[ ] end keyword handling
+[ ] script vs function workspace behavior
+[ ] global and persistent variable semantics
+[ ] nested function scope capture
+[ ] anonymous function capture semantics
+[ ] function handle identity and invocation rules
+[ ] varargin / varargout behavior
+[ ] multiple return value mechanics
+[ ] short-circuit operator rules
+[ ] classdef object model
+[ ] value vs handle class behavior
+[ ] method dispatch rules
+[ ] package and namespace lookup
+[ ] path resolution order
+[ ] error/warning behavior model
+[ ] string and char interoperability rules
+[ ] struct field access semantics
+[ ] cell indexing rules `()` `{}` and assignment behavior
+[ ] concatenation rules
+[ ] matrix construction grammar
+[ ] operator precedence and associativity
+[ ] command-form syntax policy
+[ ] function/script shadowing rules
+[ ] builtin precedence rules
+
+Before large implementation starts, each line above must map to a spec entry.
+
+==================================================
+8. Internal Compiler Pipeline
+==================================================
+
+Planned pipeline:
+
+1. Source loading
+2. Lexing
+3. Parsing
+4. AST normalization
+5. Name resolution
+6. Scope/workspace construction
+7. Semantic analysis
+8. Shape/type effect annotation
+9. HIR generation
+10. HIR canonicalization
+11. Optimization passes
+12. Lowering to backend IR
+13. Code generation
+14. Packaging/linking
+15. Runtime execution
+
+Artifacts by stage:
+
+- Lexer output:
+  - token stream
+  - trivia/source map
+
+- Parser output:
+  - concrete parse tree if needed
+  - canonical AST
+
+- Semantic output:
+  - symbol tables
+  - binding graph
+  - workspace graph
+  - diagnostics
+
+- IR output:
+  - HIR for MATLAB semantics
+  - MIR for lowered structured operations
+  - LIR/backend-ready operations
+
+- Backend output:
+  - bytecode or C or LLVM IR
+  - metadata
+  - debug/source map info
+
+==================================================
+9. IR Design Requirements
+==================================================
+
+HIR must preserve MATLAB-level semantics:
+- matrix construction
+- dynamic dispatch points
+- workspace operations
+- multiple returns
+- exception and warning sites
+- high-level indexing
+
+MIR should lower:
+- shape-normalized operations
+- explicit allocation decisions
+- explicit control flow
+- builtin call forms
+
+LIR should be:
+- backend oriented
+- explicit temporaries
+- explicit memory ownership model
+- easy to emit into bytecode, C, or LLVM
+
+IR invariants checklist:
+
+[ ] every IR level has a written invariant doc
+[ ] every lowering pass documents preconditions
+[ ] every pass has verifier logic
+[ ] IR dump format is stable enough for regression tests
+[ ] source locations survive enough stages for useful diagnostics
+[ ] exception/error edges are explicit
+[ ] multiple-result operations are first-class
+
+==================================================
+10. Runtime Architecture
+==================================================
+
+The runtime is the heart of compatibility. It must be treated as a product, not a helper library.
+
+Runtime subsystems:
+
+1. Value representation
+2. Memory management
+3. Array engine
+4. Numeric kernel layer
+5. String/char layer
+6. Cell/struct/object layer
+7. Function/method invocation layer
+8. Error/warning/stack trace layer
+9. File/path/environment layer
+10. Reflection/introspection layer
+
+Value representation requirements:
+
+[ ] tagged value or boxed object strategy chosen
+[ ] first-class support for scalars and arrays
+[~] support for complex values (first runtime complex scalars, builtin `i`/`j`, and suffix literals exist)
+[ ] shape/stride metadata policy defined
+[ ] copy-on-write metadata defined
+[ ] empty array representation defined
+[ ] sparse support strategy explicitly deferred or scoped
+
+Memory model decisions:
+
+[ ] reference counting vs tracing GC decision
+[ ] copy-on-write trigger points documented
+[ ] temporary allocation policy documented
+[ ] slice/view policy documented
+[ ] ownership transfer rules documented
+[ ] runtime leak detection strategy exists
+
+Array engine capabilities:
+
+[ ] dense numeric matrices
+[ ] N-dimensional arrays
+[ ] reshape/permute
+[ ] slicing/indexing
+[ ] concatenation
+[ ] broadcasting/scalar expansion
+[ ] logical masks
+[ ] linear indexing
+[ ] colon range materialization or lazy range policy
+
+==================================================
+11. Standard Library Strategy
+==================================================
+
+Split the standard library into tiers:
+
+Tier 0: compiler/runtime intrinsics
+- primitive arithmetic
+- comparison
+- allocation
+- shape query
+- indexing primitives
+
+Tier 1: core language builtins
+- `size`
+- `length`
+- `numel`
+- `class`
+- `isa`
+- `zeros`
+- `ones`
+- `eye`
+- `reshape`
+- `permute`
+- `sum`
+- `prod`
+- `min`
+- `max`
+
+Tier 2: high-frequency math and matrix library
+- linear algebra basics
+- decompositions needed for credibility
+- trig/exponential/log functions
+- random basics
+
+Tier 3: compatibility surface expansion
+- strings/text utilities
+- struct/cell helpers
+- filesystem utilities
+- dates/times
+- serialization
+
+Rule:
+- Builtins that affect semantics or performance-critical shape behavior belong as intrinsics.
+- Pure convenience functions should live in library space when possible.
+
+==================================================
+12. Execution Modes
+==================================================
+
+The system should support more than one execution strategy.
+
+Planned order:
+
+1. Tree-walk or direct AST interpreter for bring-up only
+2. Bytecode VM for stable early execution
+3. AOT/native backend for serious compiler milestone
+4. Optional JIT for performance phases
+
+Why:
+- Interpreter helps validate semantics fast
+- Bytecode stabilizes execution semantics
+- Native backend becomes the "compiler" story
+- JIT is valuable later, but should not block phase-1 delivery
+
+Execution mode checklist:
+
+[ ] interpreter can run parser/semantic smoke tests
+[ ] bytecode VM reaches conformance MVP
+[ ] backend compiler can emit distributable artifact
+[ ] runtime behavior is shared across all modes
+[ ] differential tests compare interpreter vs compiled output
+
+==================================================
+13. CLI and Tooling Plan
+==================================================
+
+Required commands:
+
+- `matc parse file.m`
+- `matc check file.m`
+- `matc dump-ast file.m`
+- `matc dump-ir file.m`
+- `matc compile file.m`
+- `matc run file.m`
+- `matc test`
+- `matc bench`
+
+Helpful flags:
+
+- `--emit-ast`
+- `--emit-hir`
+- `--emit-mir`
+- `--emit-lir`
+- `--opt-level`
+- `--target`
+- `--runtime-mode`
+- `--strict-compat`
+- `--warn-compat`
+
+Tooling requirements:
+
+[ ] deterministic builds
+[ ] reproducible test runs
+[ ] golden output support
+[ ] IR diff tooling
+[ ] benchmark runner
+[ ] crash minimizer for fuzzing
+[ ] structured diagnostics output
+
+==================================================
+14. Testing Strategy
+==================================================
+
+Testing is part of architecture, not cleanup work.
+
+Test layers:
+
+1. Unit tests
+2. Parser golden tests
+3. Semantic expectation tests
+4. IR pass tests
+5. Runtime behavior tests
+6. Conformance tests against documented semantics
+7. Differential tests against MATLAB or accepted reference outputs
+8. Regression tests for every fixed bug
+9. Performance benchmarks
+10. Fuzz testing for parser and selected runtime operations
+
+Must-have infrastructure:
+
+[ ] snapshot/golden test format
+[ ] error diagnostic expectation format
+[ ] differential runner
+[ ] fixture minimizer
+[ ] benchmark history storage
+[ ] flaky test policy
+
+Minimum conformance categories:
+
+[ ] expressions and operators
+[ ] arrays and indexing
+[ ] functions and returns
+[ ] scopes and closures
+[ ] control flow
+[ ] structs/cells
+[ ] strings/chars
+[ ] objects/classes
+[ ] io/errors
+[ ] path and package resolution
+
+==================================================
+15. Performance Plan
+==================================================
+
+Performance is a design concern, but not at the cost of semantic chaos.
+
+Performance priorities:
+
+1. correct semantics
+2. predictable memory behavior
+3. stable low-overhead runtime primitives
+4. array operation efficiency
+5. function call overhead reduction
+6. backend optimization
+7. JIT specialization
+
+Initial benchmark families:
+
+- scalar arithmetic loops
+- matrix creation and slicing
+- elementwise operations
+- reductions
+- function call overhead
+- closure overhead
+- struct/cell access
+- recursive calls
+- file IO smoke
+
+Optimization passes worth planning now:
+
+[ ] constant folding
+[ ] constant propagation
+[ ] dead code elimination
+[ ] copy propagation
+[ ] common subexpression elimination
+[ ] builtin inlining
+[ ] loop canonicalization
+[ ] allocation sinking where legal
+[ ] shape-specialized lowering
+[ ] bounds-check elimination where proven safe
+
+==================================================
+16. Compatibility Plan
+==================================================
+
+Compatibility must be tracked as a matrix, not vague promises.
+
+Required compatibility documents:
+
+- language feature matrix
+- builtin function matrix
+- runtime behavior differences
+- deferred feature list
+- known incompatibilities
+
+Every feature should have one of these states:
+- unplanned
+- planned
+- spec-complete
+- in-progress
+- implemented
+- tested
+- compatible
+- partially compatible
+- intentionally divergent
+
+Examples of compatibility scope areas:
+
+[ ] script semantics
+[ ] function resolution
+[ ] path precedence
+[ ] operator behavior
+[ ] classdef subset
+[ ] error identifiers
+[ ] warning behavior
+[ ] MAT-file support
+[ ] MEX boundary policy
+[ ] toolbox emulation policy
+
+==================================================
+17. Recommended Module Ownership Model
+==================================================
+
+Each module should be owned like a mini-project.
+
+For every major module create:
+- `README.md`
+- `SPEC.md`
+- `TASKS.md`
+- `DECISIONS.md`
+- `TEST_PLAN.md`
+
+Each module owner must answer:
+- What does this module own?
+- What is explicitly out of scope?
+- What data structures are public?
+- What invariants must other modules rely on?
+- What diagnostics can it emit?
+- What tests prove it works?
+
+AI handoff rule:
+- No AI should touch a module without first reading its `SPEC.md` and `TASKS.md`.
+
+==================================================
+18. Multi-AI Collaboration Rules
+==================================================
+
+This project assumes multiple AIs may work over time.
+
+Rules:
+
+- Do not make silent semantic decisions.
+- Record all behavior-affecting changes.
+- Prefer narrow PRs or patches per module.
+- Every new subsystem must include docs before deep implementation.
+- If a module API changes, update downstream expectations immediately.
+- Do not mix parser, runtime, and stdlib behavior changes in one patch unless absolutely necessary.
+- When blocked, write the blocker into the owning module task file.
+
+Required handoff documents:
+
+- `/docs/handoff/CURRENT_STATE.md`
+- `/docs/handoff/NEXT_STEPS.md`
+- `/docs/handoff/OPEN_QUESTIONS.md`
+- `/docs/handoff/KNOWN_BREAKAGE.md`
+
+Session close protocol for any contributor:
+
+[ ] update current status
+[ ] record changed modules
+[ ] record open risks
+[ ] record what should happen next
+[ ] list tests run and not run
+
+==================================================
+19. Phased Delivery Roadmap
+==================================================
+
+Important status note:
+- The unchecked boxes below are historical plan items, not a trustworthy current-state ledger by themselves.
+- Use the per-phase status lines below as the current truth for this repo.
+- For day-to-day forward work, prefer `docs/handoff/FUTURE_ONLY.md` and `docs/handoff/KNOWN_BREAKAGE.md`.
+
+Phase 0: Project foundation
+
+Current repo status:
+- effectively complete
+
+[ ] choose implementation language
+[ ] choose build system
+[ ] create repo skeleton
+[ ] define coding standards
+[ ] define module template files
+[ ] define decision record template
+[ ] define test harness structure
+[ ] define compatibility tracking format
+[ ] define artifact naming
+
+Exit criteria:
+- repository structure exists
+- documentation skeleton exists
+- empty modules compile/build cleanly
+
+Phase 1: Language surface specification
+
+Current repo status:
+- core architecture/spec documents now exist
+- partially complete as written docs
+- implementation reality already exceeds the original written-spec coverage
+- compatibility/status docs still lag the implemented surface
+- spec debt still remains in several fidelity-sensitive areas
+
+[ ] write lexical grammar
+[ ] write parser grammar
+[ ] write operator precedence spec
+[ ] write workspace/scope model
+[ ] write function resolution spec
+[ ] write indexing semantics spec
+[ ] write value model spec
+[ ] write builtin classification spec
+
+Exit criteria:
+- core language subset is written clearly enough that another team could implement it
+
+Phase 2: Front-end MVP
+
+Current repo status:
+- effectively complete for the current project stage
+
+[ ] implement lexer
+[ ] implement parser
+[ ] implement AST model
+[ ] implement source locations
+[ ] implement parser diagnostics
+[ ] implement AST dump tooling
+[ ] add parser golden tests
+
+Exit criteria:
+- representative `.m` files parse successfully
+- syntax errors are usable and stable
+
+Phase 3: Name resolution and semantics MVP
+
+Current repo status:
+- effectively complete for a meaningful MATLAB subset
+- active work now is fidelity depth, not first bring-up
+
+[ ] implement scopes
+[ ] implement symbol tables
+[ ] implement script/function distinction
+[ ] implement nested function capture model
+[ ] implement semantic diagnostics
+[ ] implement basic type/shape annotations
+
+Exit criteria:
+- nontrivial programs bind correctly
+- semantic errors are categorized and tested
+
+Phase 4: Bring-up execution
+
+Current repo status:
+- complete as a first end-to-end execution path
+
+[ ] build interpreter or direct evaluator
+[ ] execute expressions
+[ ] execute statements and control flow
+[ ] support function calls
+[ ] support arrays and indexing basics
+[ ] support basic builtins
+
+Exit criteria:
+- simple end-to-end `.m` programs run
+
+Phase 5: Runtime core
+
+Current repo status:
+- substantial first implementation exists
+- current runtime now covers first-class logical values, text values, cells, scalar structs, practical struct arrays, error/warning state, and a current MAT-file-backed `save` / `load` subset
+- the biggest remaining runtime work is structural fidelity, especially N-D arrays, copy-on-write, and exact MATLAB logical/index/shape behavior
+
+[ ] implement value container
+[ ] implement dense arrays
+[ ] implement strings/chars
+[ ] implement cell arrays
+[ ] implement structs
+[ ] implement error stack traces
+[ ] implement copy-on-write baseline
+
+Exit criteria:
+- runtime passes focused behavior tests
+
+Phase 6: IR and lowering
+
+Current repo status:
+- materially complete as a first HIR-based compiler pipeline with lowering, dump/golden coverage, and verifier support
+- deeper MIR/LIR layering is still lighter than the original idealized plan
+
+[ ] define HIR
+[ ] define MIR
+[ ] define LIR
+[ ] implement AST/HIR lowering
+[ ] implement semantic-to-HIR verification
+[ ] implement IR printer/dumper
+[ ] implement verifier passes
+
+Exit criteria:
+- compiler can lower real examples into stable IR
+
+Phase 7: Bytecode backend
+
+Current repo status:
+- complete as a first shared-runtime bytecode path
+
+[ ] define bytecode format
+[ ] define bytecode VM
+[ ] lower MIR/LIR to bytecode
+[ ] execute functions via VM
+[ ] share runtime with interpreter
+
+Exit criteria:
+- bytecode path can run same examples as interpreter
+
+Phase 8: Optimization pipeline
+
+Current repo status:
+- present and useful but still intentionally early
+- local HIR constant folding and control-flow cleanup exist, but CFG/dataflow/SSA-class maturity does not
+
+[ ] canonicalization
+[ ] constant folding
+[ ] dead code elimination
+[ ] propagation passes
+[ ] builtins lowering optimizations
+[ ] performance regression tests
+
+Exit criteria:
+- optimized output is measurably better without semantic regressions
+
+Phase 9: Compiler backend
+
+Current repo status:
+- first artifact/bundle backend path exists and can emit, inspect, serialize, reload, and run bytecode artifacts/bundles
+- broader backend maturity still remains, especially manifest richness, debug tooling, and native/backend expansion
+
+[ ] choose initial backend target
+[ ] implement code emission
+[ ] implement package/link workflow
+[ ] emit runnable artifact
+[ ] support runtime bundling
+
+Exit criteria:
+- user can compile and run a distributable artifact
+
+Phase 10: Standard library expansion
+
+Current repo status:
+- active and ongoing
+- this is one of the most advanced areas of the current repo
+- stdlib/runtime coverage now includes a broad first plotting, text, math/order/shape, error/warning/reflection, and session/workspace baseline
+
+[ ] expand matrix/math coverage
+[ ] expand string coverage
+[ ] expand filesystem coverage
+[ ] expand reflection/introspection
+[ ] add compatibility matrices
+
+Exit criteria:
+- common practical programs run with acceptable compatibility
+
+Phase 11: Objects and advanced language features
+
+Current repo status:
+- still largely remaining
+- current object-like compatibility is limited to the struct-backed `MException` surface; general `classdef` semantics are still open
+
+[ ] classdef subset
+[ ] handle/value behavior
+[ ] method dispatch
+[ ] inheritance subset
+[ ] property/method attributes subset
+
+Exit criteria:
+- realistic object-oriented samples run
+
+Phase 12: Interop and packaging
+
+Current repo status:
+- partially complete
+- MATC-specific artifact/snapshot packaging exists
+- a current MAT-file-backed `save` / `load` subset now exists for the implemented runtime surface
+- broader MATLAB MAT-file compatibility, FFI strategy, and MEX compatibility do not
+
+[ ] MAT-file support
+[ ] external library strategy
+[ ] MEX compatibility decision and scope
+[ ] packaging/distribution workflow
+
+Exit criteria:
+- compiled output can interoperate with selected external formats or APIs
+
+Phase 13: Performance and stabilization
+
+Current repo status:
+- partially active through regression/golden coverage and broad workspace validation
+- still largely remaining as a dedicated benchmark/fuzz/stabilization phase
+
+[ ] benchmark-driven tuning
+[ ] regression hardening
+[ ] fuzzing
+[ ] memory diagnostics
+[ ] compatibility bug backlog burn-down
+
+Exit criteria:
+- release candidate quality for defined subset
+
+==================================================
+20. Order of Technical Decisions
+==================================================
+
+These decisions must be made in this order to reduce churn:
+
+1. implementation language
+2. backend strategy
+3. runtime memory model
+4. IR layering
+5. value representation
+6. compatibility baseline subset
+7. standard library intrinsic boundary
+8. object model scope
+9. packaging format
+10. interop policy
+
+If these are decided out of order, the project risks endless rewrites.
+
+==================================================
+21. First Release Slice Recommendation
+==================================================
+
+To avoid infinite scope, Release 0.1 should target:
+
+- scripts and functions
+- dense numeric arrays
+- logical arrays
+- chars/strings basic subset
+- structs and cell arrays basic subset
+- control flow
+- multiple returns
+- anonymous functions basic subset
+- core builtins
+- bytecode or native compile pipeline
+- CLI-only workflow
+
+Explicitly exclude from Release 0.1:
+
+- advanced classdef completeness
+- full graphics stack
+- sparse matrix parity
+- Simulink
+- full toolbox support
+- production-grade MEX compatibility
+- GPU/distributed execution
+
+==================================================
+22. Major Risks and Mitigations
+==================================================
+
+Risk: undefined compatibility target
+Mitigation:
+- freeze a written subset before large coding effort
+
+Risk: parser and runtime evolve independently and break semantics
+Mitigation:
+- semantics spec drives both layers
+
+Risk: runtime becomes a monolith
+Mitigation:
+- separate arrays, values, memory, invocation, errors
+
+Risk: optimizer introduces silent semantic regressions
+Mitigation:
+- verifier passes and differential tests
+
+Risk: too much time spent chasing full MATLAB parity
+Mitigation:
+- feature matrix and release slices
+
+Risk: multi-AI churn and contradictory architecture
+Mitigation:
+- mandatory decision records and handoff docs
+
+==================================================
+23. Required Docs To Create Early
+==================================================
+
+[ ] `/docs/architecture/OVERVIEW.md`
+[ ] `/docs/architecture/COMPILER_PIPELINE.md`
+[ ] `/docs/architecture/RUNTIME_OVERVIEW.md`
+[ ] `/docs/compatibility/FEATURE_MATRIX.md`
+[ ] `/docs/compatibility/KNOWN_DIFFERENCES.md`
+[ ] `/docs/roadmap/PHASES.md`
+[ ] `/docs/handoff/CURRENT_STATE.md`
+[ ] `/docs/handoff/NEXT_STEPS.md`
+[ ] `/spec/language/LEXICAL_GRAMMAR.md`
+[ ] `/spec/language/SYNTAX_GRAMMAR.md`
+[ ] `/spec/language/SEMANTICS.md`
+[ ] `/spec/runtime/VALUE_MODEL.md`
+[ ] `/spec/runtime/ARRAY_MODEL.md`
+[ ] `/spec/ir/HIR.md`
+[ ] `/spec/ir/MIR.md`
+[ ] `/spec/ir/LIR.md`
+[ ] `/spec/stdlib/BUILTINS.md`
+
+==================================================
+24. Recommended Immediate Next Work
+==================================================
+
+If starting from zero, do this next:
+
+[ ] decide implementation language
+[ ] create repository skeleton exactly once
+[ ] create architecture/spec document placeholders
+[ ] write language subset definition
+[ ] write runtime value/array model draft
+[ ] write lexer/parser grammar draft
+[ ] choose bring-up execution strategy
+
+Best sequence:
+
+1. Freeze scope for Release 0.1
+2. Write the core specs
+3. Create module skeletons
+4. Implement lexer/parser
+5. Implement semantic binder
+6. Implement runtime MVP
+7. Bring up interpreter
+8. Introduce IR and bytecode backend
+9. Add optimization and compiler backend
+
+==================================================
+25. Final Decision Summary For This Planning Draft
+==================================================
+
+This plan assumes:
+
+- compiler-first architecture
+- modular repository layout
+- documented compatibility subset
+- IR-based optimizer pipeline
+- runtime-centered semantics
+- CLI-first product
+- multi-AI handoff as a first-class requirement
+- bytecode or backend-compiled execution before any desktop ambitions
+
+If this document is adopted, future contributors should treat it as the master roadmap until superseded by a versioned architecture decision.
+
+End of document.

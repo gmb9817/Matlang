@@ -1,0 +1,12 @@
+f = figure(38);
+ax = gca();
+surface = surf([0, 1, 0; 1, 2, 1; 0, 1, 0]);
+view([45, 20]);
+default_z = zlim();
+manual_z = zlim([-2, 4]);
+z_handle = zlabel("Height");
+queried_z = zlim();
+targeted_z = zlim(ax);
+zlim(ax, [-1, 3]);
+targeted_z_after_set = zlim(ax);
+current = gcf();

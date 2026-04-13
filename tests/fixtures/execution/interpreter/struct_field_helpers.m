@@ -1,0 +1,13 @@
+s = struct();
+s.name = 'alpha';
+s.value = 3;
+a = isfield(s, 'name');
+b = isfield(s, "missing");
+c = fieldnames(s);
+d = rmfield(s, "name");
+e = isfield(d, 'name');
+f = fieldnames(d);
+g = isfield(s, {'name', "missing", 'value'});
+h = isfield(s, ["missing" "value"]);
+i = rmfield(s, {'name', "value"});
+j = fieldnames(i);

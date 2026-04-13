@@ -1,0 +1,10 @@
+m = [1 2; 3 4];
+c = num2cell(m);
+d = cell2mat(c);
+e = transpose(c);
+f = horzcat(c, num2cell([5 6; 7 8]));
+s = struct();
+t1 = isstruct(s);
+t2 = iscell(c);
+t3 = isnumeric(d);
+t4 = isnumeric(c);

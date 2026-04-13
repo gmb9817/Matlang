@@ -1,0 +1,10 @@
+workspace
+  column = [3 ; 5 ; 7]
+  dim2 = [1 ; 3 ; 2]
+  dim3 = []
+  dim3_ndims = 3
+  dim3_size = [3, 2, 0]
+  matrix_default = [3, 5 ; 5, 4]
+  row = [3, 5, 7]
+  second_order = [2, 2]
+  zero_order = [1, 2 ; 3, 4]

@@ -1,0 +1,17 @@
+workspace
+  a = true
+  b = true
+  c = {'inner' ; 'name' ; 'value'}
+  d = ["alpha", "gamma", "beta", "delta"]
+  e = [1, 3, 2, 4]
+  f = [true, false, false, true]
+  g = [struct{inner=struct{flag=true}, name="alpha"}, struct{inner=struct{flag=false}, name="beta"} ; struct{inner=struct{flag=false}, name="gamma"}, struct{inner=struct{flag=true}, name="delta"}]
+  h = false
+  i = ["alpha", "gamma", "beta", "delta"]
+  j = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]
+  k = [struct{field1=10}, struct{field1=20}]
+  l = [81, 83]
+  s = [struct{inner=struct{flag=true}, name="alpha", value=1}, struct{inner=struct{flag=false}, name="beta", value=2} ; struct{inner=struct{flag=false}, name="gamma", value=3}, struct{inner=struct{flag=true}, name="delta", value=4}]
+  u = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]
+  v = [struct{field1=10}, struct{field1=20}]
+  w = [struct{inner=struct{score=81}, name='a'}, struct{inner=struct{score=83}, name='b'}]

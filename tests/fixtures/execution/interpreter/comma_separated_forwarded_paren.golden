@@ -1,0 +1,10 @@
+workspace
+  a = 20
+  b = 40
+  c = 2
+  cells = {[10, 20], [30, 40]}
+  copies = {20, 40}
+  d = 4
+  nested = {struct{score=[1, 2]}, struct{score=[3, 4]}}
+  row = [10, 30]
+  scores = [1, 3]

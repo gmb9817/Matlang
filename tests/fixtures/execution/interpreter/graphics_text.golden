@@ -1,0 +1,14 @@
+workspace
+  after_delete = false
+  axes_parent = 1001
+  curve = 2001
+  f = 39
+  label = 2002
+  label_position = [1, 0.5]
+  label_string = 'Peak'
+  label_type = 'text'
+  string_found = [2002]
+  text_ancestor = 2002
+  text_found = [2002]
+  updated_position = [1.5, 0.25]
+  updated_string = 'Center'

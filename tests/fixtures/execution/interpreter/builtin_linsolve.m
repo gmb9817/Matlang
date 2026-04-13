@@ -1,0 +1,11 @@
+a = linsolve([1 2; 3 4], [5; 11]);
+[b, c] = linsolve([1 2; 3 4], [5; 11]);
+[d, e] = linsolve([1 0; 0 1; 1 1], [1; 2; 3], struct('RECT', true));
+f = linsolve([2 0; 3 1], [4; 11], struct('LT', true));
+g = linsolve([2 3; 0 4], [8; 20], struct('UT', true));
+h = linsolve([4 2; 1 3], [6; 8], struct('TRANSA', true));
+i = linsolve([4 1; 1 3], [6; 7], struct('POSDEF', true));
+j = linsolve(complex([2 0; 1 1], [0, 0; 1, 0]), [2; 2 + 1i], struct('LT', true));
+[k, l] = linsolve([1 2; 2 4], [3; 6]);
+[m, n] = linsolve([1 2; 2 4], [1; 0]);
+[o, p] = linsolve([1 2; 2 4; 3 6], [1; 2; 3], struct('RECT', true));

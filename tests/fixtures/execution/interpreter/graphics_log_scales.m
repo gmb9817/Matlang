@@ -1,0 +1,13 @@
+f = figure(41);
+subplot(311);
+h1 = semilogx([1, 10, 100], [1, 4, 2], 'o-');
+title("Semilog X");
+subplot(312);
+h2 = semilogy([1, 2, 3], [1, 10, 100], 's-');
+title("Semilog Y");
+subplot(313);
+h3 = loglog([1, 10, 100], [0.1, 1, 10], 'd-');
+title("Log Log");
+x_limits = xlim();
+y_limits = ylim();
+current = gcf();

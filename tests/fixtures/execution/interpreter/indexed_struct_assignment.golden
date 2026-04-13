@@ -1,0 +1,10 @@
+workspace
+  a = "alpha"
+  b = "BETA"
+  c = [7, 9]
+  d = [true, false]
+  e = true
+  f = false
+  idx = 2
+  s = [struct{inner=struct{flag=true}, name="alpha", score=7}, struct{inner=struct{flag=false}, name="BETA", score=9}]
+  snapshot = [struct{inner=struct{flag=true}, name="alpha", score=7}, struct{inner=struct{flag=false}, name="BETA", score=9}]

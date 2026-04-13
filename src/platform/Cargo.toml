@@ -1,0 +1,20 @@
+[package]
+name = "matlab-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+matlab-codegen = { path = "../codegen" }
+
+[dev-dependencies]
+matlab-frontend = { path = "../frontend" }
+matlab-ir = { path = "../ir" }
+matlab-optimizer = { path = "../optimizer" }
+matlab-resolver = { path = "../resolver" }
+matlab-semantics = { path = "../semantics" }
+
+[lib]
+path = "src/lib.rs"

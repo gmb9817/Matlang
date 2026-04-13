@@ -1,0 +1,15 @@
+a = flip([1 2; 3 4], 2);
+b = flip([1 2; 3 4], 1);
+c = flip([1, 2, 3], 1);
+d = flip([1, 2, 3], 2);
+e = shiftdim([1, 2, 3]);
+[f, g] = shiftdim([1, 2, 3]);
+h = shiftdim([1; 2; 3], 1);
+i = shiftdim([1 2; 3 4], 1);
+j = shiftdim([1 2; 3 4], 2);
+k = shiftdim('abc');
+l = flip(cat(3, [1 2; 3 4], [5 6; 7 8]), 3);
+m = flip(cat(3, {1 2; 3 4}, {5 6; 7 8}), 3);
+n = flip('abc', 3);
+o = shiftdim([1, 2, 3], -1);
+p = shiftdim({10 20 30}, -1);

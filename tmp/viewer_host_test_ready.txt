@@ -1,0 +1,2 @@
+title=MATC Live Figures - sinusoidal_wave_exact
+bodyLen=8500

@@ -1,0 +1,18 @@
+[package]
+name = "matlab-optimizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+matlab-frontend = { path = "../frontend" }
+matlab-ir = { path = "../ir" }
+
+[dev-dependencies]
+matlab-resolver = { path = "../resolver" }
+matlab-semantics = { path = "../semantics" }
+
+[lib]
+path = "src/lib.rs"

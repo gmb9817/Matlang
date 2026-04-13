@@ -1,0 +1,9 @@
+unit FunctionFile
+function classify(x) -> [y]
+  if binary(LessThan, x, number(0))
+    assign [y] = unary(Minus, number(1))
+  elseif binary(LessThan, x, number(10))
+    assign [y] = x
+  else
+    assign [y] = number(10)
+  end_if

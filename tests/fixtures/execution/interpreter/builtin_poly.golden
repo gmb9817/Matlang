@@ -1,0 +1,8 @@
+workspace
+  complex_matrix_char = [1, 0, -1]
+  complex_roots = [1, -3 - 1i, 2 + 2i]
+  empty_poly = 1
+  matrix_char = [1, 0, 1]
+  roots_col = [1, -0.75, 0.125]
+  roots_row = [1, -4, 1, 6]
+  scalar_root = [1, -4]

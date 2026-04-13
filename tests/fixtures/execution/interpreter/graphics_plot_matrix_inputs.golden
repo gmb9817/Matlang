@@ -1,0 +1,13 @@
+workspace
+  hxy = [2001, 2002]
+  hxy_first_x = [0, 1, 2]
+  hxy_first_y = [0, 1, 4]
+  hxy_second_y = [1, 0, 2]
+  hxy_types = {'line', 'line'}
+  hxy_widths = {3, 3}
+  hy = [2003, 2004]
+  hy_first_x = [1, 2, 3]
+  hy_second_y = [1, 0, 2]
+  hy_styles = {'--', '--'}
+  x = [0, 1, 2]
+  y = [0, 1 ; 1, 0 ; 4, 2]

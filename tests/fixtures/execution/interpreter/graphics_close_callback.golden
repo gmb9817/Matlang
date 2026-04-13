@@ -1,0 +1,18 @@
+workspace
+  alive_after_handle = true
+  alive_after_raw = false
+  alive_after_text = false
+  callback_figure_alive = true
+  callback_figure_alive_after_closereq = false
+  callback_figure_name = 'Callback Ran'
+  close_request = @open_callback_figure
+  close_request_struct = @open_callback_figure
+  current_after_handle = 82
+  f = 80
+  fig_props = struct{Children=[], CloseRequestFcn=@open_callback_figure, CurrentAxes=[], CurrentObject=[], Name='', Number=80, NumberTitle='on', PaperOrientation='portrait', PaperPosition=[-0.4375, 2.1145833333333335, 9.375, 6.770833333333333], PaperPositionMode='auto', PaperSize=[8.5, 11], PaperType='usletter', PaperUnits='inches', Position=[80, 80, 1360, 960], ResizeFcn=@mark_resize, Type='figure', Visible='on', WindowStyle='normal'}
+  g = 81
+  resize_request = @mark_resize
+  resize_request_struct = @mark_resize
+  status_handle = 1
+  status_raw = 1
+  status_text = 1

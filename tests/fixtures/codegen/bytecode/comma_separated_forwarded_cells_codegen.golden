@@ -1,0 +1,43 @@
+codegen
+  backend = bytecode
+  functions = 1
+  instructions = 27
+  anonymous_functions = 0
+  nested_functions = 0
+  max_temps = 22
+  max_labels = 0
+
+verification
+  ok = true
+  functions_checked = 1
+  issues = 0
+
+bytecode module backend=bytecode unit_kind=Script entry=<script>
+function <script> role=script_entry params=[] outputs=[] captures=[] temps=22 labels=0
+  t0 = const number(1)
+  t1 = const number(2)
+  t2 = cell 1x2 [t0, t1]
+  t3 = const number(3)
+  t4 = const number(4)
+  t5 = cell 1x2 [t3, t4]
+  t6 = cell 1x2 [t2, t5]
+  store groups#1 <- t6
+  t7 = load groups#1
+  t8 = index_list brace t7 [:]
+  t9 = index_list brace t8 [:]
+  [t10, t11, t12, t13] = split_list t9
+  store a#2 <- t10
+  store b#3 <- t11
+  store c#4 <- t12
+  store d#5 <- t13
+  t14 = load groups#1
+  t15 = index_list brace t14 [:]
+  t16 = index_list brace t15 [:]
+  t17 = matrix_list rows=[1] [t16]
+  store row#6 <- t17
+  t18 = load groups#1
+  t19 = index_list brace t18 [:]
+  t20 = index_list brace t19 [:]
+  t21 = cell_list rows=[1] [t20]
+  store copy#7 <- t21
+  return []

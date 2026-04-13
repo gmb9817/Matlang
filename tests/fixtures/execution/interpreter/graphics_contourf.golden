@@ -1,0 +1,9 @@
+workspace
+  cb = 26
+  current = 26
+  f = 26
+  filled = 2001
+  legend_handle = 26
+  lines = 2002
+  scale = [1.5, 3.5]
+  z = [1, 2, 3 ; 2, 4, 2 ; 1, 2, 1]

@@ -1,0 +1,20 @@
+workspace
+  column = [3 ; 4 ; 6 ; 7]
+  empty = []
+  empty_gx = []
+  empty_gy = []
+  empty_ndims = 2
+  empty_size = [0, 0]
+  gx = [0.5, 0.75, 1 ; 1, 1.5, 2]
+  gy = [0.5, 0.75, 1.25 ; 0.5, 0.75, 1.25]
+  matrix_default = [1, 1.5, 2 ; 2, 3, 4]
+  page_vector(:,:,1) = [3]
+  page_vector(:,:,2) = [4]
+  page_vector(:,:,3) = [6]
+  page_vector(:,:,4) = [7]
+  page_vector_ndims = 3
+  page_vector_size = [1, 1, 4]
+  row = [3, 4, 6, 7]
+  scalar = 0
+  vector_positions = [1, 2, 5, 6]
+  vector_spacing = [1.5, 2, 3, 3.5]

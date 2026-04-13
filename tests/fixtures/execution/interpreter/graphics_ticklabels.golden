@@ -1,0 +1,21 @@
+workspace
+  bottom_axes = 1002
+  current = 51
+  curve = 2001
+  custom_x = ["zero", "mid", "two"]
+  custom_y = ["low", "half", "high"]
+  custom_z = ["floor", "center", "peak"]
+  default_x = ["0", "1", "2"]
+  default_z = ["-2", "0", "2"]
+  empty_y = []
+  f = 51
+  hidden_y = []
+  query_x = ["zero", "mid", "two"]
+  query_y = ["low", "half", "high"]
+  query_z = ["floor", "center", "peak"]
+  surface = 2002
+  target_bottom_z = ["floor", "center", "peak"]
+  target_bottom_z_after_set = ["low", "mid", "high"]
+  target_top_x = ["zero", "mid", "two"]
+  target_top_x_after_set = ["left", "mid", "right"]
+  top_axes = 1001

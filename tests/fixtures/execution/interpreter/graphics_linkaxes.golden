@@ -1,0 +1,7 @@
+workspace
+  ax1 = 1001
+  ax2 = 1002
+  f = 207
+  x_linked = [5, 25]
+  y_linked = [0, 10]
+  y_unlinked = [0, 10]

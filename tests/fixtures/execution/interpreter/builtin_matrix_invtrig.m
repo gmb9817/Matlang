@@ -1,0 +1,9 @@
+a = asinm([0 0; 0 1]);
+b = acosm([1 0; 0 0]);
+c = atanm([0 0; 0 1]);
+d = asinhm([0 1; 0 0]);
+e = acoshm([1 0; 0 2]);
+f = atanhm([0 0.5; 0 0]);
+g = asinm([0 1; 0 0]);
+h = acosm([0 1; 0 0]);
+i = atanhm([0 1; 0 0]);

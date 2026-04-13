@@ -1,0 +1,6 @@
+unit FunctionFile
+function package_refs(obj, x) -> [y]
+  assign [f] = handle(@pkg.helper)
+  assign [a] = apply(field(pkg, helper), [x])
+  assign [b] = apply(field(obj, helper), [number(1)])
+  assign [y] = a

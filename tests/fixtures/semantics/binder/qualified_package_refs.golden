@@ -1,0 +1,33 @@
+workspaces
+  Function id=0 parent=None name=None
+  Function id=1 parent=Some(0) name=Some("package_refs")
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+  FunctionBody id=1 parent=Some(0) workspace=1
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  package_refs kind=function scope=0 workspace=0 binding=None
+  ans kind=variable scope=1 workspace=1 binding=Some(1)
+  obj kind=parameter scope=1 workspace=1 binding=Some(2)
+  x kind=parameter scope=1 workspace=1 binding=Some(3)
+  y kind=output scope=1 workspace=1 binding=Some(4)
+  f kind=variable scope=1 workspace=1 binding=Some(5)
+  a kind=variable scope=1 workspace=1 binding=Some(6)
+  b kind=variable scope=1 workspace=1 binding=Some(7)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  ans id=1 storage=local owner_symbol=2 owner_scope=1 owner_workspace=1 shared=false
+  obj id=2 storage=local owner_symbol=3 owner_scope=1 owner_workspace=1 shared=false
+  x id=3 storage=local owner_symbol=4 owner_scope=1 owner_workspace=1 shared=false
+  y id=4 storage=local owner_symbol=5 owner_scope=1 owner_workspace=1 shared=false
+  f id=5 storage=local owner_symbol=6 owner_scope=1 owner_workspace=1 shared=false
+  a id=6 storage=local owner_symbol=7 owner_scope=1 owner_workspace=1 shared=false
+  b id=7 storage=local owner_symbol=8 owner_scope=1 owner_workspace=1 shared=false
+references
+  pkg.helper role=function_handle_target resolution=external_function_candidate symbol=None kind=none scope=None workspace=None binding=None capture=none
+  pkg.helper role=call_target resolution=external_function_candidate symbol=None kind=none scope=None workspace=None binding=None capture=none
+  x role=value resolution=workspace_value symbol=Some(4) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(3) capture=none
+  obj role=value resolution=workspace_value symbol=Some(3) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(2) capture=none
+  a role=value resolution=workspace_value symbol=Some(7) kind=variable scope=Some(1) workspace=Some(1) binding=Some(6) capture=none
+captures
+diagnostics

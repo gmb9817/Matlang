@@ -1,0 +1,63 @@
+codegen
+  backend = bytecode
+  functions = 1
+  instructions = 47
+  anonymous_functions = 0
+  nested_functions = 0
+  max_temps = 28
+  max_labels = 6
+
+verification
+  ok = true
+  functions_checked = 1
+  issues = 0
+
+bytecode module backend=bytecode unit_kind=FunctionFile entry=control_flow_codegen#s1w1
+function control_flow_codegen#s1w1 role=function params=[mode#2, x#3] outputs=[y#4] captures=[] temps=28 labels=6
+  t0 = load mode#2
+  t1 = const number(0)
+  t2 = binary GreaterThan t0, t1
+  jump_if_false t2 -> L1
+  t3 = load x#3
+  t4 = const number(1)
+  t5 = binary Add t3, t4
+  store y#4 <- t5
+  jump -> L0
+  L1:
+  t6 = load x#3
+  t7 = const number(1)
+  t8 = binary Subtract t6, t7
+  store y#4 <- t8
+  L0:
+  t9 = const number(1)
+  t10 = const number(2)
+  t11 = matrix 1x2 [t9, t10]
+  t12 = iter_start t11
+  L2:
+  t13 = iter_has_next t12
+  jump_if_false t13 -> L3
+  t14 = iter_next t12
+  store i#5 <- t14
+  t15 = load y#4
+  t16 = load i#5
+  t17 = binary Add t15, t16
+  store y#4 <- t17
+  jump -> L2
+  L3:
+  t18 = load mode#2
+  t19 = const number(1)
+  t20 = binary Equal t18, t19
+  jump_if_false t20 -> L5
+  t21 = load y#4
+  t22 = const number(2)
+  t23 = binary Multiply t21, t22
+  store y#4 <- t23
+  jump -> L4
+  L5:
+  t24 = load y#4
+  t25 = const number(2)
+  t26 = binary MatrixRightDivide t24, t25
+  store y#4 <- t26
+  L4:
+  t27 = load y#4
+  return [t27]

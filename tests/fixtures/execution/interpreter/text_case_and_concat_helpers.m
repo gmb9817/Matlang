@@ -1,0 +1,10 @@
+a = upper('Alpha');
+b = lower("Beta");
+c = startsWith('alphabet', "alpha");
+d = endsWith("alphabet", 'bet');
+e = append("mat", 'lab', "!");
+f = upper(lower("MiXeD"));
+g = append(upper('ab'), lower("CD"));
+h = contains(["Anne" "Elizabeth" "Marianne" "Tracy"], "anne", "IgnoreCase", true);
+i = startsWith(["alphabet" "beta" "gamma"], ["al" "ga"]);
+j = endsWith(["hello" "world" "bold"], ["ld" "lo"]);

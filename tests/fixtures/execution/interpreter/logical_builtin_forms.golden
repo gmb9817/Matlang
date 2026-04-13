@@ -1,0 +1,9 @@
+workspace
+  a = true
+  b = false
+  c = [true, true, true ; true, true, true]
+  d = [false, false]
+  e = true
+  f = true
+  g = "true"
+  h = "mask=false"

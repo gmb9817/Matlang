@@ -1,0 +1,70 @@
+codegen
+  backend = bytecode
+  functions = 1
+  instructions = 54
+  anonymous_functions = 0
+  nested_functions = 0
+  max_temps = 43
+  max_labels = 0
+
+verification
+  ok = true
+  functions_checked = 1
+  issues = 0
+
+bytecode module backend=bytecode unit_kind=Script entry=<script>
+function <script> role=script_entry params=[] outputs=[] captures=[] temps=43 labels=0
+  t0 = const number(1)
+  t1 = const number(2)
+  t2 = const number(3)
+  t3 = cell 1x3 [t0, t1, t2]
+  store cells#1 <- t3
+  t4 = load cells#1
+  t5 = index_list brace t4 [:]
+  [t6, t7, t8] = split_list t5
+  store a#2 <- t6
+  store b#3 <- t7
+  store c#4 <- t8
+  t12 = load cells#1
+  t13 = index_list brace t12 [:]
+  [t9, t10, t11] = call deal [semantic=BuiltinFunction final=BuiltinFunction] (t13)
+  store d#5 <- t9
+  store e#6 <- t10
+  store f#7 <- t11
+  t14 = load cells#1
+  t15 = index_list brace t14 [:]
+  t16 = matrix_list rows=[1] [t15]
+  store row#8 <- t16
+  t17 = load cells#1
+  t18 = index_list brace t17 [:]
+  t19 = cell_list rows=[1] [t18]
+  store copy#9 <- t19
+  t21 = const char('name')
+  t22 = const char('x')
+  t23 = const char('y')
+  t24 = cell 1x2 [t22, t23]
+  t25 = const char('value')
+  t26 = const number(10)
+  t27 = const number(20)
+  t28 = cell 1x2 [t26, t27]
+  [t20] = call struct [semantic=BuiltinFunction final=BuiltinFunction] (t21, t24, t25, t28)
+  store s#10 <- t20
+  t29 = load s#10
+  t30 = field_list t29.name
+  [t31, t32] = split_list t30
+  store n1#11 <- t31
+  store n2#12 <- t32
+  t35 = load s#10
+  t36 = field_list t35.value
+  [t33, t34] = call deal [semantic=BuiltinFunction final=BuiltinFunction] (t36)
+  store v1#13 <- t33
+  store v2#14 <- t34
+  t37 = load s#10
+  t38 = field_list t37.value
+  t39 = matrix_list rows=[1] [t38]
+  store values#15 <- t39
+  t40 = load s#10
+  t41 = field_list t40.name
+  t42 = cell_list rows=[1] [t41]
+  store names#16 <- t42
+  return []

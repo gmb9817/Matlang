@@ -1,0 +1,12 @@
+f = figure(76);
+rgb = cat(3, [1, 0; 0, 1], [0, 1; 0, 1], [0, 0; 1, 1]);
+img = image([10, 30], [5, 15], rgb);
+props = get(img);
+alpha = props.AlphaData;
+alpha_mapping = props.AlphaDataMapping;
+cdata = props.CData;
+mapping = props.CDataMapping;
+xdata = props.XData;
+ydata = props.YData;
+kind = props.Type;
+parent = props.Parent;

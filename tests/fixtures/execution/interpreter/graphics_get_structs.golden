@@ -1,0 +1,17 @@
+workspace
+  ax = 1001
+  ax_position = [0, 0.5, 1, 0.5]
+  ax_props = struct{Box='on', CLim=[0, 1], Children=[2001, 2002], Colorbar='off', Colormap='parula', Grid='off', Hold='off', Legend=[], Parent=45, Position=[0, 0.5, 1, 0.5], Title='', Type='axes', View=[-37.5, 30], Visible='on', XLabel='', XLim=[0, 2], XScale='linear', XTick=[0, 0.5, 1, 1.5, 2], XTickAngle=0, XTickLabel=["0", "0.5", "1", "1.5", "2"], YLabel='', YLim=[0, 1], YScale='linear', YTick=[0, 0.25, 0.5, 0.75, 1], YTickAngle=0, YTickLabel=["0", "0.25", "0.5", "0.75", "1"], ZLabel='', ZLim=[0, 1], ZTick=[0, 0.25, 0.5, 0.75, 1], ZTickAngle=0, ZTickLabel=["0", "0.25", "0.5", "0.75", "1"]}
+  ax_type = 'axes'
+  f = 45
+  fig_children = [1001]
+  fig_props = struct{Children=[1001], CloseRequestFcn=[], CurrentAxes=1001, CurrentObject=2002, Name='', Number=45, NumberTitle='on', PaperOrientation='portrait', PaperPosition=[-0.4375, 2.1145833333333335, 9.375, 6.770833333333333], PaperPositionMode='auto', PaperSize=[8.5, 11], PaperType='usletter', PaperUnits='inches', Position=[80, 80, 1360, 960], ResizeFcn=[], Type='figure', Visible='on', WindowStyle='normal'}
+  fig_type = 'figure'
+  line_color = [0.12156862745098039, 0.4666666666666667, 0.7058823529411765]
+  line_handle = 2001
+  line_props = struct{Color=[0.12156862745098039, 0.4666666666666667, 0.7058823529411765], DisplayName='', EdgeColor=[0.12156862745098039, 0.4666666666666667, 0.7058823529411765], LineStyle='-', LineWidth=2.5, Marker='none', MarkerEdgeColor='auto', MarkerFaceColor='none', MarkerSize=5, Parent=1001, Type='line', Visible='on', XData=[0, 1, 2], YData=[0, 1, 0]}
+  line_struct_type = 'line'
+  line_type = 'line'
+  obj_props = {struct{Color=[0.12156862745098039, 0.4666666666666667, 0.7058823529411765], DisplayName='', EdgeColor=[0.12156862745098039, 0.4666666666666667, 0.7058823529411765], LineStyle='-', LineWidth=2.5, Marker='none', MarkerEdgeColor='auto', MarkerFaceColor='none', MarkerSize=5, Parent=1001, Type='line', Visible='on', XData=[0, 1, 2], YData=[0, 1, 0]}, struct{Color=[0.13333333333333333, 0.13333333333333333, 0.13333333333333333], DisplayName='', EdgeColor=[0.13333333333333333, 0.13333333333333333, 0.13333333333333333], LineStyle='-', LineWidth=2.5, Marker='none', MarkerEdgeColor='auto', MarkerFaceColor='none', MarkerSize=5, Parent=1001, Position=[1, 0.5], String='Hello', Type='text', Visible='on'}}
+  text_struct_string = 'Hello'
+  txt = 2002

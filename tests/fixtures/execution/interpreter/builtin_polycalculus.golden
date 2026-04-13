@@ -1,0 +1,14 @@
+workspace
+  complex_der = [2, -3 - 1i]
+  complex_int = [0.6666666666666666, -0.5i, 4, 0]
+  complex_int_const = [1i, 3]
+  complex_quot_den = [1, -2i, -1]
+  complex_quot_num = -2i
+  der_const = 0
+  der_prod = [3, 4, -1]
+  der_single = [6, 2]
+  int_basic = [3, 2, 0]
+  int_col = [0.6666666666666666, -0.5, 4, 0]
+  int_const = [4, 3]
+  quot_den = [1, 2, 1]
+  quot_num = [1, 2, 1]

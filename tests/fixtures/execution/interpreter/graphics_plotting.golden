@@ -1,0 +1,16 @@
+workspace
+  bar_handle = 2004
+  current = 1
+  f = 1
+  figure_two = 2
+  legend_handle = 2
+  limits_after_clf = [1, 2]
+  line1 = 2001
+  line2 = 2002
+  line3 = 2003
+  scatter_handle = 2005
+  stem_handle = 2006
+  x = [0, 1, 2, 3]
+  x_bounds = [0, 3]
+  y = [0, 1, 4, 9]
+  y_bounds = [0, 27]

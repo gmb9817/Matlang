@@ -1,0 +1,11 @@
+module Script scope=0 workspace=0
+  assign [binding(name=x kind=variable binding=1 storage=local)] = matrix[number(1), number(2)]
+  assign [binding(name=status kind=variable binding=2 storage=local)] = string("none")
+  try
+    assign [binding(name=y kind=variable binding=3 storage=local)] = call(callable(name=x semantic=workspace_value final=workspace_value symbol=1 kind=variable binding=1), [number(3)])
+    assign [binding(name=status kind=variable binding=2 storage=local)] = string("missed")
+  catch binding(name=err kind=variable binding=4 storage=local)
+    assign [binding(name=status kind=variable binding=2 storage=local)] = string("caught")
+    assign [binding(name=message kind=variable binding=5 storage=local)] = field(value(name=err resolution=workspace_value binding=4 kind=variable), message)
+    assign [binding(name=code kind=variable binding=6 storage=local)] = field(value(name=err resolution=workspace_value binding=4 kind=variable), identifier)
+  end_try

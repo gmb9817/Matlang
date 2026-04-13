@@ -1,0 +1,7 @@
+workspace
+  current = 30
+  f = 30
+  mesh_combo = 2003
+  scale = [0, 2]
+  surface_combo = 2001
+  z = [0, 1, 0 ; 1, 2, 1 ; 0, 1, 0]

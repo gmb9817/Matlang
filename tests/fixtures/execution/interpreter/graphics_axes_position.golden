@@ -1,0 +1,11 @@
+workspace
+  children = [1001, 1002]
+  current_free = 1002
+  current_top = 1001
+  f = 44
+  free = 1002
+  free_position = [0.55, 0.15, 0.25, 0.3]
+  selected = 1001
+  top = 1001
+  top_position = [0, 0.5, 1, 0.5]
+  updated_free_position = [0.5, 0.2, 0.3, 0.35]

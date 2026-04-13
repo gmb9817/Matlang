@@ -1,0 +1,14 @@
+workspace
+  box_off = 69
+  box_on = 69
+  box_toggle = 69
+  current = 69
+  f = 69
+  lower = 1002
+  lower_box_after_target_on = 'on'
+  lower_box_after_toggle = 'off'
+  lower_box_initial = 'on'
+  main = 2001
+  upper = 1001
+  upper_box_after_logical = 'on'
+  upper_box_after_target_on = 'on'

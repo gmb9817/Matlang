@@ -1,0 +1,8 @@
+workspace
+  a = 3
+  b = 13
+  c = 4
+  d = 14
+  grid = {10, 20}
+  s = struct{left=1, right=2}
+  vec = [5, 6]

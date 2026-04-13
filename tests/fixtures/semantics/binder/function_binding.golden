@@ -1,0 +1,24 @@
+workspaces
+  Function id=0 parent=None name=None
+  Function id=1 parent=Some(0) name=Some("addtwo")
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+  FunctionBody id=1 parent=Some(0) workspace=1
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  addtwo kind=function scope=0 workspace=0 binding=None
+  ans kind=variable scope=1 workspace=1 binding=Some(1)
+  x kind=parameter scope=1 workspace=1 binding=Some(2)
+  y kind=output scope=1 workspace=1 binding=Some(3)
+  tmp kind=variable scope=1 workspace=1 binding=Some(4)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  ans id=1 storage=local owner_symbol=2 owner_scope=1 owner_workspace=1 shared=false
+  x id=2 storage=local owner_symbol=3 owner_scope=1 owner_workspace=1 shared=false
+  y id=3 storage=local owner_symbol=4 owner_scope=1 owner_workspace=1 shared=false
+  tmp id=4 storage=local owner_symbol=5 owner_scope=1 owner_workspace=1 shared=false
+references
+  x role=value resolution=workspace_value symbol=Some(3) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(2) capture=none
+  tmp role=value resolution=workspace_value symbol=Some(5) kind=variable scope=Some(1) workspace=Some(1) binding=Some(4) capture=none
+captures
+diagnostics

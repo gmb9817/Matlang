@@ -1,0 +1,12 @@
+a = repmat([1 2; 3 4], [2, 3, 2]);
+b = size(a);
+c = ndims(a);
+d = numel(a);
+e = length(a);
+f = repmat({1, 2; 3, 4}, [1, 2, 2]);
+g = size(f, [1, 2, 3]);
+h = repmat(5, [2, 1, 3]);
+i = size(h);
+j = repmat([1 2; 3 4], 2);
+k = repmat([1 2; 3 4], 2, 1, 2);
+l = size(k);

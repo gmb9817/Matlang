@@ -1,0 +1,12 @@
+workspace
+  boxes = {'off', 'off'}
+  display_names = {'Series', 'Series'}
+  dots = 2002
+  f = 38
+  line = 2001
+  lower = 1002
+  mesh_handle = 2003
+  mixed_types = {'line', 'scatter' ; 'axes', 'figure'}
+  top = 1001
+  visibility_off = {'off', 'off'}
+  visibility_on = {'on', 'on'}

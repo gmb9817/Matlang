@@ -1,0 +1,27 @@
+workspace
+  bottom = 1002
+  bottom_children_after = []
+  bottom_children_before = [2003]
+  current_after = 1002
+  dots = 2002
+  f = 33
+  figure_children_after = [1001, 1002]
+  figure_children_before = [1001, 1002]
+  line = 2001
+  line_axes = 1001
+  line_figure = 33
+  mesh_handle = 2003
+  missing_axes = []
+  top = 1001
+  top_box_reset = 'on'
+  top_children_after = []
+  top_children_before = [2001, 2002]
+  top_figure = 33
+  top_grid_reset = 'off'
+  top_hold_reset = 'off'
+  top_position_reset = [0.1, 0.2, 0.3, 0.4]
+  top_title_after = 'Keep'
+  top_title_reset = ''
+  top_view_reset = [-37.5, 30]
+  top_xlim_reset = [0, 1]
+  top_ylim_reset = [0, 1]

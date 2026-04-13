@@ -1,0 +1,6 @@
+workspace
+  current = 39
+  f = 39
+  h = 2001
+  x_limits = [0, 2]
+  y_limits = [0.8, 2.3]

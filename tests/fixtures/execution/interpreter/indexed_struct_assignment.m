@@ -1,0 +1,14 @@
+s = struct('name', {"alpha", "beta"});
+s(1).score = 7;
+idx = 2;
+s(idx).name = "BETA";
+s(idx).score = 9;
+s(1).inner.flag = true;
+s(idx).inner.flag = false;
+a = s(1).name;
+b = s(2).name;
+c = [s.score];
+d = [s.inner.flag];
+e = s(1).inner.flag;
+f = s(idx).inner.flag;
+snapshot = s;

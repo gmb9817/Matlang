@@ -1,0 +1,9 @@
+row = diff([1, 4, 9, 16]);
+column = diff([1; 4; 9; 16]);
+matrix_default = diff([1, 2; 4, 7; 9, 11]);
+second_order = diff([1, 4, 9, 16], 2);
+dim2 = diff([1, 2; 4, 7; 9, 11], 1, 2);
+zero_order = diff([1, 2; 3, 4], 0);
+dim3 = diff([1, 2; 4, 7; 9, 11], 1, 3);
+dim3_size = size(dim3);
+dim3_ndims = ndims(dim3);

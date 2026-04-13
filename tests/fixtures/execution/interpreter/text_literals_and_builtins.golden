@@ -1,0 +1,20 @@
+workspace
+  a = 'alpha'
+  b = "beta"
+  c = 'gamma'
+  d = "delta"
+  e = true
+  f = false
+  g = true
+  h = false
+  i = true
+  j = true
+  k = 5
+  l = 1
+  m = [1, 5]
+  n = true
+  o = true
+  p = 'delta'
+  q = "gamma"
+  r = false
+  s = [3, 5 ; 0, 4]

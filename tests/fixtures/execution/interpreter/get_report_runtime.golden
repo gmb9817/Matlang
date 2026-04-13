@@ -1,0 +1,9 @@
+workspace
+  basic_has_cause = true
+  basic_has_stack = false
+  err = struct{cause={struct{cause={}, identifier="MATC:Leaf", message="leaf boom", stack=[]}}, identifier="MATC:Base", message="base boom", stack=[struct{file="<root>", line=0, name="raise_base"}, struct{file="<root>", line=0, name="<script>"}]}
+  report_has_cause = true
+  report_has_header = true
+  report_has_leaf = true
+  report_has_stack = true
+  report_kind = 'char'

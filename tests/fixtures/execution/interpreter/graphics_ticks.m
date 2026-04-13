@@ -1,0 +1,26 @@
+f = figure(49);
+top_axes = subplot(211);
+curve = plot([0, 1, 2], [0, 1, 0]);
+default_x = xticks();
+default_y = yticks();
+manual_x = xticks([0, 1, 2]);
+manual_y = yticks([0, 0.5, 1]);
+empty_x = xticks([]);
+hidden_x = xticks();
+
+bottom_axes = subplot(212);
+surface = surf([0, 1, 0; 1, 2, 1; 0, 1, 0]);
+view([45, 20]);
+default_z = zticks();
+manual_z = zticks([-2, 0, 2]);
+query_z = zticks();
+target_top_x = xticks(top_axes);
+xticks(top_axes, [0, 2]);
+target_top_x_after_set = xticks(top_axes);
+target_top_y = yticks(top_axes);
+yticks(top_axes, [0, 1]);
+target_top_y_after_set = yticks(top_axes);
+target_bottom_z = zticks(bottom_axes);
+zticks(bottom_axes, [-1, 1]);
+target_bottom_z_after_set = zticks(bottom_axes);
+current = gcf();

@@ -1,0 +1,14 @@
+row = gradient([1, 4, 9, 16]);
+column = gradient([1; 4; 9; 16]);
+vector_spacing = gradient([1, 4, 9, 16], 2);
+vector_positions = gradient([0, 1, 4, 16], [0, 1, 2, 4]);
+scalar = gradient(5);
+empty = gradient([]);
+empty_size = size(empty);
+empty_ndims = ndims(empty);
+[empty_gx, empty_gy] = gradient(zeros(0, 2));
+matrix_default = gradient([1, 2, 4; 3, 5, 9]);
+[gx, gy] = gradient([1, 2, 4; 3, 5, 9], 2, 4);
+page_vector = gradient(reshape([1, 4, 9, 16], [1 1 4]));
+page_vector_size = size(page_vector);
+page_vector_ndims = ndims(page_vector);

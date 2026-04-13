@@ -1,0 +1,6 @@
+workspace
+  err = struct{cause={}, identifier="MATC:UserError", message="fallback 2.5 units", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  explicit_id = "MATC:Fmt"
+  explicit_msg = "value=7 tag=ok"
+  implicit_id = "MATC:UserError"
+  implicit_msg = "fallback 2.5 units"

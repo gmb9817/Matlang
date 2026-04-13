@@ -1,0 +1,23 @@
+f = figure(54);
+top_axes = subplot(211);
+curve = plot([0, 1, 2], [0, 1, 0]);
+default_x = xtickangle();
+default_y = ytickangle();
+custom_x = xtickangle(35);
+query_x = xtickangle();
+custom_y = ytickangle(-20);
+query_y = ytickangle();
+
+bottom_axes = subplot(212);
+surface = surf([0, 1, 0; 1, 2, 1; 0, 1, 0]);
+view([45, 20]);
+default_z = ztickangle();
+custom_z = ztickangle(40);
+query_z = ztickangle();
+target_top_x = xtickangle(top_axes);
+xtickangle(top_axes, 15);
+target_top_x_after_set = xtickangle(top_axes);
+target_bottom_z = ztickangle(bottom_axes);
+ztickangle(bottom_axes, 25);
+target_bottom_z_after_set = ztickangle(bottom_axes);
+current = gcf();

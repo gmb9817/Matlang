@@ -1,0 +1,10 @@
+a = strip('  alpha  ');
+b = strjoin({'a', 'b', 'c'}, "-");
+c = extractBetween("pre<mid>post", '<', ">");
+d = replaceBetween('pre<mid>post', "<", '>', "X");
+e = strjoin(split("alpha-beta-gamma", '-'), "/");
+f = strip(replaceBetween("  pre[mid]post  ", "[", "]", "Q"));
+g = extractBetween(["Edgar Allen Poe"; "Louisa May Alcott"], [7; 8], [11; 10]);
+h = extractBetween("Hello, world!", "w", "d", "Boundaries", "inclusive");
+i = extractBetween({'pre<mid>post', 'alpha<beta>gamma'}, '<', '>');
+j = replaceBetween({'pre<mid>post', 'alpha[beta]gamma'}, [5, 7], [7, 10], 'X');

@@ -1,0 +1,17 @@
+s = 'alpha';
+a = s(2);
+b = s(2:4);
+c = s([1 5]);
+d = s(:);
+s(2) = 'Z';
+t = 'xy';
+t(3) = 'z';
+q = 'abc';
+q(2:3) = 'YZ';
+u = 'abcd';
+u([2 4]) = [];
+v = contains("alphabet", "pha");
+w = contains('alpha', 'zz');
+x = strlength("alphabet");
+y = strcmp(b, 'lph');
+z = contains alphabet pha

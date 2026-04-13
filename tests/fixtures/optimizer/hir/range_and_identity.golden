@@ -1,0 +1,15 @@
+optimization
+  changed = true
+  constant_folds = 4
+  branch_eliminations = 0
+  loop_eliminations = 1
+  statement_eliminations = 1
+
+module Script scope=0 workspace=0
+  assign [binding(name=a kind=variable binding=1 storage=local)] = number(7)
+  assign [binding(name=b kind=variable binding=2 storage=local)] = number(8)
+  assign [binding(name=c kind=variable binding=3 storage=local)] = number(9)
+  assign [binding(name=x kind=variable binding=4 storage=local)] = matrix[number(1), number(3), number(5)]
+  assign [binding(name=y kind=variable binding=5 storage=local)] = value(name=a resolution=workspace_value binding=1 kind=variable)
+  assign [binding(name=z kind=variable binding=6 storage=local)] = value(name=b resolution=workspace_value binding=2 kind=variable)
+  assign [binding(name=w kind=variable binding=7 storage=local)] = number(0)

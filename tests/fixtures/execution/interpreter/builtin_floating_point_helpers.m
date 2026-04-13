@@ -1,0 +1,15 @@
+a = isfinite([1, inf, nan]);
+b = isinf([1, inf, nan]);
+c = isnan([1, inf, nan]);
+d = isfinite(complex([1, 0, 0], [2, inf, nan]));
+e = eps;
+f = eps(10);
+g = eps(complex(3, 4));
+h = log10([1, 10, 100]);
+i = log2([1, 2, 8, 0]);
+[j, k] = log2([1, 3.141592653589793, -3, eps, realmax, realmin]);
+l = pow2([1, -2, 4]);
+m = pow2([0.5, 0.7853981633974483, -0.75], [1, 2, 2]);
+n = pow2([1, 2], 3);
+o = eps([0, 1]);
+p = isnan(complex([nan, inf], [0, nan]));

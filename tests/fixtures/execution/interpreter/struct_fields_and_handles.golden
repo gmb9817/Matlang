@@ -1,0 +1,5 @@
+workspace
+  a = 1
+  b = 3
+  c = 8
+  s = struct{alpha=1, beta=[2, 3], fn=@helper, inner=struct{value=3}}

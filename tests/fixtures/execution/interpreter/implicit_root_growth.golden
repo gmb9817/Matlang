@@ -1,0 +1,11 @@
+workspace
+  a = ["alpha", "beta"]
+  b = [true, false]
+  c = {9}
+  d = [0, 5]
+  e = 9
+  f = "beta"
+  g = [struct{inner=struct{flag=true}, name="alpha"}, struct{inner=struct{flag=false}, name="beta"}]
+  idx = 2
+  s = [struct{inner=struct{flag=true}, name="alpha"}, struct{inner=struct{flag=false}, name="beta"}]
+  x = [0, 5]

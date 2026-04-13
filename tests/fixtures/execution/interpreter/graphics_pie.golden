@@ -1,0 +1,8 @@
+workspace
+  current = 66
+  f = 66
+  labeled_pie = 2002
+  limits = [-1.35, 1.35, -1.35, 1.35]
+  limits_after = [-1.35, 1.35, -1.35, 1.35]
+  main_pie = 2001
+  relief_pie = 2003

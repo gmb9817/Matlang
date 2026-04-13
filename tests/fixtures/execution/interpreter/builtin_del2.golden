@@ -1,0 +1,7 @@
+workspace
+  column = [1 ; 1 ; 1 ; 1]
+  matrix_default = [1, 1, 1 ; 1, 1, 1 ; 1, 1, 1]
+  matrix_spacing = [1, 1, 1 ; 1, 1, 1 ; 1, 1, 1]
+  row = [1, 1, 1, 1]
+  scalar = 0
+  scalar_spacing = [1, 1, 1, 1]

@@ -1,0 +1,25 @@
+workspace
+  auto_axis = [0.5, 3.5, 0.5, 2.5]
+  bottom_axes = 1003
+  bottom_axis = [0.5, 2.5, 0.5, 2.5]
+  cb = 11
+  current = 11
+  data = [0, 1, 2 ; 3, 4, 5]
+  direct_scale = [1, 8]
+  f = 11
+  gray_map = [0, 0, 0 ; 0.143, 0.143, 0.143 ; 0.286, 0.286, 0.286 ; 0.429, 0.429, 0.429 ; 0.571, 0.571, 0.571 ; 0.714, 0.714, 0.714 ; 0.857, 0.857, 0.857 ; 1, 1, 1]
+  heat = 2001
+  heat_xlim = [0.5, 3.5]
+  heat_ylim = [0.5, 2.5]
+  hidden_axis = [0.5, 2.5, 0.5, 2.5]
+  indexed = 2003
+  initial_axis = [0.5, 3.5, 0.5, 2.5]
+  jet_map = [0, 0, 0.5 ; 0, 0, 1 ; 0, 0.5, 1 ; 0, 1, 1 ; 0.5, 1, 0.5 ; 1, 1, 0 ; 1, 0.5, 0 ; 0.5, 0, 0]
+  manual_axis = [0.5, 3.5, 0.5, 2.5]
+  middle_axes = 1002
+  middle_scale = [0, 1]
+  photo = 2002
+  shown_axis = [0.5, 2.5, 0.5, 2.5]
+  top_axes = 1001
+  top_scale = [0, 6]
+  top_scale_query = [0, 6]

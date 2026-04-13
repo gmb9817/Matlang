@@ -1,0 +1,17 @@
+workspace
+  a = 'ba'
+  b = "baNANA"
+  c = 'matlab'
+  d = "matlab!"
+  e = {'a' ; 'b' ; 'c'}
+  f = ["alpha" ; "beta"]
+  g = "cAnA"
+  h = ["alpha", "beta" ; "gamma", "delta"]
+  i = ["alpha\nbeta\ngamma"]
+  j = ["alpha" ; "beta" ; "gamma"]
+  k = ["alpha" ; "beta" ; "gamma"]
+  l = ["," ; ";"]
+  m = {'alpha', 'beta' ; 'gamma', 'delta'}
+  n = "FOO bar BAZ"
+  o = ["fruit-fruit" ; "fruit-fruit"]
+  p = "bar"

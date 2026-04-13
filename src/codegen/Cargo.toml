@@ -1,0 +1,20 @@
+[package]
+name = "matlab-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+matlab-ir = { path = "../ir" }
+matlab-runtime = { path = "../runtime" }
+
+[dev-dependencies]
+matlab-frontend = { path = "../frontend" }
+matlab-optimizer = { path = "../optimizer" }
+matlab-resolver = { path = "../resolver" }
+matlab-semantics = { path = "../semantics" }
+
+[lib]
+path = "src/lib.rs"

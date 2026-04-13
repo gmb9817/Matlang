@@ -1,0 +1,384 @@
+//! Resolver crate for names, package lookups, and path resolution.
+
+use std::{
+    collections::HashSet,
+    env,
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
+
+pub const CRATE_NAME: &str = "matlab-resolver";
+
+pub fn summary() -> &'static str {
+    "Owns symbol resolution, package lookup, import handling, and path search."
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolverContext {
+    pub source_file: Option<PathBuf>,
+    pub search_roots: Vec<PathBuf>,
+}
+
+impl ResolverContext {
+    pub fn new(source_file: Option<PathBuf>, search_roots: Vec<PathBuf>) -> Self {
+        Self {
+            source_file,
+            search_roots,
+        }
+    }
+
+    pub fn from_source_file(path: impl Into<PathBuf>) -> Self {
+        Self {
+            source_file: Some(path.into()),
+            search_roots: Vec::new(),
+        }
+    }
+
+    pub fn with_env_search_roots(mut self, variable: &str) -> Self {
+        self.search_roots.extend(search_roots_from_env(variable));
+        self
+    }
+
+    pub fn push_search_root(&mut self, path: impl Into<PathBuf>) {
+        self.search_roots.push(path.into());
+    }
+
+    pub fn source_dir(&self) -> Option<&Path> {
+        self.source_file.as_deref().and_then(Path::parent)
+    }
+
+    pub fn effective_search_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        let mut seen = HashSet::new();
+
+        if let Some(source_dir) = self.source_dir() {
+            push_unique_path(&mut roots, &mut seen, source_dir.to_path_buf());
+        }
+
+        for root in &self.search_roots {
+            push_unique_path(&mut roots, &mut seen, root.clone());
+        }
+
+        roots
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedFunctionKind {
+    PrivateDirectory,
+    CurrentDirectory,
+    SearchPath,
+    PackageDirectory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFunction {
+    pub name: String,
+    pub kind: ResolvedFunctionKind,
+    pub path: PathBuf,
+    pub root: PathBuf,
+    pub package: Option<String>,
+}
+
+pub fn search_roots_from_env(variable: &str) -> Vec<PathBuf> {
+    env::var_os(variable)
+        .map(|value| env::split_paths(&value).collect())
+        .unwrap_or_default()
+}
+
+pub fn resolve_function(name: &str, context: &ResolverContext) -> Option<ResolvedFunction> {
+    if name.is_empty() {
+        return None;
+    }
+
+    if let Some(source_dir) = context.source_dir() {
+        if let Some(private) = resolve_private_function(name, source_dir) {
+            return Some(private);
+        }
+    }
+
+    for root in context.effective_search_roots() {
+        if let Some(package) = resolve_package_function(name, &root) {
+            return Some(package);
+        }
+
+        let candidate = root.join(format!("{name}.m"));
+        if candidate.is_file() {
+            let kind = if context
+                .source_dir()
+                .is_some_and(|dir| dir == root.as_path())
+            {
+                ResolvedFunctionKind::CurrentDirectory
+            } else {
+                ResolvedFunctionKind::SearchPath
+            };
+            return Some(ResolvedFunction {
+                name: name.to_string(),
+                kind,
+                path: candidate,
+                root,
+                package: None,
+            });
+        }
+    }
+
+    None
+}
+
+fn resolve_private_function(name: &str, source_dir: &Path) -> Option<ResolvedFunction> {
+    if name.contains('.') {
+        return None;
+    }
+
+    let candidate = source_dir.join("private").join(format!("{name}.m"));
+    if !candidate.is_file() {
+        return None;
+    }
+
+    Some(ResolvedFunction {
+        name: name.to_string(),
+        kind: ResolvedFunctionKind::PrivateDirectory,
+        path: candidate,
+        root: source_dir.to_path_buf(),
+        package: None,
+    })
+}
+
+fn resolve_package_function(name: &str, root: &Path) -> Option<ResolvedFunction> {
+    if !name.contains('.') {
+        return None;
+    }
+
+    let mut segments = name.split('.').peekable();
+    let mut current = root.to_path_buf();
+    let mut package_parts = Vec::new();
+
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            let candidate = current.join(format!("{segment}.m"));
+            if candidate.is_file() {
+                return Some(ResolvedFunction {
+                    name: name.to_string(),
+                    kind: ResolvedFunctionKind::PackageDirectory,
+                    path: candidate,
+                    root: root.to_path_buf(),
+                    package: (!package_parts.is_empty()).then(|| package_parts.join(".")),
+                });
+            }
+            return None;
+        }
+
+        package_parts.push(segment.to_string());
+        current.push(format!("+{segment}"));
+    }
+
+    None
+}
+
+fn push_unique_path(roots: &mut Vec<PathBuf>, seen: &mut HashSet<OsString>, path: PathBuf) {
+    let key = normalize_path_key(&path);
+    if seen.insert(key) {
+        roots.push(path);
+    }
+}
+
+fn normalize_path_key(path: &Path) -> OsString {
+    #[cfg(windows)]
+    {
+        OsString::from(path.to_string_lossy().to_lowercase())
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.as_os_str().to_os_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{resolve_function, search_roots_from_env, ResolvedFunctionKind, ResolverContext};
+
+    #[test]
+    fn resolves_function_in_current_directory() {
+        let workspace = temp_test_dir();
+        write_file(&workspace.join("main.m"), "y = helper(1);\n");
+        write_file(
+            &workspace.join("helper.m"),
+            "function y = helper(x)\ny = x;\nend\n",
+        );
+
+        let resolved = resolve_function(
+            "helper",
+            &ResolverContext::from_source_file(workspace.join("main.m")),
+        )
+        .expect("helper should resolve");
+
+        assert_eq!(resolved.kind, ResolvedFunctionKind::CurrentDirectory);
+        assert_eq!(resolved.path, workspace.join("helper.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn resolves_private_function_before_search_path() {
+        let workspace = temp_test_dir();
+        let search_root = workspace.join("search");
+        fs::create_dir_all(workspace.join("private")).expect("create private dir");
+        fs::create_dir_all(&search_root).expect("create search root");
+        write_file(&workspace.join("main.m"), "y = helper(1);\n");
+        write_file(
+            &workspace.join("private").join("helper.m"),
+            "function y = helper(x)\ny = x;\nend\n",
+        );
+        write_file(
+            &search_root.join("helper.m"),
+            "function y = helper(x)\ny = x + 1;\nend\n",
+        );
+
+        let mut context = ResolverContext::from_source_file(workspace.join("main.m"));
+        context.push_search_root(&search_root);
+        let resolved = resolve_function("helper", &context).expect("helper should resolve");
+
+        assert_eq!(resolved.kind, ResolvedFunctionKind::PrivateDirectory);
+        assert_eq!(resolved.path, workspace.join("private").join("helper.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn current_directory_function_can_shadow_builtin_name() {
+        let workspace = temp_test_dir();
+        write_file(&workspace.join("main.m"), "y = zeros(1, 2);\n");
+        write_file(
+            &workspace.join("zeros.m"),
+            "function y = zeros(varargin)\ny = 1;\nend\n",
+        );
+
+        let resolved = resolve_function(
+            "zeros",
+            &ResolverContext::from_source_file(workspace.join("main.m")),
+        )
+        .expect("zeros should resolve to local file");
+
+        assert_eq!(resolved.kind, ResolvedFunctionKind::CurrentDirectory);
+        assert_eq!(resolved.path, workspace.join("zeros.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn search_path_order_is_stable() {
+        let workspace = temp_test_dir();
+        let source = workspace.join("src");
+        let first = workspace.join("first");
+        let second = workspace.join("second");
+        fs::create_dir_all(&source).expect("create source dir");
+        fs::create_dir_all(&first).expect("create first root");
+        fs::create_dir_all(&second).expect("create second root");
+        write_file(&source.join("main.m"), "y = helper(1);\n");
+        write_file(
+            &first.join("helper.m"),
+            "function y = helper(x)\ny = x;\nend\n",
+        );
+        write_file(
+            &second.join("helper.m"),
+            "function y = helper(x)\ny = x + 1;\nend\n",
+        );
+
+        let context = ResolverContext::new(
+            Some(source.join("main.m")),
+            vec![first.clone(), second.clone()],
+        );
+        let resolved = resolve_function("helper", &context).expect("helper should resolve");
+
+        assert_eq!(resolved.kind, ResolvedFunctionKind::SearchPath);
+        assert_eq!(resolved.path, first.join("helper.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn resolves_package_function_from_search_root() {
+        let workspace = temp_test_dir();
+        let source = workspace.join("src");
+        let root = workspace.join("packages");
+        fs::create_dir_all(&source).expect("create source dir");
+        fs::create_dir_all(root.join("+pkg")).expect("create package dir");
+        write_file(&source.join("main.m"), "y = pkg.helper(1);\n");
+        write_file(
+            &root.join("+pkg").join("helper.m"),
+            "function y = helper(x)\ny = x;\nend\n",
+        );
+
+        let context = ResolverContext::new(Some(source.join("main.m")), vec![root.clone()]);
+        let resolved =
+            resolve_function("pkg.helper", &context).expect("package helper should resolve");
+
+        assert_eq!(resolved.kind, ResolvedFunctionKind::PackageDirectory);
+        assert_eq!(resolved.package.as_deref(), Some("pkg"));
+        assert_eq!(resolved.path, root.join("+pkg").join("helper.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn returns_none_when_function_is_missing() {
+        let workspace = temp_test_dir();
+        write_file(&workspace.join("main.m"), "y = helper(1);\n");
+
+        let resolved = resolve_function(
+            "helper",
+            &ResolverContext::from_source_file(workspace.join("main.m")),
+        );
+
+        assert!(resolved.is_none());
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn reads_search_roots_from_env_var() {
+        let workspace = temp_test_dir();
+        let first = workspace.join("first");
+        let second = workspace.join("second");
+        fs::create_dir_all(&first).expect("create first root");
+        fs::create_dir_all(&second).expect("create second root");
+        let joined = env::join_paths([first.as_path(), second.as_path()]).expect("join paths");
+        env::set_var("MATC_TEST_PATH", joined);
+
+        let roots = search_roots_from_env("MATC_TEST_PATH");
+        assert_eq!(roots, vec![first.clone(), second.clone()]);
+
+        env::remove_var("MATC_TEST_PATH");
+        cleanup(&workspace);
+    }
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_test_dir() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time")
+            .as_nanos();
+        path.push(format!(
+            "matlab_resolver_test_{}_{}",
+            nanos,
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("create temp test dir");
+        path
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent dir");
+        }
+        fs::write(path, contents).expect("write test file");
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = fs::remove_dir_all(path);
+    }
+}

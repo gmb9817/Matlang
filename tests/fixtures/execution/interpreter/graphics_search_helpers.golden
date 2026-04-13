@@ -1,0 +1,18 @@
+workspace
+  after_delete = [37, 1001, 2001, 1002, 2003]
+  all_from_figure = [37, 1001, 2001, 2002, 1002, 2003]
+  axes_only = [1001, 1002]
+  bottom = 1002
+  box_off_axes = [1002]
+  current_all = [37, 1001, 2001, 2002, 1002, 2003]
+  dots = 2002
+  f = 37
+  from_axes = [1001, 2001, 2002]
+  hidden_objects = [2002]
+  implicit_curve = [2001]
+  line = 2001
+  line_only = [2001]
+  mesh_handle = 2003
+  mesh_only = [2003]
+  top = 1001
+  top_after_delete = [1001, 2001]

@@ -1,0 +1,11 @@
+workspace
+  ax = 1001
+  current = 38
+  default_z = [0, 2]
+  f = 38
+  manual_z = [-2, 4]
+  queried_z = [-2, 4]
+  surface = 2001
+  targeted_z = [-2, 4]
+  targeted_z_after_set = [-1, 3]
+  z_handle = 38

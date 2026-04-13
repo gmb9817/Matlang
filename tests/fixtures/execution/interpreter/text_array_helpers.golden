@@ -1,0 +1,22 @@
+workspace
+  a = [" alpha ", "beta" ; "Gamma", "delta "]
+  b = ["alpha", "beta" ; "Gamma", "delta"]
+  c = ["ALPHA", "BETA" ; "GAMMA", "DELTA"]
+  d = [true, true ; true, true]
+  e = ["false", "false" ; "true", "true"]
+  f = ["pre_one", "mid_two"]
+  g = ["a" ; "b" ; "c"]
+  h = ["left/right" ; "up/down"]
+  i = ["x", "y"]
+  j = ["a", "b"]
+  k = true
+  l = true
+  m = [true, false]
+  n = ["cAb", "dAb"]
+  o = ["x + y = z" ; "a - b = c"]
+  p = [true, true]
+  q = [true ; false]
+  r = [true, true]
+  s = {'ALPHA', 'BETA'}
+  t = {'alpha', 'beta'}
+  u = {'cAb', 'dAb'}

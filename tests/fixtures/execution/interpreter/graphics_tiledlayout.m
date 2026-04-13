@@ -1,0 +1,10 @@
+f = figure(12);
+t = tiledlayout(2, 1);
+ax1 = nexttile();
+plot([0, 1, 2], [0, 1, 4]);
+title("Top Tile");
+ax2 = nexttile();
+bar([1, 2, 3], [3, 1, 2]);
+title("Bottom Tile");
+nexttile(1);
+top_xlim = xlim();

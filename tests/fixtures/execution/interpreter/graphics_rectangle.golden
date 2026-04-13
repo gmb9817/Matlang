@@ -1,0 +1,12 @@
+workspace
+  f = 42
+  found_rect = [2001]
+  rect = 2001
+  rect_edge = [1, 0, 0]
+  rect_face = [0, 0.6666666666666666, 0]
+  rect_parent = 1001
+  rect_position = [0.5, 0.25, 1.5, 1]
+  rect_type = 'rectangle'
+  red_edge_rects = [2001]
+  updated_face = 'none'
+  updated_position = [1, 0.5, 1, 0.75]

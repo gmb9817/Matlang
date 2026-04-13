@@ -1,0 +1,32 @@
+workspaces
+  Script id=0 parent=None name=None
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  kind kind=variable scope=0 workspace=0 binding=Some(1)
+  ok kind=variable scope=0 workspace=0 binding=Some(2)
+  err kind=variable scope=0 workspace=0 binding=Some(3)
+  err2 kind=variable scope=0 workspace=0 binding=Some(4)
+  report kind=variable scope=0 workspace=0 binding=Some(5)
+  msg kind=variable scope=0 workspace=0 binding=Some(6)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  kind id=1 storage=local owner_symbol=1 owner_scope=0 owner_workspace=0 shared=false
+  ok id=2 storage=local owner_symbol=2 owner_scope=0 owner_workspace=0 shared=false
+  err id=3 storage=local owner_symbol=3 owner_scope=0 owner_workspace=0 shared=false
+  err2 id=4 storage=local owner_symbol=4 owner_scope=0 owner_workspace=0 shared=false
+  report id=5 storage=local owner_symbol=5 owner_scope=0 owner_workspace=0 shared=false
+  msg id=6 storage=local owner_symbol=6 owner_scope=0 owner_workspace=0 shared=false
+references
+  class role=call_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  isa role=call_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  kind role=value resolution=workspace_value symbol=Some(1) kind=variable scope=Some(0) workspace=Some(0) binding=Some(1) capture=none
+  error role=call_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  rethrow role=call_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  err role=value resolution=workspace_value symbol=Some(3) kind=variable scope=Some(0) workspace=Some(0) binding=Some(3) capture=none
+  getReport role=call_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  err2 role=value resolution=workspace_value symbol=Some(4) kind=variable scope=Some(0) workspace=Some(0) binding=Some(4) capture=none
+  err2 role=value resolution=workspace_value symbol=Some(4) kind=variable scope=Some(0) workspace=Some(0) binding=Some(4) capture=none
+captures
+diagnostics

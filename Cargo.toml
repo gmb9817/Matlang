@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "src/frontend",
+    "src/resolver",
+    "src/semantics",
+    "src/ir",
+    "src/optimizer",
+    "src/runtime",
+    "src/stdlib",
+    "src/execution",
+    "src/codegen",
+    "src/interop",
+    "src/platform",
+    "src/cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+authors = ["Codex + collaborators"]
+rust-version = "1.78"
+
+[workspace.dependencies]

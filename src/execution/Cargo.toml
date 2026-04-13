@@ -1,0 +1,27 @@
+[package]
+name = "matlab-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flate2 = "1.1.1"
+matlab-codegen = { path = "../codegen" }
+matlab-frontend = { path = "../frontend" }
+matlab-interop = { path = "../interop" }
+matlab-ir = { path = "../ir" }
+matlab-platform = { path = "../platform" }
+matlab-resolver = { path = "../resolver" }
+matlab-runtime = { path = "../runtime" }
+matlab-semantics = { path = "../semantics" }
+matlab-stdlib = { path = "../stdlib" }
+pdf-writer = "0.14.0"
+resvg = "0.47.0"
+
+[dev-dependencies]
+matlab-optimizer = { path = "../optimizer" }
+
+[lib]
+path = "src/lib.rs"

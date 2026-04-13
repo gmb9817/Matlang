@@ -1,0 +1,23 @@
+workspace
+  a = '42.5'
+  b = "7"
+  c = "x=3 y=2.50 tag=ok"
+  d = "value-10"
+  e = '5 items'
+  f = '3.14e+00'
+  g = "lower=1.2e+01 upper=1.2E+01"
+  h = ["row=1 col=3" ; "row=2 col=4"]
+  i = ["value=10 spare=%d" ; "value=20 spare=%d"]
+  j = 9
+  k = 'hex=1A char=A'
+  l = "plain text"
+  m = ["left", "right"]
+  n = "i=-2 u=10 o=10 x=ff X=FF c=A"
+  o = {'1 + 3' ; '2 + 4'}
+  p = "real=2 imag-ignored=2.000000"
+  q = "num=3.141593e+00"
+  r = "code=A"
+  s = "complex=1.000000e+00"
+  t = 'signed=+0007 hex=0x1a left=hi     fixed=3.'
+  u = ["+0007" ; "+0012"]
+  v = 'g=3.142 alt=3.000 G=+3.14 small=1.23e-05'

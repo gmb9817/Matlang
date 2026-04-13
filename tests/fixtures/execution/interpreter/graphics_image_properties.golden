@@ -1,0 +1,21 @@
+workspace
+  ax2 = 1002
+  current = 72
+  f = 72
+  indexed = 2002
+  indexed_alpha = 0.4
+  indexed_data = [4, 3 ; 2, 1]
+  mapping_after = 'scaled'
+  mapping_before = 'direct'
+  rgb(:,:,1) = [255, 0 ; 0, 255]
+  rgb(:,:,2) = [0, 255 ; 0, 255]
+  rgb(:,:,3) = [0, 0 ; 255, 255]
+  rgb_alpha_after = [1, 0.25 ; 0.5, 0]
+  rgb_alpha_before = 1
+  rgb_alpha_mapping = 'none'
+  rgb_data(:,:,1) = [1, 0 ; 0, 1]
+  rgb_data(:,:,2) = [0, 1 ; 0, 1]
+  rgb_data(:,:,3) = [0, 0 ; 1, 1]
+  rgb_found = [2001]
+  rgb_img = 2001
+  rgb_type = 'image'

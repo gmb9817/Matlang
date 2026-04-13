@@ -1,0 +1,6 @@
+workspace
+  default_x = [5, 15]
+  descending = [25, 5]
+  linear = [5, 15, 25]
+  matrix_query = [0, 0.5 ; 2.5, NaN]
+  nearest = [0, 10, 20, 30]

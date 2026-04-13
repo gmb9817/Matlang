@@ -1,0 +1,11 @@
+unit Script
+assign [x] = matrix[number(1), number(2)]
+assign [status] = string("none")
+try
+  assign [y] = apply(x, [number(3)])
+  assign [status] = string("missed")
+catch err
+  assign [status] = string("caught")
+  assign [message] = field(err, message)
+  assign [code] = field(err, identifier)
+end_try

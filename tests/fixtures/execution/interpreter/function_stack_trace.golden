@@ -1,0 +1,5 @@
+workspace
+  bottom_name = "function_stack_trace"
+  caught_id = "MATC:Nested"
+  stack_depth = 2
+  top_name = "helper"

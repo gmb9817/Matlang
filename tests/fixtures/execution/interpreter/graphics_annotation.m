@@ -1,0 +1,12 @@
+f = figure(44);
+a1 = annotation('line', [0.1, 0.4], [0.2, 0.5], 'Color', 'r');
+a2 = annotation('textarrow', [0.25, 0.45], [0.8, 0.6], 'Peak', 'LineStyle', '--');
+a3 = annotation('textbox', [0.65, 0.2, 0.2, 0.1], 'Notes', 'FaceColor', 'y');
+children_before = allchild(f);
+type2 = get(a2, 'Type');
+text2 = get(a2, 'String');
+parent2 = get(a2, 'Parent');
+pos3 = get(a3, 'Position');
+delete(a1);
+children_after = allchild(f);
+current = get(f, 'CurrentObject');

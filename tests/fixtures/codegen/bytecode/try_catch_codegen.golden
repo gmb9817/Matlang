@@ -1,0 +1,42 @@
+codegen
+  backend = bytecode
+  functions = 1
+  instructions = 26
+  anonymous_functions = 0
+  nested_functions = 0
+  max_temps = 13
+  max_labels = 2
+
+verification
+  ok = true
+  functions_checked = 1
+  issues = 0
+
+bytecode module backend=bytecode unit_kind=Script entry=<script>
+function <script> role=script_entry params=[] outputs=[] captures=[] temps=13 labels=2
+  t0 = const number(1)
+  t1 = const number(2)
+  t2 = matrix 1x2 [t0, t1]
+  store x#1 <- t2
+  t3 = const string("none")
+  store status#2 <- t3
+  push_try -> L0
+  t5 = const number(3)
+  t6 = load x#1
+  [t4] = call t6 (t5)
+  store y#3 <- t4
+  t7 = const string("missed")
+  store status#2 <- t7
+  jump -> L1
+  L0:
+  store_last_error err#4
+  t8 = const string("caught")
+  store status#2 <- t8
+  t9 = load err#4
+  t10 = field t9.message
+  store message#5 <- t10
+  t11 = load err#4
+  t12 = field t11.identifier
+  store code#6 <- t12
+  L1:
+  return []

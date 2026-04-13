@@ -1,0 +1,12 @@
+workspace
+  a1 = 3001
+  a2 = 3002
+  a3 = 3003
+  children_after = [3002, 3003]
+  children_before = [3001, 3002, 3003]
+  current = 3003
+  f = 44
+  parent2 = 44
+  pos3 = [0.65, 0.2, 0.2, 0.1]
+  text2 = 'Peak'
+  type2 = 'textarrow'

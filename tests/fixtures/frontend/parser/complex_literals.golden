@@ -1,0 +1,7 @@
+unit Script
+assign [a] = number(1i)
+assign [b] = number(2j)
+assign [c] = binary(Add, number(3), number(4i))
+assign [d] = binary(Subtract, number(5), number(6j))
+assign [e] = matrix[number(1i), number(2) ; number(3e-2j), number(4i)]
+assign [f] = binary(Add, number(1), binary(Multiply, number(2), number(3i)))

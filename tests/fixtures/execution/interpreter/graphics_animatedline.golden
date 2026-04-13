@@ -1,0 +1,14 @@
+workspace
+  after_clear = []
+  f = 66
+  gx = [0, 1, 2]
+  gx3 = [0, 1]
+  gy = [0, 1, 0]
+  gy3 = [0, 1]
+  gz3 = [1, 2]
+  h = 2001
+  h3 = 2002
+  type1 = 'line'
+  xdata = [0, 1, 2]
+  ydata = [0, 1, 0]
+  zdata3 = [1, 2]

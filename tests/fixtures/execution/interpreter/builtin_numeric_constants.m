@@ -1,0 +1,16 @@
+a = pi;
+b = eps;
+c = Inf;
+d = NaN;
+e = realmin;
+f = realmax;
+g = flintmax;
+h = inf(2);
+i = NaN(1, 3);
+j = pi + 1;
+k = eps * 2;
+l = realmax();
+m = realmin();
+n = flintmax();
+o = inf;
+p = nan;

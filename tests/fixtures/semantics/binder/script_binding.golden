@@ -1,0 +1,20 @@
+workspaces
+  Script id=0 parent=None name=None
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  x kind=variable scope=0 workspace=0 binding=Some(1)
+  y kind=variable scope=0 workspace=0 binding=Some(2)
+  z kind=variable scope=0 workspace=0 binding=Some(3)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  x id=1 storage=local owner_symbol=1 owner_scope=0 owner_workspace=0 shared=false
+  y id=2 storage=local owner_symbol=2 owner_scope=0 owner_workspace=0 shared=false
+  z id=3 storage=local owner_symbol=3 owner_scope=0 owner_workspace=0 shared=false
+references
+  zeros role=call_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  userfunc role=call_target resolution=external_function_candidate symbol=None kind=none scope=None workspace=None binding=None capture=none
+  y role=value resolution=workspace_value symbol=Some(2) kind=variable scope=Some(0) workspace=Some(0) binding=Some(2) capture=none
+captures
+diagnostics

@@ -1,0 +1,16 @@
+a = deg2rad(180);
+b = rad2deg(3.141592653589793);
+c = sind(30);
+d = cosd(60);
+e = tand(45);
+f = asind(0.5);
+g = acosd(0.5);
+h = atand(1);
+i = atan2(1, 1);
+j = atan2d(1, 1);
+k = sind([0 30 90]);
+l = rad2deg(complex(0, 3.141592653589793));
+m = atan2([0, 1, -1], 1);
+n = atan2d([0, 1, -1], 1);
+o = (@deg2rad)(180);
+p = (@atan2d)(1, 1);

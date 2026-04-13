@@ -1,0 +1,6 @@
+workspace
+  code = "MATC:InvalidIndex"
+  err = struct{cause={}, identifier="MATC:InvalidIndex", message="linear index 3 is out of bounds for 1x2 matrix", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  message = "linear index 3 is out of bounds for 1x2 matrix"
+  status = "caught"
+  x = [1, 2]

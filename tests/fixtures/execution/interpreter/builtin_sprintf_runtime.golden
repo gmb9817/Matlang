@@ -1,0 +1,3 @@
+workspace
+  s = 'value=5'
+  t = 'value=1.25e+01 %'

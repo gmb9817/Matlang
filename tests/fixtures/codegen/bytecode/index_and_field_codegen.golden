@@ -1,0 +1,43 @@
+codegen
+  backend = bytecode
+  functions = 1
+  instructions = 27
+  anonymous_functions = 0
+  nested_functions = 0
+  max_temps = 20
+  max_labels = 0
+
+verification
+  ok = true
+  functions_checked = 1
+  issues = 0
+
+bytecode module backend=bytecode unit_kind=Script entry=<script>
+function <script> role=script_entry params=[] outputs=[] captures=[] temps=20 labels=0
+  t0 = const number(1)
+  t1 = const number(2)
+  t2 = const number(3)
+  t3 = const number(4)
+  t4 = cell 2x2 [t0, t1, t2, t3]
+  store data#1 <- t4
+  t5 = const number(9)
+  t6 = const number(8)
+  t7 = matrix 1x2 [t5, t6]
+  store row#2 <- t7
+  t8 = load row#2
+  t9 = const number(5)
+  t10 = cell 1x2 [t8, t9]
+  t11 = load-lvalue data#1
+  t12 = const number(2)
+  store_index paren t11 [t12, :] <- t10
+  t13 = load data#1
+  t14 = const number(2)
+  t15 = const number(1)
+  t16 = index brace t13 [t14, t15]
+  store picked#3 <- t16
+  [t17] = call struct [semantic=BuiltinFunction final=BuiltinFunction] ()
+  store result#4 <- t17
+  t18 = load picked#3
+  t19 = load-lvalue result#4
+  store_field t19.value <- t18
+  return []

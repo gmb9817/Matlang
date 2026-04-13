@@ -1,0 +1,11 @@
+workspace
+  a = 'alpha'
+  b = 'a-b-c'
+  c = "mid"
+  d = 'pre<X>post'
+  e = "alpha/beta/gamma"
+  f = "pre[Q]post"
+  g = ["Allen" ; "May"]
+  h = "world"
+  i = {'mid', 'beta'}
+  j = {'pre<X>post', 'alpha[X]gamma'}

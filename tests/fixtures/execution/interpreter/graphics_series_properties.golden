@@ -1,0 +1,19 @@
+workspace
+  curve3 = 2003
+  curve3_name = 'Arc'
+  curve3_type = 'line'
+  curve3_z = [1, 2, 3]
+  curve3_z_updated = [1, 3, 5]
+  dots = 2002
+  dots_visible = 'off'
+  f = 31
+  legend_handle = 31
+  legend_labels = ["Curve", "Dots"]
+  line = 2001
+  line_name = 'Curve'
+  line_type = 'line'
+  line_x = [0, 1, 2, 3]
+  line_y = [0, 1, 4, 9]
+  updated_y = [0, 2, 8, 18]
+  upper = 1002
+  visible_xlim = [0, 3]

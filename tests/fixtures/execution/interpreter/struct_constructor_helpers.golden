@@ -1,0 +1,10 @@
+workspace
+  a = struct{name="alpha", value=3}
+  b = [struct{flag=true, name="alpha", value=1}, struct{flag=true, name="beta", value=2}]
+  c = ["alpha", "beta"]
+  d = [1, 2]
+  e = [true, true]
+  f = {'flag' ; 'name' ; 'value'}
+  g = true
+  h = [struct{flag=true, name="alpha"}, struct{flag=true, name="beta"}]
+  i = ["alpha", "beta"]

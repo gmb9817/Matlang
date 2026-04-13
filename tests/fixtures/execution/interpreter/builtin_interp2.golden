@@ -1,0 +1,10 @@
+workspace
+  broadcast = [5 ; 25]
+  descending = [55, 65]
+  linear = [5, 10 ; 10, 22.5]
+  matrix_grid = [55, 65]
+  matrix_query = [15, NaN ; NaN, 30]
+  nearest = [0, 30, 30]
+  vector_grid = [55, 65]
+  xg = [0, 2, 4 ; 0, 2, 4]
+  yg = [0, 0, 0 ; 10, 10, 10]

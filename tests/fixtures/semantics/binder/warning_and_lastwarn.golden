@@ -1,0 +1,23 @@
+workspaces
+  Script id=0 parent=None name=None
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  msg kind=variable scope=0 workspace=0 binding=Some(1)
+  id kind=variable scope=0 workspace=0 binding=Some(2)
+  wh kind=variable scope=0 workspace=0 binding=Some(3)
+  lh kind=variable scope=0 workspace=0 binding=Some(4)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  msg id=1 storage=local owner_symbol=1 owner_scope=0 owner_workspace=0 shared=false
+  id id=2 storage=local owner_symbol=2 owner_scope=0 owner_workspace=0 shared=false
+  wh id=3 storage=local owner_symbol=3 owner_scope=0 owner_workspace=0 shared=false
+  lh id=4 storage=local owner_symbol=4 owner_scope=0 owner_workspace=0 shared=false
+references
+  warning role=call_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  lastwarn role=call_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  warning role=function_handle_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+  lastwarn role=function_handle_target resolution=builtin_function symbol=None kind=none scope=None workspace=None binding=None capture=none
+captures
+diagnostics

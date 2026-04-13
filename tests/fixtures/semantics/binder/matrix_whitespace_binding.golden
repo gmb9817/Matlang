@@ -1,0 +1,31 @@
+workspaces
+  Script id=0 parent=None name=None
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  a kind=variable scope=0 workspace=0 binding=Some(1)
+  b kind=variable scope=0 workspace=0 binding=Some(2)
+  c kind=variable scope=0 workspace=0 binding=Some(3)
+  d kind=variable scope=0 workspace=0 binding=Some(4)
+  x kind=variable scope=0 workspace=0 binding=Some(5)
+  cells kind=variable scope=0 workspace=0 binding=Some(6)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  a id=1 storage=local owner_symbol=1 owner_scope=0 owner_workspace=0 shared=false
+  b id=2 storage=local owner_symbol=2 owner_scope=0 owner_workspace=0 shared=false
+  c id=3 storage=local owner_symbol=3 owner_scope=0 owner_workspace=0 shared=false
+  d id=4 storage=local owner_symbol=4 owner_scope=0 owner_workspace=0 shared=false
+  x id=5 storage=local owner_symbol=5 owner_scope=0 owner_workspace=0 shared=false
+  cells id=6 storage=local owner_symbol=6 owner_scope=0 owner_workspace=0 shared=false
+references
+  a role=value resolution=workspace_value symbol=Some(1) kind=variable scope=Some(0) workspace=Some(0) binding=Some(1) capture=none
+  b role=value resolution=workspace_value symbol=Some(2) kind=variable scope=Some(0) workspace=Some(0) binding=Some(2) capture=none
+  c role=value resolution=workspace_value symbol=Some(3) kind=variable scope=Some(0) workspace=Some(0) binding=Some(3) capture=none
+  d role=value resolution=workspace_value symbol=Some(4) kind=variable scope=Some(0) workspace=Some(0) binding=Some(4) capture=none
+  a role=value resolution=workspace_value symbol=Some(1) kind=variable scope=Some(0) workspace=Some(0) binding=Some(1) capture=none
+  b role=value resolution=workspace_value symbol=Some(2) kind=variable scope=Some(0) workspace=Some(0) binding=Some(2) capture=none
+  c role=value resolution=workspace_value symbol=Some(3) kind=variable scope=Some(0) workspace=Some(0) binding=Some(3) capture=none
+  d role=value resolution=workspace_value symbol=Some(4) kind=variable scope=Some(0) workspace=Some(0) binding=Some(4) capture=none
+captures
+diagnostics

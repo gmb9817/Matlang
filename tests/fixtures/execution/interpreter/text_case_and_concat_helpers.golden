@@ -1,0 +1,11 @@
+workspace
+  a = 'ALPHA'
+  b = "beta"
+  c = true
+  d = true
+  e = "matlab!"
+  f = "MIXED"
+  g = "ABcd"
+  h = [true, false, true, false]
+  i = [true, false, true]
+  j = [true, true, true]

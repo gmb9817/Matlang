@@ -1,0 +1,14 @@
+workspace
+  dashed_lines = [2001]
+  f = 41
+  plain = 2002
+  plain_line_style = ':'
+  plain_line_width = 3
+  plain_marker = 's'
+  plain_marker_size = 6
+  square_markers = [2002]
+  styled = 2001
+  styled_line_style = '--'
+  styled_line_width = 4
+  styled_marker = 'o'
+  styled_marker_size = 8

@@ -1,0 +1,16 @@
+workspace
+  base = 2001
+  bottom = 1002
+  bottom_children = [2002]
+  copy_axes = 1003
+  copy_axes_child_type = {'line'}
+  copy_axes_children = [2003]
+  copy_axes_parent = 46
+  copy_axes_position = [0, 0.5, 1, 0.5]
+  copy_many = [2004, 2005]
+  copy_many_types = {'line', 'line'}
+  copy_one = 2002
+  copy_one_name = 'Base'
+  copy_one_parent = 1002
+  f = 46
+  top = 1001

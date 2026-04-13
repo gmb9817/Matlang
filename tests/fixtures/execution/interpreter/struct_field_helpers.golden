@@ -1,0 +1,12 @@
+workspace
+  a = true
+  b = false
+  c = {'name' ; 'value'}
+  d = struct{value=3}
+  e = false
+  f = {'value'}
+  g = [true, false, true]
+  h = [false, true]
+  i = struct{}
+  j = {}
+  s = struct{name='alpha', value=3}

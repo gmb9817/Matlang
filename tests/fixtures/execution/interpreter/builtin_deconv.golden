@@ -1,0 +1,10 @@
+workspace
+  col_q = [1 ; 2 ; 3]
+  col_r = [0 ; 0 ; 0 ; 0]
+  poly_only = [2, 7]
+  poly_q = [2, 7]
+  poly_r = [0, 0, 2, 2]
+  scaled_q = [1, 1]
+  scaled_r = [0, 0, 0]
+  short_q = 0
+  short_r = [1, 2]

@@ -1,0 +1,6 @@
+workspace
+  f = 206
+  state_off = 'off'
+  state_on = 'on'
+  state_toggle = 'off'
+  view_state = [-37.5, 30]

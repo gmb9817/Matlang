@@ -1,0 +1,42 @@
+workspaces
+  Function id=0 parent=None name=None
+  Function id=1 parent=Some(0) name=Some("outer")
+  Function id=2 parent=Some(1) name=Some("inner")
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+  FunctionBody id=1 parent=Some(0) workspace=1
+  FunctionBody id=2 parent=Some(1) workspace=2
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  outer kind=function scope=0 workspace=0 binding=None
+  ans kind=variable scope=1 workspace=1 binding=Some(1)
+  inner kind=function scope=1 workspace=1 binding=None
+  step kind=parameter scope=1 workspace=1 binding=Some(2)
+  y kind=output scope=1 workspace=1 binding=Some(3)
+  g kind=global scope=1 workspace=1 binding=Some(4)
+  p kind=persistent scope=1 workspace=1 binding=Some(5)
+  ans kind=variable scope=2 workspace=2 binding=Some(6)
+  delta kind=parameter scope=2 workspace=2 binding=Some(7)
+  g kind=global scope=2 workspace=2 binding=Some(4)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  ans id=1 storage=local owner_symbol=2 owner_scope=1 owner_workspace=1 shared=false
+  step id=2 storage=local owner_symbol=4 owner_scope=1 owner_workspace=1 shared=false
+  y id=3 storage=local owner_symbol=5 owner_scope=1 owner_workspace=1 shared=false
+  g id=4 storage=global owner_symbol=6 owner_scope=1 owner_workspace=1 shared=false
+  p id=5 storage=persistent owner_symbol=7 owner_scope=1 owner_workspace=1 shared=true
+  ans id=6 storage=local owner_symbol=8 owner_scope=2 owner_workspace=2 shared=false
+  delta id=7 storage=local owner_symbol=9 owner_scope=2 owner_workspace=2 shared=false
+references
+  step role=value resolution=workspace_value symbol=Some(4) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(2) capture=none
+  step role=value resolution=workspace_value symbol=Some(4) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(2) capture=none
+  inner role=call_target resolution=nested_function symbol=Some(3) kind=function scope=Some(1) workspace=Some(1) binding=None capture=none
+  g role=value resolution=workspace_value symbol=Some(6) kind=global scope=Some(1) workspace=Some(1) binding=Some(4) capture=none
+  p role=value resolution=workspace_value symbol=Some(7) kind=persistent scope=Some(1) workspace=Some(1) binding=Some(5) capture=none
+  g role=value resolution=workspace_value symbol=Some(10) kind=global scope=Some(2) workspace=Some(2) binding=Some(4) capture=none
+  delta role=value resolution=workspace_value symbol=Some(9) kind=parameter scope=Some(2) workspace=Some(2) binding=Some(7) capture=none
+  p role=value resolution=workspace_value symbol=Some(7) kind=persistent scope=Some(1) workspace=Some(1) binding=Some(5) capture=read
+  delta role=value resolution=workspace_value symbol=Some(9) kind=parameter scope=Some(2) workspace=Some(2) binding=Some(7) capture=none
+captures
+  p binding=5 access=read_write from_symbol=7 from_scope=1 from_workspace=1 into_scope=2 into_workspace=2
+diagnostics

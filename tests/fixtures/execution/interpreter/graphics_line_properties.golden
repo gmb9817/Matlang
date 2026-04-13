@@ -1,0 +1,11 @@
+workspace
+  base = 2001
+  base_color = [0.12156862745098039, 0.4666666666666667, 0.7058823529411765]
+  base_type = 'line'
+  blue_lines = [2001]
+  f = 40
+  red_lines = [2002]
+  styled = 2002
+  styled_color = [1, 0, 0]
+  styled_name = 'Styled'
+  updated_base_color = [0, 0, 1]

@@ -1,0 +1,36 @@
+workspace
+  f = 1
+  fig_props = struct{Children=[], CloseRequestFcn=[], CurrentAxes=[], CurrentObject=[], Name='Docked Figure', Number=1, NumberTitle='off', PaperOrientation='portrait', PaperPosition=[-0.4375, 2.1145833333333335, 9.375, 6.770833333333333], PaperPositionMode='auto', PaperSize=[8.5, 11], PaperType='usletter', PaperUnits='inches', Position=[11, 22, 333, 444], ResizeFcn=[], Type='figure', Visible='off', WindowStyle='docked'}
+  g = 72
+  g_name = 'Secondary Figure'
+  g_visible = 'on'
+  g_window_style = 'normal'
+  name_after_clf = 'Shown Again'
+  name_after_clf_reset = ''
+  name_after_figure = 'Shown Again'
+  name_initial = 'Primary Figure'
+  name_struct = 'Docked Figure'
+  number_title_after_clf = 'off'
+  number_title_after_clf_reset = 'on'
+  number_title_initial = 'on'
+  number_title_struct = 'off'
+  paper_mode_after_clf_reset = 'manual'
+  paper_orientation_after_clf_reset = 'portrait'
+  paper_position_after_clf_reset = [0.9999999999999999, 1.9999999999999998, 3, 3.9999999999999996]
+  paper_size_after_clf_reset = [21.59, 27.94]
+  paper_type_after_clf_reset = 'usletter'
+  paper_units_after_clf_reset = 'centimeters'
+  position_after_clf = [11, 22, 333, 444]
+  position_after_clf_reset = [11, 22, 333, 444]
+  position_initial = [10, 20, 700, 500]
+  position_struct = [11, 22, 333, 444]
+  props = struct{Name="Docked Figure", NumberTitle='off', Position=[11, 22, 333, 444], Visible='off', WindowStyle='docked'}
+  visible_after_clf = 'on'
+  visible_after_clf_reset = 'on'
+  visible_after_figure = 'on'
+  visible_initial = 'on'
+  visible_struct = 'off'
+  window_style_after_clf = 'docked'
+  window_style_after_clf_reset = 'docked'
+  window_style_initial = 'normal'
+  window_style_struct = 'docked'

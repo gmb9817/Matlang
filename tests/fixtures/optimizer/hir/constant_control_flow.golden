@@ -1,0 +1,10 @@
+optimization
+  changed = true
+  constant_folds = 3
+  branch_eliminations = 3
+  loop_eliminations = 1
+  statement_eliminations = 2
+
+module Script scope=0 workspace=0
+  assign [binding(name=x kind=variable binding=1 storage=local)] = number(5)
+  assign [binding(name=y kind=variable binding=2 storage=local)] = number(20)

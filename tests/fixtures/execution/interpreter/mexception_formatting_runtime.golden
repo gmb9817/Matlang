@@ -1,0 +1,5 @@
+workspace
+  err = struct{cause={}, identifier="MATC:Fmt", message="value=7 tag=ok", stack=[]}
+  kind = 'MException'
+  message = "value=7 tag=ok"
+  report_has_message = true

@@ -1,0 +1,17 @@
+workspace
+  arc = 2004
+  arc_color = [0, 0.6666666666666666, 0]
+  arc_marker = 'd'
+  arc_style = '-.'
+  dashdot = 2002
+  dashdot_color = [0.8, 0, 0.8]
+  dashdot_marker = 'x'
+  dashdot_style = '-.'
+  f = 50
+  marker_only = 2001
+  marker_only_color = [0, 0, 0]
+  marker_only_marker = '^'
+  marker_only_style = 'none'
+  property_marker = 2003
+  property_marker_marker = 'h'
+  property_marker_style = '-.'

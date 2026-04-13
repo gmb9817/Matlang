@@ -1,0 +1,2 @@
+workspace
+  out = struct{count=3, inner=struct{flag=true}, name="alpha"}

@@ -1,0 +1,12 @@
+workspace
+  current = 85
+  custom_view = [45, 20]
+  f = 85
+  field = 2002
+  implicit = 2001
+  queried_view = [45, 20]
+  top_view = [0, 90]
+  xg = [0, 2 ; 0, 2]
+  yg = [0, 0 ; 1, 1]
+  z_bounds = [0, 3]
+  zg = [0, 1 ; 2, 3]

@@ -1,0 +1,21 @@
+f = figure(72);
+rgb = cat(3, [255, 0; 0, 255], [0, 255; 0, 255], [0, 0; 255, 255]);
+rgb_img = imshow(rgb);
+rgb_type = get(rgb_img, 'Type');
+rgb_data = get(rgb_img, 'CData');
+rgb_alpha_before = get(rgb_img, 'AlphaData');
+set(rgb_img, 'AlphaData', [1, 0.25; 0.5, 0]);
+rgb_alpha_after = get(rgb_img, 'AlphaData');
+rgb_alpha_mapping = get(rgb_img, 'AlphaDataMapping');
+rgb_found = findobj(f, 'Type', 'image');
+
+ax2 = subplot(212);
+indexed = image([1, 2; 3, 4]);
+mapping_before = get(indexed, 'CDataMapping');
+set(indexed, 'CDataMapping', 'scaled');
+mapping_after = get(indexed, 'CDataMapping');
+set(indexed, 'CData', [4, 3; 2, 1]);
+indexed_data = get(indexed, 'CData');
+set(indexed, 'AlphaData', 0.4);
+indexed_alpha = get(indexed, 'AlphaData');
+current = gcf();

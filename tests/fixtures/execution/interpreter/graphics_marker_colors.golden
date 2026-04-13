@@ -1,0 +1,10 @@
+workspace
+  default_edge = 'auto'
+  default_face = 'none'
+  f = 53
+  filled_edge = [0, 0, 0]
+  filled_face = [1, 0, 0]
+  h = 2001
+  line_edge = [0, 0, 1]
+  line_face = [0, 0.6666666666666666, 0]
+  line_h = 2002

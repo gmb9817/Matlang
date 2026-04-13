@@ -1,0 +1,34 @@
+workspace
+  a = 7
+  assigned = {struct{score=21}, struct{score=23}}
+  assigned_scores = [11, 13]
+  b = 9
+  cell_array_reassigned_scores = [21, 22, 23, 24]
+  cell_array_scores = [11, 12, 13, 14]
+  cell_array_source_scores = {21, 22, 23, 24}
+  cell_arrays = {[struct{score=21}, struct{score=22}], [struct{score=23}, struct{score=24}]}
+  cells = {struct{score=7}, struct{score=9}}
+  copy = {7, 9}
+  explicit_missing_cell_struct_row = [41, 42, 43, 44]
+  explicit_missing_cell_structs = {struct{items={41, 42}}, struct{items={43, 44}}}
+  missing_cell_struct_reassigned_row = [15, 16, 17, 18]
+  missing_cell_struct_row = [11, 12, 13, 14]
+  missing_cell_struct_source = {15, 16, 17, 18}
+  missing_cell_structs = {struct{items={15, 16}}, struct{items={17, 18}}}
+  n1 = 1
+  n2 = 2
+  nested = {struct{inner=struct{score=1}}, struct{inner=struct{score=2}}}
+  nested_assigned = {struct{inner=struct{score=51}}, struct{inner=struct{score=53}}}
+  nested_assigned_scores = [31, 33]
+  nested_reassigned_scores = [51, 53]
+  nested_source_scores = {51, 53}
+  pair = [1, 2]
+  reassigned_scores = [21, 23]
+  row = [7, 9]
+  source_scores = {21, 23}
+  synthesized = {struct{inner=struct{score=61}}, struct{inner=struct{score=63}}}
+  synthesized_reassigned_scores = [61, 63]
+  synthesized_scores = [41, 43]
+  synthesized_source_scores = {61, 63}
+  x = 7
+  y = 9

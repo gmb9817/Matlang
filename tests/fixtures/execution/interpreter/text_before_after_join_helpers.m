@@ -1,0 +1,13 @@
+a = extractBefore("pre<mid>post", '<');
+b = extractAfter('pre<mid>post', ">");
+c = join({"left", "right"}, '/');
+d = join(split("a-b-c", '-'), "|");
+e = extractAfter(extractBefore("alpha[beta]gamma", ']'), '[');
+f = join(["left" "right"; "up" "down"], "/", 1);
+g = join(["a" "b" "c"]);
+h = extractBefore(["Edgar Allen Poe"; "Louisa May Alcott"], [6; 7]);
+i = extractAfter(["Edgar Allen Poe"; "Louisa May Alcott"], [12; 11]);
+j = extractBefore({'pre<mid>post', 'alpha<beta>gamma'}, '<');
+k = extractAfter({'Edgar Allen Poe'; 'Louisa May Alcott'}, [12; 11]);
+l = replaceBefore({'pre<mid>post', 'alpha<beta>gamma'}, '<', 'X');
+m = replaceAfter({'pre<mid>post', 'alpha<beta>gamma'}, [8, 12], 'Y');

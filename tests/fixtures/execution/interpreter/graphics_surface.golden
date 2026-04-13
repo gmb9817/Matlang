@@ -1,0 +1,9 @@
+workspace
+  cb = 24
+  current = 24
+  f = 24
+  legend_handle = 24
+  scale_one = [0, 2]
+  surface_one = 2001
+  surface_two = 2002
+  z = [0, 1, 0 ; 1, 2, 1 ; 0, 1, 0]

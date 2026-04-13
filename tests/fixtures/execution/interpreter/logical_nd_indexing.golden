@@ -1,0 +1,4 @@
+workspace
+  assigned(:,:,1) = [10, 2 ; 3, 20]
+  assigned(:,:,2) = [5, 40 ; 30, 8]
+  selected = [1 ; 4 ; 7 ; 6]

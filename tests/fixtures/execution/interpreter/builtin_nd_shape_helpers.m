@@ -1,0 +1,11 @@
+a = reshape([1 2 3 4 5 6 7 8], [2, 2, 2]);
+b = size(a);
+c = ndims(a);
+d = permute(a, [1, 3, 2]);
+e = size(d);
+f = ipermute(d, [1, 3, 2]);
+g = shiftdim(a, 1);
+h = size(g);
+i = permute({1, 2, 3, 4}, [1, 3, 2]);
+j = size(i);
+k = ipermute(i, [1, 3, 2]);

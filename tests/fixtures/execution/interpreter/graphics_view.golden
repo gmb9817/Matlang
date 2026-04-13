@@ -1,0 +1,19 @@
+workspace
+  current = 27
+  custom_view = [45, 20]
+  default_view = [-37.5, 30]
+  f = 27
+  lower = 1002
+  lower_default_view = [-37.5, 30]
+  lower_view_after_target = [10, 40]
+  lower_view_after_top_target = [-37.5, 30]
+  queried_custom = [45, 20]
+  queried_three = [-37.5, 30]
+  queried_top = [0, 90]
+  surface_handle = 2001
+  three_view = [-37.5, 30]
+  top = 1001
+  top_query_view = [45, 20]
+  top_view = [0, 90]
+  top_view_after_scalars = [15, 25]
+  top_view_after_target = [0, 90]

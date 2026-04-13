@@ -1,0 +1,10 @@
+workspace
+  a = [false, true, true]
+  b = true
+  c = false
+  d = true
+  e = true
+  f = "true"
+  g = "flag=true"
+  h = true
+  i = false

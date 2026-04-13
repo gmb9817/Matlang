@@ -1,0 +1,17 @@
+workspace
+  bottom = 1002
+  bottom_children = [2003]
+  dots = 2002
+  dots_parent = 1001
+  f = 32
+  figure_children = [1001, 1002]
+  figure_type = 'figure'
+  line = 2001
+  line_parent = 1001
+  line_type = 'line'
+  mesh_handle = 2003
+  mesh_parent = 1002
+  top = 1001
+  top_children = [2001, 2002]
+  top_parent = 32
+  top_type = 'axes'

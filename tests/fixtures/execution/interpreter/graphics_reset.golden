@@ -1,0 +1,16 @@
+workspace
+  after_box = 'on'
+  after_color = [0.12156862745098039, 0.4666666666666667, 0.7058823529411765]
+  after_grid = 'off'
+  after_marker = 'none'
+  after_style = '-'
+  after_x = [0, 1, 2]
+  after_xlim = [0, 2]
+  ax = 1001
+  before_box = 'off'
+  before_color = [1, 0, 0]
+  before_grid = 'on'
+  before_marker = 'o'
+  before_style = '--'
+  f = 48
+  line_handle = 2001

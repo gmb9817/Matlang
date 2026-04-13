@@ -1,0 +1,8 @@
+workspace
+  current = 60
+  f = 60
+  legend_handle = 60
+  main_area = 2001
+  overlay_area = 2002
+  x_bounds = [0, 3]
+  y_bounds = [0, 4]

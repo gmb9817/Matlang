@@ -1,0 +1,15 @@
+workspace
+  a = "X<mid>post"
+  b = 'pre<mid>Y'
+  c = 'ab   '
+  d = "   ab"
+  e = ' ab  '
+  f = "L|R"
+  g = "Clerk Maxwell"
+  h = ["Edgar Allen  Jr." ; "Louisa May  Sr."]
+  i = ["Edgar A. Poe" ; "Louisa M. Alcott"]
+  j = "Hello, Mars!"
+  k = "Hello, Mars!"
+  l = ["a  " ; "bbb"]
+  m = "0003.44"
+  n = {'a..', 'bbb'}

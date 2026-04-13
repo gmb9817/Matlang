@@ -1,0 +1,9 @@
+unit Script
+switch mode
+  case number(0)
+    assign [x] = number(1)
+  case cell{number(1), number(2)}
+    assign [x] = number(2)
+  otherwise
+    assign [x] = number(3)
+end_switch

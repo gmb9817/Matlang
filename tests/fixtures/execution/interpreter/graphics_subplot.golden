@@ -1,0 +1,7 @@
+workspace
+  bottom = 1002
+  bottom_ylim = [0, 3]
+  current = 7
+  f = 7
+  top = 1001
+  top_xlim = [0, 2]

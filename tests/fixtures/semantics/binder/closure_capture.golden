@@ -1,0 +1,28 @@
+workspaces
+  Function id=0 parent=None name=None
+  Function id=1 parent=Some(0) name=Some("outer")
+  Function id=2 parent=Some(1) name=Some("inner")
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+  FunctionBody id=1 parent=Some(0) workspace=1
+  FunctionBody id=2 parent=Some(1) workspace=2
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  outer kind=function scope=0 workspace=0 binding=None
+  ans kind=variable scope=1 workspace=1 binding=Some(1)
+  inner kind=function scope=1 workspace=1 binding=None
+  y kind=output scope=1 workspace=1 binding=Some(2)
+  x kind=variable scope=1 workspace=1 binding=Some(3)
+  ans kind=variable scope=2 workspace=2 binding=Some(4)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  ans id=1 storage=local owner_symbol=2 owner_scope=1 owner_workspace=1 shared=false
+  y id=2 storage=local owner_symbol=4 owner_scope=1 owner_workspace=1 shared=false
+  x id=3 storage=local owner_symbol=5 owner_scope=1 owner_workspace=1 shared=true
+  ans id=4 storage=local owner_symbol=6 owner_scope=2 owner_workspace=2 shared=false
+references
+  inner role=call_target resolution=nested_function symbol=Some(3) kind=function scope=Some(1) workspace=Some(1) binding=None capture=none
+  x role=value resolution=workspace_value symbol=Some(5) kind=variable scope=Some(1) workspace=Some(1) binding=Some(3) capture=none
+captures
+  x binding=3 access=write from_symbol=5 from_scope=1 from_workspace=1 into_scope=2 into_workspace=2
+diagnostics
