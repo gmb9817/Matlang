@@ -1,5 +1,9 @@
 workspace
   a = [" alpha ", "beta" ; "Gamma", "delta "]
+  aa = ["alpha", "beta"]
+  ab = ["1", "true" ; "x", "y"]
+  ac = []
+  ad = [0, 2]
   b = ["alpha", "beta" ; "Gamma", "delta"]
   c = ["ALPHA", "BETA" ; "GAMMA", "DELTA"]
   d = [true, true ; true, true]
@@ -20,3 +24,8 @@ workspace
   s = {'ALPHA', 'BETA'}
   t = {'alpha', 'beta'}
   u = {'cAb', 'dAb'}
+  v = []
+  w = [0, 1]
+  x = {'alpha', 'beta' ; 'gamma', 'delta'}
+  y = {'solo'}
+  z = {}

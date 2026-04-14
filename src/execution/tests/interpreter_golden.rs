@@ -168,6 +168,11 @@ fn nd_linearization_parity_fixture_matches_golden() {
 }
 
 #[test]
+fn selector_runtime_core_parity_fixture_matches_golden() {
+    assert_fixture("selector_runtime_core_parity", ParseMode::Script, &[]);
+}
+
+#[test]
 fn nd_rectangular_assignment_reshape_fixture_matches_golden() {
     assert_fixture("nd_rectangular_assignment_reshape", ParseMode::Script, &[]);
 }

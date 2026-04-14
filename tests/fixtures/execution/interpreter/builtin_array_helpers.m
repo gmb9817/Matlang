@@ -112,5 +112,7 @@ dj = [1 2; 2 4; 3 6] \ [1; 2; 3];
 empty_rhs = zeros(3, 0);
 [dq2, dr2] = qr([1 1; 1, -1; 0 0], empty_rhs);
 [ds2, dt2, du2] = qr([1 1; 1, -1; 0 0], empty_rhs);
+[dv2, dw2, dx2] = qr([1 10; 0 0; 0 0], 0);
+[dy2, dz2, ea2] = qr([1 1; 1, -1; 0 0], empty_rhs, 0);
 dq = pinv([1 2; 2 4]);
 dr = pinv([1 0; 0 1e-14], 1e-12);

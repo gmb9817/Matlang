@@ -1,8 +1,8 @@
 //! Standard library crate for builtin and library-layer functions.
 
 use matlab_runtime::{
-    CellValue, ComplexValue, FunctionHandleTarget, MatrixValue, RuntimeError, RuntimeStackFrame,
-    StructValue, Value,
+    ArrayStorageClass, CellValue, ComplexValue, FunctionHandleTarget, MatrixValue, RuntimeError,
+    RuntimeStackFrame, StructValue, Value,
 };
 
 pub const CRATE_NAME: &str = "matlab-stdlib";
@@ -178,6 +178,7 @@ pub fn invoke_builtin_outputs(
         "strlength" => Ok(vec![builtin_strlength(args)?]),
         "contains" => Ok(vec![builtin_contains(args)?]),
         "num2str" => Ok(vec![builtin_num2str(args)?]),
+        "cellstr" => Ok(vec![builtin_cellstr(args)?]),
         "upper" => Ok(vec![builtin_upper(args)?]),
         "lower" => Ok(vec![builtin_lower(args)?]),
         "startsWith" => Ok(vec![builtin_starts_with(args)?]),
@@ -310,6 +311,7 @@ pub fn invoke_builtin_outputs(
         "circshift" => Ok(vec![builtin_circshift(args)?]),
         "cumsum" => Ok(vec![builtin_cumsum(args)?]),
         "cumprod" => Ok(vec![builtin_cumprod(args)?]),
+        "repelem" => Ok(vec![builtin_repelem(args)?]),
         "movsum" => Ok(vec![builtin_movsum(args)?]),
         "movmean" => Ok(vec![builtin_movmean(args)?]),
         "movmax" => Ok(vec![builtin_movmax(args)?]),
@@ -328,7 +330,11 @@ pub fn invoke_builtin_outputs(
         "horzcat" => Ok(vec![builtin_horzcat(args)?]),
         "vertcat" => Ok(vec![builtin_vertcat(args)?]),
         "cat" => Ok(vec![builtin_cat(args)?]),
+        "cell" => Ok(vec![builtin_cell(args)?]),
         "num2cell" => Ok(vec![builtin_num2cell(args)?]),
+        "mat2cell" => Ok(vec![builtin_mat2cell(args)?]),
+        "cell2struct" => Ok(vec![builtin_cell2struct(args)?]),
+        "struct2cell" => Ok(vec![builtin_struct2cell(args)?]),
         "cell2mat" => Ok(vec![builtin_cell2mat(args)?]),
         "MException" => Ok(vec![builtin_mexception(args)?]),
         "addCause" => Ok(vec![builtin_add_cause(args)?]),
@@ -2857,7 +2863,11 @@ fn join_text_elements(
         .enumerate()
         .filter_map(|(axis, &size)| (axis + 1 != join_dim).then_some(size))
         .collect::<Vec<_>>();
-    let output_count = sequence_dims.iter().product::<usize>().max(1);
+    let output_count = if sequence_dims.is_empty() {
+        1
+    } else {
+        sequence_dims.iter().product::<usize>()
+    };
     let mut outputs = Vec::with_capacity(output_count);
     for linear in 0..output_count {
         let reduced_index = row_major_multi_index(linear, &sequence_dims);
@@ -4418,6 +4428,38 @@ fn builtin_char(args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::CharArray(text_value(value)?.to_string()))
 }
 
+fn builtin_cellstr(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "cellstr currently supports exactly one argument".to_string(),
+        ));
+    };
+
+    match value {
+        Value::CharArray(text) | Value::String(text) => Ok(Value::Cell(CellValue::new(
+            1,
+            1,
+            vec![Value::CharArray(text.clone())],
+        )?)),
+        Value::Matrix(matrix) if matrix_is_text(matrix) => Ok(Value::Cell(
+            CellValue::with_dimensions(
+                matrix.rows,
+                matrix.cols,
+                matrix.dims().to_vec(),
+                matrix
+                    .elements()
+                    .iter()
+                    .map(|element| Ok(Value::CharArray(text_value(element)?.to_string())))
+                    .collect::<Result<Vec<_>, RuntimeError>>()?,
+            )?,
+        )),
+        other => Err(RuntimeError::TypeError(format!(
+            "cellstr currently expects char, string, or a text matrix input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
 fn builtin_error(args: &[Value]) -> Result<Vec<Value>, RuntimeError> {
     let (identifier, format, format_values) = match args {
         [message] => ("MATC:UserError".to_string(), text_value(message)?, &[][..]),
@@ -4573,8 +4615,31 @@ fn builtin_string(args: &[Value]) -> Result<Value, RuntimeError> {
                 elements,
             )?))
         }
+        Value::Cell(cell) => {
+            let mut elements = Vec::with_capacity(cell.element_count());
+            for element in cell.elements() {
+                let text = match element {
+                    Value::Scalar(number) => render_scalar(*number),
+                    Value::Logical(flag) => render_logical(*flag),
+                    Value::CharArray(text) | Value::String(text) => text.clone(),
+                    other => {
+                        return Err(RuntimeError::TypeError(format!(
+                            "string currently expects scalar/logical/text cell elements, found {}",
+                            other.kind_name()
+                        )))
+                    }
+                };
+                elements.push(Value::String(text));
+            }
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                cell.rows,
+                cell.cols,
+                cell.dims().to_vec(),
+                elements,
+            )?))
+        }
         other => Err(RuntimeError::TypeError(format!(
-            "string currently expects scalar, logical, text, or a compatible matrix input, found {}",
+            "string currently expects scalar, logical, text, a compatible matrix, or a compatible cell array input, found {}",
             other.kind_name()
         ))),
     }
@@ -4730,15 +4795,15 @@ fn builtin_reshape(args: &[Value]) -> Result<Value, RuntimeError> {
             )?))
         }
         Value::Matrix(matrix) => {
-            if matrix.elements.len() != target_len {
+            if matrix.element_count() != target_len {
                 return Err(RuntimeError::ShapeError(format!(
                     "reshape target {}x{} does not match {} element(s)",
                     rows,
                     cols,
-                    matrix.elements.len()
+                    matrix.element_count()
                 )));
             }
-            let elements = reshape_elements_column_major(&matrix.elements, &matrix.dims, &dims);
+            let elements = reshape_elements_column_major(matrix.elements(), matrix.dims(), &dims);
             Ok(Value::Matrix(MatrixValue::with_dimensions(
                 rows,
                 cols,
@@ -4747,15 +4812,15 @@ fn builtin_reshape(args: &[Value]) -> Result<Value, RuntimeError> {
             )?))
         }
         Value::Cell(cell) => {
-            if cell.elements.len() != target_len {
+            if cell.element_count() != target_len {
                 return Err(RuntimeError::ShapeError(format!(
                     "reshape target {}x{} does not match {} element(s)",
                     rows,
                     cols,
-                    cell.elements.len()
+                    cell.element_count()
                 )));
             }
-            let elements = reshape_elements_column_major(&cell.elements, &cell.dims, &dims);
+            let elements = reshape_elements_column_major(cell.elements(), cell.dims(), &dims);
             Ok(Value::Cell(CellValue::with_dimensions(
                 rows, cols, dims, elements,
             )?))
@@ -4774,21 +4839,7 @@ fn builtin_squeeze(args: &[Value]) -> Result<Value, RuntimeError> {
     };
     let dims = value_dimensions(value);
     let squeezed = squeeze_dimensions(&dims);
-    match value {
-        Value::Matrix(matrix) => Ok(Value::Matrix(MatrixValue::with_dimensions(
-            matrix.rows,
-            matrix.cols,
-            squeezed,
-            matrix.elements.clone(),
-        )?)),
-        Value::Cell(cell) => Ok(Value::Cell(CellValue::with_dimensions(
-            cell.rows,
-            cell.cols,
-            squeezed,
-            cell.elements.clone(),
-        )?)),
-        _ => Ok(value.clone()),
-    }
+    relabel_value_dimensions(value, squeezed)
 }
 
 fn builtin_permute(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -5150,6 +5201,9 @@ fn builtin_qr(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runtime
     let second_is_rhs = |value: &Value| numeric_or_complex_operand(value, "qr").is_ok();
     let (value, rhs, output_form) = match args {
         [value] => (value, None, None),
+        [value, mode] if matches!(mode, Value::Scalar(number) if *number == 0.0) => {
+            (value, None, Some("vector".to_string()))
+        }
         [value, second] if second_is_rhs(second) => (value, Some(second), None),
         [value, mode] => {
             let mode = text_value(mode)?.to_ascii_lowercase();
@@ -5165,12 +5219,15 @@ fn builtin_qr(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runtime
             }
         }
         [value, rhs, third] if second_is_rhs(rhs) => {
-            let output_form = text_value(third)?.to_ascii_lowercase();
+            let output_form = match third {
+                Value::Scalar(number) if *number == 0.0 => "vector".to_string(),
+                _ => text_value(third)?.to_ascii_lowercase(),
+            };
             match output_form.as_str() {
                 "matrix" | "vector" if output_arity == 3 => (value, Some(rhs), Some(output_form)),
                 _ => {
                     return Err(RuntimeError::Unsupported(
-                        "qr currently supports `matrix` or `vector` permutation output forms for `qr(A, B, outputForm)`"
+                        "qr currently supports `matrix`, `vector`, or legacy economy flag 0 for `qr(A, B, outputForm)`"
                             .to_string(),
                     ))
                 }
@@ -11483,8 +11540,8 @@ fn value_dimensions(value: &Value) -> Vec<usize> {
         }
         Value::CharArray(text) => vec![1, text.chars().count()],
         Value::String(_) => vec![1, 1],
-        Value::Matrix(matrix) => matrix.dims.clone(),
-        Value::Cell(cell) => cell.dims.clone(),
+        Value::Matrix(matrix) => matrix.dims().to_vec(),
+        Value::Cell(cell) => cell.dims().to_vec(),
         Value::Struct(_) => vec![1, 1],
     }
 }
@@ -11534,20 +11591,19 @@ fn default_flip_dimension(value: &Value) -> usize {
 }
 
 fn squeeze_dimensions(dims: &[usize]) -> Vec<usize> {
+    if dims.len() <= 2 {
+        return canonical_size_vector(dims);
+    }
+
     let kept = dims
         .iter()
         .copied()
-        .enumerate()
-        .filter_map(|(index, dim)| {
-            if index < 2 || dim != 1 {
-                Some(dim)
-            } else {
-                None
-            }
-        })
+        .filter(|&dim| dim != 1)
         .collect::<Vec<_>>();
-    if kept.len() == 1 {
-        vec![1, kept[0]]
+    if kept.is_empty() {
+        vec![1, 1]
+    } else if kept.len() == 1 {
+        vec![kept[0], 1]
     } else {
         kept
     }
@@ -11560,13 +11616,13 @@ fn relabel_value_dimensions(value: &Value, dims: Vec<usize>) -> Result<Value, Ru
             rows,
             cols,
             dims,
-            matrix.elements.clone(),
+            matrix.elements().to_vec(),
         )?)),
         Value::Cell(cell) => Ok(Value::Cell(CellValue::with_dimensions(
             rows,
             cols,
             dims,
-            cell.elements.clone(),
+            cell.elements().to_vec(),
         )?)),
         _ => Ok(value.clone()),
     }
@@ -11897,9 +11953,9 @@ fn permute_value(
             Ok(value.clone())
         }
         Value::Matrix(matrix) => {
-            let dims = matrix.dims.clone();
+            let dims = matrix.dims().to_vec();
             let (rows, cols, permuted_dims, elements) =
-                permute_row_major_elements(&matrix.elements, &dims, order);
+                permute_row_major_elements(matrix.elements(), &dims, order);
             Ok(Value::Matrix(MatrixValue::with_dimensions(
                 rows,
                 cols,
@@ -11908,9 +11964,9 @@ fn permute_value(
             )?))
         }
         Value::Cell(cell) => {
-            let dims = cell.dims.clone();
+            let dims = cell.dims().to_vec();
             let (rows, cols, permuted_dims, elements) =
-                permute_row_major_elements(&cell.elements, &dims, order);
+                permute_row_major_elements(cell.elements(), &dims, order);
             Ok(Value::Cell(CellValue::with_dimensions(
                 rows,
                 cols,
@@ -11938,6 +11994,9 @@ fn permute_row_major_elements<T: Clone>(
         .map(|&dim| source_dims[dim - 1])
         .collect::<Vec<_>>();
     let (rows, cols) = storage_shape_from_dimensions(&permuted_dims);
+    if elements.is_empty() {
+        return (rows, cols, permuted_dims, Vec::new());
+    }
     let mut inverse = vec![0usize; order.len()];
     for (dest_axis, &source_axis) in order.iter().enumerate() {
         inverse[source_axis - 1] = dest_axis;
@@ -12023,7 +12082,16 @@ fn concatenate_elements<T: Clone>(
     along_dim: usize,
 ) -> Vec<T> {
     let total = output_dims.iter().product::<usize>();
-    let mut output = vec![element_groups[0][0].clone(); total];
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let prototype = element_groups
+        .iter()
+        .find_map(|group| group.first())
+        .cloned()
+        .expect("nonempty concatenation output requires at least one source element");
+    let mut output = vec![prototype; total];
     let mut running = 0usize;
     for (group_index, dims) in input_dims.iter().enumerate() {
         let mut normalized = dims.clone();
@@ -12986,6 +13054,222 @@ fn builtin_circshift(args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
+fn builtin_repelem(args: &[Value]) -> Result<Value, RuntimeError> {
+    let Some((value, reps)) = args.split_first() else {
+        return Err(RuntimeError::Unsupported(
+            "repelem currently expects an input array plus repetition counts".to_string(),
+        ));
+    };
+    if reps.is_empty() {
+        return Err(RuntimeError::Unsupported(
+        "repelem currently expects an input array plus repetition counts".to_string(),
+    ));
+    }
+
+    match value {
+        Value::CharArray(text) if reps.len() == 1 => {
+            let chars = text.chars().collect::<Vec<_>>();
+            let counts = repelem_vector_counts(&reps[0], chars.len(), "repelem")?;
+            let mut out = String::new();
+            for (ch, count) in chars.into_iter().zip(counts.into_iter()) {
+                for _ in 0..count {
+                    out.push(ch);
+                }
+            }
+            Ok(Value::CharArray(out))
+        }
+        Value::Scalar(_)
+        | Value::Logical(_)
+        | Value::Complex(_)
+        | Value::String(_)
+        | Value::Struct(_)
+            if reps.len() == 1 =>
+        {
+            let counts = repelem_vector_counts(&reps[0], 1, "repelem")?;
+            let elements = vec![value.clone(); counts.into_iter().sum()];
+            let cols = elements.len();
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                1,
+                cols,
+                vec![1, cols],
+                elements,
+            )?))
+        }
+        Value::Matrix(matrix) if reps.len() == 1 && (matrix.rows == 1 || matrix.cols == 1) => {
+            let counts = repelem_vector_counts(&reps[0], matrix.element_count(), "repelem")?;
+            let mut elements = Vec::new();
+            for (element, count) in matrix.elements().iter().cloned().zip(counts.into_iter()) {
+                for _ in 0..count {
+                    elements.push(element.clone());
+                }
+            }
+            let (rows, cols, dims) = if matrix.rows == 1 {
+                (1, elements.len(), vec![1, elements.len()])
+            } else {
+                (elements.len(), 1, vec![elements.len(), 1])
+            };
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                rows, cols, dims, elements,
+            )?))
+        }
+        Value::Cell(cell) if reps.len() == 1 && (cell.rows == 1 || cell.cols == 1) => {
+            let counts = repelem_vector_counts(&reps[0], cell.element_count(), "repelem")?;
+            let mut elements = Vec::new();
+            for (element, count) in cell.elements().iter().cloned().zip(counts.into_iter()) {
+                for _ in 0..count {
+                    elements.push(element.clone());
+                }
+            }
+            let (rows, cols, dims) = if cell.rows == 1 {
+                (1, elements.len(), vec![1, elements.len()])
+            } else {
+                (elements.len(), 1, vec![elements.len(), 1])
+            };
+            Ok(Value::Cell(CellValue::with_dimensions(
+                rows, cols, dims, elements,
+            )?))
+        }
+        Value::Matrix(matrix) => repelem_array_result(matrix.dims(), matrix.elements(), reps, false),
+        Value::Cell(cell) => repelem_array_result(cell.dims(), cell.elements(), reps, true),
+        other => Err(RuntimeError::TypeError(format!(
+            "repelem currently expects scalar, vector, matrix, or cell array input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn repelem_vector_counts(value: &Value, len: usize, builtin_name: &str) -> Result<Vec<usize>, RuntimeError> {
+    match value {
+        Value::Matrix(matrix) if matrix.rows == 0 || matrix.cols == 0 => Ok(vec![0; len]),
+        Value::Matrix(matrix) => {
+            let counts = matrix
+                .iter()
+                .map(repetition_scalar)
+                .collect::<Result<Vec<_>, _>>()?;
+            match counts.len() {
+                1 => Ok(vec![counts[0]; len]),
+                count if count == len => Ok(counts),
+                count => Err(RuntimeError::ShapeError(format!(
+                    "{builtin_name} vector repetition counts must be scalar or match input length {len}, found {count}"
+                ))),
+            }
+        }
+        _ => Ok(vec![repetition_scalar(value)?; len]),
+    }
+}
+
+fn repelem_axis_counts(
+    value: &Value,
+    extent: usize,
+    axis: usize,
+) -> Result<Vec<usize>, RuntimeError> {
+    let counts = repelem_vector_counts(value, extent, "repelem")?;
+    if counts.len() != extent {
+        return Err(RuntimeError::ShapeError(format!(
+            "repelem counts along dimension {} must match extent {}",
+            axis + 1,
+            extent
+        )));
+    }
+    Ok(counts)
+}
+
+fn repelem_array_result(
+    input_dims: &[usize],
+    source_elements: &[Value],
+    reps: &[Value],
+    cell_output: bool,
+) -> Result<Value, RuntimeError> {
+    let mut dims = canonical_size_vector(input_dims);
+    while dims.len() < reps.len() {
+        dims.push(1);
+    }
+
+    let mut axis_counts = Vec::with_capacity(dims.len());
+    for (axis, &extent) in dims.iter().enumerate() {
+        let counts = if let Some(rep) = reps.get(axis) {
+            repelem_axis_counts(rep, extent, axis)?
+        } else {
+            vec![1; extent]
+        };
+        axis_counts.push(counts);
+    }
+
+    let output_dims = axis_counts
+        .iter()
+        .map(|counts| counts.iter().sum::<usize>())
+        .collect::<Vec<_>>();
+    let output_count = output_dims.iter().product::<usize>();
+    let (rows, cols) = storage_shape_from_dimensions(&output_dims);
+    if output_count == 0 {
+        return if cell_output {
+            Ok(Value::Cell(CellValue::with_dimensions(
+                rows,
+                cols,
+                output_dims,
+                Vec::new(),
+            )?))
+        } else {
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                rows,
+                cols,
+                output_dims,
+                Vec::new(),
+            )?))
+        };
+    }
+    let mut offsets = Vec::with_capacity(axis_counts.len());
+    for counts in &axis_counts {
+        let mut starts = Vec::with_capacity(counts.len());
+        let mut current = 0usize;
+        for &count in counts {
+            starts.push(current);
+            current += count;
+        }
+        offsets.push(starts);
+    }
+
+    let prototype = source_elements
+        .first()
+        .cloned()
+        .expect("nonempty repelem output should have a source prototype");
+    let mut elements = vec![prototype; output_count];
+    for (linear, source_value) in source_elements.iter().enumerate() {
+        let source_index = row_major_multi_index(linear, &dims);
+        let start_index = source_index
+            .iter()
+            .enumerate()
+            .map(|(axis, &index)| offsets[axis][index])
+            .collect::<Vec<_>>();
+        let repeat_dims = source_index
+            .iter()
+            .enumerate()
+            .map(|(axis, &index)| axis_counts[axis][index])
+            .collect::<Vec<_>>();
+        let repeat_count = repeat_dims.iter().product::<usize>();
+        for repeat_linear in 0..repeat_count {
+            let repeat_index = row_major_multi_index(repeat_linear, &repeat_dims);
+            let destination_index = repeat_index
+                .iter()
+                .enumerate()
+                .map(|(axis, &offset)| start_index[axis] + offset)
+                .collect::<Vec<_>>();
+            let destination_linear = row_major_linear_index(&destination_index, &output_dims);
+            elements[destination_linear] = source_value.clone();
+        }
+    }
+
+    if cell_output {
+        Ok(Value::Cell(CellValue::with_dimensions(
+            rows, cols, output_dims, elements,
+        )?))
+    } else {
+        Ok(Value::Matrix(MatrixValue::with_dimensions(
+            rows, cols, output_dims, elements,
+        )?))
+    }
+}
+
 fn builtin_shiftdim(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
     match args {
         [value] => {
@@ -13477,26 +13761,368 @@ fn builtin_cat(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 fn builtin_num2cell(args: &[Value]) -> Result<Value, RuntimeError> {
-    let [value] = args else {
+    let (value, kept_dims) = match args {
+        [value] => (value, Vec::new()),
+        [value, dims] => (value, num2cell_kept_dimensions(dims)?),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "num2cell currently supports `num2cell(A)` and `num2cell(A, dim)`".to_string(),
+            ))
+        }
+    };
+
+    match value {
+        Value::Scalar(_)
+        | Value::Logical(_)
+        | Value::Complex(_)
+        | Value::CharArray(_)
+        | Value::String(_)
+        | Value::Struct(_)
+        | Value::FunctionHandle(_) => Ok(Value::Cell(CellValue::new(1, 1, vec![value.clone()])?)),
+        Value::Matrix(matrix) => num2cell_matrix_with_kept_dimensions(matrix, &kept_dims),
+        _ => Err(RuntimeError::TypeError(
+            "num2cell currently expects scalar or matrix-like input".to_string(),
+        )),
+    }
+}
+
+fn builtin_mat2cell(args: &[Value]) -> Result<Value, RuntimeError> {
+    let Some((value, partitions)) = args.split_first() else {
         return Err(RuntimeError::Unsupported(
-            "num2cell currently supports exactly one argument".to_string(),
+            "mat2cell currently expects an input array plus partition vectors".to_string(),
         ));
     };
 
     match value {
-        Value::Scalar(number) => Ok(Value::Cell(CellValue::new(
-            1,
-            1,
-            vec![Value::Scalar(*number)],
-        )?)),
-        Value::Matrix(matrix) => Ok(Value::Cell(CellValue::new(
-            matrix.rows,
-            matrix.cols,
-            matrix.elements.clone(),
-        )?)),
-        _ => Err(RuntimeError::TypeError(
-            "num2cell currently expects scalar or matrix input".to_string(),
-        )),
+        Value::Matrix(matrix) => mat2cell_from_elements(matrix.dims(), matrix.elements(), partitions, false),
+        Value::Cell(cell) => mat2cell_from_elements(cell.dims(), cell.elements(), partitions, true),
+        other => Err(RuntimeError::TypeError(format!(
+            "mat2cell currently expects a matrix or cell array input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn mat2cell_partition_vectors(
+    input_dims: &[usize],
+    partitions: &[Value],
+) -> Result<(Vec<Vec<usize>>, Vec<usize>), RuntimeError> {
+    let mut dims = canonical_size_vector(input_dims);
+    if partitions.is_empty() {
+        return Err(RuntimeError::Unsupported(
+            "mat2cell currently expects at least one partition vector".to_string(),
+        ));
+    }
+
+    if partitions.len() == 1 {
+        let rows = size_query_dimensions(&partitions[0])?;
+        if rows.iter().sum::<usize>() != dims.first().copied().unwrap_or(1) {
+            return Err(RuntimeError::ShapeError(
+                "mat2cell row partition sizes must sum to the input row count".to_string(),
+            ));
+        }
+        let row_count = rows.len();
+        let mut partition_vectors = vec![rows];
+        for &dim in dims.iter().skip(1) {
+            partition_vectors.push(vec![dim]);
+        }
+        return Ok((partition_vectors, vec![row_count, 1]));
+    }
+
+    while dims.len() < partitions.len() {
+        dims.push(1);
+    }
+
+    let mut partition_vectors = Vec::with_capacity(dims.len());
+    for (axis, partition) in partitions.iter().enumerate() {
+        let vector = size_query_dimensions(partition)?;
+        if vector.iter().sum::<usize>() != dims[axis] {
+            return Err(RuntimeError::ShapeError(format!(
+                "mat2cell partition sizes along dimension {} must sum to {}",
+                axis + 1,
+                dims[axis]
+            )));
+        }
+        partition_vectors.push(vector);
+    }
+    for &dim in dims.iter().skip(partitions.len()) {
+        partition_vectors.push(vec![dim]);
+    }
+
+    let output_dims = partition_vectors.iter().map(Vec::len).collect::<Vec<_>>();
+    Ok((partition_vectors, output_dims))
+}
+
+fn mat2cell_from_elements(
+    input_dims: &[usize],
+    elements: &[Value],
+    partitions: &[Value],
+    nested_cell_output: bool,
+) -> Result<Value, RuntimeError> {
+    let input_dims = canonical_size_vector(input_dims);
+    let (partition_vectors, output_dims) = mat2cell_partition_vectors(&input_dims, partitions)?;
+    let mut starts = Vec::with_capacity(partition_vectors.len());
+    for partition in &partition_vectors {
+        let mut offsets = Vec::with_capacity(partition.len());
+        let mut current = 0usize;
+        for &extent in partition {
+            offsets.push(current);
+            current += extent;
+        }
+        starts.push(offsets);
+    }
+
+    let output_count = if output_dims.is_empty() {
+        0
+    } else {
+        output_dims.iter().product::<usize>()
+    };
+    let mut cell_elements = Vec::with_capacity(output_count);
+    for linear in 0..output_count {
+        let output_index = row_major_multi_index(linear, &output_dims);
+        let piece_dims = partition_vectors
+            .iter()
+            .enumerate()
+            .map(|(axis, partition)| partition[output_index[axis]])
+            .collect::<Vec<_>>();
+        let piece_count = piece_dims.iter().product::<usize>();
+        let start_index = starts
+            .iter()
+            .enumerate()
+            .map(|(axis, offsets)| offsets[output_index[axis]])
+            .collect::<Vec<_>>();
+        let mut piece_elements = Vec::with_capacity(piece_count);
+        for piece_linear in 0..piece_count {
+            let piece_index = row_major_multi_index(piece_linear, &piece_dims);
+            let source_index = piece_index
+                .iter()
+                .enumerate()
+                .map(|(axis, &offset)| start_index[axis] + offset)
+                .collect::<Vec<_>>();
+            piece_elements.push(elements[row_major_linear_index(&source_index, &input_dims)].clone());
+        }
+
+        if nested_cell_output {
+            let (rows, cols) = storage_shape_from_dimensions(&piece_dims);
+            cell_elements.push(Value::Cell(CellValue::with_dimensions(
+                rows,
+                cols,
+                piece_dims,
+                piece_elements,
+            )?));
+        } else if piece_count == 1 {
+            cell_elements.push(piece_elements.into_iter().next().expect("single element piece"));
+        } else {
+            let (rows, cols) = storage_shape_from_dimensions(&piece_dims);
+            cell_elements.push(Value::Matrix(MatrixValue::with_dimensions(
+                rows,
+                cols,
+                piece_dims,
+                piece_elements,
+            )?));
+        }
+    }
+
+    let (rows, cols) = storage_shape_from_dimensions(&output_dims);
+    Ok(Value::Cell(CellValue::with_dimensions(
+        rows,
+        cols,
+        output_dims,
+        cell_elements,
+    )?))
+}
+
+fn num2cell_kept_dimensions(value: &Value) -> Result<Vec<usize>, RuntimeError> {
+    let mut dims = size_query_dimensions(value)?;
+    if dims.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "num2cell currently expects a nonempty dimension selector".to_string(),
+        ));
+    }
+    dims.sort_unstable();
+    dims.dedup();
+    Ok(dims)
+}
+
+fn num2cell_matrix_with_kept_dimensions(
+    matrix: &MatrixValue,
+    kept_dims: &[usize],
+) -> Result<Value, RuntimeError> {
+    let mut input_dims = canonical_size_vector(matrix.dims());
+    let max_kept_dim = kept_dims.iter().copied().max().unwrap_or(0);
+    while input_dims.len() < max_kept_dim {
+        input_dims.push(1);
+    }
+
+    let mut output_dims = input_dims.clone();
+    let mut cell_content_dims = vec![1usize; input_dims.len()];
+    for (axis, size) in input_dims.iter().copied().enumerate() {
+        if kept_dims.contains(&(axis + 1)) {
+            output_dims[axis] = 1;
+            cell_content_dims[axis] = size;
+        }
+    }
+
+    let output_element_count = output_dims.iter().product::<usize>();
+    let content_element_count = cell_content_dims.iter().product::<usize>();
+    let mut cell_elements = Vec::with_capacity(output_element_count);
+    for linear in 0..output_element_count {
+        let output_index = row_major_multi_index(linear, &output_dims);
+        if content_element_count == 1 {
+            let mut source_index = output_index.clone();
+            for kept_dim in kept_dims {
+                source_index[*kept_dim - 1] = 0;
+            }
+            let source_linear = row_major_linear_index(&source_index, &input_dims);
+            cell_elements.push(matrix.elements()[source_linear].clone());
+            continue;
+        }
+
+        let mut elements = Vec::with_capacity(content_element_count);
+        for content_linear in 0..content_element_count {
+            let content_index = row_major_multi_index(content_linear, &cell_content_dims);
+            let mut source_index = output_index.clone();
+            for kept_dim in kept_dims {
+                source_index[*kept_dim - 1] = content_index[*kept_dim - 1];
+            }
+            let source_linear = row_major_linear_index(&source_index, &input_dims);
+            elements.push(matrix.elements()[source_linear].clone());
+        }
+        let (rows, cols) = storage_shape_from_dimensions(&cell_content_dims);
+        cell_elements.push(Value::Matrix(MatrixValue::with_dimensions(
+            rows,
+            cols,
+            cell_content_dims.clone(),
+            elements,
+        )?));
+    }
+
+    let (rows, cols) = storage_shape_from_dimensions(&output_dims);
+    Ok(Value::Cell(CellValue::with_dimensions(
+        rows,
+        cols,
+        output_dims,
+        cell_elements,
+    )?))
+}
+
+fn builtin_cell(args: &[Value]) -> Result<Value, RuntimeError> {
+    let dims = match args {
+        [] => vec![0, 0],
+        _ => fill_dimensions(args, "cell")?,
+    };
+    let (rows, cols) = storage_shape_from_dimensions(&dims);
+    Ok(Value::Cell(CellValue::with_dimensions(
+        rows,
+        cols,
+        dims,
+        vec![Value::Matrix(MatrixValue::new(0, 0, Vec::new())?); rows * cols],
+    )?))
+}
+
+fn builtin_struct2cell(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "struct2cell currently supports exactly one argument".to_string(),
+        ));
+    };
+
+    match value {
+        Value::Struct(struct_value) => {
+            let elements = struct_value.fields.values().cloned().collect::<Vec<_>>();
+            Ok(Value::Cell(CellValue::new(elements.len(), 1, elements)?))
+        }
+        Value::Matrix(matrix) if matrix_is_struct(matrix) => {
+            if matrix.element_count() == 0 {
+                return Ok(Value::Cell(CellValue::new(0, 0, Vec::new())?));
+            }
+
+            let Value::Struct(first) = &matrix.elements()[0] else {
+                unreachable!("matrix_is_struct guard ensures struct elements");
+            };
+            let field_names = first.fields.keys().cloned().collect::<Vec<_>>();
+            let struct_dims = canonical_size_vector(matrix.dims());
+            let mut output_dims = vec![field_names.len()];
+            output_dims.extend(struct_dims.clone());
+            let (rows, cols) = storage_shape_from_dimensions(&output_dims);
+            let mut elements = Vec::with_capacity(field_names.len() * matrix.element_count());
+            for linear in 0..(field_names.len() * matrix.element_count()) {
+                let index = row_major_multi_index(linear, &output_dims);
+                let field_name = &field_names[index[0]];
+                let struct_linear = row_major_linear_index(&index[1..], &struct_dims);
+                let Value::Struct(struct_value) = &matrix.elements()[struct_linear] else {
+                    unreachable!("matrix_is_struct guard ensures struct elements");
+                };
+                let field_value = struct_value.fields.get(field_name).ok_or_else(|| {
+                    RuntimeError::MissingVariable(format!(
+                        "struct2cell expects consistent fields across struct arrays; missing `{field_name}`"
+                    ))
+                })?;
+                elements.push(field_value.clone());
+            }
+            Ok(Value::Cell(CellValue::with_dimensions(
+                rows, cols, output_dims, elements,
+            )?))
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "struct2cell currently expects struct or struct-array input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn builtin_cell2struct(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value, field_names, dim] = args else {
+        return Err(RuntimeError::Unsupported(
+            "cell2struct currently supports exactly three arguments".to_string(),
+        ));
+    };
+    let Value::Cell(cell) = value else {
+        return Err(RuntimeError::TypeError(format!(
+            "cell2struct currently expects a cell array input, found {}",
+            value.kind_name()
+        )));
+    };
+
+    let (field_names, _) = field_name_operand(field_names, "cell2struct")?;
+    let dim = positive_dimension(dim, "cell2struct")?;
+    let mut input_dims = canonical_size_vector(cell.dims());
+    while input_dims.len() < dim {
+        input_dims.push(1);
+    }
+    let field_extent = input_dims[dim - 1];
+    if field_names.len() != field_extent {
+        return Err(RuntimeError::ShapeError(format!(
+            "cell2struct expects {} field name(s) along dimension {}, found {}",
+            field_extent,
+            dim,
+            field_names.len()
+        )));
+    }
+
+    let mut output_dims = input_dims.clone();
+    output_dims[dim - 1] = 1;
+    let output_element_count = output_dims.iter().product::<usize>();
+    let mut elements = Vec::with_capacity(output_element_count.max(1));
+    for linear in 0..output_element_count.max(1) {
+        let output_index = row_major_multi_index(linear, &output_dims);
+        let mut fields = std::collections::BTreeMap::new();
+        for (field_offset, field_name) in field_names.iter().enumerate() {
+            let mut source_index = output_index.clone();
+            source_index[dim - 1] = field_offset;
+            let source_linear = row_major_linear_index(&source_index, &input_dims);
+            fields.insert(field_name.clone(), cell.elements()[source_linear].clone());
+        }
+        elements.push(Value::Struct(StructValue { fields }));
+    }
+
+    let (rows, cols) = storage_shape_from_dimensions(&output_dims);
+    if output_dims.iter().all(|&size| size == 1) {
+        Ok(elements.into_iter().next().expect("scalar struct result"))
+    } else {
+        Ok(Value::Matrix(MatrixValue::with_dimensions(
+            rows, cols, output_dims, elements,
+        )?))
     }
 }
 
@@ -13948,23 +14574,23 @@ fn structural_zero_value(value: &Value) -> Value {
 }
 
 fn flip_rows_matrix(matrix: &MatrixValue) -> Result<MatrixValue, RuntimeError> {
-    let elements = flip_elements_along_dimension(&matrix.elements, &matrix.dims, 1);
-    MatrixValue::with_dimensions(matrix.rows, matrix.cols, matrix.dims.clone(), elements)
+    let elements = flip_elements_along_dimension(matrix.elements(), matrix.dims(), 1);
+    MatrixValue::with_dimensions(matrix.rows, matrix.cols, matrix.dims().to_vec(), elements)
 }
 
 fn flip_cols_matrix(matrix: &MatrixValue) -> Result<MatrixValue, RuntimeError> {
-    let elements = flip_elements_along_dimension(&matrix.elements, &matrix.dims, 2);
-    MatrixValue::with_dimensions(matrix.rows, matrix.cols, matrix.dims.clone(), elements)
+    let elements = flip_elements_along_dimension(matrix.elements(), matrix.dims(), 2);
+    MatrixValue::with_dimensions(matrix.rows, matrix.cols, matrix.dims().to_vec(), elements)
 }
 
 fn flip_rows_cell(cell: &CellValue) -> Result<CellValue, RuntimeError> {
-    let elements = flip_elements_along_dimension(&cell.elements, &cell.dims, 1);
-    CellValue::with_dimensions(cell.rows, cell.cols, cell.dims.clone(), elements)
+    let elements = flip_elements_along_dimension(cell.elements(), cell.dims(), 1);
+    CellValue::with_dimensions(cell.rows, cell.cols, cell.dims().to_vec(), elements)
 }
 
 fn flip_cols_cell(cell: &CellValue) -> Result<CellValue, RuntimeError> {
-    let elements = flip_elements_along_dimension(&cell.elements, &cell.dims, 2);
-    CellValue::with_dimensions(cell.rows, cell.cols, cell.dims.clone(), elements)
+    let elements = flip_elements_along_dimension(cell.elements(), cell.dims(), 2);
+    CellValue::with_dimensions(cell.rows, cell.cols, cell.dims().to_vec(), elements)
 }
 
 fn flip_elements_along_dimension<T: Clone>(
@@ -14018,8 +14644,8 @@ fn flip_along_dimension(
             _ => MatrixValue::with_dimensions(
                 matrix.rows,
                 matrix.cols,
-                matrix.dims.clone(),
-                flip_elements_along_dimension(&matrix.elements, &matrix.dims, dimension),
+                matrix.dims().to_vec(),
+                flip_elements_along_dimension(matrix.elements(), matrix.dims(), dimension),
             )?,
         })),
         Value::Cell(cell) => Ok(Value::Cell(match dimension {
@@ -14028,8 +14654,8 @@ fn flip_along_dimension(
             _ => CellValue::with_dimensions(
                 cell.rows,
                 cell.cols,
-                cell.dims.clone(),
-                flip_elements_along_dimension(&cell.elements, &cell.dims, dimension),
+                cell.dims().to_vec(),
+                flip_elements_along_dimension(cell.elements(), cell.dims(), dimension),
             )?,
         })),
         _ => Err(RuntimeError::TypeError(format!(
@@ -14075,13 +14701,13 @@ fn rotate_matrix_first_two_dims(
     turns: usize,
 ) -> Result<MatrixValue, RuntimeError> {
     let (rows, cols, dims, elements) =
-        rotate_elements_first_two_dims(&matrix.elements, &matrix.dims, turns % 4);
+        rotate_elements_first_two_dims(matrix.elements(), matrix.dims(), turns % 4);
     MatrixValue::with_dimensions(rows, cols, dims, elements)
 }
 
 fn rotate_cell_first_two_dims(cell: &CellValue, turns: usize) -> Result<CellValue, RuntimeError> {
     let (rows, cols, dims, elements) =
-        rotate_elements_first_two_dims(&cell.elements, &cell.dims, turns % 4);
+        rotate_elements_first_two_dims(cell.elements(), cell.dims(), turns % 4);
     CellValue::with_dimensions(rows, cols, dims, elements)
 }
 
@@ -14136,7 +14762,7 @@ fn circshift_shifts(
     let dims = canonical_size_vector(&value_dimensions(value));
     if let Some(dim) = dim {
         let dim = size_query_dimension_scalar(dim)?;
-        let shift = shift.as_scalar()? as isize;
+        let shift = circshift_shift_scalar(shift.as_scalar()?)?;
         let mut shifts = vec![0isize; dims.len().max(dim)];
         shifts[dim - 1] = shift;
         return Ok(shifts);
@@ -14144,7 +14770,7 @@ fn circshift_shifts(
 
     match shift {
         Value::Scalar(number) => {
-            let shift = *number as isize;
+            let shift = circshift_shift_scalar(*number)?;
             let default_axis = if dimension_length(&dims, 1) != 1 {
                 1
             } else if dimension_length(&dims, 2) != 1 {
@@ -14158,8 +14784,9 @@ fn circshift_shifts(
         }
         Value::Matrix(matrix) => {
             let values = matrix
-                .iter()
-                .map(Value::as_scalar)
+                .scalar_elements()?
+                .into_iter()
+                .map(circshift_shift_scalar)
                 .collect::<Result<Vec<_>, _>>()?;
             if values.is_empty() {
                 return Err(RuntimeError::Unsupported(
@@ -14167,12 +14794,21 @@ fn circshift_shifts(
                         .to_string(),
                 ));
             }
-            Ok(values.into_iter().map(|value| value as isize).collect())
+            Ok(values)
         }
         _ => Err(RuntimeError::TypeError(
             "circshift currently expects a real numeric scalar or vector shift".to_string(),
         )),
     }
+}
+
+fn circshift_shift_scalar(value: f64) -> Result<isize, RuntimeError> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        return Err(RuntimeError::TypeError(
+            "circshift shift values must be finite integers".to_string(),
+        ));
+    }
+    Ok(value as isize)
 }
 
 fn circshift_value(
@@ -14232,12 +14868,12 @@ fn circshift_matrix(matrix: &MatrixValue, shifts: &[isize]) -> Result<MatrixValu
         return MatrixValue::with_dimensions(
             matrix.rows,
             matrix.cols,
-            matrix.dims.clone(),
-            matrix.elements.clone(),
+            matrix.dims().to_vec(),
+            matrix.elements().to_vec(),
         );
     }
-    let elements = circshift_elements(&matrix.elements, &matrix.dims, shifts);
-    MatrixValue::with_dimensions(matrix.rows, matrix.cols, matrix.dims.clone(), elements)
+    let elements = circshift_elements(matrix.elements(), matrix.dims(), shifts);
+    MatrixValue::with_dimensions(matrix.rows, matrix.cols, matrix.dims().to_vec(), elements)
 }
 
 fn circshift_cell(cell: &CellValue, shifts: &[isize]) -> Result<CellValue, RuntimeError> {
@@ -14245,12 +14881,12 @@ fn circshift_cell(cell: &CellValue, shifts: &[isize]) -> Result<CellValue, Runti
         return CellValue::with_dimensions(
             cell.rows,
             cell.cols,
-            cell.dims.clone(),
-            cell.elements.clone(),
+            cell.dims().to_vec(),
+            cell.elements().to_vec(),
         );
     }
-    let elements = circshift_elements(&cell.elements, &cell.dims, shifts);
-    CellValue::with_dimensions(cell.rows, cell.cols, cell.dims.clone(), elements)
+    let elements = circshift_elements(cell.elements(), cell.dims(), shifts);
+    CellValue::with_dimensions(cell.rows, cell.cols, cell.dims().to_vec(), elements)
 }
 
 fn cumulative_numeric_or_complex_value(
@@ -19610,9 +20246,7 @@ fn matrix_is_numeric_or_complex(matrix: &MatrixValue) -> bool {
 }
 
 fn matrix_is_logical(matrix: &MatrixValue) -> bool {
-    matrix
-        .iter()
-        .all(|element| matches!(element, Value::Logical(_)))
+    matrix.storage_class() == ArrayStorageClass::Logical
 }
 
 fn matrix_is_struct(matrix: &MatrixValue) -> bool {
@@ -21022,6 +21656,246 @@ mod tests {
     }
 
     #[test]
+    fn shape_helpers_preserve_logical_and_string_array_identity() {
+        let logical_input = Value::Matrix(
+            MatrixValue::new(
+                1,
+                4,
+                vec![
+                    Value::Logical(true),
+                    Value::Logical(false),
+                    Value::Logical(true),
+                    Value::Logical(false),
+                ],
+            )
+            .expect("logical input"),
+        );
+        let reshaped = builtin_reshape(&[
+            logical_input.clone(),
+            Value::Scalar(2.0),
+            Value::Scalar(2.0),
+        ])
+        .expect("logical reshape");
+        let permuted = permute_value(&reshaped, &[2, 1], "permute").expect("logical permute");
+        let shifted =
+            circshift_value(&permuted, &[1, 0], "circshift").expect("logical circshift");
+        let flipped = flip_along_dimension(&shifted, 1, "flip").expect("logical flip");
+        let Value::Matrix(logical_matrix) = flipped else {
+            panic!("logical shape helper result should stay matrix");
+        };
+        assert_eq!(
+            logical_matrix.storage_class(),
+            matlab_runtime::ArrayStorageClass::Logical
+        );
+
+        let string_input = Value::Matrix(
+            MatrixValue::new(
+                1,
+                4,
+                vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                    Value::String("c".to_string()),
+                    Value::String("d".to_string()),
+                ],
+            )
+            .expect("string input"),
+        );
+        let reshaped = builtin_reshape(&[
+            string_input.clone(),
+            Value::Scalar(2.0),
+            Value::Scalar(2.0),
+        ])
+        .expect("string reshape");
+        let permuted = permute_value(&reshaped, &[2, 1], "permute").expect("string permute");
+        let shifted =
+            circshift_value(&permuted, &[0, 1], "circshift").expect("string circshift");
+        let flipped = flip_along_dimension(&shifted, 2, "flip").expect("string flip");
+        let Value::Matrix(string_matrix) = flipped else {
+            panic!("string shape helper result should stay matrix");
+        };
+        assert_eq!(
+            string_matrix.storage_class(),
+            matlab_runtime::ArrayStorageClass::String
+        );
+    }
+
+    #[test]
+    fn squeeze_removes_singleton_dimensions_from_nd_inputs() {
+        let squeezed = builtin_squeeze(&[Value::Matrix(
+            MatrixValue::with_dimensions(
+                1,
+                4,
+                vec![1, 2, 1, 2],
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(3.0),
+                    Value::Scalar(2.0),
+                    Value::Scalar(4.0),
+                ],
+            )
+            .expect("nd matrix"),
+        )])
+        .expect("squeeze nd matrix");
+        assert_eq!(
+            squeezed,
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(4.0),
+                    ],
+                )
+                .expect("squeezed matrix"),
+            )
+        );
+
+        let squeezed = builtin_squeeze(&[Value::Cell(
+            CellValue::with_dimensions(
+                1,
+                4,
+                vec![1, 2, 1, 2],
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(3.0),
+                    Value::Scalar(2.0),
+                    Value::Scalar(4.0),
+                ],
+            )
+            .expect("nd cell"),
+        )])
+        .expect("squeeze nd cell");
+        assert_eq!(
+            squeezed,
+            Value::Cell(
+                CellValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(4.0),
+                    ],
+                )
+                .expect("squeezed cell"),
+            )
+        );
+    }
+
+    #[test]
+    fn permute_empty_arrays_preserve_shape_without_panicking() {
+        assert_eq!(
+            permute_value(
+                &Value::Matrix(MatrixValue::new(0, 2, Vec::new()).expect("empty matrix")),
+                &[2, 1],
+                "permute",
+            )
+            .expect("permute empty matrix"),
+            Value::Matrix(MatrixValue::new(2, 0, Vec::new()).expect("permuted empty matrix"))
+        );
+
+        assert_eq!(
+            permute_value(
+                &Value::Cell(CellValue::new(0, 2, Vec::new()).expect("empty cell")),
+                &[2, 1],
+                "permute",
+            )
+            .expect("permute empty cell"),
+            Value::Cell(CellValue::new(2, 0, Vec::new()).expect("permuted empty cell"))
+        );
+    }
+
+    #[test]
+    fn circshift_rejects_fractional_and_nonfinite_shifts() {
+        let value = Value::Matrix(
+            MatrixValue::new(
+                2,
+                2,
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(2.0),
+                    Value::Scalar(3.0),
+                    Value::Scalar(4.0),
+                ],
+            )
+            .expect("matrix"),
+        );
+        let error =
+            builtin_circshift(&[value.clone(), Value::Scalar(1.5)]).expect_err("fractional shift");
+        assert_eq!(error.to_string(), "circshift shift values must be finite integers");
+
+        let error = builtin_circshift(&[
+            value,
+            Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    2,
+                    vec![Value::Scalar(1.0), Value::Scalar(f64::INFINITY)],
+                )
+                .expect("shift vector"),
+            ),
+        ])
+        .expect_err("nonfinite shift");
+        assert_eq!(error.to_string(), "circshift shift values must be finite integers");
+    }
+
+    #[test]
+    fn concatenation_handles_empty_inputs_without_panicking() {
+        assert_eq!(
+            builtin_horzcat(&[
+                Value::Matrix(MatrixValue::new(0, 2, Vec::new()).expect("empty lhs")),
+                Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("empty rhs")),
+            ])
+            .expect("empty horzcat"),
+            Value::Matrix(MatrixValue::new(0, 5, Vec::new()).expect("empty result"))
+        );
+
+        assert_eq!(
+            builtin_vertcat(&[
+                Value::Matrix(MatrixValue::new(0, 2, Vec::new()).expect("empty top")),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                        .expect("bottom"),
+                ),
+            ])
+            .expect("mixed vertcat"),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                    .expect("mixed result"),
+            )
+        );
+
+        assert_eq!(
+            builtin_horzcat(&[
+                Value::Cell(CellValue::new(0, 2, Vec::new()).expect("empty lhs cell")),
+                Value::Cell(CellValue::new(0, 3, Vec::new()).expect("empty rhs cell")),
+            ])
+            .expect("empty cell horzcat"),
+            Value::Cell(CellValue::new(0, 5, Vec::new()).expect("empty cell result"))
+        );
+
+        assert_eq!(
+            builtin_vertcat(&[
+                Value::Cell(CellValue::new(0, 2, Vec::new()).expect("empty top cell")),
+                Value::Cell(
+                    CellValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                        .expect("bottom cell"),
+                ),
+            ])
+            .expect("mixed cell vertcat"),
+            Value::Cell(
+                CellValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                    .expect("mixed cell result"),
+            )
+        );
+    }
+
+    #[test]
     fn eye_supports_scalar_empty_and_size_vector_forms() {
         assert_eq!(builtin_eye(&[]).expect("eye"), Value::Scalar(1.0));
         assert_eq!(
@@ -21119,6 +21993,329 @@ mod tests {
     }
 
     #[test]
+    fn num2cell_supports_dimension_arguments() {
+        assert_eq!(
+            builtin_num2cell(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        2,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                        ],
+                    )
+                    .expect("matrix"),
+                ),
+                Value::Scalar(1.0),
+            ])
+            .expect("num2cell dim 1"),
+            Value::Cell(
+                CellValue::new(
+                    1,
+                    2,
+                    vec![
+                        Value::Matrix(
+                            MatrixValue::new(
+                                2,
+                                1,
+                                vec![Value::Scalar(1.0), Value::Scalar(3.0)],
+                            )
+                            .expect("first column"),
+                        ),
+                        Value::Matrix(
+                            MatrixValue::new(
+                                2,
+                                1,
+                                vec![Value::Scalar(2.0), Value::Scalar(4.0)],
+                            )
+                            .expect("second column"),
+                        ),
+                    ],
+                )
+                .expect("num2cell dim 1 result"),
+            )
+        );
+
+        assert_eq!(
+            builtin_num2cell(&[
+                Value::Matrix(
+                    MatrixValue::with_dimensions(
+                        2,
+                        4,
+                        vec![2, 2, 2],
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                            Value::Scalar(5.0),
+                            Value::Scalar(6.0),
+                            Value::Scalar(7.0),
+                            Value::Scalar(8.0),
+                        ],
+                    )
+                    .expect("nd matrix"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(3.0)])
+                        .expect("dim vector"),
+                ),
+            ])
+            .expect("num2cell dim vector"),
+            Value::Cell(
+                CellValue::with_dimensions(
+                    1,
+                    2,
+                    vec![1, 2, 1],
+                    vec![
+                        Value::Matrix(
+                            MatrixValue::with_dimensions(
+                                2,
+                                2,
+                                vec![2, 1, 2],
+                                vec![
+                                    Value::Scalar(1.0),
+                                    Value::Scalar(2.0),
+                                    Value::Scalar(5.0),
+                                    Value::Scalar(6.0),
+                                ],
+                            )
+                            .expect("first page slice"),
+                        ),
+                        Value::Matrix(
+                            MatrixValue::with_dimensions(
+                                2,
+                                2,
+                                vec![2, 1, 2],
+                                vec![
+                                    Value::Scalar(3.0),
+                                    Value::Scalar(4.0),
+                                    Value::Scalar(7.0),
+                                    Value::Scalar(8.0),
+                                ],
+                            )
+                            .expect("second page slice"),
+                        ),
+                    ],
+                )
+                .expect("num2cell dim vector result"),
+            )
+        );
+    }
+
+    #[test]
+    fn mat2cell_supports_common_partition_forms() {
+        assert_eq!(
+            builtin_mat2cell(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        3,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                            Value::Scalar(5.0),
+                            Value::Scalar(6.0),
+                        ],
+                    )
+                    .expect("matrix"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("row partition"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(1.0)])
+                        .expect("col partition"),
+                ),
+            ])
+            .expect("mat2cell 2d"),
+            Value::Cell(
+                CellValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Matrix(
+                            MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                                .expect("block 11"),
+                        ),
+                        Value::Scalar(3.0),
+                        Value::Matrix(
+                            MatrixValue::new(1, 2, vec![Value::Scalar(4.0), Value::Scalar(5.0)])
+                                .expect("block 21"),
+                        ),
+                        Value::Scalar(6.0),
+                    ],
+                )
+                .expect("mat2cell result"),
+            )
+        );
+
+        assert_eq!(
+            builtin_mat2cell(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        2,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                        ],
+                    )
+                    .expect("matrix"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("row partition"),
+                ),
+            ])
+            .expect("mat2cell row partition"),
+            Value::Cell(
+                CellValue::new(
+                    2,
+                    1,
+                    vec![
+                        Value::Matrix(
+                            MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                                .expect("row 1"),
+                        ),
+                        Value::Matrix(
+                            MatrixValue::new(1, 2, vec![Value::Scalar(3.0), Value::Scalar(4.0)])
+                                .expect("row 2"),
+                        ),
+                    ],
+                )
+                .expect("row partition result"),
+            )
+        );
+    }
+
+    #[test]
+    fn repelem_supports_vector_and_matrix_forms() {
+        assert_eq!(
+            builtin_repelem(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                        ],
+                    )
+                    .expect("row vector"),
+                ),
+                Value::Scalar(2.0),
+            ])
+            .expect("repelem vector"),
+            Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    6,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(3.0),
+                    ],
+                )
+                .expect("repeated row vector"),
+            )
+        );
+        assert_eq!(
+            builtin_repelem(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        2,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                        ],
+                    )
+                    .expect("matrix"),
+                ),
+                Value::Scalar(2.0),
+                Value::Scalar(3.0),
+            ])
+            .expect("repelem matrix"),
+            Value::Matrix(
+                MatrixValue::new(
+                    4,
+                    6,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(4.0),
+                        Value::Scalar(4.0),
+                        Value::Scalar(4.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(4.0),
+                        Value::Scalar(4.0),
+                        Value::Scalar(4.0),
+                    ],
+                )
+                .expect("repeated matrix"),
+            )
+        );
+    }
+
+    #[test]
+    fn cell_constructor_supports_empty_scalar_and_size_vector_forms() {
+        let empty = Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty matrix"));
+        assert_eq!(
+            builtin_cell(&[]).expect("cell"),
+            Value::Cell(CellValue::new(0, 0, Vec::new()).expect("empty cell"))
+        );
+        assert_eq!(
+            builtin_cell(&[Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(4.0)])
+                    .expect("cell size vector"),
+            )])
+            .expect("cell size vector"),
+            Value::Cell(
+                CellValue::new(
+                    1,
+                    4,
+                    vec![empty.clone(), empty.clone(), empty.clone(), empty.clone()],
+                )
+                .expect("cell size vector result"),
+            )
+        );
+        assert_eq!(
+            builtin_cell(&[Value::Scalar(-2.0), Value::Scalar(3.0)]).expect("negative cell size"),
+            Value::Cell(CellValue::new(0, 3, Vec::new()).expect("empty shaped cell"))
+        );
+    }
+
+    #[test]
     fn string_and_char_builtins_roundtrip_text_values() {
         let char_value = builtin_char(&[Value::String("alpha".to_string())]).expect("char");
         let string_value = builtin_string(&[Value::CharArray("beta".to_string())]).expect("string");
@@ -21132,6 +22329,78 @@ mod tests {
             ])
             .expect("strcmp"),
             Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_string(&[Value::Cell(
+                CellValue::new(
+                    1,
+                    2,
+                    vec![
+                        Value::CharArray("alpha".to_string()),
+                        Value::Logical(true),
+                    ],
+                )
+                .expect("string cell"),
+            )])
+            .expect("string cell"),
+            Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    2,
+                    vec![
+                        Value::String("alpha".to_string()),
+                        Value::String("true".to_string()),
+                    ],
+                )
+                .expect("string cell result"),
+            )
+        );
+    }
+
+    #[test]
+    fn cellstr_converts_text_scalars_and_matrices_to_char_cells() {
+        assert_eq!(
+            builtin_cellstr(&[Value::String("alpha".to_string())]).expect("cellstr scalar"),
+            Value::Cell(
+                CellValue::new(1, 1, vec![Value::CharArray("alpha".to_string())])
+                    .expect("cellstr scalar result"),
+            )
+        );
+
+        assert_eq!(
+            builtin_cellstr(&[Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::String("alpha".to_string()),
+                        Value::String("beta".to_string()),
+                        Value::CharArray("gamma".to_string()),
+                        Value::CharArray("delta".to_string()),
+                    ],
+                )
+                .expect("text matrix"),
+            )])
+            .expect("cellstr matrix"),
+            Value::Cell(
+                CellValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::CharArray("alpha".to_string()),
+                        Value::CharArray("beta".to_string()),
+                        Value::CharArray("gamma".to_string()),
+                        Value::CharArray("delta".to_string()),
+                    ],
+                )
+                .expect("cellstr matrix result"),
+            )
+        );
+
+        assert_eq!(
+            builtin_cellstr(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty"))])
+                .expect("cellstr empty"),
+            Value::Cell(CellValue::new(0, 0, Vec::new()).expect("empty cellstr")),
         );
     }
 
@@ -21315,6 +22584,23 @@ mod tests {
             )
         );
         assert_eq!(
+            builtin_struct2cell(std::slice::from_ref(&struct_array)).expect("struct2cell"),
+            Value::Cell(
+                CellValue::with_dimensions(
+                    2,
+                    2,
+                    vec![2, 1, 2],
+                    vec![
+                        Value::String("alpha".to_string()),
+                        Value::String("beta".to_string()),
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                    ],
+                )
+                .expect("struct2cell result"),
+            )
+        );
+        assert_eq!(
             builtin_rmfield(&[struct_array, Value::String("value".to_string())]).expect("rmfield"),
             Value::Matrix(
                 MatrixValue::new(
@@ -21356,6 +22642,23 @@ mod tests {
                     ("value".to_string(), Value::Scalar(3.0)),
                 ]),
             })
+        );
+        assert_eq!(
+            builtin_struct2cell(&[Value::Struct(StructValue {
+                fields: std::collections::BTreeMap::from([
+                    ("x".to_string(), Value::Scalar(1.0)),
+                    ("y".to_string(), Value::String("two".to_string())),
+                ]),
+            })])
+            .expect("scalar struct2cell"),
+            Value::Cell(
+                CellValue::new(
+                    2,
+                    1,
+                    vec![Value::Scalar(1.0), Value::String("two".to_string())],
+                )
+                .expect("scalar struct2cell result"),
+            )
         );
 
         let array = builtin_struct(&[
@@ -21405,6 +22708,57 @@ mod tests {
                     ],
                 )
                 .expect("expected struct array"),
+            )
+        );
+        assert_eq!(
+            builtin_cell2struct(&[
+                Value::Cell(
+                    CellValue::new(
+                        2,
+                        2,
+                        vec![
+                            Value::String("alpha".to_string()),
+                            Value::String("beta".to_string()),
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                        ],
+                    )
+                    .expect("cell2struct array input"),
+                ),
+                Value::Cell(
+                    CellValue::new(
+                        2,
+                        1,
+                        vec![
+                            Value::CharArray("name".to_string()),
+                            Value::CharArray("value".to_string()),
+                        ],
+                    )
+                    .expect("cell2struct field names"),
+                ),
+                Value::Scalar(1.0),
+            ])
+            .expect("cell2struct array"),
+            Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    2,
+                    vec![
+                        Value::Struct(StructValue {
+                            fields: std::collections::BTreeMap::from([
+                                ("name".to_string(), Value::String("alpha".to_string())),
+                                ("value".to_string(), Value::Scalar(1.0)),
+                            ]),
+                        }),
+                        Value::Struct(StructValue {
+                            fields: std::collections::BTreeMap::from([
+                                ("name".to_string(), Value::String("beta".to_string())),
+                                ("value".to_string(), Value::Scalar(2.0)),
+                            ]),
+                        }),
+                    ],
+                )
+                .expect("cell2struct array result"),
             )
         );
     }
@@ -26634,6 +27988,109 @@ mod tests {
                         ],
                     )
                     .expect("qr permutation"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_qr(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            3,
+                            2,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(10.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("legacy qr matrix"),
+                    ),
+                    Value::Scalar(0.0),
+                ],
+                3,
+            )
+            .expect("legacy qr zero flag"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        2,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                        ],
+                    )
+                    .expect("legacy qr q"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        2,
+                        vec![
+                            Value::Scalar(10.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                        ],
+                    )
+                    .expect("legacy qr r"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(1.0)])
+                        .expect("legacy qr p"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_qr(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            3,
+                            2,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(-1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("legacy qr rhs matrix"),
+                    ),
+                    Value::Matrix(MatrixValue::new(3, 0, Vec::new()).expect("legacy empty rhs")),
+                    Value::Scalar(0.0),
+                ],
+                3,
+            )
+            .expect("legacy qr rhs zero flag"),
+            vec![
+                Value::Matrix(MatrixValue::new(2, 0, Vec::new()).expect("legacy qr c")),
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        2,
+                        vec![
+                            Value::Scalar(1.414213562373),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.414213562373),
+                        ],
+                    )
+                    .expect("legacy qr r rhs"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                        .expect("legacy qr p rhs"),
                 ),
             ]
         );

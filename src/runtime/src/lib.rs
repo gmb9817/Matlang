@@ -25,6 +25,15 @@ pub enum Value {
     FunctionHandle(FunctionHandleValue),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayStorageClass {
+    Numeric,
+    Logical,
+    Complex,
+    String,
+    Generic,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatrixValue {
     pub rows: usize,
@@ -311,6 +320,76 @@ impl MatrixValue {
         }
     }
 
+    pub fn dims(&self) -> &[usize] {
+        &self.dims
+    }
+
+    pub fn element_count(&self) -> usize {
+        self.elements.len()
+    }
+
+    pub fn elements(&self) -> &[Value] {
+        &self.elements
+    }
+
+    pub fn elements_mut(&mut self) -> &mut [Value] {
+        &mut self.elements
+    }
+
+    pub fn into_elements(self) -> Vec<Value> {
+        self.elements
+    }
+
+    pub fn storage_class(&self) -> ArrayStorageClass {
+        let mut saw_complex = false;
+        let mut saw_other = false;
+
+        for element in self.elements() {
+            match element {
+                Value::Scalar(_) => {}
+                Value::Logical(_) => {
+                    return if self
+                        .elements()
+                        .iter()
+                        .all(|value| matches!(value, Value::Logical(_)))
+                    {
+                        ArrayStorageClass::Logical
+                    } else {
+                        ArrayStorageClass::Generic
+                    };
+                }
+                Value::Complex(_) => saw_complex = true,
+                Value::String(_) => {
+                    return if self
+                        .elements()
+                        .iter()
+                        .all(|value| matches!(value, Value::String(_)))
+                    {
+                        ArrayStorageClass::String
+                    } else {
+                        ArrayStorageClass::Generic
+                    };
+                }
+                _ => saw_other = true,
+            }
+        }
+
+        if saw_other {
+            ArrayStorageClass::Generic
+        } else if saw_complex {
+            ArrayStorageClass::Complex
+        } else {
+            ArrayStorageClass::Numeric
+        }
+    }
+
+    pub fn scalar_elements(&self) -> Result<Vec<f64>, RuntimeError> {
+        self.elements()
+            .iter()
+            .map(Value::as_scalar)
+            .collect::<Result<Vec<_>, _>>()
+    }
+
     pub fn get(&self, row: usize, col: usize) -> &Value {
         &self.elements[row * self.cols + col]
     }
@@ -363,6 +442,26 @@ impl CellValue {
         Self::new(row_count, col_count, elements)
     }
 
+    pub fn dims(&self) -> &[usize] {
+        &self.dims
+    }
+
+    pub fn element_count(&self) -> usize {
+        self.elements.len()
+    }
+
+    pub fn elements(&self) -> &[Value] {
+        &self.elements
+    }
+
+    pub fn elements_mut(&mut self) -> &mut [Value] {
+        &mut self.elements
+    }
+
+    pub fn into_elements(self) -> Vec<Value> {
+        self.elements
+    }
+
     pub fn get(&self, row: usize, col: usize) -> &Value {
         &self.elements[row * self.cols + col]
     }
@@ -374,7 +473,7 @@ impl CellValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{CellValue, MatrixValue, Value};
+    use super::{ArrayStorageClass, CellValue, ComplexValue, MatrixValue, Value};
 
     #[test]
     fn matrix_with_dimensions_preserves_explicit_metadata() {
@@ -403,6 +502,64 @@ mod tests {
         )
         .expect("cell");
         assert_eq!(cell.dims, vec![1, 2, 1]);
+    }
+
+    #[test]
+    fn matrix_storage_class_tracks_homogeneous_array_identity() {
+        let logical = MatrixValue::new(
+            1,
+            3,
+            vec![Value::Logical(true), Value::Logical(false), Value::Logical(true)],
+        )
+        .expect("logical matrix");
+        assert_eq!(logical.storage_class(), ArrayStorageClass::Logical);
+
+        let complex = MatrixValue::new(
+            1,
+            2,
+            vec![
+                Value::Scalar(1.0),
+                Value::Complex(ComplexValue {
+                    real: 2.0,
+                    imag: 3.0,
+                }),
+            ],
+        )
+        .expect("complex matrix");
+        assert_eq!(complex.storage_class(), ArrayStorageClass::Complex);
+
+        let strings = MatrixValue::new(
+            1,
+            2,
+            vec![Value::String("a".to_string()), Value::String("b".to_string())],
+        )
+        .expect("string matrix");
+        assert_eq!(strings.storage_class(), ArrayStorageClass::String);
+
+        let generic = MatrixValue::new(
+            1,
+            2,
+            vec![Value::Scalar(1.0), Value::String("b".to_string())],
+        )
+        .expect("generic matrix");
+        assert_eq!(generic.storage_class(), ArrayStorageClass::Generic);
+    }
+
+    #[test]
+    fn matrix_and_cell_accessors_expose_shape_and_storage_views() {
+        let mut matrix = MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+            .expect("matrix");
+        assert_eq!(matrix.dims(), &[1, 2]);
+        assert_eq!(matrix.element_count(), 2);
+        matrix.elements_mut()[1] = Value::Scalar(4.0);
+        assert_eq!(matrix.elements()[1], Value::Scalar(4.0));
+
+        let mut cell = CellValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+            .expect("cell");
+        assert_eq!(cell.dims(), &[1, 2]);
+        assert_eq!(cell.element_count(), 2);
+        cell.elements_mut()[0] = Value::String("x".to_string());
+        assert_eq!(cell.elements()[0], Value::String("x".to_string()));
     }
 }
 

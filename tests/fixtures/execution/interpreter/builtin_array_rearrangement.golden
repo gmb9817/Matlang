@@ -6,10 +6,16 @@ workspace
   c = [2, 4 ; 1, 3]
   d = [4, 3 ; 2, 1]
   e = [3, 1 ; 4, 2]
+  empty_cell_perm = {}
+  empty_cell_perm_size = [2, 0]
+  empty_perm = []
+  empty_perm_size = [2, 0]
   f = [3, 4 ; 1, 2]
+  frac_shift_msg = 'circshift shift values must be finite integers'
   g = [4, 3 ; 2, 1]
   h = [3, 1, 2]
   i = 'cba'
+  inf_shift_msg = 'circshift shift values must be finite integers'
   j = 'abc'
   k = {2, 4 ; 1, 3}
   l = {2, 1 ; 4, 3}

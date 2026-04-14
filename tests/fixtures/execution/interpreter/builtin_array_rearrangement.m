@@ -22,6 +22,22 @@ u = pagetranspose(cat(3, {1 2; 3 4}, {5 6; 7 8}));
 v = ctranspose({1, 2; 3, 4});
 wtmp = {1, 2; 3, 4};
 w = wtmp';
+empty_perm = permute(zeros(0, 2), [2 1]);
+empty_perm_size = size(empty_perm);
+empty_cell_perm = permute(num2cell(zeros(0, 2)), [2 1]);
+empty_cell_perm_size = size(empty_cell_perm);
+try
+    frac_shift = circshift([1 2; 3 4], 1.5);
+catch err
+    frac_shift_msg = char(err.message);
+    clear err
+end
+try
+    inf_shift = circshift([1 2; 3 4], [1 Inf]);
+catch err
+    inf_shift_msg = char(err.message);
+    clear err
+end
 nd = cat(3, [1 2; 3 4], [5 6; 7 8]);
 try
     bad_ctranspose = nd';

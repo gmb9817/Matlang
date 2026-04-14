@@ -38,9 +38,9 @@ use matlab_ir::{
 };
 use matlab_resolver::ResolverContext;
 use matlab_runtime::{
-    render_named_value, render_value, render_workspace, CellValue, ComplexValue,
-    FunctionHandleTarget, FunctionHandleValue, MatrixValue, RuntimeError, RuntimeStackFrame,
-    StructValue, Value, Workspace,
+    render_named_value, render_value, render_workspace, ArrayStorageClass, CellValue,
+    ComplexValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue, RuntimeError,
+    RuntimeStackFrame, StructValue, Value, Workspace,
 };
 use matlab_semantics::{
     analyze_compilation_unit_with_context,
@@ -184,6 +184,30 @@ struct AssignmentPlan {
     target_rows: usize,
     target_cols: usize,
     target_dims: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorSource {
+    Numeric,
+    LogicalMask,
+    ScalarLogical,
+    FullSlice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorPlanMode {
+    Selection,
+    Assignment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectorPlan {
+    source: SelectorSource,
+    indices: Vec<usize>,
+    output_rows: usize,
+    output_cols: usize,
+    output_dims: Vec<usize>,
+    target_extent: usize,
 }
 
 #[derive(Clone)]
@@ -1294,8 +1318,8 @@ fn matlab_value_dimensions(value: &Value) -> Vec<usize> {
     match value {
         Value::Scalar(_) | Value::Complex(_) | Value::Logical(_) | Value::String(_) => vec![1, 1],
         Value::CharArray(text) => vec![1, text.chars().count().max(1)],
-        Value::Matrix(matrix) => matrix.dims.clone(),
-        Value::Cell(cell) => cell.dims.clone(),
+        Value::Matrix(matrix) => matrix.dims().to_vec(),
+        Value::Cell(cell) => cell.dims().to_vec(),
         Value::Struct(_) | Value::FunctionHandle(_) => vec![1, 1],
     }
 }
@@ -1314,35 +1338,20 @@ fn matlab_class_name(value: &Value) -> &'static str {
 }
 
 fn matrix_class_name(matrix: &MatrixValue) -> &'static str {
-    let Some(first) = matrix.elements.first() else {
-        return "double";
-    };
-    match first {
-        Value::Logical(_)
-            if matrix
-                .elements
-                .iter()
-                .all(|value| matches!(value, Value::Logical(_))) =>
-        {
-            "logical"
+    match matrix.storage_class() {
+        ArrayStorageClass::Logical => "logical",
+        ArrayStorageClass::String => "string",
+        _ => {
+            let Some(first) = matrix.elements().first() else {
+                return "double";
+            };
+            match first {
+                Value::Struct(_) if matrix.iter().all(|value| matches!(value, Value::Struct(_))) => {
+                    "struct"
+                }
+                _ => "double",
+            }
         }
-        Value::String(_)
-            if matrix
-                .elements
-                .iter()
-                .all(|value| matches!(value, Value::String(_))) =>
-        {
-            "string"
-        }
-        Value::Struct(_)
-            if matrix
-                .elements
-                .iter()
-                .all(|value| matches!(value, Value::Struct(_))) =>
-        {
-            "struct"
-        }
-        _ => "double",
     }
 }
 
@@ -7782,8 +7791,8 @@ fn end_index_extent(
 ) -> Result<usize, RuntimeError> {
     let (dims, kind) = match target {
         Value::CharArray(text) => (vec![1, text.chars().count()], "char array"),
-        Value::Matrix(matrix) => (matrix.dims.clone(), "matrix"),
-        Value::Cell(cell) => (cell.dims.clone(), "cell array"),
+        Value::Matrix(matrix) => (matrix.dims().to_vec(), "matrix"),
+        Value::Cell(cell) => (cell.dims().to_vec(), "cell array"),
         Value::Struct(_) => (vec![1, 1], "struct array"),
         _ => {
             return Err(RuntimeError::TypeError(format!(
@@ -7822,7 +7831,7 @@ fn assign_matrix_index(
     let mut matrix = resize_matrix_to_dims(matrix, &plan.target_dims, Value::Scalar(0.0));
     let values = matrix_assignment_values(&value, &plan.selection)?;
     for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
-        matrix.elements[position] = value;
+        matrix.elements_mut()[position] = value;
     }
     Ok(matrix)
 }
@@ -7861,7 +7870,7 @@ fn assign_cell_content_index(
     let mut cell = resize_cell_to_dims(cell, &plan.target_dims, empty_matrix_value());
     if plan.selection.positions.len() == 1 {
         let position = plan.selection.positions[0];
-        cell.elements[position] = value;
+        cell.elements_mut()[position] = value;
         return Ok(cell);
     }
 
@@ -7873,7 +7882,7 @@ fn assign_cell_content_index(
     };
     let values = cell_assignment_values(&value, &plan.selection)?;
     for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
-        cell.elements[position] = value;
+        cell.elements_mut()[position] = value;
     }
     Ok(cell)
 }
@@ -7891,7 +7900,7 @@ fn assign_cell_index(
     let mut cell = resize_cell_to_dims(cell, &plan.target_dims, empty_matrix_value());
     let values = cell_assignment_values(&value, &plan.selection)?;
     for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
-        cell.elements[position] = value;
+        cell.elements_mut()[position] = value;
     }
     Ok(cell)
 }
@@ -7910,7 +7919,7 @@ fn evaluate_cell_content_index(
     let selection = cell_selection(cell, args)?;
     match selection.positions.len() {
         0 => Ok(empty_cell_value()),
-        1 => Ok(cell.elements[selection.positions[0]].clone()),
+        1 => Ok(cell.elements()[selection.positions[0]].clone()),
         count => Err(single_output_dot_or_brace_result_error(count)),
     }
 }
@@ -7930,7 +7939,7 @@ fn materialize_cell_content_index(
     let values = selection
         .positions
         .iter()
-        .map(|&position| cell.elements[position].clone())
+        .map(|&position| cell.elements()[position].clone())
         .collect::<Vec<_>>();
     if values.is_empty() {
         return Ok(empty_cell_value());
@@ -7973,7 +7982,7 @@ fn evaluate_cell_content_outputs(
     Ok(selection
         .positions
         .into_iter()
-        .map(|position| cell.elements[position].clone())
+        .map(|position| cell.elements()[position].clone())
         .collect())
 }
 
@@ -7983,7 +7992,7 @@ fn read_matrix_selection(
 ) -> Result<Value, RuntimeError> {
     let selection = matrix_selection(matrix, args)?;
     if selection.rows == 1 && selection.cols == 1 {
-        return Ok(matrix.elements[selection.positions[0]].clone());
+        return Ok(matrix.elements()[selection.positions[0]].clone());
     }
 
     let rows = selection.rows;
@@ -7991,7 +8000,7 @@ fn read_matrix_selection(
     let elements = selection
         .positions
         .into_iter()
-        .map(|position| matrix.elements[position].clone())
+        .map(|position| matrix.elements()[position].clone())
         .collect();
     Ok(Value::Matrix(MatrixValue::with_dimensions(
         rows,
@@ -8011,7 +8020,7 @@ fn read_cell_selection(
     let elements = selection
         .positions
         .into_iter()
-        .map(|position| cell.elements[position].clone())
+        .map(|position| cell.elements()[position].clone())
         .collect();
     Ok(Value::Cell(CellValue::with_dimensions(
         rows,
@@ -8039,11 +8048,11 @@ fn matrix_selection(
     args: &[EvaluatedIndexArgument],
 ) -> Result<IndexSelection, RuntimeError> {
     match args {
-        [index] => linear_selection(index, matrix.rows, matrix.cols, &matrix.dims, "matrix"),
+        [index] => linear_selection(index, matrix.rows, matrix.cols, matrix.dims(), "matrix"),
         [row, col] => row_col_selection(row, col, matrix.rows, matrix.cols, "matrix"),
         _ => nd_selection(
             args,
-            &indexing_dimensions_from_dims(&matrix.dims, args.len()),
+            &indexing_dimensions_from_dims(matrix.dims(), args.len()),
             "matrix",
         ),
     }
@@ -8054,11 +8063,11 @@ fn cell_selection(
     args: &[EvaluatedIndexArgument],
 ) -> Result<IndexSelection, RuntimeError> {
     match args {
-        [index] => linear_selection(index, cell.rows, cell.cols, &cell.dims, "cell array"),
+        [index] => linear_selection(index, cell.rows, cell.cols, cell.dims(), "cell array"),
         [row, col] => row_col_selection(row, col, cell.rows, cell.cols, "cell array"),
         _ => nd_selection(
             args,
-            &indexing_dimensions_from_dims(&cell.dims, args.len()),
+            &indexing_dimensions_from_dims(cell.dims(), args.len()),
             "cell array",
         ),
     }
@@ -8069,8 +8078,8 @@ fn matrix_assignment_plan(
     args: &[EvaluatedIndexArgument],
 ) -> Result<AssignmentPlan, RuntimeError> {
     match args {
-        [_] | [_, _] => assignment_plan(&matrix.dims, "matrix", args),
-        _ => nd_assignment_plan(&matrix.dims, "matrix", args),
+        [_] | [_, _] => assignment_plan(matrix.dims(), "matrix", args),
+        _ => nd_assignment_plan(matrix.dims(), "matrix", args),
     }
 }
 
@@ -8079,8 +8088,8 @@ fn cell_assignment_plan(
     args: &[EvaluatedIndexArgument],
 ) -> Result<AssignmentPlan, RuntimeError> {
     match args {
-        [_] | [_, _] => assignment_plan(&cell.dims, "cell array", args),
-        _ => nd_assignment_plan(&cell.dims, "cell array", args),
+        [_] | [_, _] => assignment_plan(cell.dims(), "cell array", args),
+        _ => nd_assignment_plan(cell.dims(), "cell array", args),
     }
 }
 
@@ -8129,170 +8138,58 @@ fn linear_assignment_plan(
     let (current_rows, current_cols) = storage_shape_from_dimensions(current_dims);
     let allow_growth = current_dims.len() <= 2 || current_dims.iter().skip(2).all(|dim| *dim == 1);
     let current_extent = current_dims.iter().product::<usize>();
-    match argument {
-        EvaluatedIndexArgument::FullSlice => Ok(AssignmentPlan {
-            selection: linear_selection(argument, current_rows, current_cols, current_dims, kind)?,
+    let stable_target_dims = || {
+        if allow_growth {
+            let mut dims = vec![current_rows, current_cols];
+            if current_dims.len() > 2 {
+                dims.extend(current_dims.iter().skip(2).copied());
+            }
+            dims
+        } else {
+            current_dims.to_vec()
+        }
+    };
+
+    let selector =
+        plan_linear_selector(argument, current_rows, current_cols, current_dims, kind, SelectorPlanMode::Assignment)?;
+
+    match selector.source {
+        SelectorSource::FullSlice
+        | SelectorSource::LogicalMask
+        | SelectorSource::ScalarLogical => Ok(AssignmentPlan {
+            selection: IndexSelection {
+                positions: selector
+                    .indices
+                    .iter()
+                    .copied()
+                    .map(|index| {
+                        linear_position_for_dimensions(
+                            index,
+                            current_rows,
+                            current_cols,
+                            current_dims,
+                            kind,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                rows: selector.output_rows,
+                cols: selector.output_cols,
+                dims: selector.output_dims,
+                linear: true,
+            },
             target_rows: current_rows,
             target_cols: current_cols,
-            target_dims: if allow_growth {
-                let mut dims = vec![current_rows, current_cols];
-                if current_dims.len() > 2 {
-                    dims.extend(current_dims.iter().skip(2).copied());
-                }
-                dims
-            } else {
-                current_dims.to_vec()
-            },
+            target_dims: stable_target_dims(),
         }),
-        EvaluatedIndexArgument::Numeric {
-            values,
-            rows,
-            cols,
-            logical,
-            ..
-        } => {
-            if *logical && is_logical_selector(values) && values.len() == current_rows * current_cols {
-                return Ok(AssignmentPlan {
-                    selection: IndexSelection {
-                        positions: logical_selector_indices(values, *rows, *cols, current_dims)
-                            .into_iter()
-                            .map(|index| {
-                                linear_position_for_dimensions(
-                                    index,
-                                    current_rows,
-                                    current_cols,
-                                    current_dims,
-                                    kind,
-                                )
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                        rows: if current_rows == 1 && current_cols != 1 {
-                            1
-                        } else {
-                            values.iter().filter(|value| **value != 0.0).count()
-                        },
-                        cols: if current_rows == 1 && current_cols != 1 {
-                            values.iter().filter(|value| **value != 0.0).count()
-                        } else {
-                            1
-                        },
-                        dims: if current_rows == 1 && current_cols != 1 {
-                            vec![1, values.iter().filter(|value| **value != 0.0).count()]
-                        } else {
-                            vec![values.iter().filter(|value| **value != 0.0).count(), 1]
-                        },
-                        linear: true,
-                    },
-                    target_rows: current_rows,
-                    target_cols: current_cols,
-                    target_dims: if allow_growth {
-                        let mut dims = vec![current_rows, current_cols];
-                        if current_dims.len() > 2 {
-                            dims.extend(current_dims.iter().skip(2).copied());
-                        }
-                        dims
-                    } else {
-                        current_dims.to_vec()
-                    },
-                });
-            }
-            if *logical && is_logical_selector(values) {
-                return Ok(AssignmentPlan {
-                    selection: IndexSelection {
-                        positions: bounded_logical_selector_indices(
-                            values,
-                            *rows,
-                            *cols,
-                            current_dims,
-                            current_rows * current_cols,
-                            "linear",
-                            kind,
-                        )?
-                        .into_iter()
-                        .map(|index| {
-                            linear_position_for_dimensions(
-                                index,
-                                current_rows,
-                                current_cols,
-                                current_dims,
-                                kind,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                        rows: if current_rows == 1 && current_cols != 1 {
-                            1
-                        } else {
-                            values.iter().filter(|value| **value != 0.0).count()
-                        },
-                        cols: if current_rows == 1 && current_cols != 1 {
-                            values.iter().filter(|value| **value != 0.0).count()
-                        } else {
-                            1
-                        },
-                        dims: if current_rows == 1 && current_cols != 1 {
-                            vec![1, values.iter().filter(|value| **value != 0.0).count()]
-                        } else {
-                            vec![values.iter().filter(|value| **value != 0.0).count(), 1]
-                        },
-                        linear: true,
-                    },
-                    target_rows: current_rows,
-                    target_cols: current_cols,
-                    target_dims: if allow_growth {
-                        let mut dims = vec![current_rows, current_cols];
-                        if current_dims.len() > 2 {
-                            dims.extend(current_dims.iter().skip(2).copied());
-                        }
-                        dims
-                    } else {
-                        current_dims.to_vec()
-                    },
-                });
-            }
-            if is_scalar_logical_selector(values, *logical) {
-                return Ok(AssignmentPlan {
-                    selection: IndexSelection {
-                        positions: scalar_logical_selection_positions(values[0])
-                            .into_iter()
-                            .map(|index| {
-                                linear_position_for_dimensions(
-                                    index,
-                                    current_rows,
-                                    current_cols,
-                                    current_dims,
-                                    kind,
-                                )
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                        rows: 1,
-                        cols: if values[0] != 0.0 { 1 } else { 0 },
-                        dims: vec![1, if values[0] != 0.0 { 1 } else { 0 }],
-                        linear: true,
-                    },
-                    target_rows: current_rows,
-                    target_cols: current_cols,
-                    target_dims: if allow_growth {
-                        let mut dims = vec![current_rows, current_cols];
-                        if current_dims.len() > 2 {
-                            dims.extend(current_dims.iter().skip(2).copied());
-                        }
-                        dims
-                    } else {
-                        current_dims.to_vec()
-                    },
-                });
+        SelectorSource::Numeric => {
+            let max_index = selector.indices.iter().copied().max().unwrap_or(0);
+            let collapsed_growth = current_dims.len() > 2 && max_index > current_extent;
+            if !allow_growth && max_index > current_rows * current_cols && !collapsed_growth {
+                return Err(RuntimeError::Unsupported(format!(
+                    "{kind} indexed assignment currently does not grow arrays when fewer indices than dimensions are provided"
+                )));
             }
 
-            let indices = numeric_selector_indices(values)?;
-            let max_index = indices.iter().copied().max().unwrap_or(0);
-            let collapsed_growth = current_dims.len() > 2 && max_index > current_extent;
-            if !allow_growth && max_index > current_rows * current_cols {
-                if !collapsed_growth {
-                    return Err(RuntimeError::Unsupported(format!(
-                        "{kind} indexed assignment currently does not grow arrays when fewer indices than dimensions are provided"
-                    )));
-                }
-            }
             let (target_rows, target_cols, target_dims) = if collapsed_growth {
                 let extent = max_index.max(1);
                 (extent, 1, vec![extent, 1])
@@ -8322,9 +8219,11 @@ fn linear_assignment_plan(
                 };
                 (target_rows, target_cols, target_dims)
             };
+
             Ok(AssignmentPlan {
                 selection: IndexSelection {
-                    positions: indices
+                    positions: selector
+                        .indices
                         .iter()
                         .copied()
                         .map(|index| {
@@ -8337,9 +8236,9 @@ fn linear_assignment_plan(
                             )
                         })
                         .collect::<Result<Vec<_>, _>>()?,
-                    rows: *rows,
-                    cols: *cols,
-                    dims: vec![*rows, *cols],
+                    rows: selector.output_rows,
+                    cols: selector.output_cols,
+                    dims: selector.output_dims,
                     linear: true,
                 },
                 target_rows,
@@ -8409,12 +8308,13 @@ fn row_col_assignment_plan(
     })
 }
 
-fn assignment_dimension_indices(
+fn plan_dimension_selector(
     argument: &EvaluatedIndexArgument,
-    current_extent: usize,
+    extent: usize,
     dimension: &str,
     kind: &str,
-) -> Result<(Vec<usize>, usize), RuntimeError> {
+    mode: SelectorPlanMode,
+) -> Result<SelectorPlan, RuntimeError> {
     match argument {
         EvaluatedIndexArgument::Numeric {
             values,
@@ -8423,46 +8323,186 @@ fn assignment_dimension_indices(
             dims,
             logical,
         } => {
-            if *logical && is_logical_selector(values) && values.len() == current_extent {
-                return Ok((
-                    logical_selector_indices(values, *rows, *cols, dims),
-                    current_extent,
-                ));
+            if *logical && is_logical_selector(values) && values.len() == extent {
+                let indices = logical_selector_indices(values, *rows, *cols, dims);
+                return Ok(SelectorPlan {
+                    source: SelectorSource::LogicalMask,
+                    output_rows: indices.len(),
+                    output_cols: 1,
+                    output_dims: vec![indices.len()],
+                    target_extent: extent,
+                    indices,
+                });
             }
             if *logical && is_logical_selector(values) {
-                return Ok((
-                    bounded_logical_selector_indices(
-                        values,
-                        *rows,
-                        *cols,
-                        dims,
-                        current_extent,
-                        dimension,
-                        kind,
-                    )?,
-                    current_extent,
-                ));
+                let indices = bounded_logical_selector_indices(
+                    values, *rows, *cols, dims, extent, dimension, kind,
+                )?;
+                return Ok(SelectorPlan {
+                    source: SelectorSource::LogicalMask,
+                    output_rows: indices.len(),
+                    output_cols: 1,
+                    output_dims: vec![indices.len()],
+                    target_extent: extent,
+                    indices,
+                });
             }
             if is_scalar_logical_selector(values, *logical) {
-                return Ok((
-                    scalar_logical_selection_positions(values[0]),
-                    current_extent,
-                ));
+                let indices = scalar_logical_selection_positions(values[0]);
+                return Ok(SelectorPlan {
+                    source: SelectorSource::ScalarLogical,
+                    output_rows: indices.len(),
+                    output_cols: 1,
+                    output_dims: vec![indices.len()],
+                    target_extent: extent,
+                    indices,
+                });
             }
 
             let indices = numeric_selector_indices(values)?;
-            let Some(max_index) = indices.iter().copied().max() else {
-                return Ok((Vec::new(), current_extent));
-            };
-            if max_index == 0 {
-                return Err(RuntimeError::InvalidIndex(format!(
-                    "{dimension} index 0 is out of bounds for {kind}"
-                )));
+            if mode == SelectorPlanMode::Selection {
+                if let Some(index) = indices.iter().copied().find(|index| *index > extent) {
+                    return Err(RuntimeError::InvalidIndex(format!(
+                        "{dimension} index {index} is out of bounds for {kind} with extent {extent}"
+                    )));
+                }
             }
-            Ok((indices.clone(), current_extent.max(max_index)))
+
+            let target_extent = if mode == SelectorPlanMode::Assignment {
+                indices.iter().copied().max().map_or(extent, |index| extent.max(index))
+            } else {
+                extent
+            };
+            Ok(SelectorPlan {
+                source: SelectorSource::Numeric,
+                output_rows: indices.len(),
+                output_cols: 1,
+                output_dims: vec![indices.len()],
+                target_extent,
+                indices,
+            })
         }
-        EvaluatedIndexArgument::FullSlice => Ok(((1..=current_extent).collect(), current_extent)),
+        EvaluatedIndexArgument::FullSlice => Ok(SelectorPlan {
+            source: SelectorSource::FullSlice,
+            indices: (1..=extent).collect(),
+            output_rows: extent,
+            output_cols: 1,
+            output_dims: vec![extent],
+            target_extent: extent,
+        }),
     }
+}
+
+fn plan_linear_selector(
+    argument: &EvaluatedIndexArgument,
+    rows: usize,
+    cols: usize,
+    _dims: &[usize],
+    kind: &str,
+    mode: SelectorPlanMode,
+) -> Result<SelectorPlan, RuntimeError> {
+    let current_extent = rows * cols;
+    match argument {
+        EvaluatedIndexArgument::Numeric {
+            values,
+            rows: selection_rows,
+            cols: selection_cols,
+            dims: selector_dims,
+            logical,
+        } => {
+            if *logical && is_logical_selector(values) && values.len() == current_extent {
+                let indices =
+                    logical_selector_indices(values, *selection_rows, *selection_cols, selector_dims);
+                let (output_rows, output_cols) =
+                    logical_linear_result_shape(rows, cols, indices.len());
+                return Ok(SelectorPlan {
+                    source: SelectorSource::LogicalMask,
+                    output_rows,
+                    output_cols,
+                    output_dims: vec![output_rows, output_cols],
+                    target_extent: current_extent,
+                    indices,
+                });
+            }
+            if *logical && is_logical_selector(values) {
+                let indices = bounded_logical_selector_indices(
+                    values,
+                    *selection_rows,
+                    *selection_cols,
+                    selector_dims,
+                    current_extent,
+                    "linear",
+                    kind,
+                )?;
+                let (output_rows, output_cols) =
+                    logical_linear_result_shape(rows, cols, indices.len());
+                return Ok(SelectorPlan {
+                    source: SelectorSource::LogicalMask,
+                    output_rows,
+                    output_cols,
+                    output_dims: vec![output_rows, output_cols],
+                    target_extent: current_extent,
+                    indices,
+                });
+            }
+            if is_scalar_logical_selector(values, *logical) {
+                let indices = scalar_logical_selection_positions(values[0]);
+                let (output_rows, output_cols) =
+                    logical_linear_result_shape(rows, cols, indices.len());
+                return Ok(SelectorPlan {
+                    source: SelectorSource::ScalarLogical,
+                    output_rows,
+                    output_cols,
+                    output_dims: vec![output_rows, output_cols],
+                    target_extent: current_extent,
+                    indices,
+                });
+            }
+
+            let indices = numeric_selector_indices(values)?;
+            let target_extent = if mode == SelectorPlanMode::Assignment {
+                indices
+                    .iter()
+                    .copied()
+                    .max()
+                    .map_or(current_extent, |index| current_extent.max(index))
+            } else {
+                current_extent
+            };
+            Ok(SelectorPlan {
+                source: SelectorSource::Numeric,
+                output_rows: *selection_rows,
+                output_cols: *selection_cols,
+                output_dims: vec![*selection_rows, *selection_cols],
+                target_extent,
+                indices,
+            })
+        }
+        EvaluatedIndexArgument::FullSlice => Ok(SelectorPlan {
+            source: SelectorSource::FullSlice,
+            indices: (1..=current_extent).collect(),
+            output_rows: current_extent,
+            output_cols: 1,
+            output_dims: vec![current_extent, 1],
+            target_extent: current_extent,
+        }),
+    }
+}
+
+fn assignment_dimension_indices(
+    argument: &EvaluatedIndexArgument,
+    current_extent: usize,
+    dimension: &str,
+    kind: &str,
+) -> Result<(Vec<usize>, usize), RuntimeError> {
+    let plan = plan_dimension_selector(
+        argument,
+        current_extent,
+        dimension,
+        kind,
+        SelectorPlanMode::Assignment,
+    )?;
+    Ok((plan.indices, plan.target_extent))
 }
 
 fn linear_selection(
@@ -8472,92 +8512,19 @@ fn linear_selection(
     dims: &[usize],
     kind: &str,
 ) -> Result<IndexSelection, RuntimeError> {
-    match argument {
-        EvaluatedIndexArgument::Numeric {
-            values,
-            rows: selection_rows,
-            cols: selection_cols,
-            dims,
-            logical,
-        } => {
-            if *logical && is_logical_selector(values) && values.len() == rows * cols {
-                let positions =
-                    logical_selector_indices(values, *selection_rows, *selection_cols, dims)
-                        .into_iter()
-                        .map(|index| linear_position_for_dimensions(index, rows, cols, dims, kind))
-                        .collect::<Result<Vec<_>, _>>()?;
-                let (result_rows, result_cols) =
-                    logical_linear_result_shape(rows, cols, positions.len());
-                return Ok(IndexSelection {
-                    positions,
-                    rows: result_rows,
-                    cols: result_cols,
-                    dims: vec![result_rows, result_cols],
-                    linear: true,
-                });
-            }
-            if *logical && is_logical_selector(values) {
-                let positions = bounded_logical_selector_indices(
-                    values,
-                    *selection_rows,
-                    *selection_cols,
-                    dims,
-                    rows * cols,
-                    "linear",
-                    kind,
-                )?
-                .into_iter()
-                .map(|index| linear_position_for_dimensions(index, rows, cols, dims, kind))
-                .collect::<Result<Vec<_>, _>>()?;
-                let (result_rows, result_cols) =
-                    logical_linear_result_shape(rows, cols, positions.len());
-                return Ok(IndexSelection {
-                    positions,
-                    rows: result_rows,
-                    cols: result_cols,
-                    dims: vec![result_rows, result_cols],
-                    linear: true,
-                });
-            }
-            if is_scalar_logical_selector(values, *logical) {
-                let positions = scalar_logical_selection_positions(values[0])
-                    .into_iter()
-                    .map(|index| linear_position_for_dimensions(index, rows, cols, dims, kind))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let (result_rows, result_cols) =
-                    logical_linear_result_shape(rows, cols, positions.len());
-                return Ok(IndexSelection {
-                    positions,
-                    rows: result_rows,
-                    cols: result_cols,
-                    dims: vec![result_rows, result_cols],
-                    linear: true,
-                });
-            }
-
-            let indices = numeric_selector_indices(values)?;
-            Ok(IndexSelection {
-                positions: indices
-                    .iter()
-                    .copied()
-                    .map(|index| linear_position_for_dimensions(index, rows, cols, dims, kind))
-                    .collect::<Result<Vec<_>, _>>()?,
-                rows: *selection_rows,
-                cols: *selection_cols,
-                dims: vec![*selection_rows, *selection_cols],
-                linear: true,
-            })
-        }
-        EvaluatedIndexArgument::FullSlice => Ok(IndexSelection {
-            positions: (1..=rows * cols)
-                .map(|index| linear_position_for_dimensions(index, rows, cols, dims, kind))
-                .collect::<Result<Vec<_>, _>>()?,
-            rows: rows * cols,
-            cols: 1,
-            dims: vec![rows * cols, 1],
-            linear: true,
-        }),
-    }
+    let plan = plan_linear_selector(argument, rows, cols, dims, kind, SelectorPlanMode::Selection)?;
+    Ok(IndexSelection {
+        positions: plan
+            .indices
+            .iter()
+            .copied()
+            .map(|index| linear_position_for_dimensions(index, rows, cols, dims, kind))
+            .collect::<Result<Vec<_>, _>>()?,
+        rows: plan.output_rows,
+        cols: plan.output_cols,
+        dims: plan.output_dims,
+        linear: true,
+    })
 }
 
 fn row_col_selection(
@@ -8696,40 +8663,10 @@ fn dimension_indices(
     dimension: &str,
     kind: &str,
 ) -> Result<Vec<usize>, RuntimeError> {
-    match argument {
-        EvaluatedIndexArgument::Numeric {
-            values,
-            rows,
-            cols,
-            dims,
-            logical,
-        } => {
-            if *logical && is_logical_selector(values) && values.len() == extent {
-                return Ok(logical_selector_indices(values, *rows, *cols, dims));
-            }
-            if *logical && is_logical_selector(values) {
-                return bounded_logical_selector_indices(
-                    values, *rows, *cols, dims, extent, dimension, kind,
-                );
-            }
-            if is_scalar_logical_selector(values, *logical) {
-                return Ok(scalar_logical_selection_positions(values[0]));
-            }
-
-            let indices = numeric_selector_indices(values)?;
-            if let Some(index) = indices
-                .iter()
-                .copied()
-                .find(|index| *index == 0 || *index > extent)
-            {
-                return Err(RuntimeError::InvalidIndex(format!(
-                    "{dimension} index {index} is out of bounds for {kind} with extent {extent}"
-                )));
-            }
-            Ok(indices.clone())
-        }
-        EvaluatedIndexArgument::FullSlice => Ok((1..=extent).collect()),
-    }
+    Ok(
+        plan_dimension_selector(argument, extent, dimension, kind, SelectorPlanMode::Selection)?
+            .indices,
+    )
 }
 
 fn matrix_assignment_values(
@@ -8748,7 +8685,7 @@ fn expand_matrix_assignment_values(
 ) -> Result<Vec<Value>, RuntimeError> {
     let count = selection.positions.len();
     if matrix.rows * matrix.cols == 1 {
-        return Ok(vec![matrix.elements[0].clone(); count]);
+        return Ok(vec![matrix.elements()[0].clone(); count]);
     }
 
     if selection.linear {
@@ -8762,11 +8699,11 @@ fn expand_matrix_assignment_values(
         return linearized_matrix_elements(matrix);
     }
 
-    if equivalent_dimensions(&matrix.dims, &selection.dims) {
-        return Ok(matrix.elements.clone());
+    if equivalent_dimensions(matrix.dims(), &selection.dims) {
+        return Ok(matrix.elements().to_vec());
     }
 
-    if matrix.elements.len() == count {
+    if matrix.element_count() == count {
         return Ok(reorder_matlab_linear_values_to_row_major(
             linearized_matrix_elements(matrix)?,
             &selection.dims,
@@ -8775,7 +8712,8 @@ fn expand_matrix_assignment_values(
 
     Err(RuntimeError::ShapeError(format!(
         "matrix assignment expects rhs dimensions {:?}, found {:?}",
-        selection.dims, matrix.dims
+        selection.dims,
+        matrix.dims()
     )))
 }
 
@@ -8828,7 +8766,7 @@ fn expand_cell_assignment_values(
 ) -> Result<Vec<Value>, RuntimeError> {
     let count = selection.positions.len();
     if cell.rows == 1 && cell.cols == 1 {
-        return Ok(vec![cell.elements[0].clone(); count]);
+        return Ok(vec![cell.elements()[0].clone(); count]);
     }
 
     if selection.linear {
@@ -8842,11 +8780,11 @@ fn expand_cell_assignment_values(
         return linearized_cell_elements(cell);
     }
 
-    if equivalent_dimensions(&cell.dims, &selection.dims) {
-        return Ok(cell.elements.clone());
+    if equivalent_dimensions(cell.dims(), &selection.dims) {
+        return Ok(cell.elements().to_vec());
     }
 
-    if cell.elements.len() == count {
+    if cell.element_count() == count {
         return Ok(reorder_matlab_linear_values_to_row_major(
             linearized_cell_elements(cell)?,
             &selection.dims,
@@ -8855,7 +8793,8 @@ fn expand_cell_assignment_values(
 
     Err(RuntimeError::ShapeError(format!(
         "cell assignment expects rhs dimensions {:?}, found {:?}",
-        selection.dims, cell.dims
+        selection.dims,
+        cell.dims()
     )))
 }
 
@@ -8874,16 +8813,16 @@ fn distributed_cell_assignment_values(
         return Ok(Vec::new());
     }
     if cell.rows == 1 && cell.cols == 1 {
-        return Ok(vec![cell.elements[0].clone(); count]);
+        return Ok(vec![cell.elements()[0].clone(); count]);
     }
-    if cell.elements.len() == count {
+    if cell.element_count() == count {
         return linearized_cell_elements(cell);
     }
 
     Err(RuntimeError::ShapeError(format!(
         "cell-content assignment expects {} rhs element(s), found {}",
         count,
-        cell.elements.len()
+        cell.element_count()
     )))
 }
 
@@ -9683,13 +9622,13 @@ fn is_empty_matrix_value(value: &Value) -> bool {
 }
 
 fn linearized_matrix_elements(matrix: &MatrixValue) -> Result<Vec<Value>, RuntimeError> {
-    (1..=matrix.elements.len())
+    (1..=matrix.element_count())
         .map(|index| {
-            Ok(matrix.elements[linear_position_for_dimensions(
+            Ok(matrix.elements()[linear_position_for_dimensions(
                 index,
                 matrix.rows,
                 matrix.cols,
-                &matrix.dims,
+                matrix.dims(),
                 "matrix",
             )?]
             .clone())
@@ -9698,13 +9637,13 @@ fn linearized_matrix_elements(matrix: &MatrixValue) -> Result<Vec<Value>, Runtim
 }
 
 fn linearized_cell_elements(cell: &CellValue) -> Result<Vec<Value>, RuntimeError> {
-    (1..=cell.elements.len())
+    (1..=cell.element_count())
         .map(|index| {
-            Ok(cell.elements[linear_position_for_dimensions(
+            Ok(cell.elements()[linear_position_for_dimensions(
                 index,
                 cell.rows,
                 cell.cols,
-                &cell.dims,
+                cell.dims(),
                 "cell array",
             )?]
             .clone())
@@ -9805,17 +9744,11 @@ fn evaluated_index_argument(value: Value) -> Result<EvaluatedIndexArgument, Runt
             logical: true,
         }),
         Value::Matrix(matrix) => Ok(EvaluatedIndexArgument::Numeric {
-            values: matrix
-                .elements
-                .iter()
-                .map(Value::as_scalar)
-                .collect::<Result<Vec<_>, _>>()?,
+            values: matrix.scalar_elements()?,
             rows: matrix.rows,
             cols: matrix.cols,
-            dims: matrix.dims.clone(),
-            logical: matrix
-                .iter()
-                .all(|element| matches!(element, Value::Logical(_))),
+            dims: matrix.dims().to_vec(),
+            logical: matrix.storage_class() == ArrayStorageClass::Logical,
         }),
         other => Err(RuntimeError::TypeError(format!(
             "indexing expects numeric scalar or matrix selectors, found {}",
@@ -10838,9 +10771,10 @@ mod tests {
         consume_figure_backend_events, distributed_cell_assignment_values,
         distributed_struct_assignment_values, execute_script, execute_script_bytecode,
         invoke_graphics_builtin_outputs, linearized_cell_elements, linearized_matrix_elements,
-        logical_value, render_execution_result, render_figure_backend_index,
-        render_matlab_execution_result, render_native_figure_host_index, session_manifest_json,
-        FigureBackendState, Frame, HirItem, Interpreter, RenderedFigure,
+        logical_value, plan_dimension_selector, plan_linear_selector, render_execution_result,
+        render_figure_backend_index, render_matlab_execution_result,
+        render_native_figure_host_index, session_manifest_json, EvaluatedIndexArgument,
+        FigureBackendState, Frame, HirItem, Interpreter, RenderedFigure, SelectorPlanMode,
     };
     use matlab_frontend::{
         parser::{parse_source, ParseMode},
@@ -11673,6 +11607,85 @@ mod tests {
                 .contains("expected positive integer index, found 0"),
             "{bytecode}"
         );
+    }
+
+    #[test]
+    fn selector_planner_accepts_longer_logical_masks_when_extra_entries_are_false() {
+        let logical_linear = EvaluatedIndexArgument::Numeric {
+            values: vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            rows: 1,
+            cols: 10,
+            dims: vec![1, 10],
+            logical: true,
+        };
+        let linear_plan = plan_linear_selector(
+            &logical_linear,
+            2,
+            4,
+            &[2, 2, 2],
+            "matrix",
+            SelectorPlanMode::Selection,
+        )
+        .expect("linear logical selector plan");
+        assert_eq!(linear_plan.indices, vec![1, 3, 5, 7]);
+        assert_eq!(linear_plan.output_dims, vec![4, 1]);
+
+        let logical_axis = EvaluatedIndexArgument::Numeric {
+            values: vec![1.0, 0.0, 1.0, 0.0, 0.0],
+            rows: 1,
+            cols: 5,
+            dims: vec![1, 5],
+            logical: true,
+        };
+        let axis_plan = plan_dimension_selector(
+            &logical_axis,
+            3,
+            "column",
+            "matrix",
+            SelectorPlanMode::Selection,
+        )
+        .expect("dimension logical selector plan");
+        assert_eq!(axis_plan.indices, vec![1, 3]);
+        assert_eq!(axis_plan.target_extent, 3);
+    }
+
+    #[test]
+    fn selector_planner_only_grows_numeric_assignment_extents() {
+        let numeric = EvaluatedIndexArgument::Numeric {
+            values: vec![2.0, 5.0],
+            rows: 1,
+            cols: 2,
+            dims: vec![1, 2],
+            logical: false,
+        };
+        let numeric_plan = plan_dimension_selector(
+            &numeric,
+            3,
+            "column",
+            "matrix",
+            SelectorPlanMode::Assignment,
+        )
+        .expect("numeric assignment selector plan");
+        assert_eq!(numeric_plan.indices, vec![2, 5]);
+        assert_eq!(numeric_plan.target_extent, 5);
+
+        let logical = EvaluatedIndexArgument::Numeric {
+            values: vec![1.0, 0.0, 1.0, 0.0, 0.0],
+            rows: 1,
+            cols: 5,
+            dims: vec![1, 5],
+            logical: true,
+        };
+        let logical_plan = plan_dimension_selector(
+            &logical,
+            3,
+            "column",
+            "matrix",
+            SelectorPlanMode::Assignment,
+        )
+        .expect("logical assignment selector plan");
+        assert_eq!(logical_plan.indices, vec![1, 3]);
+        assert_eq!(logical_plan.target_extent, 3);
     }
 
     #[test]
