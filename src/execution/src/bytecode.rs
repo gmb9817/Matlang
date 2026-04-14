@@ -1163,6 +1163,45 @@ impl BytecodeVm {
                     )
                     .map(wrap_vm_values);
             }
+            if parsed.display_name == "arrayfun" {
+                return super::execute_arrayfun_builtin_outputs(
+                    &args,
+                    requested_outputs,
+                    |callback, call_args, requested| {
+                        let Value::FunctionHandle(handle) = callback else {
+                            unreachable!("arrayfun callback parser produces function handles");
+                        };
+                        self.call_function_value_outputs(frame, handle, call_args, requested)
+                    },
+                )
+                .map(wrap_vm_values);
+            }
+            if parsed.display_name == "cellfun" {
+                return super::execute_cellfun_builtin_outputs(
+                    &args,
+                    requested_outputs,
+                    |callback, call_args, requested| {
+                        let Value::FunctionHandle(handle) = callback else {
+                            unreachable!("cellfun callback parser produces function handles");
+                        };
+                        self.call_function_value_outputs(frame, handle, call_args, requested)
+                    },
+                )
+                .map(wrap_vm_values);
+            }
+            if parsed.display_name == "structfun" {
+                return super::execute_structfun_builtin_outputs(
+                    &args,
+                    requested_outputs,
+                    |callback, call_args, requested| {
+                        let Value::FunctionHandle(handle) = callback else {
+                            unreachable!("structfun callback parser produces function handles");
+                        };
+                        self.call_function_value_outputs(frame, handle, call_args, requested)
+                    },
+                )
+                .map(wrap_vm_values);
+            }
             return invoke_runtime_builtin_outputs(
                 &self.shared_state,
                 None,
@@ -1217,6 +1256,45 @@ impl BytecodeVm {
             return self
                 .invoke_fcontour3_builtin_outputs(frame, &args, requested_outputs)
                 .map(wrap_vm_values);
+        }
+        if parsed.display_name == "arrayfun" {
+            return super::execute_arrayfun_builtin_outputs(
+                &args,
+                requested_outputs,
+                |callback, call_args, requested| {
+                    let Value::FunctionHandle(handle) = callback else {
+                        unreachable!("arrayfun callback parser produces function handles");
+                    };
+                    self.call_function_value_outputs(frame, handle, call_args, requested)
+                },
+            )
+            .map(wrap_vm_values);
+        }
+        if parsed.display_name == "cellfun" {
+            return super::execute_cellfun_builtin_outputs(
+                &args,
+                requested_outputs,
+                |callback, call_args, requested| {
+                    let Value::FunctionHandle(handle) = callback else {
+                        unreachable!("cellfun callback parser produces function handles");
+                    };
+                    self.call_function_value_outputs(frame, handle, call_args, requested)
+                },
+            )
+            .map(wrap_vm_values);
+        }
+        if parsed.display_name == "structfun" {
+            return super::execute_structfun_builtin_outputs(
+                &args,
+                requested_outputs,
+                |callback, call_args, requested| {
+                    let Value::FunctionHandle(handle) = callback else {
+                        unreachable!("structfun callback parser produces function handles");
+                    };
+                    self.call_function_value_outputs(frame, handle, call_args, requested)
+                },
+            )
+            .map(wrap_vm_values);
         }
         if matches!(
             parsed.display_name.as_str(),
@@ -1390,6 +1468,42 @@ impl BytecodeVm {
                 }
                 if name == "close" {
                     return self.invoke_close_builtin_outputs(frame, args, requested_outputs);
+                }
+                if name == "arrayfun" {
+                    return super::execute_arrayfun_builtin_outputs(
+                        args,
+                        requested_outputs,
+                        |callback, call_args, requested| {
+                            let Value::FunctionHandle(handle) = callback else {
+                                unreachable!("arrayfun callback parser produces function handles");
+                            };
+                            self.call_function_value_outputs(frame, handle, call_args, requested)
+                        },
+                    );
+                }
+                if name == "cellfun" {
+                    return super::execute_cellfun_builtin_outputs(
+                        args,
+                        requested_outputs,
+                        |callback, call_args, requested| {
+                            let Value::FunctionHandle(handle) = callback else {
+                                unreachable!("cellfun callback parser produces function handles");
+                            };
+                            self.call_function_value_outputs(frame, handle, call_args, requested)
+                        },
+                    );
+                }
+                if name == "structfun" {
+                    return super::execute_structfun_builtin_outputs(
+                        args,
+                        requested_outputs,
+                        |callback, call_args, requested| {
+                            let Value::FunctionHandle(handle) = callback else {
+                                unreachable!("structfun callback parser produces function handles");
+                            };
+                            self.call_function_value_outputs(frame, handle, call_args, requested)
+                        },
+                    );
                 }
                 if matches!(name.as_str(), "figure" | "set") {
                     return self.invoke_graphics_builtin_with_resize_callbacks(

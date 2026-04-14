@@ -273,6 +273,26 @@ fn builtin_array_helpers_fixture_matches_golden() {
 }
 
 #[test]
+fn builtin_arrayfun_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_arrayfun_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
+fn builtin_cellfun_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_cellfun_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
+fn builtin_structfun_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_structfun_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
+fn builtin_blockdiag_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_blockdiag_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
 fn builtin_container_helpers_fixture_matches_golden() {
     assert_fixture("builtin_container_helpers", ParseMode::Script, &[]);
 }

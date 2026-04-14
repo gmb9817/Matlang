@@ -1,0 +1,4 @@
+workspace
+  a = [2 ; 3]
+  b = {[1, 2] ; [2, 3]}
+  s = struct{a=1, b=2}

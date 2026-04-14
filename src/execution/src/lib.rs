@@ -553,6 +553,305 @@ fn invoke_runtime_builtin_outputs(
     }
 }
 
+#[derive(Debug, Clone)]
+struct ArrayfunOperand {
+    dims: Vec<usize>,
+    elements: Vec<Value>,
+}
+
+fn arrayfun_callback_value(value: &Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::FunctionHandle(_) => Ok(value.clone()),
+        Value::CharArray(text) | Value::String(text) => Ok(Value::FunctionHandle(
+            FunctionHandleValue {
+                display_name: text.clone(),
+                target: FunctionHandleTarget::Named(text.clone()),
+            },
+        )),
+        other => Err(RuntimeError::TypeError(format!(
+            "arrayfun currently expects a function handle or text function name, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn arrayfun_operand_from_value(value: &Value) -> Result<ArrayfunOperand, RuntimeError> {
+    match value {
+        Value::Matrix(matrix) => Ok(ArrayfunOperand {
+            dims: matrix.dims().to_vec(),
+            elements: matrix.elements().to_vec(),
+        }),
+        Value::Cell(_) => Err(RuntimeError::TypeError(
+            "arrayfun currently does not accept cell array inputs; use cellfun instead"
+                .to_string(),
+        )),
+        other => Ok(ArrayfunOperand {
+            dims: vec![1, 1],
+            elements: vec![other.clone()],
+        }),
+    }
+}
+
+fn split_uniform_output_option<'a>(
+    rest: &'a [Value],
+    builtin_name: &str,
+) -> Result<(&'a [Value], bool), RuntimeError> {
+    let mut uniform_output = true;
+    let inputs = if rest.len() >= 2
+        && matches!(&rest[rest.len() - 2], Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("UniformOutput"))
+    {
+        uniform_output = match &rest[rest.len() - 1] {
+            Value::Logical(flag) => *flag,
+            Value::Scalar(number) if *number == 0.0 => false,
+            Value::Scalar(number) if *number == 1.0 => true,
+            other => {
+                return Err(RuntimeError::TypeError(format!(
+                    "{builtin_name} currently expects UniformOutput to be true or false, found {}",
+                    other.kind_name()
+                )))
+            }
+        };
+        &rest[..rest.len() - 2]
+    } else {
+        rest
+    };
+    Ok((inputs, uniform_output))
+}
+
+fn parse_arrayfun_arguments(args: &[Value]) -> Result<(Value, Vec<ArrayfunOperand>, bool), RuntimeError> {
+    let Some((callback, rest)) = args.split_first() else {
+        return Err(RuntimeError::Unsupported(
+            "arrayfun currently expects a function handle plus at least one input array"
+                .to_string(),
+        ));
+    };
+    let (inputs, uniform_output) = split_uniform_output_option(rest, "arrayfun")?;
+
+    if inputs.is_empty() {
+        return Err(RuntimeError::Unsupported(
+            "arrayfun currently expects at least one input array".to_string(),
+        ));
+    }
+
+    let callback = arrayfun_callback_value(callback)?;
+    let operands = inputs
+        .iter()
+        .map(arrayfun_operand_from_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let first = operands.first().expect("inputs are nonempty");
+    for operand in operands.iter().skip(1) {
+        if operand.elements.len() != first.elements.len()
+            || !equivalent_dimensions(&operand.dims, &first.dims)
+        {
+            return Err(RuntimeError::ShapeError(
+                "arrayfun currently expects all input arrays to have the same size".to_string(),
+            ));
+        }
+    }
+
+    Ok((callback, operands, uniform_output))
+}
+
+fn cellfun_operand_from_value(value: &Value) -> Result<ArrayfunOperand, RuntimeError> {
+    match value {
+        Value::Cell(cell) => Ok(ArrayfunOperand {
+            dims: cell.dims().to_vec(),
+            elements: cell.elements().to_vec(),
+        }),
+        other => Err(RuntimeError::TypeError(format!(
+            "cellfun currently expects cell array inputs, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn parse_cellfun_arguments(args: &[Value]) -> Result<(Value, Vec<ArrayfunOperand>, bool), RuntimeError> {
+    let Some((callback, rest)) = args.split_first() else {
+        return Err(RuntimeError::Unsupported(
+            "cellfun currently expects a function handle plus at least one cell array".to_string(),
+        ));
+    };
+    let (inputs, uniform_output) = split_uniform_output_option(rest, "cellfun")?;
+    if inputs.is_empty() {
+        return Err(RuntimeError::Unsupported(
+            "cellfun currently expects at least one cell array".to_string(),
+        ));
+    }
+
+    let callback = arrayfun_callback_value(callback)?;
+    let operands = inputs
+        .iter()
+        .map(cellfun_operand_from_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let first = operands.first().expect("inputs are nonempty");
+    for operand in operands.iter().skip(1) {
+        if operand.elements.len() != first.elements.len()
+            || !equivalent_dimensions(&operand.dims, &first.dims)
+        {
+            return Err(RuntimeError::ShapeError(
+                "cellfun currently expects all input cell arrays to have the same size"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok((callback, operands, uniform_output))
+}
+
+fn parse_structfun_arguments(args: &[Value]) -> Result<(Value, Vec<ArrayfunOperand>, bool), RuntimeError> {
+    let Some((callback, rest)) = args.split_first() else {
+        return Err(RuntimeError::Unsupported(
+            "structfun currently expects a function handle plus a scalar struct input".to_string(),
+        ));
+    };
+    let (inputs, uniform_output) = split_uniform_output_option(rest, "structfun")?;
+    let [value] = inputs else {
+        return Err(RuntimeError::Unsupported(
+            "structfun currently expects exactly one struct input".to_string(),
+        ));
+    };
+    let Value::Struct(struct_value) = value else {
+        return Err(RuntimeError::TypeError(format!(
+            "structfun currently expects a scalar struct input, found {}",
+            value.kind_name()
+        )));
+    };
+    let callback = arrayfun_callback_value(callback)?;
+    Ok((
+        callback,
+        vec![ArrayfunOperand {
+            dims: vec![struct_value.fields.len(), 1],
+            elements: struct_value.fields.values().cloned().collect(),
+        }],
+        uniform_output,
+    ))
+}
+
+fn normalize_arrayfun_uniform_output(value: Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Matrix(matrix) if matrix.element_count() == 1 => Ok(matrix.elements()[0].clone()),
+        Value::Cell(_) => Err(RuntimeError::Unsupported(
+            "arrayfun with UniformOutput=true currently requires scalar outputs".to_string(),
+        )),
+        Value::Matrix(_) => Err(RuntimeError::Unsupported(
+            "arrayfun with UniformOutput=true currently requires scalar outputs".to_string(),
+        )),
+        other => Ok(other),
+    }
+}
+
+fn build_arrayfun_output(dims: &[usize], values: Vec<Value>, uniform_output: bool) -> Result<Value, RuntimeError> {
+    let (rows, cols) = storage_shape_from_dimensions(dims);
+    if uniform_output {
+        if rows == 1 && cols == 1 && values.len() == 1 {
+            return Ok(values.into_iter().next().expect("scalar arrayfun output"));
+        }
+        Ok(Value::Matrix(MatrixValue::with_dimensions(
+            rows,
+            cols,
+            dims.to_vec(),
+            values,
+        )?))
+    } else {
+        Ok(Value::Cell(CellValue::with_dimensions(
+            rows,
+            cols,
+            dims.to_vec(),
+            values,
+        )?))
+    }
+}
+
+pub(crate) fn execute_arrayfun_builtin_outputs<F>(
+    args: &[Value],
+    output_arity: usize,
+    invoke_callback: F,
+) -> Result<Vec<Value>, RuntimeError>
+where
+    F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
+{
+    let output_arity = output_arity.max(1);
+    let (callback, operands, uniform_output) = parse_arrayfun_arguments(args)?;
+    execute_elementwise_callback_outputs(callback, operands, uniform_output, output_arity, "arrayfun", invoke_callback)
+}
+
+pub(crate) fn execute_cellfun_builtin_outputs<F>(
+    args: &[Value],
+    output_arity: usize,
+    invoke_callback: F,
+) -> Result<Vec<Value>, RuntimeError>
+where
+    F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
+{
+    let output_arity = output_arity.max(1);
+    let (callback, operands, uniform_output) = parse_cellfun_arguments(args)?;
+    execute_elementwise_callback_outputs(callback, operands, uniform_output, output_arity, "cellfun", invoke_callback)
+}
+
+pub(crate) fn execute_structfun_builtin_outputs<F>(
+    args: &[Value],
+    output_arity: usize,
+    invoke_callback: F,
+) -> Result<Vec<Value>, RuntimeError>
+where
+    F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
+{
+    let output_arity = output_arity.max(1);
+    let (callback, operands, uniform_output) = parse_structfun_arguments(args)?;
+    execute_elementwise_callback_outputs(callback, operands, uniform_output, output_arity, "structfun", invoke_callback)
+}
+
+fn execute_elementwise_callback_outputs<F>(
+    callback: Value,
+    operands: Vec<ArrayfunOperand>,
+    uniform_output: bool,
+    output_arity: usize,
+    builtin_name: &str,
+    mut invoke_callback: F,
+) -> Result<Vec<Value>, RuntimeError>
+where
+    F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
+{
+    let dims = operands
+        .first()
+        .map(|operand| operand.dims.clone())
+        .unwrap_or_else(|| vec![1, 1]);
+    let element_count = operands
+        .first()
+        .map(|operand| operand.elements.len())
+        .unwrap_or(1);
+
+    let mut per_output = (0..output_arity)
+        .map(|_| Vec::with_capacity(element_count))
+        .collect::<Vec<_>>();
+
+    for index in 0..element_count {
+        let element_args = operands
+            .iter()
+            .map(|operand| operand.elements[index].clone())
+            .collect::<Vec<_>>();
+        let outputs = invoke_callback(&callback, &element_args, output_arity)?;
+        if outputs.len() < output_arity {
+            return Err(RuntimeError::Unsupported(format!(
+                "{builtin_name} requested {output_arity} output(s), but the callback produced {}",
+                outputs.len()
+            )));
+        }
+        for output_index in 0..output_arity {
+            let value = if uniform_output {
+                normalize_arrayfun_uniform_output(outputs[output_index].clone())?
+            } else {
+                outputs[output_index].clone()
+            };
+            per_output[output_index].push(value);
+        }
+    }
+
+    per_output
+        .into_iter()
+        .map(|values| build_arrayfun_output(&dims, values, uniform_output))
+        .collect()
+}
+
 fn invoke_display_builtin_outputs(
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
     name: &str,
@@ -5725,6 +6024,21 @@ impl<'a> Interpreter<'a> {
                 if reference.name == "fcontour3" {
                     return self.invoke_fcontour3_builtin_outputs(frame, args, output_arity);
                 }
+                if reference.name == "arrayfun" {
+                    return execute_arrayfun_builtin_outputs(args, output_arity, |callback, call_args, requested| {
+                        self.call_function_value_outputs(frame, callback, call_args, Some(requested))
+                    });
+                }
+                if reference.name == "cellfun" {
+                    return execute_cellfun_builtin_outputs(args, output_arity, |callback, call_args, requested| {
+                        self.call_function_value_outputs(frame, callback, call_args, Some(requested))
+                    });
+                }
+                if reference.name == "structfun" {
+                    return execute_structfun_builtin_outputs(args, output_arity, |callback, call_args, requested| {
+                        self.call_function_value_outputs(frame, callback, call_args, Some(requested))
+                    });
+                }
                 if matches!(
                     reference.name.as_str(),
                     "clear" | "clearvars" | "save" | "load"
@@ -6324,6 +6638,48 @@ impl<'a> Interpreter<'a> {
                                 frame,
                                 args,
                                 requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "arrayfun" {
+                            return execute_arrayfun_builtin_outputs(
+                                args,
+                                requested_outputs.unwrap_or(1),
+                                |callback, call_args, requested| {
+                                    self.call_function_value_outputs(
+                                        frame,
+                                        callback,
+                                        call_args,
+                                        Some(requested),
+                                    )
+                                },
+                            );
+                        }
+                        if name == "cellfun" {
+                            return execute_cellfun_builtin_outputs(
+                                args,
+                                requested_outputs.unwrap_or(1),
+                                |callback, call_args, requested| {
+                                    self.call_function_value_outputs(
+                                        frame,
+                                        callback,
+                                        call_args,
+                                        Some(requested),
+                                    )
+                                },
+                            );
+                        }
+                        if name == "structfun" {
+                            return execute_structfun_builtin_outputs(
+                                args,
+                                requested_outputs.unwrap_or(1),
+                                |callback, call_args, requested| {
+                                    self.call_function_value_outputs(
+                                        frame,
+                                        callback,
+                                        call_args,
+                                        Some(requested),
+                                    )
+                                },
                             );
                         }
                         if matches!(name.as_str(), "figure" | "set") {
@@ -11686,6 +12042,88 @@ mod tests {
         .expect("logical assignment selector plan");
         assert_eq!(logical_plan.indices, vec![1, 3]);
         assert_eq!(logical_plan.target_extent, 3);
+    }
+
+    #[test]
+    fn arrayfun_supports_uniform_scalar_outputs_in_interpreter_and_bytecode() {
+        let source = "out = arrayfun(@(x) x + 1, [1 2 3]);\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), "workspace\n  out = [2, 3, 4]\n");
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), "workspace\n  out = [2, 3, 4]\n");
+    }
+
+    #[test]
+    fn arrayfun_supports_nonuniform_cell_outputs_in_interpreter_and_bytecode() {
+        let source = "out = arrayfun(@(x) [x x + 1], [1 2], 'UniformOutput', false);\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = {[1, 2], [2, 3]}\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = {[1, 2], [2, 3]}\n"
+        );
+    }
+
+    #[test]
+    fn cellfun_supports_uniform_scalar_outputs_in_interpreter_and_bytecode() {
+        let source = "out = cellfun(@(x) x + 1, {1, 2, 3});\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), "workspace\n  out = [2, 3, 4]\n");
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), "workspace\n  out = [2, 3, 4]\n");
+    }
+
+    #[test]
+    fn cellfun_supports_nonuniform_cell_outputs_in_interpreter_and_bytecode() {
+        let source = "out = cellfun(@(x) [x x + 1], {1, 2}, 'UniformOutput', false);\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = {[1, 2], [2, 3]}\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = {[1, 2], [2, 3]}\n"
+        );
+    }
+
+    #[test]
+    fn structfun_supports_uniform_and_nonuniform_outputs_in_interpreter_and_bytecode() {
+        let uniform_source = "s = struct('a', 1, 'b', 2);\nout = structfun(@(x) x + 1, s);\n";
+        let interpreted = execute_script_source(uniform_source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = [2 ; 3]\n  s = struct{a=1, b=2}\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(uniform_source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = [2 ; 3]\n  s = struct{a=1, b=2}\n"
+        );
+
+        let nonuniform_source =
+            "s = struct('a', 1, 'b', 2);\nout = structfun(@(x) [x x + 1], s, 'UniformOutput', false);\n";
+        let interpreted = execute_script_source(nonuniform_source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = {[1, 2] ; [2, 3]}\n  s = struct{a=1, b=2}\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(nonuniform_source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = {[1, 2] ; [2, 3]}\n  s = struct{a=1, b=2}\n"
+        );
     }
 
     #[test]

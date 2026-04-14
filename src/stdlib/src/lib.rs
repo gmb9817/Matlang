@@ -330,6 +330,7 @@ pub fn invoke_builtin_outputs(
         "horzcat" => Ok(vec![builtin_horzcat(args)?]),
         "vertcat" => Ok(vec![builtin_vertcat(args)?]),
         "cat" => Ok(vec![builtin_cat(args)?]),
+        "blkdiag" => Ok(vec![builtin_blkdiag(args)?]),
         "cell" => Ok(vec![builtin_cell(args)?]),
         "num2cell" => Ok(vec![builtin_num2cell(args)?]),
         "mat2cell" => Ok(vec![builtin_mat2cell(args)?]),
@@ -13760,6 +13761,74 @@ fn builtin_cat(args: &[Value]) -> Result<Value, RuntimeError> {
     concatenate_values(rest, ConcatAxis::Dimension(dimension))
 }
 
+fn builtin_blkdiag(args: &[Value]) -> Result<Value, RuntimeError> {
+    if args.is_empty() {
+        return Ok(Value::Matrix(MatrixValue::new(0, 0, Vec::new())?));
+    }
+
+    let matrices = args
+        .iter()
+        .map(blkdiag_operand)
+        .collect::<Result<Vec<_>, _>>()?;
+    let total_rows = matrices.iter().map(|matrix| matrix.rows).sum::<usize>();
+    let total_cols = matrices.iter().map(|matrix| matrix.cols).sum::<usize>();
+    let fill = if matrices
+        .iter()
+        .all(|matrix| matrix.storage_class() == ArrayStorageClass::Logical)
+    {
+        Value::Logical(false)
+    } else {
+        Value::Scalar(0.0)
+    };
+
+    let mut elements = vec![fill; total_rows * total_cols];
+    let mut row_offset = 0usize;
+    let mut col_offset = 0usize;
+    for matrix in matrices {
+        for row in 0..matrix.rows {
+            for col in 0..matrix.cols {
+                let dest = (row_offset + row) * total_cols + (col_offset + col);
+                elements[dest] = matrix.get(row, col).clone();
+            }
+        }
+        row_offset += matrix.rows;
+        col_offset += matrix.cols;
+    }
+
+    Ok(Value::Matrix(MatrixValue::new(
+        total_rows,
+        total_cols,
+        elements,
+    )?))
+}
+
+fn blkdiag_operand(value: &Value) -> Result<MatrixValue, RuntimeError> {
+    match value {
+        Value::Scalar(number) => Ok(MatrixValue::new(1, 1, vec![Value::Scalar(*number)])?),
+        Value::Logical(flag) => Ok(MatrixValue::new(1, 1, vec![Value::Logical(*flag)])?),
+        Value::Complex(number) => Ok(MatrixValue::new(1, 1, vec![Value::Complex(number.clone())])?),
+        Value::Matrix(matrix) => {
+            if canonical_size_vector(matrix.dims()).len() > 2 {
+                return Err(RuntimeError::TypeError(
+                    "blkdiag currently expects scalar, logical, complex, or 2-D matrix input"
+                        .to_string(),
+                ));
+            }
+            if !matrix_is_supported_structural_input(matrix) {
+                return Err(RuntimeError::TypeError(
+                    "blkdiag currently expects numeric, logical, or complex scalar or matrix input"
+                        .to_string(),
+                ));
+            }
+            Ok(matrix.clone())
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "blkdiag currently expects numeric, logical, or complex scalar or matrix input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
 fn builtin_num2cell(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, kept_dims) = match args {
         [value] => (value, Vec::new()),
@@ -22193,6 +22262,74 @@ mod tests {
                     ],
                 )
                 .expect("row partition result"),
+            )
+        );
+    }
+
+    #[test]
+    fn blkdiag_supports_common_scalar_matrix_and_logical_forms() {
+        assert_eq!(
+            builtin_blkdiag(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        2,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                        ],
+                    )
+                    .expect("lhs"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(5.0), Value::Scalar(6.0)])
+                        .expect("rhs"),
+                ),
+            ])
+            .expect("blkdiag"),
+            Value::Matrix(
+                MatrixValue::new(
+                    3,
+                    4,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(4.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(5.0),
+                        Value::Scalar(6.0),
+                    ],
+                )
+                .expect("blkdiag result"),
+            )
+        );
+
+        assert_eq!(
+            builtin_blkdiag(&[
+                Value::Logical(true),
+                Value::Logical(false),
+            ])
+            .expect("logical blkdiag"),
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Logical(true),
+                        Value::Logical(false),
+                        Value::Logical(false),
+                        Value::Logical(false),
+                    ],
+                )
+                .expect("logical blkdiag result"),
             )
         );
     }
