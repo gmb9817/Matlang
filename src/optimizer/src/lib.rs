@@ -63,6 +63,7 @@ impl Optimizer {
             scope_id: module.scope_id,
             workspace_id: module.workspace_id,
             implicit_ans: module.implicit_ans.clone(),
+            classes: module.classes.clone(),
             items: self.optimize_items(&module.items),
         }
     }
@@ -117,6 +118,7 @@ impl Optimizer {
             HirStatement::Assignment {
                 targets,
                 value,
+                list_assignment,
                 display_suppressed,
             } => vec![HirStatement::Assignment {
                 targets: targets
@@ -124,6 +126,7 @@ impl Optimizer {
                     .map(|target| self.optimize_assignment_target(target))
                     .collect(),
                 value: self.optimize_expression(value),
+                list_assignment: *list_assignment,
                 display_suppressed: *display_suppressed,
             }],
             HirStatement::Expression {

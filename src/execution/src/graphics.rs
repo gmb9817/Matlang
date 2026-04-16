@@ -564,6 +564,17 @@ struct Histogram2SeriesData {
     count_range: (f64, f64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistogramNormalization {
+    Count,
+    Probability,
+    Percentage,
+    CountDensity,
+    Cumcount,
+    Pdf,
+    Cdf,
+}
+
 #[derive(Debug, Clone)]
 struct PieSeriesData {
     slices: Vec<PieSlice>,
@@ -6185,7 +6196,7 @@ fn graphics_property_struct_value(
         }
     }
 
-    Ok(Value::Struct(StructValue { fields }))
+    Ok(Value::Struct(StructValue::from_fields(fields)))
 }
 
 fn apply_graphics_property_pairs(
@@ -9226,41 +9237,25 @@ fn positive_axis_spacing(values: &[f64]) -> f64 {
 }
 
 fn parse_histogram_args(args: &[Value]) -> Result<HistogramSeriesData, RuntimeError> {
-    let (data_value, requested_bins) = match args {
-        [data] => (data, None),
-        [data, requested] => (data, Some(requested)),
-        _ => {
-            return Err(RuntimeError::Unsupported(
-                "histogram currently supports `histogram(data)`, `histogram(data, nbins)`, or `histogram(data, edges)`".to_string(),
-            ))
-        }
+    if let Some(histogram) = try_parse_histogram_property_form(args)? {
+        return Ok(histogram);
+    }
+    let outputs = invoke_stdlib_builtin_outputs("histcounts", args, 2)?;
+    let [counts_value, edges_value] = outputs.as_slice() else {
+        return Err(RuntimeError::Unsupported(
+            "histogram currently expects two outputs from the shared histcounts helper".to_string(),
+        ));
     };
-
-    let (_, _, raw_values) = numeric_matrix(data_value, "histogram")?;
-    let values = raw_values
-        .into_iter()
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-
-    let edges = match requested_bins {
-        None => uniform_histogram_edges(&values, 10),
-        Some(requested) => {
-            let requested_values = numeric_vector(requested, "histogram")?;
-            if requested_values.len() == 1 {
-                uniform_histogram_edges(&values, scalar_usize(requested, "histogram")?)
-            } else {
-                histogram_edges(requested)?
-            }
-        }
-    };
-
-    Ok(HistogramSeriesData {
-        counts: histogram_counts(&values, &edges),
-        edges,
-    })
+    let counts = numeric_vector(counts_value, "histogram")?;
+    let edges = numeric_vector(edges_value, "histogram")?;
+    validate_histogram_counts_and_edges(&counts, &edges, "histogram")?;
+    Ok(HistogramSeriesData { edges, counts })
 }
 
 fn parse_histogram2_args(args: &[Value]) -> Result<Histogram2SeriesData, RuntimeError> {
+    if let Some(histogram2) = try_parse_histogram2_property_form(args)? {
+        return Ok(histogram2);
+    }
     let outputs = invoke_stdlib_builtin_outputs("histcounts2", args, 3)?;
     let [counts_value, x_edges_value, y_edges_value] = outputs.as_slice() else {
         return Err(RuntimeError::Unsupported(
@@ -9293,6 +9288,354 @@ fn parse_histogram2_args(args: &[Value]) -> Result<Histogram2SeriesData, Runtime
             (0.0, upper)
         },
     })
+}
+
+fn try_parse_histogram_property_form(
+    args: &[Value],
+) -> Result<Option<HistogramSeriesData>, RuntimeError> {
+    if args.is_empty() || args.len() % 2 != 0 || !graphics_value_is_text(&args[0]) {
+        return Ok(None);
+    }
+
+    let mut edges = None;
+    let mut counts = None;
+    let mut normalization = HistogramNormalization::Count;
+    let mut seen_normalization = false;
+    for pair in args.chunks_exact(2) {
+        let Some(name) = graphics_text_value(&pair[0]) else {
+            return Ok(None);
+        };
+        if name.eq_ignore_ascii_case("binedges") {
+            if edges.is_some() {
+                return Err(RuntimeError::Unsupported(
+                    "histogram currently supports `BinEdges` at most once".to_string(),
+                ));
+            }
+            edges = Some(histogram_edges(&pair[1])?);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("bincounts") {
+            if counts.is_some() {
+                return Err(RuntimeError::Unsupported(
+                    "histogram currently supports `BinCounts` at most once".to_string(),
+                ));
+            }
+            counts = Some(numeric_vector(&pair[1], "histogram")?);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("normalization") {
+            if seen_normalization {
+                return Err(RuntimeError::Unsupported(
+                    "histogram currently supports `Normalization` at most once".to_string(),
+                ));
+            }
+            normalization = parse_histogram_normalization(&pair[1], "histogram")?;
+            seen_normalization = true;
+            continue;
+        }
+        return Err(RuntimeError::Unsupported(format!(
+            "histogram currently supports only the `BinEdges`, `BinCounts`, and `Normalization` property/value constructor form, found `{name}`"
+        )));
+    }
+
+    match (edges, counts) {
+        (Some(edges), Some(counts)) => {
+            validate_histogram_counts_and_edges(&counts, &edges, "histogram")?;
+            Ok(Some(HistogramSeriesData {
+                counts: normalize_histogram_counts(counts, &edges, normalization),
+                edges,
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(RuntimeError::Unsupported(
+            "histogram property/value construction currently requires both `BinEdges` and `BinCounts`"
+                .to_string(),
+        )),
+    }
+}
+
+fn try_parse_histogram2_property_form(
+    args: &[Value],
+) -> Result<Option<Histogram2SeriesData>, RuntimeError> {
+    if args.is_empty() || args.len() % 2 != 0 || !graphics_value_is_text(&args[0]) {
+        return Ok(None);
+    }
+
+    let mut x_edges = None;
+    let mut y_edges = None;
+    let mut counts = None;
+    let mut normalization = HistogramNormalization::Count;
+    let mut seen_normalization = false;
+    for pair in args.chunks_exact(2) {
+        let Some(name) = graphics_text_value(&pair[0]) else {
+            return Ok(None);
+        };
+        if name.eq_ignore_ascii_case("xbinedges") {
+            if x_edges.is_some() {
+                return Err(RuntimeError::Unsupported(
+                    "histogram2 currently supports `XBinEdges` at most once".to_string(),
+                ));
+            }
+            x_edges = Some(histogram_edges(&pair[1])?);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("ybinedges") {
+            if y_edges.is_some() {
+                return Err(RuntimeError::Unsupported(
+                    "histogram2 currently supports `YBinEdges` at most once".to_string(),
+                ));
+            }
+            y_edges = Some(histogram_edges(&pair[1])?);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("bincounts") {
+            if counts.is_some() {
+                return Err(RuntimeError::Unsupported(
+                    "histogram2 currently supports `BinCounts` at most once".to_string(),
+                ));
+            }
+            counts = Some(numeric_matrix(&pair[1], "histogram2")?);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("normalization") {
+            if seen_normalization {
+                return Err(RuntimeError::Unsupported(
+                    "histogram2 currently supports `Normalization` at most once".to_string(),
+                ));
+            }
+            normalization = parse_histogram_normalization(&pair[1], "histogram2")?;
+            seen_normalization = true;
+            continue;
+        }
+        return Err(RuntimeError::Unsupported(format!(
+            "histogram2 currently supports only the `XBinEdges`, `YBinEdges`, `BinCounts`, and `Normalization` property/value constructor form, found `{name}`"
+        )));
+    }
+
+    match (x_edges, y_edges, counts) {
+        (Some(x_edges), Some(y_edges), Some((rows, cols, counts))) => {
+            validate_histogram2_counts_and_edges(rows, cols, &x_edges, &y_edges)?;
+            let counts = normalize_histogram2_counts(counts, &x_edges, &y_edges, normalization);
+            let upper = counts.iter().copied().fold(0.0, f64::max);
+            Ok(Some(Histogram2SeriesData {
+                x_edges,
+                y_edges,
+                counts,
+                count_range: if upper <= f64::EPSILON {
+                    (0.0, 1.0)
+                } else {
+                    (0.0, upper)
+                },
+            }))
+        }
+        (None, None, None) => Ok(None),
+        _ => Err(RuntimeError::Unsupported(
+            "histogram2 property/value construction currently requires `XBinEdges`, `YBinEdges`, and `BinCounts`"
+                .to_string(),
+        )),
+    }
+}
+
+fn validate_histogram_counts_and_edges(
+    counts: &[f64],
+    edges: &[f64],
+    builtin_name: &str,
+) -> Result<(), RuntimeError> {
+    if counts.len() + 1 != edges.len() {
+        return Err(RuntimeError::ShapeError(format!(
+            "{builtin_name} expects `BinCounts` to have length {} for {} edge value(s), found {}",
+            edges.len().saturating_sub(1),
+            edges.len(),
+            counts.len()
+        )));
+    }
+    if counts.iter().any(|count| !count.is_finite() || *count < 0.0) {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects finite nonnegative bin counts"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_histogram2_counts_and_edges(
+    rows: usize,
+    cols: usize,
+    x_edges: &[f64],
+    y_edges: &[f64],
+) -> Result<(), RuntimeError> {
+    if rows + 1 != x_edges.len() || cols + 1 != y_edges.len() {
+        return Err(RuntimeError::ShapeError(format!(
+            "histogram2 expects `BinCounts` to have size {}x{} for edge lengths {} and {}, found {}x{}",
+            x_edges.len().saturating_sub(1),
+            y_edges.len().saturating_sub(1),
+            x_edges.len(),
+            y_edges.len(),
+            rows,
+            cols
+        )));
+    }
+    Ok(())
+}
+
+fn parse_histogram_normalization(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<HistogramNormalization, RuntimeError> {
+    match text_arg(value, builtin_name)?.to_ascii_lowercase().as_str() {
+        "count" => Ok(HistogramNormalization::Count),
+        "probability" => Ok(HistogramNormalization::Probability),
+        "percentage" => Ok(HistogramNormalization::Percentage),
+        "countdensity" => Ok(HistogramNormalization::CountDensity),
+        "cumcount" => Ok(HistogramNormalization::Cumcount),
+        "pdf" => Ok(HistogramNormalization::Pdf),
+        "cdf" => Ok(HistogramNormalization::Cdf),
+        other => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} `Normalization` currently supports count, probability, percentage, countdensity, cumcount, pdf, or cdf, found `{other}`"
+        ))),
+    }
+}
+
+fn normalize_histogram_counts(
+    mut counts: Vec<f64>,
+    edges: &[f64],
+    normalization: HistogramNormalization,
+) -> Vec<f64> {
+    let sample_count = counts.iter().sum::<f64>();
+    match normalization {
+        HistogramNormalization::Count => counts,
+        HistogramNormalization::Probability => {
+            scale_histogram_counts(&mut counts, sample_count, 1.0);
+            counts
+        }
+        HistogramNormalization::Percentage => {
+            scale_histogram_counts(&mut counts, sample_count, 100.0);
+            counts
+        }
+        HistogramNormalization::CountDensity => {
+            for (count, window) in counts.iter_mut().zip(edges.windows(2)) {
+                *count /= window[1] - window[0];
+            }
+            counts
+        }
+        HistogramNormalization::Cumcount => {
+            accumulate_histogram_counts(&mut counts);
+            counts
+        }
+        HistogramNormalization::Pdf => {
+            for (count, window) in counts.iter_mut().zip(edges.windows(2)) {
+                *count /= window[1] - window[0];
+            }
+            scale_histogram_counts(&mut counts, sample_count, 1.0);
+            counts
+        }
+        HistogramNormalization::Cdf => {
+            accumulate_histogram_counts(&mut counts);
+            scale_histogram_counts(&mut counts, sample_count, 1.0);
+            counts
+        }
+    }
+}
+
+fn normalize_histogram2_counts(
+    mut counts: Vec<f64>,
+    x_edges: &[f64],
+    y_edges: &[f64],
+    normalization: HistogramNormalization,
+) -> Vec<f64> {
+    let sample_count = counts.iter().sum::<f64>();
+    let rows = x_edges.len().saturating_sub(1);
+    let cols = y_edges.len().saturating_sub(1);
+    match normalization {
+        HistogramNormalization::Count => counts,
+        HistogramNormalization::Probability => {
+            scale_histogram_counts(&mut counts, sample_count, 1.0);
+            counts
+        }
+        HistogramNormalization::Percentage => {
+            scale_histogram_counts(&mut counts, sample_count, 100.0);
+            counts
+        }
+        HistogramNormalization::CountDensity => {
+            for row in 0..rows {
+                let x_width = x_edges[row + 1] - x_edges[row];
+                for col in 0..cols {
+                    let y_width = y_edges[col + 1] - y_edges[col];
+                    counts[row * cols + col] /= x_width * y_width;
+                }
+            }
+            counts
+        }
+        HistogramNormalization::Cumcount => {
+            accumulate_histogram2_counts(&mut counts, cols);
+            counts
+        }
+        HistogramNormalization::Pdf => {
+            for row in 0..rows {
+                let x_width = x_edges[row + 1] - x_edges[row];
+                for col in 0..cols {
+                    let y_width = y_edges[col + 1] - y_edges[col];
+                    counts[row * cols + col] /= x_width * y_width;
+                }
+            }
+            scale_histogram_counts(&mut counts, sample_count, 1.0);
+            counts
+        }
+        HistogramNormalization::Cdf => {
+            accumulate_histogram2_counts(&mut counts, cols);
+            scale_histogram_counts(&mut counts, sample_count, 1.0);
+            counts
+        }
+    }
+}
+
+fn scale_histogram_counts(counts: &mut [f64], sample_count: f64, factor: f64) {
+    if sample_count <= f64::EPSILON {
+        return;
+    }
+    let scale = factor / sample_count;
+    for count in counts {
+        *count *= scale;
+    }
+}
+
+fn accumulate_histogram_counts(counts: &mut [f64]) {
+    let mut running = 0.0;
+    for count in counts {
+        running += *count;
+        *count = running;
+    }
+}
+
+fn accumulate_histogram2_counts(counts: &mut [f64], cols: usize) {
+    if cols == 0 {
+        return;
+    }
+    for index in 0..counts.len() {
+        let row = index / cols;
+        let col = index % cols;
+        let mut prefix = counts[index];
+        if row > 0 {
+            prefix += counts[index - cols];
+        }
+        if col > 0 {
+            prefix += counts[index - 1];
+        }
+        if row > 0 && col > 0 {
+            prefix -= counts[index - cols - 1];
+        }
+        counts[index] = prefix;
+    }
+}
+
+fn graphics_text_value(value: &Value) -> Option<&str> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => Some(text),
+        _ => None,
+    }
+}
+
+fn graphics_value_is_text(value: &Value) -> bool {
+    matches!(value, Value::CharArray(_) | Value::String(_))
 }
 
 fn parse_pie_args(args: &[Value], builtin_name: &str) -> Result<PieSeriesData, RuntimeError> {
@@ -12136,23 +12479,6 @@ fn row_major_linear_index(index: &[usize], dims: &[usize]) -> usize {
     linear
 }
 
-fn uniform_histogram_edges(values: &[f64], bin_count: usize) -> Vec<f64> {
-    let (mut lower, mut upper) = if values.is_empty() {
-        (0.0, 1.0)
-    } else {
-        finite_min_max(values)
-    };
-    if (upper - lower).abs() <= f64::EPSILON {
-        lower -= 0.5;
-        upper += 0.5;
-    }
-
-    let width = (upper - lower) / bin_count as f64;
-    (0..=bin_count)
-        .map(|index| lower + index as f64 * width)
-        .collect()
-}
-
 fn histogram_edges(value: &Value) -> Result<Vec<f64>, RuntimeError> {
     let edges = numeric_vector(value, "histogram")?;
     if edges.len() < 2 {
@@ -12171,36 +12497,6 @@ fn histogram_edges(value: &Value) -> Result<Vec<f64>, RuntimeError> {
         ));
     }
     Ok(edges)
-}
-
-fn histogram_counts(values: &[f64], edges: &[f64]) -> Vec<f64> {
-    let mut counts = vec![0.0; edges.len().saturating_sub(1)];
-    if counts.is_empty() {
-        return counts;
-    }
-
-    let lower = edges[0];
-    let upper = edges[edges.len() - 1];
-    for &value in values {
-        if value < lower || value > upper {
-            continue;
-        }
-
-        let index = if (value - upper).abs() <= f64::EPSILON {
-            counts.len() - 1
-        } else {
-            match edges
-                .windows(2)
-                .position(|window| value >= window[0] && value < window[1])
-            {
-                Some(index) => index,
-                None => continue,
-            }
-        };
-        counts[index] += 1.0;
-    }
-
-    counts
 }
 
 fn pie_slice_points(slice: &PieSlice) -> Vec<(f64, f64)> {
@@ -17818,3 +18114,4 @@ impl TickKind {
         }
     }
 }
+

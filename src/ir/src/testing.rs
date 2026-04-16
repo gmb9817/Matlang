@@ -1,7 +1,7 @@
 use crate::hir::{
     HirAnonymousFunction, HirAssignmentTarget, HirBinding, HirCallTarget, HirCallableRef,
-    HirCapture, HirConditionalBranch, HirExpression, HirFunction, HirIndexArgument, HirItem,
-    HirModule, HirStatement, HirSwitchCase, HirValueRef,
+    HirCapture, HirClass, HirClassProperty, HirConditionalBranch, HirExpression, HirFunction,
+    HirIndexArgument, HirItem, HirModule, HirStatement, HirSwitchCase, HirValueRef,
 };
 use matlab_semantics::symbols::{
     BindingStorage, CaptureAccess, FinalReferenceResolution, PathResolutionKind,
@@ -18,6 +18,9 @@ pub fn render_hir(module: &HirModule) -> String {
             module.kind, module.scope_id.0, module.workspace_id.0
         ),
     );
+    for class in &module.classes {
+        render_class(class, 1, &mut out);
+    }
     for item in &module.items {
         render_item(item, 1, &mut out);
     }
@@ -58,6 +61,66 @@ fn render_function(function: &HirFunction, depth: usize, out: &mut String) {
     }
     for local in &function.local_functions {
         render_function(local, depth + 1, out);
+    }
+}
+
+fn render_class(class: &HirClass, depth: usize, out: &mut String) {
+    push_line(
+        out,
+        depth,
+        format!(
+            "class {} package={:?} handle={} constructor={:?} source_path={:?}",
+            class.name,
+            class.package,
+            class.inherits_handle,
+            class.constructor,
+            class.source_path
+                .as_ref()
+                .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+                .map(|name| name.to_string())
+        ),
+    );
+    if !class.properties.is_empty() {
+        push_line(
+            out,
+            depth + 1,
+            format!(
+                "properties [{}]",
+                class.properties
+                    .iter()
+                    .map(render_class_property)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    if !class.inline_methods.is_empty() {
+        push_line(
+            out,
+            depth + 1,
+            format!("inline_methods [{}]", class.inline_methods.join(", ")),
+        );
+    }
+    if !class.external_methods.is_empty() {
+        push_line(
+            out,
+            depth + 1,
+            format!(
+                "external_methods [{}]",
+                class.external_methods
+                    .iter()
+                    .map(|method| format!("{}={}", method.name, method.path.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+}
+
+fn render_class_property(property: &HirClassProperty) -> String {
+    match &property.default {
+        Some(default) => format!("{}={}", property.name, render_expression(default)),
+        None => property.name.clone(),
     }
 }
 
@@ -425,6 +488,9 @@ fn render_symbol_kind(kind: SymbolKind) -> &'static str {
         SymbolKind::Parameter => "parameter",
         SymbolKind::Output => "output",
         SymbolKind::Function => "function",
+        SymbolKind::Class => "class",
+        SymbolKind::Method => "method",
+        SymbolKind::Property => "property",
         SymbolKind::Global => "global",
         SymbolKind::Persistent => "persistent",
     }
@@ -479,6 +545,12 @@ fn render_path_kind(kind: PathResolutionKind) -> &'static str {
         PathResolutionKind::CurrentDirectory => "current_directory_function",
         PathResolutionKind::SearchPath => "search_path_function",
         PathResolutionKind::PackageDirectory => "package_function",
+        PathResolutionKind::ClassCurrentDirectory => "current_directory_class",
+        PathResolutionKind::ClassSearchPath => "search_path_class",
+        PathResolutionKind::ClassPackageDirectory => "package_class",
+        PathResolutionKind::ClassFolderCurrentDirectory => "current_directory_folder_class",
+        PathResolutionKind::ClassFolderSearchPath => "search_path_folder_class",
+        PathResolutionKind::ClassFolderPackageDirectory => "package_folder_class",
     }
 }
 

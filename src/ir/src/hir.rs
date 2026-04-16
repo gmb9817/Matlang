@@ -1,8 +1,10 @@
+use std::path::PathBuf;
+
 use matlab_frontend::ast::{BinaryOp, CompilationUnitKind, UnaryOp};
 use matlab_semantics::{
     symbols::{
-        BindingId, BindingStorage, CaptureAccess, FinalReferenceResolution, ReferenceResolution,
-        SymbolId, SymbolKind,
+        BindingId, BindingStorage, CaptureAccess, ExternalMethodInfo, FinalReferenceResolution,
+        ReferenceResolution, SymbolId, SymbolKind,
     },
     workspace::{ScopeId, WorkspaceId},
 };
@@ -13,7 +15,26 @@ pub struct HirModule {
     pub scope_id: ScopeId,
     pub workspace_id: WorkspaceId,
     pub implicit_ans: Option<HirBinding>,
+    pub classes: Vec<HirClass>,
     pub items: Vec<HirItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirClass {
+    pub name: String,
+    pub package: Option<String>,
+    pub inherits_handle: bool,
+    pub properties: Vec<HirClassProperty>,
+    pub inline_methods: Vec<String>,
+    pub external_methods: Vec<ExternalMethodInfo>,
+    pub constructor: Option<String>,
+    pub source_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirClassProperty {
+    pub name: String,
+    pub default: Option<HirExpression>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +87,7 @@ pub enum HirStatement {
     Assignment {
         targets: Vec<HirAssignmentTarget>,
         value: HirExpression,
+        list_assignment: bool,
         display_suppressed: bool,
     },
     Expression {

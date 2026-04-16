@@ -1,10 +1,10 @@
 workspace
   a = struct{name="alpha", value=3}
-  b = [struct{flag=true, name="alpha", value=1}, struct{flag=true, name="beta", value=2}]
+  b = [struct{name="alpha", value=1, flag=true}, struct{name="beta", value=2, flag=true}]
   c = ["alpha", "beta"]
   d = [1, 2]
   e = [true, true]
-  f = {'flag' ; 'name' ; 'value'}
+  f = {'name' ; 'value' ; 'flag'}
   g = true
-  h = [struct{flag=true, name="alpha"}, struct{flag=true, name="beta"}]
+  h = [struct{name="alpha", flag=true}, struct{name="beta", flag=true}]
   i = ["alpha", "beta"]

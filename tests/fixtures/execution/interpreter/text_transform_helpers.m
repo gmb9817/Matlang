@@ -13,3 +13,6 @@ m = split({'alpha-beta'; 'gamma-delta'}, '-');
 n = replace("foo bar baz", ["foo" "baz"], ["FOO" "BAZ"]);
 o = replace(["apple-pear"; "pear-apple"], ["apple" "pear"], "fruit");
 p = erase("foo bar baz", ["foo " " baz"]);
+q = split({'alpha-beta'; "gamma-delta"}, '-');
+r = strrep({'banana', 'cabana'}, 'ba', 'BA');
+s = strrep("abc 2 def 22 ghi 222 jkl 2222", '22', '*');

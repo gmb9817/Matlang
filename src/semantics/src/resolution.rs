@@ -1,6 +1,8 @@
 //! Resolver-backed finalization of semantic reference classifications.
 
-use matlab_resolver::{resolve_function, ResolvedFunctionKind, ResolverContext};
+use matlab_resolver::{
+    resolve_callable, ResolvedCallable, ResolvedClassKind, ResolvedFunctionKind, ResolverContext,
+};
 
 use crate::{
     binder::AnalysisResult,
@@ -40,24 +42,40 @@ fn resolve_final_reference(
         ReferenceResolution::NestedFunction => FinalReferenceResolution::NestedFunction,
         ReferenceResolution::FileFunction => FinalReferenceResolution::FileFunction,
         ReferenceResolution::BuiltinFunction => {
-            if let Some(resolved) = resolve_function(&reference.name, context) {
-                FinalReferenceResolution::ResolvedPath {
-                    kind: map_path_kind(resolved.kind),
-                    path: resolved.path,
-                    package: resolved.package,
-                    shadowed_builtin: true,
+            if let Some(resolved) = resolve_callable(&reference.name, context) {
+                match resolved {
+                    ResolvedCallable::Function(resolved) => FinalReferenceResolution::ResolvedPath {
+                        kind: map_path_kind(resolved.kind),
+                        path: resolved.path,
+                        package: resolved.package,
+                        shadowed_builtin: true,
+                    },
+                    ResolvedCallable::Class(resolved) => FinalReferenceResolution::ResolvedPath {
+                        kind: map_class_path_kind(resolved.kind),
+                        path: resolved.path,
+                        package: resolved.package,
+                        shadowed_builtin: true,
+                    },
                 }
             } else {
                 FinalReferenceResolution::BuiltinFunction
             }
         }
         ReferenceResolution::ExternalFunctionCandidate => {
-            if let Some(resolved) = resolve_function(&reference.name, context) {
-                FinalReferenceResolution::ResolvedPath {
-                    kind: map_path_kind(resolved.kind),
-                    path: resolved.path,
-                    package: resolved.package,
-                    shadowed_builtin: false,
+            if let Some(resolved) = resolve_callable(&reference.name, context) {
+                match resolved {
+                    ResolvedCallable::Function(resolved) => FinalReferenceResolution::ResolvedPath {
+                        kind: map_path_kind(resolved.kind),
+                        path: resolved.path,
+                        package: resolved.package,
+                        shadowed_builtin: false,
+                    },
+                    ResolvedCallable::Class(resolved) => FinalReferenceResolution::ResolvedPath {
+                        kind: map_class_path_kind(resolved.kind),
+                        path: resolved.path,
+                        package: resolved.package,
+                        shadowed_builtin: false,
+                    },
                 }
             } else {
                 FinalReferenceResolution::UnresolvedExternal
@@ -73,6 +91,19 @@ fn map_path_kind(kind: ResolvedFunctionKind) -> PathResolutionKind {
         ResolvedFunctionKind::CurrentDirectory => PathResolutionKind::CurrentDirectory,
         ResolvedFunctionKind::SearchPath => PathResolutionKind::SearchPath,
         ResolvedFunctionKind::PackageDirectory => PathResolutionKind::PackageDirectory,
+    }
+}
+
+fn map_class_path_kind(kind: ResolvedClassKind) -> PathResolutionKind {
+    match kind {
+        ResolvedClassKind::CurrentDirectory => PathResolutionKind::ClassCurrentDirectory,
+        ResolvedClassKind::SearchPath => PathResolutionKind::ClassSearchPath,
+        ResolvedClassKind::PackageDirectory => PathResolutionKind::ClassPackageDirectory,
+        ResolvedClassKind::FolderCurrentDirectory => PathResolutionKind::ClassFolderCurrentDirectory,
+        ResolvedClassKind::FolderSearchPath => PathResolutionKind::ClassFolderSearchPath,
+        ResolvedClassKind::FolderPackageDirectory => {
+            PathResolutionKind::ClassFolderPackageDirectory
+        }
     }
 }
 

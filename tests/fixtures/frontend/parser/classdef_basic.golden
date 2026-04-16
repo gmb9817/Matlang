@@ -1,0 +1,13 @@
+unit ClassFile
+class Point < handle
+  properties
+    property x = number(1)
+    property y = number(2)
+  end_properties
+  methods
+    function Point(x, y) -> [obj]
+      assign [field(obj, x)] = x
+      assign [field(obj, y)] = y
+    function total(obj) -> [total]
+      assign [total] = binary(Add, field(obj, x), field(obj, y))
+  end_methods

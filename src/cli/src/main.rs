@@ -415,6 +415,9 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                     execute_script(&hir)
                 }
                 CompilationUnitKind::FunctionFile => execute_function_file(&hir, &runtime_args),
+                CompilationUnitKind::ClassFile => {
+                    return Err("`matc run` does not execute class definition files directly".to_string())
+                }
             }
             .map_err(|error| format!("execution failed for `{path}`: {error}"))?;
             match unit.kind {
@@ -424,6 +427,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                 CompilationUnitKind::FunctionFile => {
                     print!("{}", render_execution_result(&result));
                 }
+                CompilationUnitKind::ClassFile => unreachable!("class-file execution returns early"),
             }
             maybe_surface_figures(&result, Path::new(path), live_figures.as_ref());
             Ok(0)
@@ -464,6 +468,12 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                     execute_script(&hir)
                 }
                 CompilationUnitKind::FunctionFile => execute_function_file(&hir, &runtime_args),
+                CompilationUnitKind::ClassFile => {
+                    return Err(
+                        "`matc run-workspace` does not execute class definition files directly"
+                            .to_string(),
+                    )
+                }
             }
             .map_err(|error| format!("execution failed for `{path}`: {error}"))?;
             print!("{}", render_execution_result(&result));
@@ -512,6 +522,12 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                     &runtime_args,
                     path.to_string(),
                 ),
+                CompilationUnitKind::ClassFile => {
+                    return Err(
+                        "`matc run-bytecode` does not execute class definition files directly"
+                            .to_string(),
+                    )
+                }
             }
             .map_err(|error| format!("bytecode execution failed for `{path}`: {error}"))?;
             print!("{}", render_execution_result(&result));
@@ -800,6 +816,12 @@ fn execute_input_workspace(input_path: &str, runtime_args: &[Value]) -> Result<W
                     execute_script(&hir)
                 }
                 CompilationUnitKind::FunctionFile => execute_function_file(&hir, runtime_args),
+                CompilationUnitKind::ClassFile => {
+                    return Err(
+                        "`matc export-workspace` does not execute class definition files directly"
+                            .to_string(),
+                    )
+                }
             }
             .map_err(|error| format!("execution failed for `{input_path}`: {error}"))?;
             Ok(result.workspace)

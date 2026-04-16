@@ -1,8 +1,9 @@
 //! Test-oriented rendering helpers for golden fixtures.
 
 use crate::ast::{
-    AssignmentTarget, CompilationUnit, Expression, ExpressionKind, FunctionDef, Identifier,
-    IndexArgument, Item, QualifiedName, Statement, StatementKind,
+    AssignmentTarget, ClassDef, ClassMethodBlock, ClassPropertyBlock, ClassPropertyDef,
+    CompilationUnit, Expression, ExpressionKind, FunctionDef, Identifier, IndexArgument, Item,
+    QualifiedName, Statement, StatementKind,
 };
 
 pub fn render_compilation_unit(unit: &CompilationUnit) -> String {
@@ -18,6 +19,7 @@ fn render_item(item: &Item, depth: usize, out: &mut String) {
     match item {
         Item::Statement(statement) => render_statement(statement, depth, out),
         Item::Function(function) => render_function(function, depth, out),
+        Item::Class(class_def) => render_class(class_def, depth, out),
     }
 }
 
@@ -40,9 +42,52 @@ fn render_function(function: &FunctionDef, depth: usize, out: &mut String) {
     }
 }
 
+fn render_class(class_def: &ClassDef, depth: usize, out: &mut String) {
+    let superclass = class_def
+        .superclass
+        .as_ref()
+        .map(|name| format!(" < {}", join_qualified_name(name)))
+        .unwrap_or_default();
+    push_line(
+        out,
+        depth,
+        format!("class {}{}", class_def.name.name, superclass),
+    );
+    for block in &class_def.property_blocks {
+        render_property_block(block, depth + 1, out);
+    }
+    for block in &class_def.method_blocks {
+        render_method_block(block, depth + 1, out);
+    }
+}
+
+fn render_property_block(block: &ClassPropertyBlock, depth: usize, out: &mut String) {
+    push_line(out, depth, "properties".to_string());
+    for property in &block.properties {
+        render_property(property, depth + 1, out);
+    }
+    push_line(out, depth, "end_properties".to_string());
+}
+
+fn render_property(property: &ClassPropertyDef, depth: usize, out: &mut String) {
+    let line = match &property.default {
+        Some(default) => format!("property {} = {}", property.name.name, render_expression(default)),
+        None => format!("property {}", property.name.name),
+    };
+    push_line(out, depth, line);
+}
+
+fn render_method_block(block: &ClassMethodBlock, depth: usize, out: &mut String) {
+    push_line(out, depth, "methods".to_string());
+    for method in &block.methods {
+        render_function(method, depth + 1, out);
+    }
+    push_line(out, depth, "end_methods".to_string());
+}
+
 fn render_statement(statement: &Statement, depth: usize, out: &mut String) {
     match &statement.kind {
-        StatementKind::Assignment { targets, value } => {
+        StatementKind::Assignment { targets, value, .. } => {
             push_line(
                 out,
                 depth,

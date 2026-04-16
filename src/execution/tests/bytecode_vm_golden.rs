@@ -54,6 +54,9 @@ fn assert_fixture(name: &str, mode: ParseMode, args: &[Value]) {
     let result = match unit.kind {
         CompilationUnitKind::Script => execute_script_bytecode(&hir),
         CompilationUnitKind::FunctionFile => execute_function_file_bytecode(&hir, args),
+        CompilationUnitKind::ClassFile => {
+            panic!("class-file fixtures are not executable through the bytecode golden harness")
+        }
     }
     .expect("execute bytecode module");
     let rendered = render_execution_result(&result);
@@ -94,6 +97,9 @@ fn assert_artifact_fixture(name: &str, mode: ParseMode, args: &[Value]) {
         }
         CompilationUnitKind::FunctionFile => {
             execute_function_file_bytecode_module(&decoded, args, source_path.display().to_string())
+        }
+        CompilationUnitKind::ClassFile => {
+            panic!("class-file fixtures are not executable through the artifact harness")
         }
     }
     .expect("execute loaded bytecode artifact");
@@ -177,6 +183,9 @@ fn assert_bundle_fixture(name: &str, mode: ParseMode, args: &[Value]) {
     let result = match unit.kind {
         CompilationUnitKind::Script => execute_script_bytecode_bundle(&bundle),
         CompilationUnitKind::FunctionFile => execute_function_file_bytecode_bundle(&bundle, args),
+        CompilationUnitKind::ClassFile => {
+            panic!("class-file fixtures are not executable through the bundle harness")
+        }
     }
     .expect("execute bytecode bundle");
     let rendered = render_execution_result(&result);

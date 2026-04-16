@@ -6,8 +6,8 @@ pub mod testing;
 
 pub use hir::{
     HirAnonymousFunction, HirAssignmentTarget, HirBinding, HirCallTarget, HirCallableRef,
-    HirCapture, HirConditionalBranch, HirExpression, HirFunction, HirIndexArgument, HirItem,
-    HirModule, HirStatement, HirSwitchCase, HirValueRef,
+    HirCapture, HirClass, HirClassProperty, HirConditionalBranch, HirExpression, HirFunction,
+    HirIndexArgument, HirItem, HirModule, HirStatement, HirSwitchCase, HirValueRef,
 };
 pub use lower::lower_to_hir;
 

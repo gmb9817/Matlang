@@ -6,6 +6,7 @@ use crate::source::SourceSpan;
 pub enum CompilationUnitKind {
     Script,
     FunctionFile,
+    ClassFile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub struct CompilationUnit {
 pub enum Item {
     Statement(Statement),
     Function(FunctionDef),
+    Class(ClassDef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,34 @@ pub struct FunctionDef {
     pub outputs: Vec<Identifier>,
     pub body: Vec<Statement>,
     pub local_functions: Vec<FunctionDef>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassDef {
+    pub name: Identifier,
+    pub superclass: Option<QualifiedName>,
+    pub property_blocks: Vec<ClassPropertyBlock>,
+    pub method_blocks: Vec<ClassMethodBlock>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassPropertyBlock {
+    pub properties: Vec<ClassPropertyDef>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassPropertyDef {
+    pub name: Identifier,
+    pub default: Option<Expression>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassMethodBlock {
+    pub methods: Vec<FunctionDef>,
     pub span: SourceSpan,
 }
 
@@ -49,6 +79,7 @@ pub enum StatementKind {
     Assignment {
         targets: Vec<AssignmentTarget>,
         value: Expression,
+        list_assignment: bool,
     },
     Expression(Expression),
     If {

@@ -44,6 +44,9 @@ fn assert_fixture(name: &str, mode: ParseMode, args: &[Value]) {
     let result = match unit.kind {
         CompilationUnitKind::Script => execute_script(&hir),
         CompilationUnitKind::FunctionFile => execute_function_file(&hir, args),
+        CompilationUnitKind::ClassFile => {
+            panic!("class-file fixtures are not executable through the golden harness")
+        }
     }
     .expect("execute module");
     let rendered = render_execution_result(&result);

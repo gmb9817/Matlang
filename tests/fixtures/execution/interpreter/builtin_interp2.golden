@@ -1,6 +1,7 @@
 workspace
   broadcast = [5 ; 25]
   descending = [55, 65]
+  fill = [-1, 5 ; 20, -1]
   linear = [5, 10 ; 10, 22.5]
   matrix_grid = [55, 65]
   matrix_query = [15, NaN ; NaN, 30]

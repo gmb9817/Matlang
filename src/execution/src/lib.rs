@@ -39,8 +39,9 @@ use matlab_ir::{
 use matlab_resolver::ResolverContext;
 use matlab_runtime::{
     render_named_value, render_value, render_workspace, ArrayStorageClass, CellValue,
-    ComplexValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue, RuntimeError,
-    RuntimeStackFrame, StructValue, Value, Workspace,
+    ComplexValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue, ObjectClassMetadata,
+    ObjectStorageKind, ObjectValue, RuntimeError, RuntimeStackFrame, StructValue, Value,
+    Workspace,
 };
 use matlab_semantics::{
     analyze_compilation_unit_with_context,
@@ -287,6 +288,93 @@ struct AnonymousClosure<'a> {
     function: HirAnonymousFunction,
     captured_cells: HashMap<BindingId, Cell>,
     visible_functions: BTreeMap<String, &'a HirFunction>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedClassModule {
+    module: HirModule,
+    class: matlab_ir::HirClass,
+    source_path: PathBuf,
+}
+
+fn load_class_module_from_path(path: &Path) -> Result<LoadedClassModule, RuntimeError> {
+    let source = fs::read_to_string(path).map_err(|error| {
+        RuntimeError::Unsupported(format!(
+            "failed to read class definition `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+    if parsed.has_errors() {
+        return Err(RuntimeError::Unsupported(format!(
+            "failed to parse class definition `{}`: {}",
+            path.display(),
+            format_frontend_diagnostics(&parsed.diagnostics)
+        )));
+    }
+    let unit = parsed.unit.ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "parser produced no compilation unit for class definition `{}`",
+            path.display()
+        ))
+    })?;
+    if unit.kind != CompilationUnitKind::ClassFile {
+        return Err(RuntimeError::Unsupported(format!(
+            "`{}` is not a class definition file",
+            path.display()
+        )));
+    }
+    let context =
+        ResolverContext::from_source_file(path.to_path_buf()).with_env_search_roots("MATC_PATH");
+    let analysis = analyze_compilation_unit_with_context(&unit, &context);
+    if analysis.has_errors() {
+        return Err(RuntimeError::Unsupported(format!(
+            "failed to analyze class definition `{}`: {}",
+            path.display(),
+            format_semantic_diagnostics(&analysis.diagnostics)
+        )));
+    }
+    let hir = lower_to_hir(&unit, &analysis);
+    let class = hir.classes.first().cloned().ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "class definition `{}` did not lower class metadata",
+            path.display()
+        ))
+    })?;
+    Ok(LoadedClassModule {
+        module: hir,
+        class,
+        source_path: path.to_path_buf(),
+    })
+}
+
+fn path_resolution_is_class(kind: matlab_semantics::symbols::PathResolutionKind) -> bool {
+    matches!(
+        kind,
+        matlab_semantics::symbols::PathResolutionKind::ClassCurrentDirectory
+            | matlab_semantics::symbols::PathResolutionKind::ClassSearchPath
+            | matlab_semantics::symbols::PathResolutionKind::ClassPackageDirectory
+            | matlab_semantics::symbols::PathResolutionKind::ClassFolderCurrentDirectory
+            | matlab_semantics::symbols::PathResolutionKind::ClassFolderSearchPath
+            | matlab_semantics::symbols::PathResolutionKind::ClassFolderPackageDirectory
+    )
+}
+
+fn object_has_method(object: &ObjectValue, method_name: &str) -> bool {
+    object.class.inline_methods.contains(method_name)
+        || object.class.external_methods.contains_key(method_name)
+}
+
+fn bound_method_value(object: &ObjectValue, method_name: &str) -> Value {
+    Value::FunctionHandle(FunctionHandleValue {
+        display_name: format!("@{}.{}", object.class.class_name, method_name),
+        target: FunctionHandleTarget::BoundMethod {
+            class_name: object.class.class_name.clone(),
+            package: object.class.package.clone(),
+            method_name: method_name.to_string(),
+            receiver: Box::new(Value::Object(object.clone())),
+        },
+    })
 }
 
 pub fn execute_script(module: &HirModule) -> Result<ExecutionResult, RuntimeError> {
@@ -559,6 +647,12 @@ struct ArrayfunOperand {
     elements: Vec<Value>,
 }
 
+#[derive(Debug, Clone)]
+struct ElementwiseCallbackOptions {
+    uniform_output: bool,
+    error_handler: Option<Value>,
+}
+
 fn arrayfun_callback_value(value: &Value) -> Result<Value, RuntimeError> {
     match value {
         Value::FunctionHandle(_) => Ok(value.clone()),
@@ -592,40 +686,85 @@ fn arrayfun_operand_from_value(value: &Value) -> Result<ArrayfunOperand, Runtime
     }
 }
 
-fn split_uniform_output_option<'a>(
+fn split_elementwise_callback_options<'a>(
     rest: &'a [Value],
     builtin_name: &str,
-) -> Result<(&'a [Value], bool), RuntimeError> {
-    let mut uniform_output = true;
-    let inputs = if rest.len() >= 2
-        && matches!(&rest[rest.len() - 2], Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("UniformOutput"))
-    {
-        uniform_output = match &rest[rest.len() - 1] {
-            Value::Logical(flag) => *flag,
-            Value::Scalar(number) if *number == 0.0 => false,
-            Value::Scalar(number) if *number == 1.0 => true,
-            other => {
-                return Err(RuntimeError::TypeError(format!(
-                    "{builtin_name} currently expects UniformOutput to be true or false, found {}",
-                    other.kind_name()
-                )))
-            }
-        };
-        &rest[..rest.len() - 2]
-    } else {
-        rest
+) -> Result<(&'a [Value], ElementwiseCallbackOptions), RuntimeError> {
+    let mut options = ElementwiseCallbackOptions {
+        uniform_output: true,
+        error_handler: None,
     };
-    Ok((inputs, uniform_output))
+    let mut input_end = rest.len();
+
+    while input_end >= 2 {
+        let option_name = match &rest[input_end - 2] {
+            Value::CharArray(text) | Value::String(text) => text.as_str(),
+            _ => break,
+        };
+
+        if option_name.eq_ignore_ascii_case("UniformOutput") {
+            options.uniform_output = match &rest[input_end - 1] {
+                Value::Logical(flag) => *flag,
+                Value::Scalar(number) if *number == 0.0 => false,
+                Value::Scalar(number) if *number == 1.0 => true,
+                other => {
+                    return Err(RuntimeError::TypeError(format!(
+                        "{builtin_name} currently expects UniformOutput to be true or false, found {}",
+                        other.kind_name()
+                    )))
+                }
+            };
+            input_end -= 2;
+            continue;
+        }
+
+        if option_name.eq_ignore_ascii_case("ErrorHandler") {
+            options.error_handler = Some(arrayfun_callback_value(&rest[input_end - 1])?);
+            input_end -= 2;
+            continue;
+        }
+
+        break;
+    }
+
+    Ok((&rest[..input_end], options))
 }
 
-fn parse_arrayfun_arguments(args: &[Value]) -> Result<(Value, Vec<ArrayfunOperand>, bool), RuntimeError> {
+fn callback_error_struct_value(error: &RuntimeError, index: usize) -> Value {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "identifier".to_string(),
+        Value::String(error.identifier().to_string()),
+    );
+    fields.insert(
+        "message".to_string(),
+        Value::String(error.message().to_string()),
+    );
+    fields.insert("index".to_string(), Value::Scalar(index as f64));
+    Value::Struct(StructValue::from_fields(fields))
+}
+
+fn error_handler_arguments(
+    error: &RuntimeError,
+    index: usize,
+    element_args: &[Value],
+) -> Vec<Value> {
+    let mut args = Vec::with_capacity(element_args.len() + 1);
+    args.push(callback_error_struct_value(error, index));
+    args.extend(element_args.iter().cloned());
+    args
+}
+
+fn parse_arrayfun_arguments(
+    args: &[Value],
+) -> Result<(Value, Vec<ArrayfunOperand>, ElementwiseCallbackOptions), RuntimeError> {
     let Some((callback, rest)) = args.split_first() else {
         return Err(RuntimeError::Unsupported(
             "arrayfun currently expects a function handle plus at least one input array"
                 .to_string(),
         ));
     };
-    let (inputs, uniform_output) = split_uniform_output_option(rest, "arrayfun")?;
+    let (inputs, options) = split_elementwise_callback_options(rest, "arrayfun")?;
 
     if inputs.is_empty() {
         return Err(RuntimeError::Unsupported(
@@ -649,7 +788,7 @@ fn parse_arrayfun_arguments(args: &[Value]) -> Result<(Value, Vec<ArrayfunOperan
         }
     }
 
-    Ok((callback, operands, uniform_output))
+    Ok((callback, operands, options))
 }
 
 fn cellfun_operand_from_value(value: &Value) -> Result<ArrayfunOperand, RuntimeError> {
@@ -665,13 +804,15 @@ fn cellfun_operand_from_value(value: &Value) -> Result<ArrayfunOperand, RuntimeE
     }
 }
 
-fn parse_cellfun_arguments(args: &[Value]) -> Result<(Value, Vec<ArrayfunOperand>, bool), RuntimeError> {
+fn parse_cellfun_arguments(
+    args: &[Value],
+) -> Result<(Value, Vec<ArrayfunOperand>, ElementwiseCallbackOptions), RuntimeError> {
     let Some((callback, rest)) = args.split_first() else {
         return Err(RuntimeError::Unsupported(
             "cellfun currently expects a function handle plus at least one cell array".to_string(),
         ));
     };
-    let (inputs, uniform_output) = split_uniform_output_option(rest, "cellfun")?;
+    let (inputs, options) = split_elementwise_callback_options(rest, "cellfun")?;
     if inputs.is_empty() {
         return Err(RuntimeError::Unsupported(
             "cellfun currently expects at least one cell array".to_string(),
@@ -694,16 +835,18 @@ fn parse_cellfun_arguments(args: &[Value]) -> Result<(Value, Vec<ArrayfunOperand
             ));
         }
     }
-    Ok((callback, operands, uniform_output))
+    Ok((callback, operands, options))
 }
 
-fn parse_structfun_arguments(args: &[Value]) -> Result<(Value, Vec<ArrayfunOperand>, bool), RuntimeError> {
+fn parse_structfun_arguments(
+    args: &[Value],
+) -> Result<(Value, Vec<ArrayfunOperand>, ElementwiseCallbackOptions), RuntimeError> {
     let Some((callback, rest)) = args.split_first() else {
         return Err(RuntimeError::Unsupported(
             "structfun currently expects a function handle plus a scalar struct input".to_string(),
         ));
     };
-    let (inputs, uniform_output) = split_uniform_output_option(rest, "structfun")?;
+    let (inputs, options) = split_elementwise_callback_options(rest, "structfun")?;
     let [value] = inputs else {
         return Err(RuntimeError::Unsupported(
             "structfun currently expects exactly one struct input".to_string(),
@@ -720,9 +863,9 @@ fn parse_structfun_arguments(args: &[Value]) -> Result<(Value, Vec<ArrayfunOpera
         callback,
         vec![ArrayfunOperand {
             dims: vec![struct_value.fields.len(), 1],
-            elements: struct_value.fields.values().cloned().collect(),
+            elements: struct_value.ordered_values().cloned().collect(),
         }],
-        uniform_output,
+        options,
     ))
 }
 
@@ -770,8 +913,8 @@ where
     F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
 {
     let output_arity = output_arity.max(1);
-    let (callback, operands, uniform_output) = parse_arrayfun_arguments(args)?;
-    execute_elementwise_callback_outputs(callback, operands, uniform_output, output_arity, "arrayfun", invoke_callback)
+    let (callback, operands, options) = parse_arrayfun_arguments(args)?;
+    execute_elementwise_callback_outputs(callback, operands, options, output_arity, "arrayfun", invoke_callback)
 }
 
 pub(crate) fn execute_cellfun_builtin_outputs<F>(
@@ -783,8 +926,8 @@ where
     F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
 {
     let output_arity = output_arity.max(1);
-    let (callback, operands, uniform_output) = parse_cellfun_arguments(args)?;
-    execute_elementwise_callback_outputs(callback, operands, uniform_output, output_arity, "cellfun", invoke_callback)
+    let (callback, operands, options) = parse_cellfun_arguments(args)?;
+    execute_elementwise_callback_outputs(callback, operands, options, output_arity, "cellfun", invoke_callback)
 }
 
 pub(crate) fn execute_structfun_builtin_outputs<F>(
@@ -796,14 +939,14 @@ where
     F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
 {
     let output_arity = output_arity.max(1);
-    let (callback, operands, uniform_output) = parse_structfun_arguments(args)?;
-    execute_elementwise_callback_outputs(callback, operands, uniform_output, output_arity, "structfun", invoke_callback)
+    let (callback, operands, options) = parse_structfun_arguments(args)?;
+    execute_elementwise_callback_outputs(callback, operands, options, output_arity, "structfun", invoke_callback)
 }
 
 fn execute_elementwise_callback_outputs<F>(
     callback: Value,
     operands: Vec<ArrayfunOperand>,
-    uniform_output: bool,
+    options: ElementwiseCallbackOptions,
     output_arity: usize,
     builtin_name: &str,
     mut invoke_callback: F,
@@ -829,7 +972,16 @@ where
             .iter()
             .map(|operand| operand.elements[index].clone())
             .collect::<Vec<_>>();
-        let outputs = invoke_callback(&callback, &element_args, output_arity)?;
+        let outputs = match invoke_callback(&callback, &element_args, output_arity) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let Some(handler) = options.error_handler.as_ref() else {
+                    return Err(error);
+                };
+                let handler_args = error_handler_arguments(&error, index + 1, &element_args);
+                invoke_callback(handler, &handler_args, output_arity)?
+            }
+        };
         if outputs.len() < output_arity {
             return Err(RuntimeError::Unsupported(format!(
                 "{builtin_name} requested {output_arity} output(s), but the callback produced {}",
@@ -837,7 +989,7 @@ where
             )));
         }
         for output_index in 0..output_arity {
-            let value = if uniform_output {
+            let value = if options.uniform_output {
                 normalize_arrayfun_uniform_output(outputs[output_index].clone())?
             } else {
                 outputs[output_index].clone()
@@ -848,7 +1000,7 @@ where
 
     per_output
         .into_iter()
-        .map(|values| build_arrayfun_output(&dims, values, uniform_output))
+        .map(|values| build_arrayfun_output(&dims, values, options.uniform_output))
         .collect()
 }
 
@@ -1152,19 +1304,19 @@ fn invoke_save_builtin_outputs(
         };
         let mut filtered = Workspace::new();
         let field_names = if let Some(names) = spec.names {
-            names
+            names.into_iter().collect()
         } else if spec.regexes.is_empty() {
-            struct_value.fields.keys().cloned().collect()
+            struct_value.field_names().to_vec()
         } else {
             let mut names = BTreeSet::new();
             for pattern in &spec.regexes {
-                for field_name in struct_value.fields.keys() {
+                for field_name in struct_value.field_names() {
                     if matlab_regexp_is_match(pattern, field_name)? {
                         names.insert(field_name.clone());
                     }
                 }
             }
-            names
+            names.into_iter().collect()
         };
         for field_name in field_names {
             let value = struct_value
@@ -1619,20 +1771,21 @@ fn matlab_value_dimensions(value: &Value) -> Vec<usize> {
         Value::CharArray(text) => vec![1, text.chars().count().max(1)],
         Value::Matrix(matrix) => matrix.dims().to_vec(),
         Value::Cell(cell) => cell.dims().to_vec(),
-        Value::Struct(_) | Value::FunctionHandle(_) => vec![1, 1],
+        Value::Struct(_) | Value::Object(_) | Value::FunctionHandle(_) => vec![1, 1],
     }
 }
 
-fn matlab_class_name(value: &Value) -> &'static str {
+fn matlab_class_name(value: &Value) -> String {
     match value {
-        Value::Scalar(_) | Value::Complex(_) => "double",
-        Value::Logical(_) => "logical",
-        Value::CharArray(_) => "char",
-        Value::String(_) => "string",
-        Value::Matrix(matrix) => matrix_class_name(matrix),
-        Value::Cell(_) => "cell",
-        Value::Struct(_) => "struct",
-        Value::FunctionHandle(_) => "function_handle",
+        Value::Scalar(_) | Value::Complex(_) => "double".to_string(),
+        Value::Logical(_) => "logical".to_string(),
+        Value::CharArray(_) => "char".to_string(),
+        Value::String(_) => "string".to_string(),
+        Value::Matrix(matrix) => matrix_class_name(matrix).to_string(),
+        Value::Cell(_) => "cell".to_string(),
+        Value::Struct(_) => "struct".to_string(),
+        Value::Object(object) => object.class.class_name.clone(),
+        Value::FunctionHandle(_) => "function_handle".to_string(),
     }
 }
 
@@ -1667,6 +1820,12 @@ fn approximate_value_bytes(value: &Value) -> usize {
             .iter()
             .map(|(name, value)| name.encode_utf16().count() * 2 + approximate_value_bytes(value))
             .sum(),
+        Value::Object(object) => object
+            .properties()
+            .fields
+            .iter()
+            .map(|(name, value)| name.encode_utf16().count() * 2 + approximate_value_bytes(value))
+            .sum(),
         Value::FunctionHandle(handle) => handle.display_name.encode_utf16().count() * 2,
     }
 }
@@ -1677,6 +1836,7 @@ fn value_is_complex(value: &Value) -> bool {
         Value::Matrix(matrix) => matrix.elements.iter().any(value_is_complex),
         Value::Cell(cell) => cell.elements.iter().any(value_is_complex),
         Value::Struct(struct_value) => struct_value.fields.values().any(value_is_complex),
+        Value::Object(object) => object.properties().fields.values().any(value_is_complex),
         _ => false,
     }
 }
@@ -1698,7 +1858,7 @@ fn whos_struct_value(name: &str, value: &Value) -> Value {
     );
     fields.insert(
         "class".to_string(),
-        Value::CharArray(matlab_class_name(value).to_string()),
+        Value::CharArray(matlab_class_name(value)),
     );
     fields.insert("global".to_string(), Value::Logical(false));
     fields.insert("sparse".to_string(), Value::Logical(false));
@@ -1708,7 +1868,7 @@ fn whos_struct_value(name: &str, value: &Value) -> Value {
     );
     fields.insert("nesting".to_string(), Value::Scalar(0.0));
     fields.insert("persistent".to_string(), Value::Logical(false));
-    Value::Struct(StructValue { fields })
+    Value::Struct(StructValue::from_fields(fields))
 }
 
 fn current_wall_clock_seconds() -> f64 {
@@ -2530,7 +2690,7 @@ fn workspace_struct_value(workspace: Workspace) -> Value {
     for (name, value) in workspace {
         fields.insert(name, value);
     }
-    Value::Struct(StructValue { fields })
+    Value::Struct(StructValue::from_fields(fields))
 }
 
 fn parse_clearvars_spec(args: &[Value]) -> Result<ClearvarsSpec, RuntimeError> {
@@ -3392,6 +3552,16 @@ fn render_value_with_format(value: &Value, format: DisplayFormatState) -> String
                 .join(", ");
             format!("struct{{{fields}}}")
         }
+        Value::Object(object) => format!(
+            "{} with properties {{{}}}",
+            object.class.class_name,
+            object
+                .properties()
+                .ordered_entries()
+                .map(|(name, value)| format!("{name}={}", render_value_with_format(value, format)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Value::FunctionHandle(handle) => format!("@{}", handle.display_name),
     }
 }
@@ -3738,7 +3908,7 @@ fn warning_query_value(identifier: &str, enabled: bool) -> Value {
         "state".to_string(),
         Value::CharArray(if enabled { "on" } else { "off" }.to_string()),
     );
-    Value::Struct(StructValue { fields })
+    Value::Struct(StructValue::from_fields(fields))
 }
 
 fn parse_warning_arguments(args: &[Value]) -> Result<WarningState, RuntimeError> {
@@ -3802,7 +3972,7 @@ fn runtime_error_value_with_stack_fallback(
             error.stack()
         }),
     );
-    Value::Struct(StructValue { fields })
+    Value::Struct(StructValue::from_fields(fields))
 }
 
 fn empty_error_cause_value() -> Value {
@@ -3846,7 +4016,7 @@ fn runtime_error_stack_value(stack: &[RuntimeStackFrame]) -> Value {
                 fields.insert("file".to_string(), Value::String(frame.file.clone()));
                 fields.insert("line".to_string(), Value::Scalar(frame.line as f64));
                 fields.insert("name".to_string(), Value::String(frame.name.clone()));
-                Value::Struct(StructValue { fields })
+                Value::Struct(StructValue::from_fields(fields))
             })
             .collect(),
     })
@@ -3995,6 +4165,16 @@ impl<'a> Interpreter<'a> {
         args: &[Value],
         caller: Option<&Frame<'a>>,
     ) -> Result<Vec<Value>, RuntimeError> {
+        self.invoke_function_with_prebound_outputs(function, args, caller, &[])
+    }
+
+    fn invoke_function_with_prebound_outputs(
+        &mut self,
+        function: &'a HirFunction,
+        args: &[Value],
+        caller: Option<&Frame<'a>>,
+        prebound_outputs: &[(String, Value)],
+    ) -> Result<Vec<Value>, RuntimeError> {
         let stack_frame = self.make_stack_frame(function.name.clone());
         self.with_stack_frame(stack_frame, |this| {
             if args.len() != function.inputs.len() {
@@ -4037,6 +4217,11 @@ impl<'a> Interpreter<'a> {
             for output in &function.outputs {
                 frame.declare_binding(output)?;
             }
+            for (name, value) in prebound_outputs {
+                if let Some(binding) = function.outputs.iter().find(|binding| binding.name == *name) {
+                    frame.assign_binding(binding, value.clone())?;
+                }
+            }
 
             let _ = this.execute_block(&mut frame, &function.body)?;
 
@@ -4045,6 +4230,197 @@ impl<'a> Interpreter<'a> {
                 .iter()
                 .map(|binding| frame.read_binding(binding))
                 .collect()
+        })
+    }
+
+    fn find_module_function<'b>(
+        &'b self,
+        module: &'b HirModule,
+        name: &str,
+    ) -> Option<&'b HirFunction> {
+        module.items.iter().find_map(|item| match item {
+            HirItem::Function(function) if function.name == name => Some(function),
+            HirItem::Statement(_) => None,
+            HirItem::Function(_) => None,
+        })
+    }
+
+    fn build_default_object_from_class(
+        &mut self,
+        class_module: &HirModule,
+        class: &matlab_ir::HirClass,
+        module_identity: String,
+    ) -> Result<Value, RuntimeError> {
+        let mut evaluator = Interpreter::with_shared_state(
+            class_module,
+            module_identity,
+            Rc::clone(&self.shared_state),
+            self.call_stack.clone(),
+        );
+        let mut frame = Frame::new(evaluator.module_functions.clone());
+        let mut fields = BTreeMap::new();
+        let mut field_order = Vec::new();
+        for property in &class.properties {
+            let value = if let Some(default) = &property.default {
+                evaluator.evaluate_expression(&mut frame, default)?
+            } else {
+                empty_matrix_value()
+            };
+            field_order.push(property.name.clone());
+            fields.insert(property.name.clone(), value);
+        }
+        let inline_methods = class.inline_methods.iter().cloned().collect::<BTreeSet<_>>();
+        Ok(Value::Object(ObjectValue::new(
+            ObjectClassMetadata {
+                class_name: class.name.clone(),
+                package: class.package.clone(),
+                storage_kind: if class.inherits_handle {
+                    ObjectStorageKind::Handle
+                } else {
+                    ObjectStorageKind::Value
+                },
+                source_path: class.source_path.clone(),
+                property_order: field_order.clone(),
+                inline_methods,
+                external_methods: class
+                    .external_methods
+                    .iter()
+                    .map(|method| (method.name.clone(), method.path.clone()))
+                    .collect(),
+                constructor: class.constructor.clone(),
+            },
+            StructValue::with_field_order(fields, field_order),
+        )))
+    }
+
+    fn construct_class_from_path(
+        &mut self,
+        path: &Path,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let loaded = load_class_module_from_path(path)?;
+        let default_object = self.build_default_object_from_class(
+            &loaded.module,
+            &loaded.class,
+            loaded.source_path.display().to_string(),
+        )?;
+        if let Some(constructor_name) = &loaded.class.constructor {
+            let constructor = self.find_module_function(&loaded.module, constructor_name).ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "constructor `{constructor_name}` is not available in class `{}`",
+                    loaded.class.name
+                ))
+            })?;
+            let prebound_outputs = constructor
+                .outputs
+                .first()
+                .map(|binding| vec![(binding.name.clone(), default_object.clone())])
+                .unwrap_or_default();
+            let mut interpreter = Interpreter::with_shared_state(
+                &loaded.module,
+                loaded.source_path.display().to_string(),
+                Rc::clone(&self.shared_state),
+                self.call_stack.clone(),
+            );
+            let mut values = interpreter.invoke_function_with_prebound_outputs(
+                constructor,
+                args,
+                None,
+                &prebound_outputs,
+            )?;
+            if values.is_empty() {
+                values.push(default_object);
+            }
+            return Ok(values);
+        }
+        Ok(vec![default_object])
+    }
+
+    fn invoke_object_method_outputs(
+        &mut self,
+        object: &ObjectValue,
+        method_name: &str,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if object.class.inline_methods.contains(method_name) {
+            let source_path = object.class.source_path.as_ref().ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "class `{}` does not record its source path for inline method dispatch",
+                    object.class.class_name
+                ))
+            })?;
+            let loaded = load_class_module_from_path(source_path)?;
+            let method = self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "inline method `{method_name}` is not available in class `{}`",
+                    object.class.class_name
+                ))
+            })?;
+            let mut method_args = Vec::with_capacity(args.len() + 1);
+            method_args.push(Value::Object(object.clone()));
+            method_args.extend(args.iter().cloned());
+            let mut interpreter = Interpreter::with_shared_state(
+                &loaded.module,
+                loaded.source_path.display().to_string(),
+                Rc::clone(&self.shared_state),
+                self.call_stack.clone(),
+            );
+            return interpreter.invoke_function(method, &method_args, None);
+        }
+
+        let path = object
+            .class
+            .external_methods
+            .get(method_name)
+            .ok_or_else(|| {
+                RuntimeError::MissingVariable(format!(
+                    "object method `{method_name}` is not defined for class `{}`",
+                    object.class.class_name
+                ))
+            })?
+            .clone();
+        let source = fs::read_to_string(&path).map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "failed to read external method `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        if parsed.has_errors() {
+            return Err(RuntimeError::Unsupported(format!(
+                "failed to parse external method `{}`: {}",
+                path.display(),
+                format_frontend_diagnostics(&parsed.diagnostics)
+            )));
+        }
+        let unit = parsed.unit.ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "parser produced no compilation unit for external method `{}`",
+                path.display()
+            ))
+        })?;
+        let context =
+            ResolverContext::from_source_file(path.clone()).with_env_search_roots("MATC_PATH");
+        let analysis = analyze_compilation_unit_with_context(&unit, &context);
+        if analysis.has_errors() {
+            return Err(RuntimeError::Unsupported(format!(
+                "failed to analyze external method `{}`: {}",
+                path.display(),
+                format_semantic_diagnostics(&analysis.diagnostics)
+            )));
+        }
+        let hir = lower_to_hir(&unit, &analysis);
+        let mut method_args = Vec::with_capacity(args.len() + 1);
+        method_args.push(Value::Object(object.clone()));
+        method_args.extend(args.iter().cloned());
+        let mut interpreter = Interpreter::with_shared_state(
+            &hir,
+            path.display().to_string(),
+            Rc::clone(&self.shared_state),
+            self.call_stack.clone(),
+        );
+        interpreter.invoke_primary_function(&method_args).map(|values| {
+            values.into_iter().map(|(_, value)| value).collect()
         })
     }
 
@@ -4156,9 +4532,70 @@ impl<'a> Interpreter<'a> {
             HirStatement::Assignment {
                 targets,
                 value,
+                list_assignment,
                 display_suppressed,
             } => {
-                let values = self.evaluate_assignment_values(frame, targets, value)?;
+                if let Some(field) =
+                    self.unsupported_multi_struct_field_subindex_target(frame, targets)?
+                {
+                    return Err(unsupported_multi_struct_field_subindexing_error(&field));
+                }
+                if !*list_assignment
+                    && matches!(
+                        targets.as_slice(),
+                        [HirAssignmentTarget::Field { target, .. }]
+                            if field_target_requires_list_assignment(target)
+                    )
+                {
+                    if let Some(count) =
+                        self.simple_struct_field_assignment_target_count(frame, targets)?
+                    {
+                        return Err(unsupported_simple_csl_assignment_error(count));
+                    }
+                }
+                if self.try_execute_undefined_root_colon_brace_csl_assignment(
+                    frame, targets, value,
+                )? {
+                    return Ok(None);
+                }
+                if self.try_execute_undefined_cell_receiver_struct_field_brace_csl_assignment(
+                    frame, targets, value,
+                )? {
+                    return Ok(None);
+                }
+                if self.try_execute_undefined_cell_struct_field_csl_assignment(
+                    frame, targets, value,
+                )? {
+                    return Ok(None);
+                }
+                if self.try_execute_undefined_struct_field_brace_csl_assignment(
+                    frame, targets, value,
+                )? {
+                    return Ok(None);
+                }
+                if self.try_execute_undefined_indexed_struct_field_brace_csl_assignment(
+                    frame, targets, value,
+                )? {
+                    return Ok(None);
+                }
+                if *list_assignment
+                    && self.try_execute_undefined_scalar_struct_field_csl_assignment(
+                        frame, targets, value,
+                    )?
+                {
+                    return Ok(None);
+                }
+                if self.try_execute_undefined_indexed_struct_field_csl_assignment(
+                    frame, targets, value,
+                )? {
+                    return Ok(None);
+                }
+                let values = self.evaluate_assignment_values(
+                    frame,
+                    targets,
+                    value,
+                    *list_assignment,
+                )?;
                 if !display_suppressed && targets.len() == 1 {
                     if let HirAssignmentTarget::Binding(binding) = &targets[0] {
                         if let Some(display_value) = values.first().cloned() {
@@ -4282,11 +4719,1049 @@ impl<'a> Interpreter<'a> {
         result
     }
 
+    fn try_execute_undefined_root_colon_brace_csl_assignment(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+        value: &HirExpression,
+    ) -> Result<bool, RuntimeError> {
+        let [HirAssignmentTarget::CellIndex { target, indices }] = targets else {
+            return Ok(false);
+        };
+        if !indices
+            .iter()
+            .any(|argument| matches!(argument, HirIndexArgument::FullSlice))
+        {
+            return Ok(false);
+        }
+
+        let (_name, cell, projections) = match frame.lvalue_root(target) {
+            Ok(root) => root,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if cell.borrow().is_some() || !projections.is_empty() {
+            return Ok(false);
+        }
+
+        let values = match value {
+            HirExpression::Call {
+                target: HirCallTarget::Callable(reference),
+                args,
+            } if reference.name == "deal" => {
+                self.evaluate_call_outputs(
+                    frame,
+                    &HirCallTarget::Callable(reference.clone()),
+                    args,
+                    Some(args.len().max(1)),
+                )?
+            }
+            _ if expression_supports_list_expansion(value) => {
+                self.evaluate_expression_outputs(frame, value)?
+            }
+            _ => {
+                let direct = self.evaluate_expression(frame, value)?;
+                let Some(values) = direct_multi_value_values_ordered(&direct)? else {
+                    return Ok(false);
+                };
+                values
+            }
+        };
+
+        if values.is_empty() {
+            return Ok(false);
+        }
+
+        let Some(materialized) =
+            self.materialize_undefined_root_brace_csl_assignment(frame, indices, values)?
+        else {
+            return Ok(false);
+        };
+        *cell.borrow_mut() = Some(Value::Cell(materialized));
+        Ok(true)
+    }
+
+    fn materialize_undefined_root_brace_csl_assignment(
+        &mut self,
+        frame: &mut Frame<'a>,
+        indices: &[HirIndexArgument],
+        values: Vec<Value>,
+    ) -> Result<Option<CellValue>, RuntimeError> {
+        let output_count = values.len();
+        if output_count == 0 {
+            return Ok(None);
+        }
+        if indices.iter().any(|argument| match argument {
+            HirIndexArgument::FullSlice => false,
+            HirIndexArgument::End => true,
+            HirIndexArgument::Expression(expression) => expression_contains_end_keyword(expression),
+        }) {
+            return Ok(None);
+        }
+
+        let full_slice_axes = indices
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, argument)| {
+                matches!(argument, HirIndexArgument::FullSlice).then_some(axis)
+            })
+            .collect::<Vec<_>>();
+        if full_slice_axes.len() > 1 {
+            return Ok(None);
+        }
+
+        let empty = empty_cell_value();
+        let Value::Cell(empty_cell) = &empty else {
+            unreachable!("empty cell helper should return a cell value");
+        };
+        let evaluated_on_empty = indices
+            .iter()
+            .enumerate()
+            .map(|(axis, argument)| {
+                self.evaluate_index_argument(frame, &empty, argument, axis, indices.len())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let target_dims = if full_slice_axes.is_empty() {
+            let plan = cell_assignment_plan(empty_cell, &evaluated_on_empty)?;
+            if plan.selection.positions.len() != output_count {
+                return Ok(None);
+            }
+            plan.target_dims
+        } else {
+            let effective_dims = indexing_dimensions_from_dims(empty_cell.dims(), indices.len());
+            let mut target_dims = effective_dims.clone();
+            let mut known_selection_product = 1usize;
+            for (axis, argument) in indices.iter().enumerate() {
+                if matches!(argument, HirIndexArgument::FullSlice) {
+                    continue;
+                }
+                let label = format!("dimension {}", axis + 1);
+                let (selected, target_extent) = assignment_dimension_indices(
+                    &evaluated_on_empty[axis],
+                    effective_dims[axis],
+                    &label,
+                    "cell array",
+                )?;
+                if selected.is_empty() {
+                    return Ok(None);
+                }
+                known_selection_product *= selected.len();
+                target_dims[axis] = target_extent;
+            }
+
+            if output_count % known_selection_product != 0 {
+                return Ok(None);
+            }
+            let unknown_selection_count = output_count / known_selection_product;
+            if indices.len() == 1 {
+                vec![1, unknown_selection_count]
+            } else {
+                target_dims[full_slice_axes[0]] = unknown_selection_count;
+                target_dims
+            }
+        };
+
+        let element_count = target_dims.iter().product::<usize>();
+        let (rows, cols) = storage_shape_from_dimensions(&target_dims);
+        let current = CellValue::with_dimensions(
+            rows,
+            cols,
+            target_dims,
+            vec![empty_matrix_value(); element_count],
+        )?;
+        let current_value = Value::Cell(current.clone());
+        let evaluated_indices = self.evaluate_index_arguments(frame, &current_value, indices)?;
+        let selection = cell_selection(&current, &evaluated_indices)?;
+        if selection.positions.len() != output_count {
+            return Ok(None);
+        }
+        let rhs = Value::Cell(CellValue::with_dimensions(
+            selection.rows,
+            selection.cols,
+            selection.dims.clone(),
+            values,
+        )?);
+        Ok(Some(assign_cell_content_index(
+            current,
+            &evaluated_indices,
+            rhs,
+        )?))
+    }
+
+    fn try_execute_undefined_scalar_struct_field_csl_assignment(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+        value: &HirExpression,
+    ) -> Result<bool, RuntimeError> {
+        let [HirAssignmentTarget::Field { target, field }] = targets else {
+            return Ok(false);
+        };
+
+        let (_name, cell, projections) = match frame.lvalue_root(target) {
+            Ok(root) => root,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if cell.borrow().is_some()
+            || projections
+                .iter()
+                .any(|projection| !matches!(projection, LValueProjection::Field(_)))
+        {
+            return Ok(false);
+        }
+
+        let values = match value {
+            HirExpression::Call {
+                target: HirCallTarget::Callable(reference),
+                args,
+            } if reference.name == "deal" => {
+                self.evaluate_call_outputs(
+                    frame,
+                    &HirCallTarget::Callable(reference.clone()),
+                    args,
+                    Some(args.len()),
+                )?
+            }
+            _ if expression_supports_list_expansion(value) => self.evaluate_expression_outputs(frame, value)?,
+            _ => {
+                let direct = self.evaluate_expression(frame, value)?;
+                let Some(values) = direct_multi_value_values_ordered(&direct)? else {
+                    return Ok(false);
+                };
+                values
+            }
+        };
+
+        if values.is_empty() {
+            return Ok(false);
+        }
+
+        let nested = if values.len() == 1 {
+            assign_struct_path(
+                Value::Struct(StructValue::default()),
+                std::slice::from_ref(field),
+                values.into_iter().next().expect("single scalar struct assignment value"),
+            )?
+        } else {
+            let assigned_values = Value::Matrix(MatrixValue::with_dimensions(
+                1,
+                values.len(),
+                vec![1, values.len()],
+                values,
+            )?);
+            assign_struct_path(
+                empty_struct_assignment_target_row(values_len(&assigned_values)?)?,
+                std::slice::from_ref(field),
+                assigned_values,
+            )?
+        };
+        let updated = if projections.is_empty() {
+            nested
+        } else {
+            assign_struct_path(
+                Value::Struct(StructValue::default()),
+                &projections
+                    .iter()
+                    .map(|projection| match projection {
+                        LValueProjection::Field(field) => field.clone(),
+                        _ => unreachable!("guard restricted to field projections"),
+                    })
+                    .collect::<Vec<_>>(),
+                nested,
+            )?
+        };
+        *cell.borrow_mut() = Some(updated);
+        Ok(true)
+    }
+
+    fn try_execute_undefined_indexed_struct_field_csl_assignment(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+        value: &HirExpression,
+    ) -> Result<bool, RuntimeError> {
+        let [HirAssignmentTarget::Field { target, field }] = targets else {
+            return Ok(false);
+        };
+
+        let (_name, cell, projections) = match frame.lvalue_root(target) {
+            Ok(root) => root,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut prefix_fields = Vec::new();
+        let mut paren_index = None;
+        for (index, projection) in projections.iter().enumerate() {
+            match projection {
+                LValueProjection::Field(field) if paren_index.is_none() => {
+                    prefix_fields.push(field.clone());
+                }
+                LValueProjection::Paren(_) if paren_index.is_none() => paren_index = Some(index),
+                _ => {}
+            }
+        }
+        let Some(paren_index) = paren_index else {
+            return Ok(false);
+        };
+        let LValueProjection::Paren(receiver_indices) = &projections[paren_index] else {
+            unreachable!("paren index identified a paren projection");
+        };
+        let field_projections = &projections[paren_index + 1..];
+        if cell.borrow().is_some()
+            || field_projections
+                .iter()
+                .any(|projection| !matches!(projection, LValueProjection::Field(_)))
+            || projections.iter().any(|projection| {
+                !matches!(projection, LValueProjection::Field(_) | LValueProjection::Paren(_))
+            })
+        {
+            return Ok(false);
+        }
+
+        let (output_count, assigned) = match value {
+            HirExpression::Call {
+                target: HirCallTarget::Callable(reference),
+                args,
+            } if reference.name == "deal" => {
+                let values = self.evaluate_call_outputs(
+                    frame,
+                    &HirCallTarget::Callable(reference.clone()),
+                    args,
+                    Some(args.len().max(1)),
+                )?;
+                if values.is_empty() {
+                    return Ok(false);
+                }
+                (
+                    values.len(),
+                    Value::Matrix(MatrixValue::with_dimensions(
+                        1,
+                        values.len(),
+                        vec![1, values.len()],
+                        values,
+                    )?),
+                )
+            }
+            _ if expression_supports_list_expansion(value) => {
+                let values = self.evaluate_expression_outputs(frame, value)?;
+                if values.is_empty() {
+                    return Ok(false);
+                }
+                (
+                    values.len(),
+                    Value::Matrix(MatrixValue::with_dimensions(
+                        1,
+                        values.len(),
+                        vec![1, values.len()],
+                        values,
+                    )?),
+                )
+            }
+            _ => {
+                let direct = self.evaluate_expression(frame, value)?;
+                let Some(count) = direct_multi_value_count(&direct) else {
+                    return Ok(false);
+                };
+                (count, direct)
+            }
+        };
+
+        let Some(receivers) = self.materialize_undefined_indexed_struct_receivers(
+            frame,
+            receiver_indices,
+            output_count,
+        )? else {
+            return Ok(false);
+        };
+        let receiver_count = match &receivers {
+            Value::Struct(_) => 1,
+            Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
+            _ => return Ok(false),
+        };
+        if receiver_count != output_count {
+            return Ok(false);
+        }
+
+        let mut field_path = field_projections
+            .iter()
+            .map(|projection| match projection {
+                LValueProjection::Field(field) => field.clone(),
+                _ => unreachable!("guard restricted to field projections"),
+            })
+            .collect::<Vec<_>>();
+        field_path.push(field.clone());
+        let mut updated = assign_struct_path(receivers, &field_path, assigned)?;
+        if !prefix_fields.is_empty() {
+            updated =
+                assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+        }
+        *cell.borrow_mut() = Some(updated);
+        Ok(true)
+    }
+
+    fn materialize_undefined_indexed_struct_receivers(
+        &mut self,
+        frame: &mut Frame<'a>,
+        receiver_indices: &[HirIndexArgument],
+        output_count: usize,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if output_count == 0 {
+            return Ok(None);
+        }
+
+        let receiver_target = empty_matrix_value();
+        let Value::Matrix(empty_receiver) = &receiver_target else {
+            unreachable!("empty matrix helper should return a matrix value");
+        };
+        let evaluated_receiver_indices =
+            self.evaluate_index_arguments(frame, &receiver_target, receiver_indices)?;
+        if let Some(receivers) =
+            default_struct_selection_value_for_index_update(&receiver_target, &evaluated_receiver_indices)?
+        {
+            let receiver_count = match &receivers {
+                Value::Struct(_) => 1,
+                Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
+                _ => 0,
+            };
+            if receiver_count > 0 {
+                return Ok(Some(receivers));
+            }
+        }
+
+        if receiver_indices
+            .iter()
+            .any(index_argument_contains_end_keyword)
+        {
+            return Ok(None);
+        }
+
+        let full_slice_axes = receiver_indices
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, argument)| {
+                matches!(argument, HirIndexArgument::FullSlice).then_some(axis)
+            })
+            .collect::<Vec<_>>();
+        if full_slice_axes.len() != 1 {
+            return Ok(None);
+        }
+
+        let effective_dims = indexing_dimensions_from_dims(empty_receiver.dims(), receiver_indices.len());
+        let mut target_dims = effective_dims.clone();
+        let mut known_selection_product = 1usize;
+        for (axis, argument) in evaluated_receiver_indices.iter().enumerate() {
+            if matches!(argument, EvaluatedIndexArgument::FullSlice) {
+                continue;
+            }
+            let label = format!("dimension {}", axis + 1);
+            let (selected, target_extent) =
+                assignment_dimension_indices(argument, effective_dims[axis], &label, "struct array")?;
+            if selected.is_empty() {
+                return Ok(None);
+            }
+            known_selection_product *= selected.len();
+            target_dims[axis] = target_extent;
+        }
+
+        if output_count % known_selection_product != 0 {
+            return Ok(None);
+        }
+        let unknown_selection_count = output_count / known_selection_product;
+        if receiver_indices.len() == 1 {
+            target_dims = vec![1, unknown_selection_count];
+        } else {
+            target_dims[full_slice_axes[0]] = unknown_selection_count;
+        }
+
+        let receiver_count = target_dims.iter().product::<usize>();
+        if receiver_count == 0 {
+            return Ok(None);
+        }
+        if receiver_count == 1 {
+            return Ok(Some(Value::Struct(StructValue::default())));
+        }
+
+        let (rows, cols) = storage_shape_from_dimensions(&target_dims);
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            rows,
+            cols,
+            target_dims,
+            vec![Value::Struct(StructValue::default()); receiver_count],
+        )?)))
+    }
+
+    fn try_execute_undefined_cell_struct_field_csl_assignment(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+        value: &HirExpression,
+    ) -> Result<bool, RuntimeError> {
+        let [HirAssignmentTarget::Field { target, field }] = targets else {
+            return Ok(false);
+        };
+
+        let (_name, cell, projections) = match frame.lvalue_root(target) {
+            Ok(root) => root,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut prefix_fields = Vec::new();
+        let mut brace_index = None;
+        for (index, projection) in projections.iter().enumerate() {
+            match projection {
+                LValueProjection::Field(field) if brace_index.is_none() => {
+                    prefix_fields.push(field.clone());
+                }
+                LValueProjection::Brace(_) if brace_index.is_none() => brace_index = Some(index),
+                _ => {}
+            }
+        }
+        let Some(brace_index) = brace_index else {
+            return Ok(false);
+        };
+        let LValueProjection::Brace(receiver_indices) = &projections[brace_index] else {
+            unreachable!("brace index identified a brace projection");
+        };
+        let field_projections = &projections[brace_index + 1..];
+        if cell.borrow().is_some()
+            || projections.iter().any(|projection| {
+                !matches!(projection, LValueProjection::Field(_) | LValueProjection::Brace(_))
+            })
+            || field_projections
+                .iter()
+                .any(|projection| !matches!(projection, LValueProjection::Field(_)))
+        {
+            return Ok(false);
+        }
+
+        let (receiver_count, assigned_value) = match value {
+            HirExpression::Call {
+                target: HirCallTarget::Callable(reference),
+                args,
+            } if reference.name == "deal" => {
+                let values = self.evaluate_call_outputs(
+                    frame,
+                    &HirCallTarget::Callable(reference.clone()),
+                    args,
+                    Some(args.len().max(1)),
+                )?;
+                if values.is_empty() {
+                    return Ok(false);
+                }
+                (
+                    values.len(),
+                    Value::Matrix(MatrixValue::with_dimensions(
+                        1,
+                        values.len(),
+                        vec![1, values.len()],
+                        values,
+                    )?),
+                )
+            }
+            _ if expression_supports_list_expansion(value) => {
+                let values = self.evaluate_expression_outputs(frame, value)?;
+                if values.is_empty() {
+                    return Ok(false);
+                }
+                (
+                    values.len(),
+                    Value::Matrix(MatrixValue::with_dimensions(
+                        1,
+                        values.len(),
+                        vec![1, values.len()],
+                        values,
+                    )?),
+                )
+            }
+            _ => {
+                let direct = self.evaluate_expression(frame, value)?;
+                let Some(count) = direct_multi_value_count(&direct) else {
+                    return Ok(false);
+                };
+                (count, direct)
+            }
+        };
+        if receiver_count == 0 {
+            return Ok(false);
+        }
+
+        let receiver_defaults = vec![Value::Struct(StructValue::default()); receiver_count];
+        let Some(receivers) = self.materialize_undefined_root_brace_csl_assignment(
+            frame,
+            receiver_indices,
+            receiver_defaults,
+        )? else {
+            return Ok(false);
+        };
+
+        let mut field_path = field_projections
+            .iter()
+            .map(|projection| match projection {
+                LValueProjection::Field(field) => field.clone(),
+                _ => unreachable!("guard restricted to field projections"),
+            })
+            .collect::<Vec<_>>();
+        field_path.push(field.clone());
+        let mut updated = assign_struct_path(
+            Value::Cell(receivers),
+            &field_path,
+            assigned_value,
+        )?;
+        if !prefix_fields.is_empty() {
+            updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+        }
+        *cell.borrow_mut() = Some(updated);
+        Ok(true)
+    }
+
+    fn try_execute_undefined_cell_receiver_struct_field_brace_csl_assignment(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+        value: &HirExpression,
+    ) -> Result<bool, RuntimeError> {
+        let [HirAssignmentTarget::CellIndex { target, indices }] = targets else {
+            return Ok(false);
+        };
+
+        let (_name, cell, projections) = match frame.lvalue_root(target) {
+            Ok(root) => root,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut prefix_fields = Vec::new();
+        let mut brace_index = None;
+        for (index, projection) in projections.iter().enumerate() {
+            match projection {
+                LValueProjection::Field(field) if brace_index.is_none() => {
+                    prefix_fields.push(field.clone());
+                }
+                LValueProjection::Brace(_) if brace_index.is_none() => brace_index = Some(index),
+                _ => {}
+            }
+        }
+        let Some(brace_index) = brace_index else {
+            return Ok(false);
+        };
+        let LValueProjection::Brace(receiver_indices) = &projections[brace_index] else {
+            unreachable!("brace index identified a brace projection");
+        };
+        let field_projections = &projections[brace_index + 1..];
+        if cell.borrow().is_some()
+            || field_projections.is_empty()
+            || projections.iter().any(|projection| {
+                !matches!(projection, LValueProjection::Field(_) | LValueProjection::Brace(_))
+            })
+            || field_projections
+                .iter()
+                .any(|projection| !matches!(projection, LValueProjection::Field(_)))
+            || receiver_indices
+                .iter()
+                .any(|argument| matches!(argument, HirIndexArgument::End))
+        {
+            return Ok(false);
+        }
+
+        let values = match value {
+            HirExpression::Call {
+                target: HirCallTarget::Callable(reference),
+                args,
+            } if reference.name == "deal" => {
+                self.evaluate_call_outputs(
+                    frame,
+                    &HirCallTarget::Callable(reference.clone()),
+                    args,
+                    Some(args.len().max(1)),
+                )?
+            }
+            _ if expression_supports_list_expansion(value) => {
+                self.evaluate_expression_outputs(frame, value)?
+            }
+            _ => {
+                let direct = self.evaluate_expression(frame, value)?;
+                let Some(values) = direct_multi_value_values_ordered(&direct)? else {
+                    return Ok(false);
+                };
+                values
+            }
+        };
+        if values.is_empty() {
+            return Ok(false);
+        }
+
+        let empty = empty_cell_value();
+        let Value::Cell(empty_cell) = &empty else {
+            unreachable!("empty cell helper should return a cell value");
+        };
+        let evaluated_receiver_indices =
+            self.evaluate_index_arguments(frame, &empty, receiver_indices)?;
+        let receiver_plan = cell_assignment_plan(empty_cell, &evaluated_receiver_indices)?;
+        let receiver_count = if receiver_plan.selection.positions.is_empty() {
+            match value {
+                HirExpression::Call { .. } if expression_supports_list_expansion(value) => 0,
+                HirExpression::Call { .. } => 0,
+                _ => infer_missing_root_receiver_count_from_value(
+                    receiver_indices,
+                    &self.evaluate_expression(frame, value)?,
+                )
+                .unwrap_or(0),
+            }
+        } else {
+            receiver_plan.selection.positions.len()
+        };
+        if receiver_count == 0 || values.len() % receiver_count != 0 {
+            return Ok(false);
+        }
+
+        let receiver_defaults = vec![Value::Struct(StructValue::default()); receiver_count];
+        let Some(receivers) = self.materialize_undefined_root_brace_csl_assignment(
+            frame,
+            receiver_indices,
+            receiver_defaults,
+        )? else {
+            return Ok(false);
+        };
+
+        let field_path = field_projections
+            .iter()
+            .map(|projection| match projection {
+                LValueProjection::Field(field) => field.clone(),
+                _ => unreachable!("guard restricted to field projections"),
+            })
+            .collect::<Vec<_>>();
+        let chunk_len = values.len() / receiver_count;
+        let mut chunks = values.chunks(chunk_len);
+        let mut elements = Vec::with_capacity(receivers.elements.len());
+        for element in receivers.elements {
+            let chunk = chunks.next().expect("chunk per cell receiver").to_vec();
+            let Some(materialized) =
+                self.materialize_undefined_root_brace_csl_assignment(frame, indices, chunk)?
+            else {
+                return Ok(false);
+            };
+            elements.push(assign_struct_path(
+                element,
+                &field_path,
+                Value::Cell(materialized),
+            )?);
+        }
+
+        let mut updated = Value::Cell(CellValue::with_dimensions(
+            receivers.rows,
+            receivers.cols,
+            receivers.dims,
+            elements,
+        )?);
+        if !prefix_fields.is_empty() {
+            updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+        }
+        *cell.borrow_mut() = Some(updated);
+        Ok(true)
+    }
+
+    fn try_execute_undefined_struct_field_brace_csl_assignment(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+        value: &HirExpression,
+    ) -> Result<bool, RuntimeError> {
+        let [HirAssignmentTarget::CellIndex { target, indices }] = targets else {
+            return Ok(false);
+        };
+
+        let (_name, cell, projections) = match frame.lvalue_root(target) {
+            Ok(root) => root,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if cell.borrow().is_some()
+            || projections
+                .iter()
+                .any(|projection| !matches!(projection, LValueProjection::Field(_)))
+        {
+            return Ok(false);
+        }
+
+        let values = match value {
+            HirExpression::Call {
+                target: HirCallTarget::Callable(reference),
+                args,
+            } if reference.name == "deal" => {
+                self.evaluate_call_outputs(
+                    frame,
+                    &HirCallTarget::Callable(reference.clone()),
+                    args,
+                    Some(args.len().max(1)),
+                )?
+            }
+            _ if expression_supports_list_expansion(value) => self.evaluate_expression_outputs(frame, value)?,
+            _ => {
+                let direct = self.evaluate_expression(frame, value)?;
+                let Some(values) = direct_multi_value_values_ordered(&direct)? else {
+                    return Ok(false);
+                };
+                values
+            }
+        };
+        if values.is_empty() {
+            return Ok(false);
+        }
+
+        let Some(materialized) =
+            self.materialize_undefined_root_brace_csl_assignment(frame, indices, values)?
+        else {
+            return Ok(false);
+        };
+        let updated = assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &projections
+                .iter()
+                .map(|projection| match projection {
+                    LValueProjection::Field(field) => field.clone(),
+                    _ => unreachable!("guard restricted to field projections"),
+                })
+                .collect::<Vec<_>>(),
+            Value::Cell(materialized),
+        )?;
+        *cell.borrow_mut() = Some(updated);
+        Ok(true)
+    }
+
+    fn try_execute_undefined_indexed_struct_field_brace_csl_assignment(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+        value: &HirExpression,
+    ) -> Result<bool, RuntimeError> {
+        let [HirAssignmentTarget::CellIndex { target, indices }] = targets else {
+            return Ok(false);
+        };
+
+        let (_name, cell, projections) = match frame.lvalue_root(target) {
+            Ok(root) => root,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut prefix_fields = Vec::new();
+        let mut paren_index = None;
+        for (index, projection) in projections.iter().enumerate() {
+            match projection {
+                LValueProjection::Field(field) if paren_index.is_none() => {
+                    prefix_fields.push(field.clone());
+                }
+                LValueProjection::Paren(_) if paren_index.is_none() => paren_index = Some(index),
+                _ => {}
+            }
+        }
+        let Some(paren_index) = paren_index else {
+            return Ok(false);
+        };
+        let LValueProjection::Paren(receiver_indices) = &projections[paren_index] else {
+            unreachable!("paren index identified a paren projection");
+        };
+        let field_projections = &projections[paren_index + 1..];
+        if cell.borrow().is_some()
+            || field_projections.is_empty()
+            || projections
+                .iter()
+                .any(|projection| !matches!(projection, LValueProjection::Field(_) | LValueProjection::Paren(_)))
+            || field_projections
+                .iter()
+                .any(|projection| !matches!(projection, LValueProjection::Field(_)))
+        {
+            return Ok(false);
+        }
+
+        let values = match value {
+            HirExpression::Call {
+                target: HirCallTarget::Callable(reference),
+                args,
+            } if reference.name == "deal" => {
+                self.evaluate_call_outputs(
+                    frame,
+                    &HirCallTarget::Callable(reference.clone()),
+                    args,
+                    Some(args.len().max(1)),
+                )?
+            }
+            _ if expression_supports_list_expansion(value) => {
+                self.evaluate_expression_outputs(frame, value)?
+            }
+            _ => {
+                let direct = self.evaluate_expression(frame, value)?;
+                let Some(values) = direct_multi_value_values_ordered(&direct)? else {
+                    return Ok(false);
+                };
+                values
+            }
+        };
+        if values.is_empty() {
+            return Ok(false);
+        }
+
+        let Some(receivers) = self.materialize_undefined_indexed_struct_brace_receivers(
+            frame,
+            receiver_indices,
+            indices,
+            values.len(),
+        )? else {
+            return Ok(false);
+        };
+        let updated = self.materialize_undefined_indexed_struct_field_brace_csl_assignment(
+            frame,
+            receivers,
+            field_projections,
+            indices,
+            values,
+        )?;
+        let Some(mut updated) = updated else {
+            return Ok(false);
+        };
+        if !prefix_fields.is_empty() {
+            updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+        }
+        *cell.borrow_mut() = Some(updated);
+        Ok(true)
+    }
+
+    fn materialize_undefined_indexed_struct_brace_receivers(
+        &mut self,
+        frame: &mut Frame<'a>,
+        receiver_indices: &[HirIndexArgument],
+        indices: &[HirIndexArgument],
+        output_count: usize,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let receiver_target = empty_matrix_value();
+        let evaluated_receiver_indices =
+            self.evaluate_index_arguments(frame, &receiver_target, receiver_indices)?;
+        if let Some(receivers) = default_struct_selection_value_for_index_update(
+            &receiver_target,
+            &evaluated_receiver_indices,
+        )? {
+            let receiver_count = match &receivers {
+                Value::Struct(_) => 1,
+                Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
+                _ => 0,
+            };
+            if receiver_count > 0 {
+                return Ok(Some(receivers));
+            }
+        }
+
+        let Some(receiver_count) = self.infer_missing_root_indexed_struct_brace_receiver_count(
+            frame,
+            indices,
+            output_count,
+        )? else {
+            return Ok(None);
+        };
+        self.materialize_undefined_indexed_struct_receivers(frame, receiver_indices, receiver_count)
+    }
+
+    fn infer_missing_root_indexed_struct_brace_receiver_count(
+        &mut self,
+        frame: &mut Frame<'a>,
+        indices: &[HirIndexArgument],
+        output_count: usize,
+    ) -> Result<Option<usize>, RuntimeError> {
+        if output_count == 0 || indices.iter().any(index_argument_contains_end_keyword) {
+            return Ok(None);
+        }
+
+        let empty = empty_cell_value();
+        let Value::Cell(empty_cell) = &empty else {
+            unreachable!("empty cell helper should return a cell value");
+        };
+        let evaluated_indices = self.evaluate_index_arguments(frame, &empty, indices)?;
+        if evaluated_indices
+            .iter()
+            .any(|argument| matches!(argument, EvaluatedIndexArgument::FullSlice))
+        {
+            return Ok(None);
+        }
+
+        let plan = cell_assignment_plan(empty_cell, &evaluated_indices)?;
+        let per_receiver_count = plan.selection.positions.len();
+        if per_receiver_count == 0 || output_count % per_receiver_count != 0 {
+            return Ok(None);
+        }
+        Ok(Some(output_count / per_receiver_count))
+    }
+
+    fn materialize_undefined_indexed_struct_field_brace_csl_assignment(
+        &mut self,
+        frame: &mut Frame<'a>,
+        receivers: Value,
+        field_projections: &[LValueProjection],
+        indices: &[HirIndexArgument],
+        values: Vec<Value>,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let receiver_count = match &receivers {
+            Value::Struct(_) => 1,
+            Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
+            _ => return Ok(None),
+        };
+        if receiver_count == 0 || values.len() % receiver_count != 0 {
+            return Ok(None);
+        }
+
+        let chunk_len = values.len() / receiver_count;
+        let field_path = field_projections
+            .iter()
+            .map(|projection| match projection {
+                LValueProjection::Field(field) => field.clone(),
+                _ => unreachable!("guard restricted to field projections"),
+            })
+            .collect::<Vec<_>>();
+
+        let mut chunks = values.chunks(chunk_len);
+        match receivers {
+            Value::Struct(receiver) => {
+                let chunk = chunks.next().expect("single receiver chunk").to_vec();
+                let Some(materialized) =
+                    self.materialize_undefined_root_brace_csl_assignment(frame, indices, chunk)?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(assign_struct_path(
+                    Value::Struct(receiver),
+                    &field_path,
+                    Value::Cell(materialized),
+                )?))
+            }
+            Value::Matrix(matrix) if matrix_is_struct_array(&matrix) => {
+                let mut elements = Vec::with_capacity(matrix.elements.len());
+                for element in matrix.elements {
+                    let chunk = chunks.next().expect("chunk per indexed receiver").to_vec();
+                    let Some(materialized) =
+                        self.materialize_undefined_root_brace_csl_assignment(frame, indices, chunk)?
+                    else {
+                        return Ok(None);
+                    };
+                    elements.push(assign_struct_path(
+                        element,
+                        &field_path,
+                        Value::Cell(materialized),
+                    )?);
+                }
+                Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+                    matrix.rows,
+                    matrix.cols,
+                    matrix.dims,
+                    elements,
+                )?)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn evaluate_assignment_values(
         &mut self,
         frame: &mut Frame<'a>,
         targets: &[HirAssignmentTarget],
         value: &HirExpression,
+        list_assignment: bool,
     ) -> Result<Vec<Value>, RuntimeError> {
         if targets.is_empty() {
             return Ok(Vec::new());
@@ -4549,8 +6024,9 @@ impl<'a> Interpreter<'a> {
                 }
             }
             if let HirAssignmentTarget::Field { target, .. } = &targets[0] {
-                if matches!(value, HirExpression::Call { .. })
-                    || expression_supports_list_expansion(value)
+                if (list_assignment || field_target_requires_list_assignment(target))
+                    && (matches!(value, HirExpression::Call { .. })
+                        || expression_supports_list_expansion(value))
                 {
                     if self.undefined_struct_field_list_assignment_requires_index(frame, target)? {
                         return Err(RuntimeError::Unsupported(
@@ -5218,6 +6694,52 @@ impl<'a> Interpreter<'a> {
                 .any(|projection| matches!(projection, LValueProjection::Paren(_))))
     }
 
+    fn simple_struct_field_assignment_target_count(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+    ) -> Result<Option<usize>, RuntimeError> {
+        let [HirAssignmentTarget::Field { target, .. }] = targets else {
+            return Ok(None);
+        };
+        if let Some(count) = self.list_expanded_struct_assignment_target_count(frame, target)? {
+            if count > 1 {
+                return Ok(Some(count));
+            }
+        }
+        self.undefined_explicit_struct_assignment_target_count(frame, target)
+    }
+
+    fn unsupported_multi_struct_field_subindex_target(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+    ) -> Result<Option<String>, RuntimeError> {
+        let target = match targets {
+            [HirAssignmentTarget::Index { target, .. }] => target,
+            _ => return Ok(None),
+        };
+        let HirExpression::FieldAccess { target: receiver, field } = &**target else {
+            return Ok(None);
+        };
+        let receiver = match self.evaluate_expression(frame, receiver) {
+            Ok(receiver) => receiver,
+            Err(RuntimeError::MissingVariable(_))
+            | Err(RuntimeError::InvalidIndex(_))
+            | Err(RuntimeError::TypeError(_)) => return Ok(None),
+            Err(error) if is_single_output_dot_or_brace_result_error(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match receiver {
+            Value::Matrix(matrix)
+                if matrix_is_struct_array(&matrix) && matrix.element_count() > 1 =>
+            {
+                Ok(Some(field.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn evaluate_index_literal_rows(
         &mut self,
         frame: &mut Frame<'a>,
@@ -5719,6 +7241,16 @@ impl<'a> Interpreter<'a> {
 
         match projection {
             LValueProjection::Field(field) => {
+                if matches!(
+                    &current,
+                    Value::Matrix(matrix)
+                        if matrix_is_struct_array(matrix)
+                            && matrix.element_count() > 1
+                            && (field_subindexing_requires_single_struct(rest)
+                                || matches!(leaf, LValueLeaf::Index { kind: IndexAssignmentKind::Paren, .. }))
+                ) {
+                    return Err(unsupported_multi_struct_field_subindexing_error(field));
+                }
                 if let Some(updated) = self.try_assign_distributed_struct_field_projection(
                     frame, &current, field, rest, &leaf,
                 )? {
@@ -6072,26 +7604,37 @@ impl<'a> Interpreter<'a> {
                 Some(FinalReferenceResolution::ResolvedPath { .. })
             ) =>
             {
-                let Some(FinalReferenceResolution::ResolvedPath { path, .. }) =
+                let Some(FinalReferenceResolution::ResolvedPath { path, kind, .. }) =
                     reference.final_resolution.as_ref()
                 else {
                     unreachable!("guard ensured resolved path final resolution");
                 };
-                self.load_and_invoke_external_function(path, args)
+                if path_resolution_is_class(*kind) {
+                    self.construct_class_from_path(path, args)
+                } else {
+                    self.load_and_invoke_external_function(path, args)
+                }
             }
-            _ => invoke_runtime_builtin_outputs(
-                &self.shared_state,
-                Some(frame),
-                &reference.name,
-                args,
-                output_arity,
-            )
-            .map_err(|_| {
-                RuntimeError::Unsupported(format!(
-                    "call target `{}` is not executable in the current interpreter",
-                    reference.name
-                ))
-            }),
+            _ => {
+                if let Some(Value::Object(object)) = args.first() {
+                    if object_has_method(object, &reference.name) {
+                        return self.invoke_object_method_outputs(object, &reference.name, &args[1..]);
+                    }
+                }
+                invoke_runtime_builtin_outputs(
+                    &self.shared_state,
+                    Some(frame),
+                    &reference.name,
+                    args,
+                    output_arity,
+                )
+                .map_err(|_| {
+                    RuntimeError::Unsupported(format!(
+                        "call target `{}` is not executable in the current interpreter",
+                        reference.name
+                    ))
+                })
+            }
         }
     }
 
@@ -6715,6 +8258,15 @@ impl<'a> Interpreter<'a> {
                         handle.display_name
                     ),
                 )),
+                FunctionHandleTarget::BoundMethod { receiver, method_name, .. } => {
+                    let Value::Object(object) = receiver.as_ref() else {
+                        return Err(RuntimeError::Unsupported(format!(
+                            "bound method handle `{}` does not carry an object receiver",
+                            handle.display_name
+                        )));
+                    };
+                    self.invoke_object_method_outputs(object, method_name, args)
+                }
             },
             _ => Err(RuntimeError::Unsupported(format!(
                 "value `{}` is not invocable as a function in the current interpreter",
@@ -6785,6 +8337,25 @@ impl<'a> Interpreter<'a> {
             .map(|(_, value)| value)
             .collect())
     }
+}
+
+fn values_len(value: &Value) -> Result<usize, RuntimeError> {
+    match value {
+        Value::Matrix(matrix) => Ok(matrix.element_count()),
+        other => Err(RuntimeError::TypeError(format!(
+            "expected matrix assignment payload, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn empty_struct_assignment_target_row(count: usize) -> Result<Value, RuntimeError> {
+    Ok(Value::Matrix(MatrixValue::with_dimensions(
+        1,
+        count,
+        vec![1, count],
+        vec![Value::Struct(StructValue::default()); count],
+    )?))
 }
 
 impl<'a> Frame<'a> {
@@ -7038,6 +8609,7 @@ fn iteration_values(value: &Value) -> Result<Vec<Value>, RuntimeError> {
         | Value::CharArray(_)
         | Value::String(_)
         | Value::Struct(_)
+        | Value::Object(_)
         | Value::FunctionHandle(_) => Ok(vec![value.clone()]),
         Value::Matrix(matrix) => Ok(matrix.iter().cloned().collect()),
         Value::Cell(cell) => Ok(cell.iter().cloned().collect()),
@@ -8133,6 +9705,9 @@ fn evaluate_expression_call(
                 .expect("single struct matrix is valid"),
             args,
         ),
+        Value::Object(_) => Err(RuntimeError::Unsupported(
+            "expression-call execution is not defined for object values".to_string(),
+        )),
         _ => Err(RuntimeError::Unsupported(format!(
             "expression-call execution is not defined for {} values",
             target.kind_name()
@@ -8230,13 +9805,7 @@ fn assign_cell_content_index(
         return Ok(cell);
     }
 
-    let Value::Cell(_) = value else {
-        return Err(RuntimeError::Unsupported(
-            "cell-content assignment with multiple targets currently expects a cell rhs"
-                .to_string(),
-        ));
-    };
-    let values = cell_assignment_values(&value, &plan.selection)?;
+    let values = cell_content_assignment_values(&value, &plan.selection)?;
     for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
         cell.elements_mut()[position] = value;
     }
@@ -9158,28 +10727,73 @@ fn distributed_cell_assignment_values(
     value: &Value,
     count: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let Value::Cell(cell) = value else {
-        return Err(RuntimeError::Unsupported(
-            "cell-content assignment with multiple targets currently expects a cell rhs"
-                .to_string(),
-        ));
-    };
+    match value {
+        Value::Cell(cell) => {
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            if cell.rows == 1 && cell.cols == 1 {
+                return Ok(vec![cell.elements()[0].clone(); count]);
+            }
+            if cell.element_count() == count {
+                return linearized_cell_elements(cell);
+            }
 
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    if cell.rows == 1 && cell.cols == 1 {
-        return Ok(vec![cell.elements()[0].clone(); count]);
-    }
-    if cell.element_count() == count {
-        return linearized_cell_elements(cell);
-    }
+            Err(RuntimeError::ShapeError(format!(
+                "cell-content assignment expects {} rhs element(s), found {}",
+                count,
+                cell.element_count()
+            )))
+        }
+        Value::Matrix(matrix) => {
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            if matrix.rows == 1 && matrix.cols == 1 {
+                return Ok(vec![matrix.elements()[0].clone(); count]);
+            }
+            if matrix.element_count() == count {
+                return linearized_matrix_elements(matrix);
+            }
 
-    Err(RuntimeError::ShapeError(format!(
-        "cell-content assignment expects {} rhs element(s), found {}",
-        count,
-        cell.element_count()
-    )))
+            Err(RuntimeError::ShapeError(format!(
+                "cell-content assignment expects {} rhs element(s), found {}",
+                count,
+                matrix.element_count()
+            )))
+        }
+        other => Err(RuntimeError::Unsupported(format!(
+            "cell-content assignment with multiple targets currently expects a cell or matrix rhs, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn cell_content_assignment_values(
+    value: &Value,
+    selection: &IndexSelection,
+) -> Result<Vec<Value>, RuntimeError> {
+    match value {
+        Value::Cell(_) => cell_assignment_values(value, selection),
+        Value::Matrix(matrix) => {
+            let count = selection.positions.len();
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            if matrix.element_count() == count {
+                return linearized_matrix_elements(matrix);
+            }
+            Err(RuntimeError::ShapeError(format!(
+                "cell-content assignment expects {} rhs element(s), found {}",
+                count,
+                matrix.element_count()
+            )))
+        }
+        other => Err(RuntimeError::Unsupported(format!(
+            "cell-content assignment with multiple targets currently expects a cell or matrix rhs, found {}",
+            other.kind_name()
+        ))),
+    }
 }
 
 fn pack_cell_assignment_rhs(
@@ -9346,7 +10960,7 @@ fn try_assign_field_to_nested_cell_containers(
                 .into_iter()
                 .map(|assigned| {
                     let mut struct_value = StructValue::default();
-                    struct_value.fields.insert(field_name.clone(), assigned);
+                    struct_value.insert_field(field_name.clone(), assigned);
                     Value::Struct(struct_value)
                 })
                 .collect::<Vec<_>>();
@@ -9819,23 +11433,34 @@ fn resize_matrix_to_dims(matrix: MatrixValue, target_dims: &[usize], fill: Value
         };
     }
 
-    if matrix.dims.len() > 2 && target_dims.len() == 2 && target_dims[1] == 1 {
-        let mut elements = vec![fill; target_rows * target_cols];
-        for (offset, value) in linearized_matrix_elements(&matrix)
-            .expect("matrix linearization should succeed")
-            .into_iter()
-            .enumerate()
-        {
-            if offset < elements.len() {
-                elements[offset] = value;
+    if matrix.dims.len() > 2 && target_dims.len() == 2 {
+        if target_dims[1] == 1 {
+            let mut elements = vec![fill; target_rows * target_cols];
+            for (offset, value) in linearized_matrix_elements(&matrix)
+                .expect("matrix linearization should succeed")
+                .into_iter()
+                .enumerate()
+            {
+                if offset < elements.len() {
+                    elements[offset] = value;
+                }
             }
+            return MatrixValue {
+                rows: target_rows,
+                cols: target_cols,
+                dims: target_dims.to_vec(),
+                elements,
+            };
         }
-        return MatrixValue {
-            rows: target_rows,
-            cols: target_cols,
-            dims: target_dims.to_vec(),
-            elements,
-        };
+
+        let collapsed = MatrixValue::with_dimensions(
+            matrix.rows,
+            matrix.cols,
+            vec![matrix.rows, matrix.cols],
+            matrix.elements,
+        )
+        .expect("collapsed matrix view should preserve folded storage order");
+        return resize_matrix_to_dims(collapsed, target_dims, fill);
     }
 
     let (source_dims, source_elements) =
@@ -9867,23 +11492,34 @@ fn resize_cell_to_dims(cell: CellValue, target_dims: &[usize], fill: Value) -> C
         };
     }
 
-    if cell.dims.len() > 2 && target_dims.len() == 2 && target_dims[1] == 1 {
-        let mut elements = vec![fill; target_rows * target_cols];
-        for (offset, value) in linearized_cell_elements(&cell)
-            .expect("cell linearization should succeed")
-            .into_iter()
-            .enumerate()
-        {
-            if offset < elements.len() {
-                elements[offset] = value;
+    if cell.dims.len() > 2 && target_dims.len() == 2 {
+        if target_dims[1] == 1 {
+            let mut elements = vec![fill; target_rows * target_cols];
+            for (offset, value) in linearized_cell_elements(&cell)
+                .expect("cell linearization should succeed")
+                .into_iter()
+                .enumerate()
+            {
+                if offset < elements.len() {
+                    elements[offset] = value;
+                }
             }
+            return CellValue {
+                rows: target_rows,
+                cols: target_cols,
+                dims: target_dims.to_vec(),
+                elements,
+            };
         }
-        return CellValue {
-            rows: target_rows,
-            cols: target_cols,
-            dims: target_dims.to_vec(),
-            elements,
-        };
+
+        let collapsed = CellValue::with_dimensions(
+            cell.rows,
+            cell.cols,
+            vec![cell.rows, cell.cols],
+            cell.elements,
+        )
+        .expect("collapsed cell view should preserve folded storage order");
+        return resize_cell_to_dims(collapsed, target_dims, fill);
     }
 
     let (source_dims, source_elements) =
@@ -10292,6 +11928,18 @@ fn read_field_value(target: &Value, field: &str) -> Result<Value, RuntimeError> 
         Value::Struct(struct_value) => struct_value.fields.get(field).cloned().ok_or_else(|| {
             RuntimeError::MissingVariable(format!("struct field `{field}` is not defined"))
         }),
+        Value::Object(object) => {
+            if let Some(value) = object.property_value(field) {
+                Ok(value)
+            } else if object_has_method(object, field) {
+                Ok(bound_method_value(object, field))
+            } else {
+                Err(RuntimeError::MissingVariable(format!(
+                    "object property or method `{field}` is not defined for class `{}`",
+                    object.class.class_name
+                )))
+            }
+        }
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => {
             if matrix.rows == 1 && matrix.cols == 1 {
                 let Value::Struct(struct_value) = &matrix.elements[0] else {
@@ -10319,6 +11967,7 @@ fn read_field_outputs(target: &Value, field: &str) -> Result<Vec<Value>, Runtime
             })?;
             Ok(vec![value])
         }
+        Value::Object(object) => Ok(vec![read_field_value(&Value::Object(object.clone()), field)?]),
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => {
             let mut values = Vec::with_capacity(matrix.elements.len());
             for index in 1..=matrix.rows * matrix.cols {
@@ -10353,6 +12002,7 @@ fn read_field_outputs_from_values(
 
 fn read_field_lvalue_value(target: &Value, field: &str) -> Result<Value, RuntimeError> {
     match target {
+        Value::Object(_) => read_field_value(target, field),
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => {
             let mut elements = Vec::with_capacity(matrix.elements.len());
             for element in &matrix.elements {
@@ -10417,12 +12067,16 @@ fn read_field_lvalue_value_for_assignment(
     };
 
     match target {
+        Value::Object(_) => read_field_value(target, field),
         Value::Struct(_) => match read_field_value(target, field) {
             Ok(value) => Ok(value),
             Err(RuntimeError::MissingVariable(_)) => fallback(),
             Err(error) => Err(error),
         },
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => {
+            if matrix.element_count() > 1 && field_subindexing_requires_single_struct(rest) {
+                return Err(unsupported_multi_struct_field_subindexing_error(field));
+            }
             let mut elements = Vec::with_capacity(matrix.elements.len());
             let mut all_cells = true;
             for element in &matrix.elements {
@@ -10493,6 +12147,23 @@ fn assign_struct_path(target: Value, path: &[String], value: Value) -> Result<Va
     }
 
     match target {
+        Value::Object(mut object) => {
+            let field = &path[0];
+            if !object.class.property_order.iter().any(|name| name == field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "object property `{field}` is not defined for class `{}`",
+                    object.class.class_name
+                )));
+            }
+            let assigned = if path.len() == 1 {
+                value
+            } else {
+                let next = object.property_value(field).unwrap_or_else(empty_matrix_value);
+                assign_struct_path(next, &path[1..], value)?
+            };
+            object.set_property_value(field, assigned)?;
+            Ok(Value::Object(object))
+        }
         Value::Struct(mut struct_value) => {
             let field = &path[0];
             let assigned = if path.len() == 1 {
@@ -10504,7 +12175,7 @@ fn assign_struct_path(target: Value, path: &[String], value: Value) -> Result<Va
                     .unwrap_or_else(|| Value::Struct(StructValue::default()));
                 assign_struct_path(next, &path[1..], value)?
             };
-            struct_value.fields.insert(field.clone(), assigned);
+            struct_value.insert_field(field.clone(), assigned);
             Ok(Value::Struct(struct_value))
         }
         Value::Matrix(matrix) if matrix_is_struct_array(&matrix) => {
@@ -10560,7 +12231,7 @@ fn value_is_struct_assignment_target(value: &Value) -> bool {
 
 fn nested_struct_assignment_target_count(value: &Value) -> Option<usize> {
     match value {
-        Value::Struct(_) => Some(1),
+        Value::Struct(_) | Value::Object(_) => Some(1),
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => Some(matrix.elements.len()),
         Value::Cell(cell) => {
             let mut total = 0;
@@ -10610,7 +12281,7 @@ fn distributed_struct_assignment_values(
 
 fn pack_struct_assignment_chunk(target: &Value, values: Vec<Value>) -> Result<Value, RuntimeError> {
     match target {
-        Value::Struct(_) => values.into_iter().next().ok_or_else(|| {
+        Value::Struct(_) | Value::Object(_) => values.into_iter().next().ok_or_else(|| {
             RuntimeError::ShapeError("struct assignment expected one rhs element".to_string())
         }),
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => Ok(Value::Matrix(
@@ -10633,6 +12304,7 @@ fn pack_struct_assignment_chunk(target: &Value, values: Vec<Value>) -> Result<Va
 
 fn default_struct_value_like(target: &Value) -> Value {
     match target {
+        Value::Object(object) => Value::Object(object.clone()),
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => Value::Matrix(
             MatrixValue::with_dimensions(
                 matrix.rows,
@@ -10772,9 +12444,7 @@ fn struct_assignment_values(
         Value::Matrix(matrix) if matrix.rows == 1 && matrix.cols == 1 => {
             Ok(vec![matrix.elements[0].clone(); rows * cols])
         }
-        Value::Matrix(matrix) if matrix.elements.len() == rows * cols => {
-            Ok(matrix.elements.clone())
-        }
+        Value::Matrix(matrix) if matrix.elements.len() == rows * cols => Ok(matrix.elements.clone()),
         Value::Matrix(matrix)
             if matrix.rows == rows
                 && matrix.cols == cols
@@ -10811,6 +12481,49 @@ fn expression_supports_list_expansion(expression: &HirExpression) -> bool {
                 if expression_supports_list_expansion(target_expression)
         ),
         _ => false,
+    }
+}
+
+fn field_target_requires_list_assignment(expression: &HirExpression) -> bool {
+    match expression {
+        HirExpression::CellIndex { .. } | HirExpression::Call { .. } => true,
+        HirExpression::FieldAccess { target, .. } => field_target_requires_list_assignment(target),
+        _ => false,
+    }
+}
+
+fn field_subindexing_requires_single_struct(rest: &[LValueProjection]) -> bool {
+    rest.iter()
+        .any(|projection| matches!(projection, LValueProjection::Paren(_)))
+}
+
+fn unsupported_simple_csl_assignment_error(count: usize) -> RuntimeError {
+    RuntimeError::Unsupported(format!(
+        "assigning to {count} elements using a simple assignment statement is not supported; use comma-separated list assignment"
+    ))
+}
+
+fn unsupported_multi_struct_field_subindexing_error(field: &str) -> RuntimeError {
+    RuntimeError::Unsupported(format!(
+        "indexing into part of field `{field}` for multiple struct-array elements is not supported; index a single struct element first"
+    ))
+}
+
+fn direct_multi_value_count(value: &Value) -> Option<usize> {
+    match value {
+        Value::Matrix(matrix) if matrix.element_count() > 1 => Some(matrix.element_count()),
+        Value::Cell(cell) if cell.element_count() > 1 => Some(cell.element_count()),
+        _ => None,
+    }
+}
+
+fn direct_multi_value_values_ordered(value: &Value) -> Result<Option<Vec<Value>>, RuntimeError> {
+    match value {
+        Value::Matrix(matrix) if matrix.element_count() > 1 => {
+            Ok(Some(linearized_matrix_elements(matrix)?))
+        }
+        Value::Cell(cell) if cell.element_count() > 1 => Ok(Some(linearized_cell_elements(cell)?)),
+        _ => Ok(None),
     }
 }
 
@@ -11014,6 +12727,35 @@ fn brace_args_contain_full_slice(args: &[HirIndexArgument]) -> bool {
         .any(|argument| matches!(argument, HirIndexArgument::FullSlice))
 }
 
+fn infer_missing_root_receiver_count_from_value(
+    receiver_indices: &[HirIndexArgument],
+    value: &Value,
+) -> Option<usize> {
+    let full_slice_axes = receiver_indices
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, argument)| matches!(argument, HirIndexArgument::FullSlice).then_some(axis))
+        .collect::<Vec<_>>();
+    if full_slice_axes.len() != 1 {
+        return None;
+    }
+
+    let axis = full_slice_axes[0];
+    match value {
+        Value::Matrix(matrix) => match axis {
+            0 => Some(matrix.rows),
+            1 => Some(matrix.cols),
+            _ => None,
+        },
+        Value::Cell(cell) => match axis {
+            0 => Some(cell.rows),
+            1 => Some(cell.cols),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn undefined_brace_assignment_with_colon(
     projections: &[LValueProjection],
     leaf: &LValueLeaf,
@@ -11125,19 +12867,25 @@ fn format_semantic_diagnostics(
 mod tests {
     use super::{
         consume_figure_backend_events, distributed_cell_assignment_values,
-        distributed_struct_assignment_values, execute_script, execute_script_bytecode,
+        distributed_struct_assignment_values, execute_function_file,
+        execute_function_file_bytecode_module, execute_script, execute_script_bytecode,
+        execute_script_bytecode_module,
         invoke_graphics_builtin_outputs, linearized_cell_elements, linearized_matrix_elements,
         logical_value, plan_dimension_selector, plan_linear_selector, render_execution_result,
         render_figure_backend_index, render_matlab_execution_result,
         render_native_figure_host_index, session_manifest_json, EvaluatedIndexArgument,
         FigureBackendState, Frame, HirItem, Interpreter, RenderedFigure, SelectorPlanMode,
+        resize_matrix_to_dims,
     };
     use matlab_frontend::{
+        ast::CompilationUnitKind,
         parser::{parse_source, ParseMode},
         source::SourceFileId,
     };
     use matlab_interop::{read_mat_file, write_mat_file};
     use matlab_ir::lower_to_hir;
+    use matlab_codegen::emit_bytecode;
+    use matlab_optimizer::optimize_module;
     use matlab_resolver::ResolverContext;
     use matlab_runtime::{
         CellValue, FunctionHandleTarget, MatrixValue, RuntimeError, Value, Workspace,
@@ -11184,6 +12932,66 @@ mod tests {
 
     fn execute_script_source_bytecode(source: &str) -> super::ExecutionResult {
         execute_script_source_bytecode_result(source).expect("execute bytecode script")
+    }
+
+    fn execute_path_result(
+        path: &std::path::Path,
+        args: &[Value],
+    ) -> Result<super::ExecutionResult, RuntimeError> {
+        let source = fs::read_to_string(path).expect("read source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("compilation unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(path.to_path_buf()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        match unit.kind {
+            CompilationUnitKind::Script => execute_script(&hir),
+            CompilationUnitKind::FunctionFile => execute_function_file(&hir, args),
+            CompilationUnitKind::ClassFile => Err(RuntimeError::Unsupported(
+                "class-file tests must execute a script or function entrypoint".to_string(),
+            )),
+        }
+    }
+
+    fn execute_path(path: &std::path::Path, args: &[Value]) -> super::ExecutionResult {
+        execute_path_result(path, args).expect("execute source path")
+    }
+
+    fn execute_path_bytecode_result(
+        path: &std::path::Path,
+        args: &[Value],
+    ) -> Result<super::ExecutionResult, RuntimeError> {
+        let source = fs::read_to_string(path).expect("read source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("compilation unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(path.to_path_buf()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let bytecode = emit_bytecode(&optimized.module);
+        match unit.kind {
+            CompilationUnitKind::Script => {
+                execute_script_bytecode_module(&bytecode, path.display().to_string())
+            }
+            CompilationUnitKind::FunctionFile => {
+                execute_function_file_bytecode_module(&bytecode, args, path.display().to_string())
+            }
+            CompilationUnitKind::ClassFile => Err(RuntimeError::Unsupported(
+                "class-file tests must execute a script or function entrypoint".to_string(),
+            )),
+        }
+    }
+
+    fn execute_path_bytecode(path: &std::path::Path, args: &[Value]) -> super::ExecutionResult {
+        execute_path_bytecode_result(path, args).expect("execute bytecode source path")
     }
 
     #[test]
@@ -11745,6 +13553,51 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_nd_resize_uses_folded_view_storage_order() {
+        let matrix = MatrixValue::with_dimensions(
+            2,
+            4,
+            vec![2, 2, 2],
+            vec![
+                Value::Scalar(1.0),
+                Value::Scalar(5.0),
+                Value::Scalar(2.0),
+                Value::Scalar(6.0),
+                Value::Scalar(3.0),
+                Value::Scalar(7.0),
+                Value::Scalar(4.0),
+                Value::Scalar(8.0),
+            ],
+        )
+        .expect("matrix dimensions should be valid");
+        let resized = resize_matrix_to_dims(matrix, &[2, 5], Value::Scalar(0.0));
+        let resized_scalars = resized
+            .elements()
+            .iter()
+            .map(|value| value.as_scalar().expect("resized matrix helper should return scalars"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resized_scalars,
+            vec![1.0, 5.0, 2.0, 6.0, 0.0, 3.0, 7.0, 4.0, 8.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn cat_nd_storage_order_matches_runtime_expectations() {
+        let result =
+            execute_script_source("a = cat(3, [1 2; 3 4], [5 6; 7 8]);\n");
+        let Value::Matrix(matrix) = result.workspace.get("a").expect("cat output matrix") else {
+            panic!("expected matrix output from cat");
+        };
+        let scalars = matrix
+            .elements()
+            .iter()
+            .map(|value| value.as_scalar().expect("cat storage scalar"))
+            .collect::<Vec<_>>();
+        assert_eq!(scalars, vec![1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0]);
+    }
+
+    #[test]
     fn nd_linearized_assignment_and_nested_cell_distribution_follow_matlab_order() {
         let source = "source = cat(3, [1 2; 3 4], [5 6; 7 8]);\n\
              matrix_out = zeros(1, 8);\n\
@@ -11906,8 +13759,7 @@ mod tests {
 
     #[test]
     fn end_in_mixed_index_expressions_supports_builtin_and_nested_index_forms() {
-        let result = execute_script_source(
-            "x = [1 2 3; 4 5 6; 7 8 9];\n\
+        let source = "x = [1 2 3; 4 5 6; 7 8 9];\n\
              idx = [1 3];\n\
              cells = {1, 2, 3};\n\
              a = x(max(1, end - 1), 2);\n\
@@ -11915,12 +13767,15 @@ mod tests {
              c = x(cells{end}, end);\n\
              x(max(1, end - 1), end - 1:end) = [88 99];\n\
              out = x;\n\
-             clear idx cells x;\n",
-        );
-        assert_eq!(
-            render_execution_result(&result),
-            "workspace\n  a = 5\n  b = 7\n  c = 9\n  out = [1, 2, 3 ; 4, 88, 99 ; 7, 8, 9]\n"
-        );
+             clear idx cells x;\n";
+        let expected =
+            "workspace\n  a = 5\n  b = 7\n  c = 9\n  out = [1, 2, 3 ; 4, 88, 99 ; 7, 8, 9]\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
     }
 
     #[test]
@@ -12127,6 +13982,106 @@ mod tests {
     }
 
     #[test]
+    fn arrayfun_supports_error_handler_outputs_in_interpreter_and_bytecode() {
+        let source = "out = arrayfun(@arrayfun_error_demo, [1 2 3], 'ErrorHandler', @arrayfun_error_fallback);\n\
+                      [a, b] = arrayfun(@arrayfun_pair_demo, [1 2 3], 'ErrorHandler', @arrayfun_pair_fallback);\n\
+                      function y = arrayfun_error_demo(x)\n\
+                      if x == 2\n\
+                          error('MATC:Arrayfun', 'boom %d', x);\n\
+                      end\n\
+                      y = x + 10;\n\
+                      end\n\
+                      function y = arrayfun_error_fallback(err, x)\n\
+                      y = -x - err.index;\n\
+                      end\n\
+                      function [first, second] = arrayfun_pair_demo(x)\n\
+                      if x == 2\n\
+                          error('MATC:ArrayfunPair', 'pair %d', x);\n\
+                      end\n\
+                      first = x;\n\
+                      second = x + 100;\n\
+                      end\n\
+                      function [first, second] = arrayfun_pair_fallback(err, x)\n\
+                      first = -x;\n\
+                      second = err.index;\n\
+                      end\n";
+        let expected = "workspace\n  a = [1, -2, 3]\n  b = [101, 2, 103]\n  out = [11, -4, 13]\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn cellfun_supports_error_handler_outputs_in_interpreter_and_bytecode() {
+        let source = "out = cellfun(@cellfun_error_demo, {1, 2, 3}, 'ErrorHandler', @cellfun_error_fallback);\n\
+                      [a, b] = cellfun(@cellfun_pair_demo, {1, 2, 3}, 'ErrorHandler', @cellfun_pair_fallback);\n\
+                      function y = cellfun_error_demo(x)\n\
+                      if x == 2\n\
+                          error('MATC:Cellfun', 'boom %d', x);\n\
+                      end\n\
+                      y = x + 20;\n\
+                      end\n\
+                      function y = cellfun_error_fallback(err, x)\n\
+                      y = -x - err.index;\n\
+                      end\n\
+                      function [first, second] = cellfun_pair_demo(x)\n\
+                      if x == 2\n\
+                          error('MATC:CellfunPair', 'pair %d', x);\n\
+                      end\n\
+                      first = x;\n\
+                      second = x + 200;\n\
+                      end\n\
+                      function [first, second] = cellfun_pair_fallback(err, x)\n\
+                      first = -x;\n\
+                      second = err.index;\n\
+                      end\n";
+        let expected = "workspace\n  a = [1, -2, 3]\n  b = [201, 2, 203]\n  out = [21, -4, 23]\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn structfun_supports_error_handler_outputs_in_interpreter_and_bytecode() {
+        let source = "s = struct('a', 1, 'b', 2, 'c', 3);\n\
+                      out = structfun(@structfun_error_demo, s, 'ErrorHandler', @structfun_error_fallback);\n\
+                      [a, b] = structfun(@structfun_pair_demo, s, 'ErrorHandler', @structfun_pair_fallback);\n\
+                      function y = structfun_error_demo(x)\n\
+                      if x == 2\n\
+                          error('MATC:Structfun', 'boom %d', x);\n\
+                      end\n\
+                      y = x + 30;\n\
+                      end\n\
+                      function y = structfun_error_fallback(err, x)\n\
+                      y = -x - err.index;\n\
+                      end\n\
+                      function [first, second] = structfun_pair_demo(x)\n\
+                      if x == 2\n\
+                          error('MATC:StructfunPair', 'pair %d', x);\n\
+                      end\n\
+                      first = x;\n\
+                      second = x + 300;\n\
+                      end\n\
+                      function [first, second] = structfun_pair_fallback(err, x)\n\
+                      first = -x;\n\
+                      second = err.index;\n\
+                      end\n";
+        let expected = "workspace\n  a = [1 ; -2 ; 3]\n  b = [301 ; 2 ; 303]\n  out = [31 ; -4 ; 33]\n  s = struct{a=1, b=2, c=3}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
     fn linear_growth_on_nd_arrays_collapses_to_folded_column_vector() {
         let result = execute_script_source(
             "a = cat(3, [1 2; 3 4], [5 6; 7 8]);\n\
@@ -12189,24 +14144,130 @@ mod tests {
     }
 
     #[test]
-    fn undefined_colon_brace_assignment_errors_but_explicit_indices_work() {
-        let source = "[y{:}] = deal([10 20], [14 12]);\n";
-        let interpreted =
-            execute_script_source_result(source).expect_err("undefined colon brace assignment should fail");
-        assert!(
-            interpreted
-                .to_string()
-                .contains("comma-separated list assignment to a nonexistent variable is not supported when any index is a colon"),
-            "{interpreted}"
+    fn folded_view_column_growth_on_nd_arrays_remains_2d() {
+        let source = "a = cat(3, [1 2; 3 4], [5 6; 7 8]);\n\
+             a(:, 5) = [9; 10];\n\
+             out = a;\n\
+             cells = cat(3, {1, 2; 3, 4}, {5, 6; 7, 8});\n\
+             cells(:, 5) = {90; 100};\n\
+             out_cells = cells;\n\
+             clear a cells;\n";
+        let expected =
+            "workspace\n  out = [1, 5, 2, 6, 9 ; 3, 7, 4, 8, 10]\n  out_cells = {1, 5, 2, 6, 90 ; 3, 7, 4, 8, 100}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn folded_view_row_growth_on_nd_arrays_remains_2d() {
+        let source = "a = cat(3, [1 2; 3 4], [5 6; 7 8]);\n\
+             a(3, :) = [9 10 11 12];\n\
+             out = a;\n\
+             cells = cat(3, {1, 2; 3, 4}, {5, 6; 7, 8});\n\
+             cells(3, :) = {90 100 110 120};\n\
+             out_cells = cells;\n\
+             clear a cells;\n";
+        let expected =
+            "workspace\n  out = [1, 5, 2, 6 ; 3, 7, 4, 8 ; 9, 10, 11, 12]\n  out_cells = {1, 5, 2, 6 ; 3, 7, 4, 8 ; 90, 100, 110, 120}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn folded_view_corner_growth_on_nd_arrays_remains_2d() {
+        let source = "a = cat(3, [1 2; 3 4], [5 6; 7 8]);\n\
+             a(3, 5) = 99;\n\
+             out = a;\n\
+             cells = cat(3, {1, 2; 3, 4}, {5, 6; 7, 8});\n\
+             cells(3, 5) = {990};\n\
+             out_cells = cells;\n\
+             clear a cells;\n";
+        let expected =
+            "workspace\n  out = [1, 5, 2, 6, 0 ; 3, 7, 4, 8, 0 ; 0, 0, 0, 0, 99]\n  out_cells = {1, 5, 2, 6, [] ; 3, 7, 4, 8, [] ; [], [], [], [], 990}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn folded_view_rectangular_growth_on_nd_arrays_remains_2d() {
+        let source = "a = cat(3, [1 2; 3 4], [5 6; 7 8]);\n\
+             a(3:4, 5:6) = [9 10; 11 12];\n\
+             out = a;\n\
+             cells = cat(3, {1, 2; 3, 4}, {5, 6; 7, 8});\n\
+             cells(3:4, 5:6) = {90 100; 110 120};\n\
+             out_cells = cells;\n\
+             clear a cells;\n";
+        let expected =
+            "workspace\n  out = [1, 5, 2, 6, 0, 0 ; 3, 7, 4, 8, 0, 0 ; 0, 0, 0, 0, 9, 10 ; 0, 0, 0, 0, 11, 12]\n  out_cells = {1, 5, 2, 6, [], [] ; 3, 7, 4, 8, [], [] ; [], [], [], [], 90, 100 ; [], [], [], [], 110, 120}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn folded_view_logical_axis_masks_accept_longer_false_trailers() {
+        let source = "a = cat(3, [1 2; 3 4], [5 6; 7 8]);\n\
+             cols = a(:, [true false true false false]);\n\
+             a(:, [true false true false false]) = [10 20; 30 40];\n\
+             out = a;\n\
+             cells = cat(3, {1, 2; 3, 4}, {5, 6; 7, 8});\n\
+             ccols = cells(:, [true false true false false]);\n\
+             cells(:, [true false true false false]) = {100 200; 300 400};\n\
+             out_cells = cells;\n\
+             clear a cells;\n";
+        let expected =
+            "workspace\n  ccols = {1, 2 ; 3, 4}\n  cols = [1, 2 ; 3, 4]\n  out(:,:,1) = [10, 20 ; 30, 40]\n  out(:,:,2) = [5, 6 ; 7, 8]\n  out_cells(:,:,1) = {100, 200 ; 300, 400}\n  out_cells(:,:,2) = {5, 6 ; 7, 8}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn nested_brace_assignment_accepts_matrix_rhs_in_matlab_linear_order() {
+        let source = "outer = {{0, 0}, {0, 0}};\n\
+             [outer{1:2}{:}] = [1 2; 3 4];\n\
+             out = [outer{1:2}{:}];\n";
+        let expected =
+            "workspace\n  out = [1, 3, 2, 4]\n  outer = {{1, 3}, {2, 4}}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_colon_brace_assignment_materializes_cell_array() {
+        let source = "[y{:}] = deal([10 20], [14 12]);\nout = y;\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = {[10, 20], [14, 12]}\n  y = {[10, 20], [14, 12]}\n"
         );
 
-        let bytecode = execute_script_source_bytecode_result(source)
-            .expect_err("bytecode undefined colon brace assignment should fail");
-        assert!(
-            bytecode
-                .to_string()
-                .contains("comma-separated list assignment to a nonexistent variable is not supported when any index is a colon"),
-            "{bytecode}"
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = {[10, 20], [14, 12]}\n  y = {[10, 20], [14, 12]}\n"
         );
 
         let explicit = execute_script_source(
@@ -12226,6 +14287,201 @@ mod tests {
             render_execution_result(&explicit_bytecode),
             "workspace\n  out = {[10, 20], [14, 12]}\n  z = {[10, 20], [14, 12]}\n"
         );
+
+        let column = execute_script_source("[c{:,1}] = deal(10, 20);\nout = c;\n");
+        assert_eq!(
+            render_execution_result(&column),
+            "workspace\n  c = {10 ; 20}\n  out = {10 ; 20}\n"
+        );
+
+        let column_bytecode =
+            execute_script_source_bytecode("[c{:,1}] = deal(10, 20);\nout = c;\n");
+        assert_eq!(
+            render_execution_result(&column_bytecode),
+            "workspace\n  c = {10 ; 20}\n  out = {10 ; 20}\n"
+        );
+
+        let matrix_missing_root = execute_script_source(
+            "[m{:}] = [1 2; 3 4];\n\
+             out = [m{:}];\n",
+        );
+        assert_eq!(
+            render_execution_result(&matrix_missing_root),
+            "workspace\n  m = {1, 3, 2, 4}\n  out = [1, 3, 2, 4]\n"
+        );
+
+        let matrix_missing_root_bytecode = execute_script_source_bytecode(
+            "[m{:}] = [1 2; 3 4];\n\
+             out = [m{:}];\n",
+        );
+        assert_eq!(
+            render_execution_result(&matrix_missing_root_bytecode),
+            "workspace\n  m = {1, 3, 2, 4}\n  out = [1, 3, 2, 4]\n"
+        );
+
+        let explicit_rhs = execute_script_source(
+            "[q{:}] = {[10 20], [14 12]};\n\
+             out = q;\n",
+        );
+        assert_eq!(
+            render_execution_result(&explicit_rhs),
+            "workspace\n  out = {[10, 20], [14, 12]}\n  q = {[10, 20], [14, 12]}\n"
+        );
+
+        let explicit_rhs_bytecode = execute_script_source_bytecode(
+            "[q{:}] = {[10 20], [14 12]};\n\
+             out = q;\n",
+        );
+        assert_eq!(
+            render_execution_result(&explicit_rhs_bytecode),
+            "workspace\n  out = {[10, 20], [14, 12]}\n  q = {[10, 20], [14, 12]}\n"
+        );
+
+        let matrix_rhs = execute_script_source(
+            "c = {0, 0; 0, 0};\n\
+             [c{:}] = [1 2; 3 4];\n\
+             out = [c{:}];\n",
+        );
+        assert_eq!(
+            render_execution_result(&matrix_rhs),
+            "workspace\n  c = {1, 2 ; 3, 4}\n  out = [1, 3, 2, 4]\n"
+        );
+
+        let matrix_rhs_bytecode = execute_script_source_bytecode(
+            "c = {0, 0; 0, 0};\n\
+             [c{:}] = [1 2; 3 4];\n\
+             out = [c{:}];\n",
+        );
+        assert_eq!(
+            render_execution_result(&matrix_rhs_bytecode),
+            "workspace\n  c = {1, 2 ; 3, 4}\n  out = [1, 3, 2, 4]\n"
+        );
+    }
+
+    #[test]
+    fn undefined_cell_receiver_struct_field_brace_assignment_materializes_missing_root() {
+        let source = "[root_cell_structs{1:2}.items{:}] = deal(91, 92, 93, 94);\n\
+             out = [root_cell_structs{:}.items{:}];\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = [91, 92, 93, 94]\n  root_cell_structs = {struct{items={91, 92}}, struct{items={93, 94}}}\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = [91, 92, 93, 94]\n  root_cell_structs = {struct{items={91, 92}}, struct{items={93, 94}}}\n"
+        );
+    }
+
+    #[test]
+    fn undefined_nested_cell_receiver_struct_field_brace_assignment_materializes_missing_root() {
+        let source = "[root_nested_cell_structs{1:2}.inner.items{:}] = deal(101, 102, 103, 104);\n\
+             out = [root_nested_cell_structs{:}.inner.items{:}];\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = [101, 102, 103, 104]\n  root_nested_cell_structs = {struct{inner=struct{items={101, 102}}}, struct{inner=struct{items={103, 104}}}}\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = [101, 102, 103, 104]\n  root_nested_cell_structs = {struct{inner=struct{items={101, 102}}}, struct{inner=struct{items={103, 104}}}}\n"
+        );
+    }
+
+    #[test]
+    fn struct_cell_brace_assignment_accepts_matrix_rhs_in_matlab_linear_order() {
+        let source = "struct_cells = struct('items', {{0, 0}, {0, 0}});\n\
+             [struct_cells.items{:}] = [1 2; 3 4];\n\
+             out = [struct_cells.items{:}];\n";
+        let expected =
+            "workspace\n  out = [1, 3, 2, 4]\n  struct_cells = [struct{items={1, 3}}, struct{items={2, 4}}]\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_cell_receiver_struct_field_direct_matrix_assignment_materializes_missing_root() {
+        let source = "[direct_root_cells{1:2}.score] = [171 173];\n\
+             out = [direct_root_cells{:}.score];\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  direct_root_cells = {struct{score=171}, struct{score=173}}\n  out = [171, 173]\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  direct_root_cells = {struct{score=171}, struct{score=173}}\n  out = [171, 173]\n"
+        );
+    }
+
+    #[test]
+    fn undefined_prefixed_cell_receiver_struct_field_direct_matrix_assignment_materializes_missing_root(
+    ) {
+        let source = "[deep_direct.groups{1:2}.score] = [181 183];\n\
+             out = [deep_direct.groups{:}.score];\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  deep_direct = struct{groups={struct{score=181}, struct{score=183}}}\n  out = [181, 183]\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  deep_direct = struct{groups={struct{score=181}, struct{score=183}}}\n  out = [181, 183]\n"
+        );
+    }
+
+    #[test]
+    fn undefined_cell_receiver_struct_field_matrix_rhs_uses_matlab_linear_order() {
+        let source = "[root_matrix_cell_structs{1:2}.items{:}] = [191 192; 193 194];\n\
+             out = [root_matrix_cell_structs{:}.items{:}];\n";
+        let expected =
+            "workspace\n  out = [191, 193, 192, 194]\n  root_matrix_cell_structs = {struct{items={191, 193}}, struct{items={192, 194}}}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_prefixed_cell_receiver_struct_field_matrix_rhs_uses_matlab_linear_order() {
+        let source = "[deep_matrix.groups{1:2}.items{:}] = [301 302; 303 304];\n\
+             out = [deep_matrix.groups{:}.items{:}];\n";
+        let expected =
+            "workspace\n  deep_matrix = struct{groups={struct{items={301, 303}}, struct{items={302, 304}}}}\n  out = [301, 303, 302, 304]\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_colon_cell_receiver_struct_field_matrix_rhs_uses_matlab_linear_order() {
+        let source = "[root_matrix_cell_structs{:}.items{:}] = [141 142; 143 144];\n\
+             out = [root_matrix_cell_structs{:}.items{:}];\n";
+        let expected =
+            "workspace\n  out = [141, 143, 142, 144]\n  root_matrix_cell_structs = {struct{items={141, 143}}, struct{items={142, 144}}}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
     }
 
     #[test]
@@ -12245,23 +14501,251 @@ mod tests {
     }
 
     #[test]
-    fn undefined_struct_field_scalar_csl_errors_in_interpreter_and_bytecode() {
+    fn undefined_struct_field_explicit_indices_accept_direct_matrix_rhs() {
+        let source = "[s(1:2).field1] = [10 12];\nout = s;\n";
+        let expected =
+            "workspace\n  out = [struct{field1=10}, struct{field1=12}]\n  s = [struct{field1=10}, struct{field1=12}]\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_nested_struct_field_explicit_indices_accept_direct_matrix_rhs() {
+        let source = "[s.inner(1:2).field1] = [21 23];\nout = s;\n";
+        let expected =
+            "workspace\n  out = struct{inner=[struct{field1=21}, struct{field1=23}]}\n  s = struct{inner=[struct{field1=21}, struct{field1=23}]}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_struct_field_colon_indices_accept_distinct_deal_outputs() {
+        let source = "[s(:).field1] = deal(10, 12);\nout = s;\n";
+        let expected =
+            "workspace\n  out = [struct{field1=10}, struct{field1=12}]\n  s = [struct{field1=10}, struct{field1=12}]\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_nested_struct_field_colon_indices_accept_distinct_deal_outputs() {
+        let source = "[s.inner(:).field1] = deal(21, 23);\nout = s;\n";
+        let expected =
+            "workspace\n  out = struct{inner=[struct{field1=21}, struct{field1=23}]}\n  s = struct{inner=[struct{field1=21}, struct{field1=23}]}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_indexed_struct_brace_colon_receivers_materialize_missing_root() {
+        let source = "[s(:).items{1:2}] = deal(181, 182, 183, 184);\nout = [s.items{:}];\n";
+        let expected =
+            "workspace\n  out = [181, 182, 183, 184]\n  s = [struct{items={181, 182}}, struct{items={183, 184}}]\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_nested_indexed_struct_brace_colon_receivers_materialize_missing_root() {
+        let source =
+            "[s.inner(:).items{1:2}] = deal(191, 192, 193, 194);\nout = [s.inner.items{:}];\n";
+        let expected =
+            "workspace\n  out = [191, 192, 193, 194]\n  s = struct{inner=[struct{items={191, 192}}, struct{items={193, 194}}]}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_indexed_struct_brace_colon_receivers_accept_direct_matrix_rhs() {
+        let source = "[s(:).items{1:2}] = [201 202 203 204];\nout = [s.items{:}];\n";
+        let expected =
+            "workspace\n  out = [201, 202, 203, 204]\n  s = [struct{items={201, 202}}, struct{items={203, 204}}]\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn undefined_struct_field_scalar_csl_materializes_struct_array() {
         let source = "[s.field1] = deal([10 20], [14 12]);\n";
+        let interpreted = execute_script_source(format!("{source}out = s;\n").as_str());
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n  s = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(format!("{source}out = s;\n").as_str());
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n  s = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n"
+        );
+
+        let explicit_source = "[q.field1] = {[10 20], [14 12]};\nout = q;\n";
+        let explicit_interpreted = execute_script_source(explicit_source);
+        assert_eq!(
+            render_execution_result(&explicit_interpreted),
+            "workspace\n  out = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n  q = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n"
+        );
+
+        let explicit_bytecode = execute_script_source_bytecode(explicit_source);
+        assert_eq!(
+            render_execution_result(&explicit_bytecode),
+            "workspace\n  out = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n  q = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n"
+        );
+
+    }
+
+    #[test]
+    fn undefined_nested_struct_field_scalar_csl_materializes_nested_struct_array() {
+        let source = "[s.inner.field1] = deal([10 20], [14 12]);\n";
+        let interpreted = execute_script_source(format!("{source}out = s;\n").as_str());
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = struct{inner=[struct{field1=[10, 20]}, struct{field1=[14, 12]}]}\n  s = struct{inner=[struct{field1=[10, 20]}, struct{field1=[14, 12]}]}\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(format!("{source}out = s;\n").as_str());
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = struct{inner=[struct{field1=[10, 20]}, struct{field1=[14, 12]}]}\n  s = struct{inner=[struct{field1=[10, 20]}, struct{field1=[14, 12]}]}\n"
+        );
+    }
+
+    #[test]
+    fn undefined_struct_field_single_output_deal_materializes_scalar_struct() {
+        let source = "s.field1 = deal([10 20]);\nout = s;\n";
+        let interpreted = execute_script_source(source);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = struct{field1=[10, 20]}\n  s = struct{field1=[10, 20]}\n"
+        );
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = struct{field1=[10, 20]}\n  s = struct{field1=[10, 20]}\n"
+        );
+    }
+
+    #[test]
+    fn plain_scalar_struct_field_assignment_preserves_matrix_rhs_as_scalar_field_value() {
+        let source = "s.field1 = [10 20];\nout = s;\n";
+        let expected = "workspace\n  out = struct{field1=[10, 20]}\n  s = struct{field1=[10, 20]}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn plain_nested_scalar_struct_field_assignment_preserves_matrix_rhs_as_scalar_field_value() {
+        let source = "s.inner.field1 = [21 23];\nout = s;\n";
+        let expected =
+            "workspace\n  out = struct{inner=struct{field1=[21, 23]}}\n  s = struct{inner=struct{field1=[21, 23]}}\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn plain_multi_element_struct_field_assignment_errors_in_interpreter_and_bytecode() {
+        let source = "s = struct('field1', {0, 0});\ns(1:2).field1 = [31 32];\n";
         let interpreted = execute_script_source_result(source)
-            .expect_err("undefined scalar struct field CSL assignment should fail");
+            .expect_err("plain multi-element struct field assignment should fail");
         assert!(
             interpreted
                 .to_string()
-                .contains("comma-separated list assignment to a nonexistent struct array requires an explicit indexed receiver"),
+                .contains("assigning to 2 elements using a simple assignment statement is not supported"),
             "{interpreted}"
         );
 
         let bytecode = execute_script_source_bytecode_result(source)
-            .expect_err("bytecode undefined scalar struct field CSL assignment should fail");
+            .expect_err("bytecode plain multi-element struct field assignment should fail");
         assert!(
             bytecode
                 .to_string()
-                .contains("comma-separated list assignment to a nonexistent struct array requires an explicit indexed receiver"),
+                .contains("assigning to 2 elements using a simple assignment statement is not supported"),
+            "{bytecode}"
+        );
+    }
+
+    #[test]
+    fn plain_missing_root_multi_element_struct_field_assignment_errors_in_interpreter_and_bytecode()
+    {
+        let source = "s(1:2).field1 = [31 32];\n";
+        let interpreted = execute_script_source_result(source)
+            .expect_err("plain missing-root multi-element struct field assignment should fail");
+        assert!(
+            interpreted
+                .to_string()
+                .contains("assigning to 2 elements using a simple assignment statement is not supported"),
+            "{interpreted}"
+        );
+
+        let bytecode = execute_script_source_bytecode_result(source)
+            .expect_err(
+                "bytecode plain missing-root multi-element struct field assignment should fail",
+            );
+        assert!(
+            bytecode
+                .to_string()
+                .contains("assigning to 2 elements using a simple assignment statement is not supported"),
+            "{bytecode}"
+        );
+    }
+
+    #[test]
+    fn multi_struct_field_paren_subindex_assignment_errors_in_interpreter_and_bytecode() {
+        let source = "s(1).test = [1 2; 3 4];\n\
+             s(2).test = [5 6; 7 8];\n\
+             s(1:2).test(1,1) = [9 10];\n";
+        let interpreted = execute_script_source_result(source)
+            .expect_err("multi-struct field paren subindex assignment should fail");
+        assert!(
+            interpreted
+                .to_string()
+                .contains("indexing into part of field `test` for multiple struct-array elements is not supported"),
+            "{interpreted}"
+        );
+
+        let bytecode = execute_script_source_bytecode_result(source)
+            .expect_err("bytecode multi-struct field paren subindex assignment should fail");
+        assert!(
+            bytecode
+                .to_string()
+                .contains("indexing into part of field `test` for multiple struct-array elements is not supported"),
             "{bytecode}"
         );
     }
@@ -12852,6 +15336,150 @@ mod tests {
         let _ = fs::remove_dir_all(temp_dir);
     }
 
+    #[test]
+    fn classdef_value_objects_support_defaults_methods_and_copy_semantics() {
+        let temp_dir = unique_temp_script_dir("classdef-value");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             function obj = setX(obj, value)\n\
+             obj.x = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write value class");
+        fs::write(
+            &main_path,
+            "p = Point(3, 4);\n\
+             q = p;\n\
+             p = p.setX(10);\n\
+             sum_value = p.total();\n\
+             out = [p.x q.x sum_value];\n\
+             kind = class(p);\n\
+             ok = isa(p, 'Point');\n",
+        )
+        .expect("write value script");
+
+        let expected =
+            "workspace\n  kind = 'Point'\n  ok = true\n  out = [10, 3, 14]\n  p = Point with properties {x=10, y=4}\n  q = Point with properties {x=3, y=4}\n  sum_value = 14\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_objects_support_aliasing_and_external_dot_methods() {
+        let temp_dir = unique_temp_script_dir("classdef-handle");
+        let class_dir = temp_dir.join("@Counter");
+        fs::create_dir_all(&class_dir).expect("create class dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("increment.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write handle class");
+        fs::write(
+            &method_path,
+            "function obj = increment(obj, delta)\n\
+             obj.value = obj.value + delta;\n\
+             end\n",
+        )
+        .expect("write method file");
+        fs::write(
+            &main_path,
+            "c = Counter(5);\n\
+             d = c;\n\
+             c.increment(2);\n\
+             out = [c.value d.value];\n\
+             ok = isa(c, 'Counter');\n\
+             is_handle = isa(c, 'handle');\n",
+        )
+        .expect("write handle script");
+
+        let expected =
+            "workspace\n  c = Counter with properties {value=7}\n  d = Counter with properties {value=7}\n  is_handle = true\n  ok = true\n  out = [7, 7]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_objects_roundtrip_through_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-save-load");
+        let class_path = temp_dir.join("Pair.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-pair");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Pair\n\
+             properties\n\
+             left = 1;\n\
+             right = 2;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write pair class");
+        fs::write(
+            &main_path,
+            format!(
+                "p = Pair();\n\
+                 save('{matlab_path}', 'p');\n\
+                 clear('p');\n\
+                 s = load('{matlab_path}');\n\
+                 kind = class(s.p);\n\
+                 ok = isa(s.p, 'Pair');\n\
+                 out = [s.p.left s.p.right];\n"
+            ),
+        )
+        .expect("write pair script");
+
+        let expected =
+            "workspace\n  kind = 'Pair'\n  ok = true\n  out = [1, 2]\n  s = struct{p=Pair with properties {left=1, right=2}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
     fn unique_temp_mat_path(label: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -12875,3 +15503,4 @@ mod tests {
 pub fn summary() -> &'static str {
     "Owns interpreter, bytecode execution, and future JIT/AOT execution orchestration."
 }
+

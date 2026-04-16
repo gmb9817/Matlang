@@ -103,3 +103,8 @@ fn mexception_helpers_fixture_matches_golden() {
 fn warning_and_lastwarn_fixture_matches_golden() {
     assert_fixture("warning_and_lastwarn", ParseMode::Script);
 }
+
+#[test]
+fn classdef_basic_fixture_matches_golden() {
+    assert_fixture("classdef_basic", ParseMode::AutoDetect);
+}

@@ -1,0 +1,13 @@
+module ClassFile scope=0 workspace=0
+  class Point package=None handle=true constructor=Some("Point") source_path=Some("classdef_basic.m")
+    properties [x=number(1), y=number(2)]
+    inline_methods [Point, total]
+  function Point scope=2 workspace=2 captures=[]
+    inputs [binding(name=x kind=parameter binding=1 storage=local), binding(name=y kind=parameter binding=2 storage=local)]
+    outputs [binding(name=obj kind=output binding=3 storage=local)]
+    assign [field(value(name=obj resolution=workspace_value binding=3 kind=output), x)] = value(name=x resolution=workspace_value binding=1 kind=parameter)
+    assign [field(value(name=obj resolution=workspace_value binding=3 kind=output), y)] = value(name=y resolution=workspace_value binding=2 kind=parameter)
+  function total scope=3 workspace=3 captures=[]
+    inputs [binding(name=obj kind=parameter binding=5 storage=local)]
+    outputs [binding(name=total kind=output binding=6 storage=local)]
+    assign [binding(name=total kind=output binding=6 storage=local)] = binary(Add, field(value(name=obj resolution=workspace_value binding=5 kind=parameter), x), field(value(name=obj resolution=workspace_value binding=5 kind=parameter), y))

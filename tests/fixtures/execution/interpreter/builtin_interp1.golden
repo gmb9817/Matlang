@@ -1,6 +1,13 @@
 workspace
+  default_extrap = [-5, 25]
   default_x = [5, 15]
   descending = [25, 5]
   linear = [5, 15, 25]
+  linear_extrap = [-10, 5, 35]
   matrix_query = [0, 0.5 ; 2.5, NaN]
   nearest = [0, 10, 20, 30]
+  nearest_fill = [-99, 0, -99]
+  next = [10, 20, 30, 30]
+  next_extrap = [100, 17, NaN]
+  previous = [0, 10, 20, 30]
+  previous_extrap = [NaN, 100, 100]

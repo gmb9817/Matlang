@@ -623,11 +623,17 @@ fn push_instruction(out: &mut String, instruction: &BytecodeInstruction) {
             fields.push(target.to_string());
             fields.push(field.clone());
         }
-        BytecodeInstruction::StoreField { target, field, src } => {
+        BytecodeInstruction::StoreField {
+            target,
+            field,
+            src,
+            list_assignment,
+        } => {
             fields.push("StoreField".to_string());
             fields.push(target.to_string());
             fields.push(field.clone());
             fields.push(src.to_string());
+            fields.push(if *list_assignment { "1" } else { "0" }.to_string());
         }
         BytecodeInstruction::SplitList { outputs, src } => {
             fields.push("SplitList".to_string());
@@ -873,11 +879,12 @@ fn parse_instruction(
             })
         }
         "StoreField" => {
-            let fields = exact_slice(fields, 5, "StoreField", line_number)?;
+            let fields = exact_slice(fields, 6, "StoreField", line_number)?;
             Ok(BytecodeInstruction::StoreField {
                 target: parse_temp(&fields[0], line_number)?,
                 field: fields[1].clone(),
                 src: parse_temp(&fields[2], line_number)?,
+                list_assignment: parse_bool(&fields[3], line_number)?,
             })
         }
         "SplitList" => parse_split_list(fields, line_number),
@@ -1318,6 +1325,16 @@ fn parse_usize(value: &str, kind: &str, line_number: usize) -> Result<usize, Pla
             "line {line_number}: invalid {kind} `{value}`: {error}"
         ))
     })
+}
+
+fn parse_bool(value: &str, line_number: usize) -> Result<bool, PlatformError> {
+    match value {
+        "0" | "false" => Ok(false),
+        "1" | "true" => Ok(true),
+        _ => Err(PlatformError::Parse(format!(
+            "line {line_number}: invalid boolean flag `{value}`"
+        ))),
+    }
 }
 
 fn parse_backend(value: &str, line_number: usize) -> Result<BackendKind, PlatformError> {

@@ -161,6 +161,7 @@ pub enum BytecodeInstruction {
         target: TempId,
         field: String,
         src: TempId,
+        list_assignment: bool,
     },
     SplitList {
         outputs: Vec<TempId>,
@@ -562,8 +563,13 @@ impl<'a> FunctionEmitter<'a> {
 
     fn lower_statement(&mut self, statement: &HirStatement) {
         match statement {
-            HirStatement::Assignment { targets, value, .. } => {
-                self.lower_assignment(targets, value)
+            HirStatement::Assignment {
+                targets,
+                value,
+                list_assignment,
+                ..
+            } => {
+                self.lower_assignment(targets, value, *list_assignment)
             }
             HirStatement::Expression { expression, .. } => {
                 if let HirExpression::Call { target, args } = expression {
@@ -683,7 +689,12 @@ impl<'a> FunctionEmitter<'a> {
         }
     }
 
-    fn lower_assignment(&mut self, targets: &[HirAssignmentTarget], value: &HirExpression) {
+    fn lower_assignment(
+        &mut self,
+        targets: &[HirAssignmentTarget],
+        value: &HirExpression,
+        list_assignment: bool,
+    ) {
         let temps = if targets.len() > 1 {
             match value {
                 HirExpression::Call { target, args } => {
@@ -734,7 +745,15 @@ impl<'a> FunctionEmitter<'a> {
                 }
                 _ => vec![self.lower_expression(value)],
             }
-        } else if matches!(targets.first(), Some(HirAssignmentTarget::Field { .. })) {
+        } else if matches!(targets.first(), Some(HirAssignmentTarget::Field { .. }))
+            && (list_assignment
+                || target_expression_requires_field_list_assignment(
+                    match targets.first() {
+                        Some(HirAssignmentTarget::Field { target, .. }) => target,
+                        _ => unreachable!("guard restricted to field target"),
+                    },
+                ))
+        {
             match value {
                 HirExpression::Call {
                     target: HirCallTarget::Callable(reference),
@@ -768,11 +787,11 @@ impl<'a> FunctionEmitter<'a> {
         };
 
         for (target, temp) in targets.iter().zip(temps.into_iter()) {
-            self.store_target(target, temp);
+            self.store_target(target, temp, list_assignment);
         }
     }
 
-    fn store_target(&mut self, target: &HirAssignmentTarget, src: TempId) {
+    fn store_target(&mut self, target: &HirAssignmentTarget, src: TempId, list_assignment: bool) {
         match target {
             HirAssignmentTarget::Binding(binding) => {
                 self.instructions.push(BytecodeInstruction::StoreBinding {
@@ -806,6 +825,7 @@ impl<'a> FunctionEmitter<'a> {
                     target,
                     field: field.clone(),
                     src,
+                    list_assignment,
                 });
             }
         }
@@ -1606,6 +1626,14 @@ fn expression_supports_list_expansion(expression: &HirExpression) -> bool {
     }
 }
 
+fn target_expression_requires_field_list_assignment(expression: &HirExpression) -> bool {
+    match expression {
+        HirExpression::FieldAccess { target, .. } => target_expression_requires_field_list_assignment(target),
+        HirExpression::Call { .. } | HirExpression::CellIndex { .. } => true,
+        _ => false,
+    }
+}
+
 fn literal_rows_need_list_expansion(rows: &[Vec<HirExpression>]) -> bool {
     rows.iter()
         .flatten()
@@ -1732,8 +1760,17 @@ fn render_instruction(instruction: &BytecodeInstruction) -> String {
         BytecodeInstruction::LoadFieldList { dst, target, field } => {
             format!("t{dst} = field_list t{target}.{field}")
         }
-        BytecodeInstruction::StoreField { target, field, src } => {
-            format!("store_field t{target}.{field} <- t{src}")
+        BytecodeInstruction::StoreField {
+            target,
+            field,
+            src,
+            list_assignment,
+        } => {
+            if *list_assignment {
+                format!("store_field[list] t{target}.{field} <- t{src}")
+            } else {
+                format!("store_field t{target}.{field} <- t{src}")
+            }
         }
         BytecodeInstruction::SplitList { outputs, src } => {
             format!("[{}] = split_list t{src}", join_temps(outputs))

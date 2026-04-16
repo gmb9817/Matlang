@@ -28,6 +28,22 @@ cz = cat(3, {1, 2; 3, 4}, {5, 6; 7, 8});
 cz(:, 5) = {9; 10};
 czcol = cz(:, end);
 
+zr = cat(3, [1 2; 3 4], [5 6; 7 8]);
+zr(3, :) = [9 10 11 12];
+zrrow = zr(end, :);
+
+czr = cat(3, {1, 2; 3, 4}, {5, 6; 7, 8});
+czr(3, :) = {90 100 110 120};
+czrrow = czr(end, :);
+
+zk = cat(3, [1 2; 3 4], [5 6; 7 8]);
+zk(3, 5) = 99;
+zkcorner = zk(end, end);
+
+czk = cat(3, {1, 2; 3, 4}, {5, 6; 7, 8});
+czk(3, 5) = {990};
+czkcorner = czk{end, end};
+
 lg = cat(3, [1 2; 3 4], [5 6; 7 8]);
 lg(13) = 9;
 lglast = lg(end);

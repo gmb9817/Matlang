@@ -9,3 +9,16 @@ workspace
   h = "world"
   i = {'mid', 'beta'}
   j = {'pre<X>post', 'alpha[X]gamma'}
+  k = {'Hello', 'world'}
+  l = ["alpha", "beta", "gamma"]
+  m = [",", ";"]
+  n = ["left", "right"]
+  o = {'a', '', 'b'}
+  p = 'alpha'
+  q = ' beta'
+  r = "left"
+  s = "/right"
+  t = {'1.21', '1.985', '1.955', '2.015', '1.885', ''}
+  u = {'m/s', 'm/s ', ' m/s', ' m/s ', 'm/s'}
+  v = {'The', 'r', '', 'in', 'Sp', '', 'stays', 'm', 'ly', 'in', 'the', 'pl', '.'}
+  w = {' ', 'ain', ' ', ' ', 'ain', ' ', ' ', 'ain', ' ', ' ', ' ', 'ain'}

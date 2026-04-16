@@ -17,3 +17,6 @@ p = char(d);
 q = string(c);
 r = strcmp(p, q);
 s = strlength({'red', 'green'; '', 'blue'});
+t = char([65 66 67]);
+u = char(9731);
+v = string(t);

@@ -59,6 +59,52 @@ pub fn render_analysis(result: &AnalysisResult) -> String {
         ));
     }
 
+    if !result.classes.is_empty() {
+        out.push_str("classes\n");
+        for class in &result.classes {
+            out.push_str(&format!(
+                "  {} package={:?} handle={} constructor={:?} source_path={:?}\n",
+                class.name,
+                class.package,
+                class.inherits_handle,
+                class.constructor,
+                class.source_path
+            ));
+            if !class.properties.is_empty() {
+                out.push_str(&format!(
+                    "    properties [{}]\n",
+                    class.properties
+                        .iter()
+                        .map(|property| {
+                            if property.default.is_some() {
+                                format!("{}=default", property.name)
+                            } else {
+                                property.name.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !class.inline_methods.is_empty() {
+                out.push_str(&format!(
+                    "    inline_methods [{}]\n",
+                    class.inline_methods.join(", ")
+                ));
+            }
+            if !class.external_methods.is_empty() {
+                out.push_str(&format!(
+                    "    external_methods [{}]\n",
+                    class.external_methods
+                        .iter()
+                        .map(|method| format!("{}={}", method.name, method.path.display()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+    }
+
     out.push_str("references\n");
     for reference in &result.references {
         out.push_str(&format!(
@@ -143,6 +189,9 @@ fn render_symbol_kind(kind: SymbolKind) -> &'static str {
         SymbolKind::Parameter => "parameter",
         SymbolKind::Output => "output",
         SymbolKind::Function => "function",
+        SymbolKind::Class => "class",
+        SymbolKind::Method => "method",
+        SymbolKind::Property => "property",
         SymbolKind::Global => "global",
         SymbolKind::Persistent => "persistent",
     }
@@ -201,5 +250,11 @@ fn render_path_resolution_kind(kind: PathResolutionKind) -> &'static str {
         PathResolutionKind::CurrentDirectory => "current_directory_function",
         PathResolutionKind::SearchPath => "search_path_function",
         PathResolutionKind::PackageDirectory => "package_function",
+        PathResolutionKind::ClassCurrentDirectory => "current_directory_class",
+        PathResolutionKind::ClassSearchPath => "search_path_class",
+        PathResolutionKind::ClassPackageDirectory => "package_class",
+        PathResolutionKind::ClassFolderCurrentDirectory => "current_directory_folder_class",
+        PathResolutionKind::ClassFolderSearchPath => "search_path_folder_class",
+        PathResolutionKind::ClassFolderPackageDirectory => "package_folder_class",
     }
 }

@@ -3,3 +3,7 @@ default = divergence([0, 1, 4; 0, 1, 4; 0, 1, 4], [0, 0, 0; 1, 1, 1; 4, 4, 4]);
 matrix_grid = divergence(xg, yg, [0, 4, 16; 0, 4, 16; 0, 4, 16], [0, 0, 0; 16, 16, 16; 64, 64, 64]);
 descending = divergence([4, 2, 0], [8, 4, 0], [16, 4, 0; 16, 4, 0; 16, 4, 0], [64, 64, 64; 16, 16, 16; 0, 0, 0]);
 scalar = divergence(5, 7);
+empty = divergence([], []);
+empty_size = size(empty);
+empty_cols = divergence(zeros(3, 0), zeros(3, 0));
+empty_cols_size = size(empty_cols);

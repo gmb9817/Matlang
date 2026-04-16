@@ -1,0 +1,44 @@
+workspaces
+  Class id=0 parent=None name=None
+  Class id=1 parent=Some(0) name=Some("Point")
+  Function id=2 parent=Some(1) name=Some("Point")
+  Function id=3 parent=Some(1) name=Some("total")
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+  ClassBody id=1 parent=Some(0) workspace=1
+  FunctionBody id=2 parent=Some(1) workspace=2
+  FunctionBody id=3 parent=Some(1) workspace=3
+symbols
+  Point kind=class scope=0 workspace=0 binding=None
+  x kind=property scope=1 workspace=1 binding=None
+  y kind=property scope=1 workspace=1 binding=None
+  Point kind=method scope=1 workspace=1 binding=None
+  total kind=method scope=1 workspace=1 binding=None
+  ans kind=variable scope=2 workspace=2 binding=Some(0)
+  x kind=parameter scope=2 workspace=2 binding=Some(1)
+  y kind=parameter scope=2 workspace=2 binding=Some(2)
+  obj kind=output scope=2 workspace=2 binding=Some(3)
+  ans kind=variable scope=3 workspace=3 binding=Some(4)
+  obj kind=parameter scope=3 workspace=3 binding=Some(5)
+  total kind=output scope=3 workspace=3 binding=Some(6)
+bindings
+  ans id=0 storage=local owner_symbol=5 owner_scope=2 owner_workspace=2 shared=false
+  x id=1 storage=local owner_symbol=6 owner_scope=2 owner_workspace=2 shared=false
+  y id=2 storage=local owner_symbol=7 owner_scope=2 owner_workspace=2 shared=false
+  obj id=3 storage=local owner_symbol=8 owner_scope=2 owner_workspace=2 shared=false
+  ans id=4 storage=local owner_symbol=9 owner_scope=3 owner_workspace=3 shared=false
+  obj id=5 storage=local owner_symbol=10 owner_scope=3 owner_workspace=3 shared=false
+  total id=6 storage=local owner_symbol=11 owner_scope=3 owner_workspace=3 shared=false
+classes
+  Point package=None handle=true constructor=Some("Point") source_path=None
+    properties [x=default, y=default]
+    inline_methods [Point, total]
+references
+  x role=value resolution=workspace_value symbol=Some(6) kind=parameter scope=Some(2) workspace=Some(2) binding=Some(1) capture=none
+  obj role=value resolution=workspace_value symbol=Some(8) kind=output scope=Some(2) workspace=Some(2) binding=Some(3) capture=none
+  y role=value resolution=workspace_value symbol=Some(7) kind=parameter scope=Some(2) workspace=Some(2) binding=Some(2) capture=none
+  obj role=value resolution=workspace_value symbol=Some(8) kind=output scope=Some(2) workspace=Some(2) binding=Some(3) capture=none
+  obj role=value resolution=workspace_value symbol=Some(10) kind=parameter scope=Some(3) workspace=Some(3) binding=Some(5) capture=none
+  obj role=value resolution=workspace_value symbol=Some(10) kind=parameter scope=Some(3) workspace=Some(3) binding=Some(5) capture=none
+captures
+diagnostics

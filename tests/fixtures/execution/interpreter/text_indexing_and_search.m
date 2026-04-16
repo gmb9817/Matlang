@@ -15,3 +15,6 @@ w = contains('alpha', 'zz');
 x = strlength("alphabet");
 y = strcmp(b, 'lph');
 z = contains alphabet pha
+aa = strfind('banana', 'na');
+ab = strfind("alphabet", "a");
+ac = strfind({'banana', "cabana"}, 'ba');

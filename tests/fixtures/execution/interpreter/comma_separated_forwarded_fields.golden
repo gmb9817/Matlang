@@ -8,9 +8,26 @@ workspace
   cell_array_source_scores = {21, 22, 23, 24}
   cell_arrays = {[struct{score=21}, struct{score=22}], [struct{score=23}, struct{score=24}]}
   cells = {struct{score=7}, struct{score=9}}
+  column_root_cell_struct_row = [201, 202, 203, 204]
+  column_root_cell_structs = {struct{items={201, 202}}, struct{items={203, 204}}}
   copy = {7, 9}
+  deep_direct = struct{groups={struct{score=181}, struct{score=183}}}
+  deep_direct_scores = [181, 183]
+  deep_matrix = struct{groups={struct{items={301, 303}}, struct{items={302, 304}}}}
+  deep_matrix_row = [301, 303, 302, 304]
+  deep_root = struct{groups={struct{score=121, items={131, 132}}, struct{score=123, items={133, 134}}}}
+  deep_root_row = [131, 132, 133, 134]
+  deep_root_scores = [121, 123]
+  direct_root_cell_struct_row = [191, 192, 193, 194]
+  direct_root_cell_structs = {struct{items={191, 192}}, struct{items={193, 194}}}
+  direct_root_cells = {struct{score=171}, struct{score=173}}
+  direct_root_scores = [171, 173]
   explicit_missing_cell_struct_row = [41, 42, 43, 44]
   explicit_missing_cell_structs = {struct{items={41, 42}}, struct{items={43, 44}}}
+  matrix_cell_array_scores = [51, 53, 52, 54]
+  matrix_cell_arrays = {[struct{score=51}, struct{score=53}], [struct{score=52}, struct{score=54}]}
+  matrix_missing_cell_struct_row = [141, 143, 142, 144]
+  matrix_missing_cell_structs = {struct{items={141, 143}}, struct{items={142, 144}}}
   missing_cell_struct_reassigned_row = [15, 16, 17, 18]
   missing_cell_struct_row = [11, 12, 13, 14]
   missing_cell_struct_source = {15, 16, 17, 18}
@@ -24,6 +41,18 @@ workspace
   nested_source_scores = {51, 53}
   pair = [1, 2]
   reassigned_scores = [21, 23]
+  root_cell_reassigned_scores = [75, 77]
+  root_cell_scores = [71, 73]
+  root_cell_source_scores = {75, 77}
+  root_cell_struct_row = [91, 92, 93, 94]
+  root_cell_structs = {struct{items={91, 92}}, struct{items={93, 94}}}
+  root_cells = {struct{score=75}, struct{score=77}}
+  root_matrix_cell_struct_row = [191, 193, 192, 194]
+  root_matrix_cell_structs = {struct{items={191, 193}}, struct{items={192, 194}}}
+  root_nested_cell_struct_row = [101, 102, 103, 104]
+  root_nested_cell_structs = {struct{inner=struct{items={101, 102}}}, struct{inner=struct{items={103, 104}}}}
+  root_nested_cells = {struct{inner=struct{score=81}}, struct{inner=struct{score=83}}}
+  root_nested_scores = [81, 83]
   row = [7, 9]
   source_scores = {21, 23}
   synthesized = {struct{inner=struct{score=61}}, struct{inner=struct{score=63}}}

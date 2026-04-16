@@ -2,12 +2,14 @@
 
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
 };
 
 use matlab_frontend::ast::{
-    AssignmentTarget, CompilationUnit, CompilationUnitKind, Expression, ExpressionKind,
-    FunctionDef, Identifier, IndexArgument, Item, QualifiedName, Statement, StatementKind,
+    AssignmentTarget, ClassDef, ClassMethodBlock, ClassPropertyBlock, CompilationUnit,
+    CompilationUnitKind, Expression, ExpressionKind, FunctionDef, Identifier, IndexArgument,
+    Item, QualifiedName, Statement, StatementKind,
 };
 use matlab_frontend::source::{SourceFileId, SourcePosition, SourceSpan};
 use matlab_interop::{read_mat_file, read_workspace_snapshot};
@@ -15,8 +17,9 @@ use matlab_interop::{read_mat_file, read_workspace_snapshot};
 use crate::{
     diagnostics::SemanticDiagnostic,
     symbols::{
-        Binding, BindingId, BindingStorage, Capture, CaptureAccess, ReferenceResolution,
-        ReferenceRole, ResolvedReference, Symbol, SymbolId, SymbolKind, SymbolReference,
+        Binding, BindingId, BindingStorage, Capture, CaptureAccess, ClassInfo,
+        ClassPropertyInfo, ExternalMethodInfo, ReferenceResolution, ReferenceRole,
+        ResolvedReference, Symbol, SymbolId, SymbolKind, SymbolReference,
     },
     workspace::{Scope, ScopeId, ScopeKind, Workspace, WorkspaceId, WorkspaceKind},
 };
@@ -27,6 +30,7 @@ pub struct AnalysisResult {
     pub workspaces: Vec<Workspace>,
     pub symbols: Vec<Symbol>,
     pub bindings: Vec<Binding>,
+    pub classes: Vec<ClassInfo>,
     pub references: Vec<SymbolReference>,
     pub resolved_references: Vec<ResolvedReference>,
     pub captures: Vec<Capture>,
@@ -74,6 +78,7 @@ struct Binder {
     workspaces: Vec<Workspace>,
     symbols: Vec<Symbol>,
     bindings: Vec<Binding>,
+    classes: Vec<ClassInfo>,
     references: Vec<SymbolReference>,
     captures: Vec<Capture>,
     diagnostics: Vec<SemanticDiagnostic>,
@@ -305,6 +310,7 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "repmat",
     "isstruct",
     "iscell",
+    "iscellstr",
     "isnumeric",
     "isreal",
     "islogical",
@@ -314,7 +320,10 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "isa",
     "isfield",
     "fieldnames",
+    "orderfields",
     "rmfield",
+    "getfield",
+    "setfield",
     "qr",
     "lu",
     "chol",
@@ -378,8 +387,14 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "nan",
     "NaN",
     "strcmp",
+    "strcmpi",
+    "strncmp",
+    "strncmpi",
     "strlength",
     "contains",
+    "count",
+    "strfind",
+    "matches",
     "upper",
     "lower",
     "startsWith",
@@ -387,6 +402,7 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "append",
     "erase",
     "replace",
+    "strrep",
     "strcat",
     "split",
     "splitlines",
@@ -394,6 +410,8 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "strtrim",
     "deblank",
     "strjoin",
+    "strsplit",
+    "strtok",
     "join",
     "extractBefore",
     "extractAfter",
@@ -535,6 +553,7 @@ impl Binder {
             workspaces: Vec::new(),
             symbols: Vec::new(),
             bindings: Vec::new(),
+            classes: Vec::new(),
             references: Vec::new(),
             captures: Vec::new(),
             diagnostics: Vec::new(),
@@ -556,6 +575,7 @@ impl Binder {
             workspaces: self.workspaces,
             symbols: self.symbols,
             bindings: self.bindings,
+            classes: self.classes,
             references: self.references,
             resolved_references: Vec::new(),
             captures: self.captures,
@@ -569,12 +589,14 @@ impl Binder {
         let workspace_kind = match unit.kind {
             CompilationUnitKind::Script => WorkspaceKind::Script,
             CompilationUnitKind::FunctionFile => WorkspaceKind::Function,
+            CompilationUnitKind::ClassFile => WorkspaceKind::Class,
         };
         let root_workspace = self.alloc_workspace(None, workspace_kind, root_scope, None);
         self.patch_scope_workspace(root_scope, root_workspace);
-        self.declare_ans_symbol(root_scope, root_workspace);
-
-        self.predeclare_top_level_functions(unit, root_scope, root_workspace);
+        if workspace_kind != WorkspaceKind::Class {
+            self.declare_ans_symbol(root_scope, root_workspace);
+            self.predeclare_top_level_functions(unit, root_scope, root_workspace);
+        }
 
         match unit.kind {
             CompilationUnitKind::Script => {
@@ -585,6 +607,16 @@ impl Binder {
                         }
                         Item::Function(function) => {
                             self.bind_function(function, root_scope, root_workspace);
+                        }
+                        Item::Class(class_def) => {
+                            self.diagnostics.push(SemanticDiagnostic::error(
+                                "SEM009",
+                                format!(
+                                    "class definition `{}` is not valid inside a script file",
+                                    class_def.name.name
+                                ),
+                                class_def.span,
+                            ));
                         }
                     }
                 }
@@ -599,6 +631,42 @@ impl Binder {
                             self.diagnostics.push(SemanticDiagnostic::error(
                                 "SEM001",
                                 "top-level statements are not expected before the primary function in a function file",
+                                statement.span,
+                            ));
+                        }
+                        Item::Class(class_def) => {
+                            self.diagnostics.push(SemanticDiagnostic::error(
+                                "SEM004",
+                                format!(
+                                    "class definition `{}` is not valid inside a function file",
+                                    class_def.name.name
+                                ),
+                                class_def.span,
+                            ));
+                        }
+                    }
+                }
+            }
+            CompilationUnitKind::ClassFile => {
+                for item in &unit.items {
+                    match item {
+                        Item::Class(class_def) => {
+                            self.bind_class_definition(class_def, root_scope, root_workspace)
+                        }
+                        Item::Function(function) => {
+                            self.diagnostics.push(SemanticDiagnostic::error(
+                                "SEM005",
+                                format!(
+                                    "top-level function `{}` is not valid outside a methods block in a class file",
+                                    function.name.name
+                                ),
+                                function.span,
+                            ));
+                        }
+                        Item::Statement(statement) => {
+                            self.diagnostics.push(SemanticDiagnostic::error(
+                                "SEM006",
+                                "top-level statements are not valid in a class file",
                                 statement.span,
                             ));
                         }
@@ -625,6 +693,226 @@ impl Binder {
                 );
             }
         }
+    }
+
+    fn bind_class_definition(
+        &mut self,
+        class_def: &ClassDef,
+        parent_scope: ScopeId,
+        parent_workspace: WorkspaceId,
+    ) {
+        self.declare_symbol(
+            parent_scope,
+            parent_workspace,
+            &class_def.name.name,
+            SymbolKind::Class,
+            class_def.name.span,
+        );
+        let class_scope = self.alloc_scope(Some(parent_scope), ScopeKind::ClassBody, WorkspaceId(0));
+        let class_workspace = self.alloc_workspace(
+            Some(parent_workspace),
+            WorkspaceKind::Class,
+            class_scope,
+            Some(class_def.name.name.clone()),
+        );
+        self.patch_scope_workspace(class_scope, class_workspace);
+
+        for block in &class_def.property_blocks {
+            self.predeclare_class_properties(block, class_scope, class_workspace);
+        }
+        for block in &class_def.method_blocks {
+            self.predeclare_class_methods(block, class_scope, class_workspace);
+        }
+        for block in &class_def.property_blocks {
+            self.bind_class_property_block(block, class_scope);
+        }
+        for block in &class_def.method_blocks {
+            for method in &block.methods {
+                self.bind_method(method, class_scope, class_workspace);
+            }
+        }
+
+        let package = self.class_package_name();
+        let inline_methods = class_def
+            .method_blocks
+            .iter()
+            .flat_map(|block| block.methods.iter())
+            .map(|method| method.name.name.clone())
+            .collect::<Vec<_>>();
+        let external_methods =
+            self.discover_external_class_methods(&class_def.name.name, class_def.name.span);
+        let constructor = inline_methods
+            .iter()
+            .find(|method| method.eq_ignore_ascii_case(&class_def.name.name))
+            .cloned();
+        let properties = class_def
+            .property_blocks
+            .iter()
+            .flat_map(|block| block.properties.iter())
+            .map(|property| ClassPropertyInfo {
+                name: property.name.name.clone(),
+                default: property.default.clone(),
+            })
+            .collect::<Vec<_>>();
+        let inherits_handle = class_def
+            .superclass
+            .as_ref()
+            .is_some_and(|superclass| qualified_name_identifier(superclass).name.eq_ignore_ascii_case("handle"));
+        if let Some(superclass) = &class_def.superclass {
+            let superclass_name = qualified_name_identifier(superclass).name;
+            if !superclass_name.eq_ignore_ascii_case("handle") {
+                self.diagnostics.push(SemanticDiagnostic::error(
+                    "SEM007",
+                    format!(
+                        "only `handle` inheritance is supported for class `{}`",
+                        class_def.name.name
+                    ),
+                    superclass.span,
+                ));
+            }
+        }
+        self.classes.push(ClassInfo {
+            name: class_def.name.name.clone(),
+            package,
+            inherits_handle,
+            properties,
+            inline_methods,
+            external_methods,
+            constructor,
+            source_path: self.source_file.clone(),
+        });
+    }
+
+    fn predeclare_class_properties(
+        &mut self,
+        block: &ClassPropertyBlock,
+        scope_id: ScopeId,
+        workspace_id: WorkspaceId,
+    ) {
+        for property in &block.properties {
+            self.declare_symbol(
+                scope_id,
+                workspace_id,
+                &property.name.name,
+                SymbolKind::Property,
+                property.name.span,
+            );
+        }
+    }
+
+    fn predeclare_class_methods(
+        &mut self,
+        block: &ClassMethodBlock,
+        scope_id: ScopeId,
+        workspace_id: WorkspaceId,
+    ) {
+        for method in &block.methods {
+            self.declare_symbol(
+                scope_id,
+                workspace_id,
+                &method.name.name,
+                SymbolKind::Method,
+                method.name.span,
+            );
+        }
+    }
+
+    fn bind_class_property_block(&mut self, block: &ClassPropertyBlock, scope_id: ScopeId) {
+        for property in &block.properties {
+            if let Some(default) = &property.default {
+                self.bind_expression(default, scope_id);
+            }
+        }
+    }
+
+    fn bind_method(
+        &mut self,
+        function: &FunctionDef,
+        parent_scope: ScopeId,
+        parent_workspace: WorkspaceId,
+    ) {
+        self.bind_function(function, parent_scope, parent_workspace);
+    }
+
+    fn class_package_name(&self) -> Option<String> {
+        let path = self.source_file.as_deref()?;
+        let mut parts = Vec::new();
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            let Some(name) = dir.file_name().and_then(|value| value.to_str()) else {
+                break;
+            };
+            if let Some(package) = name.strip_prefix('+') {
+                parts.push(package.to_string());
+            }
+            current = dir.parent();
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            parts.reverse();
+            Some(parts.join("."))
+        }
+    }
+
+    fn discover_external_class_methods(
+        &mut self,
+        class_name: &str,
+        span: SourceSpan,
+    ) -> Vec<ExternalMethodInfo> {
+        let Some(source_file) = self.source_file.as_deref() else {
+            return Vec::new();
+        };
+        let Some(class_dir) = source_file.parent() else {
+            return Vec::new();
+        };
+        let Some(class_dir_name) = class_dir.file_name().and_then(|value| value.to_str()) else {
+            return Vec::new();
+        };
+        let Some(folder_class_name) = class_dir_name.strip_prefix('@') else {
+            return Vec::new();
+        };
+        if !folder_class_name.eq_ignore_ascii_case(class_name) {
+            self.diagnostics.push(SemanticDiagnostic::error(
+                "SEM008",
+                format!(
+                    "class file `{}` does not match enclosing class folder `@{folder_class_name}`",
+                    source_file.display()
+                ),
+                span,
+            ));
+            return Vec::new();
+        }
+
+        let mut methods = Vec::new();
+        let Ok(entries) = fs::read_dir(class_dir) else {
+            return methods;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path == source_file {
+                continue;
+            }
+            if !path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("m"))
+            {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            methods.push(ExternalMethodInfo {
+                name: name.to_string(),
+                path,
+            });
+        }
+        methods.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+        methods
     }
 
     fn bind_function(
@@ -698,7 +986,7 @@ impl Binder {
         workspace_id: WorkspaceId,
     ) {
         match &statement.kind {
-            StatementKind::Assignment { targets, value } => {
+            StatementKind::Assignment { targets, value, .. } => {
                 self.bind_expression(value, scope_id);
                 for target in targets {
                     self.bind_assignment_target(target, scope_id, workspace_id);
@@ -1457,6 +1745,7 @@ impl Binder {
             .and_then(|table| table.values.get(name))
             .copied()
             .map(|symbol_id| self.resolved_symbol(symbol_id))
+            .filter(|resolved| self.symbol_kind_can_resolve_as_value(resolved.kind))
     }
 
     fn lookup_capture_value_symbol_in_ancestors(
@@ -1520,7 +1809,7 @@ impl Binder {
 
     fn function_reference_resolution(&self, declaring_scope: ScopeId) -> ReferenceResolution {
         match self.scope(declaring_scope).kind {
-            ScopeKind::CompilationUnit => ReferenceResolution::FileFunction,
+            ScopeKind::CompilationUnit | ScopeKind::ClassBody => ReferenceResolution::FileFunction,
             ScopeKind::FunctionBody | ScopeKind::AnonymousFunctionBody => {
                 ReferenceResolution::NestedFunction
             }
@@ -1686,8 +1975,21 @@ impl Binder {
     fn current_scope_declares_value(&self, scope_id: ScopeId, name: &str) -> bool {
         self.scope_symbols
             .get(&scope_id)
-            .map(|table| table.values.contains_key(name))
+            .and_then(|table| table.values.get(name))
+            .copied()
+            .map(|symbol_id| self.symbol_kind_can_resolve_as_value(self.symbol(symbol_id).kind))
             .unwrap_or(false)
+    }
+
+    fn symbol_kind_can_resolve_as_value(&self, kind: SymbolKind) -> bool {
+        matches!(
+            kind,
+            SymbolKind::Variable
+                | SymbolKind::Parameter
+                | SymbolKind::Output
+                | SymbolKind::Global
+                | SymbolKind::Persistent
+        )
     }
 
     fn scope_workspace(&self, scope_id: ScopeId) -> WorkspaceId {
@@ -1758,7 +2060,7 @@ impl Binder {
             let workspace = &self.workspaces[current.0 as usize];
             match workspace.kind {
                 WorkspaceKind::Function => return current,
-                WorkspaceKind::AnonymousFunction | WorkspaceKind::Script => {
+                WorkspaceKind::AnonymousFunction | WorkspaceKind::Script | WorkspaceKind::Class => {
                     if let Some(parent) = workspace.parent {
                         current = parent;
                     } else {

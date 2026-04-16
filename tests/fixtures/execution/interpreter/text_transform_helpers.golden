@@ -15,3 +15,6 @@ workspace
   n = "FOO bar BAZ"
   o = ["fruit-fruit" ; "fruit-fruit"]
   p = "bar"
+  q = ["alpha", "beta" ; "gamma", "delta"]
+  r = {'BAnana', 'caBAna'}
+  s = "abc 2 def * ghi ** jkl ***"

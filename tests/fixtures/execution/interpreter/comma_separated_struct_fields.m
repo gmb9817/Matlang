@@ -20,6 +20,18 @@ source_cells = {11, 13};
 [assigned_from_cells.x] = source_cells{:};
 assigned_from_cells_values = [assigned_from_cells.x];
 
+[colon_field_synth(:).score] = deal(161, 163);
+colon_field_scores = [colon_field_synth.score];
+
+[colon_field_nested.inner(:).score] = deal(171, 173);
+colon_field_nested_scores = [colon_field_nested.inner.score];
+
+[colon_brace_structs(:).items{1:2}] = deal(181, 182, 183, 184);
+colon_brace_row = [colon_brace_structs.items{:}];
+
+[colon_brace_nested.inner(:).items{1:2}] = deal(191, 192, 193, 194);
+colon_brace_nested_row = [colon_brace_nested.inner.items{:}];
+
 grid = [struct() struct(); struct() struct()];
 grid.name = ["alpha" "beta"; "gamma" "delta"];
 grid.value = [1 2; 3 4];
@@ -57,3 +69,40 @@ missing_struct_cell_reassigned_row = [missing_struct_cells.items{:}];
 explicit_missing_struct_cells = struct('name', {'a', 'b'});
 [explicit_missing_struct_cells.items{:}] = {1, 2, 3, 4};
 explicit_missing_struct_cell_row = [explicit_missing_struct_cells.items{:}];
+
+[synth_root_cells.items{:}] = deal(21, 22, 23, 24);
+synth_root_cell_row = [synth_root_cells.items{:}];
+
+[synth_root_col.items{:, 1}] = deal(31, 32);
+synth_root_col_row = [synth_root_col.items{:}];
+
+[indexed_synth_struct_cells(1:2).items{:}] = deal(101, 102, 103, 104);
+indexed_synth_struct_row = [indexed_synth_struct_cells.items{:}];
+
+[deep_synth.inner(1:2).items{:}] = deal(111, 112, 113, 114);
+deep_synth_row = [deep_synth.inner.items{:}];
+
+[direct_struct_cells.items{:}] = [211 212 213 214];
+direct_struct_cell_row = [direct_struct_cells.items{:}];
+
+direct_struct_matrix = struct('items', {{0, 0}, {0, 0}});
+[direct_struct_matrix.items{:}] = [241 242; 243 244];
+direct_struct_matrix_row = [direct_struct_matrix.items{:}];
+
+[direct_indexed_struct(1:2).items{:}] = [221 222 223 224];
+direct_indexed_struct_row = [direct_indexed_struct.items{:}];
+
+[column_struct_cells.items{:}] = [231; 232; 233; 234];
+column_struct_cell_row = [column_struct_cells.items{:}];
+
+[deep_field_synth.groups(1:2).score] = deal(121, 123);
+deep_field_scores = [deep_field_synth.groups.score];
+
+[deep_field_synth.groups(1:2).inner.score] = deal(131, 133);
+deep_field_nested_scores = [deep_field_synth.groups.inner.score];
+
+[direct_field_matrix.groups(1:2).score] = [141 143];
+direct_field_matrix_scores = [direct_field_matrix.groups.score];
+
+[direct_field_nested_matrix.groups(1:2).inner.score] = [151 153];
+direct_field_nested_matrix_scores = [direct_field_nested_matrix.groups.inner.score];

@@ -18,3 +18,6 @@ workspace
   q = "gamma"
   r = false
   s = [3, 5 ; 0, 4]
+  t = 'ABC'
+  u = '☃'
+  v = "ABC"

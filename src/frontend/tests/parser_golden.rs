@@ -72,3 +72,8 @@ fn complex_literals_fixture_matches_golden() {
 fn try_catch_fixture_matches_golden() {
     assert_fixture("try_catch", ParseMode::Script);
 }
+
+#[test]
+fn classdef_basic_fixture_matches_golden() {
+    assert_fixture("classdef_basic", ParseMode::AutoDetect);
+}

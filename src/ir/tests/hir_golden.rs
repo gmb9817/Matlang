@@ -56,3 +56,8 @@ fn script_control_flow_fixture_matches_golden() {
 fn try_catch_flow_fixture_matches_golden() {
     assert_fixture("try_catch_flow", ParseMode::Script);
 }
+
+#[test]
+fn classdef_basic_fixture_matches_golden() {
+    assert_fixture("classdef_basic", ParseMode::AutoDetect);
+}

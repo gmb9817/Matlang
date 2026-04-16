@@ -1,10 +1,18 @@
 //! Interop crate for workspace snapshots, MAT-file, FFI, and MEX-compat boundaries.
 
-use std::{collections::BTreeMap, error::Error, fmt, fs, path::Path, str::Chars};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    fs,
+    path::{Path, PathBuf},
+    str::Chars,
+};
 
 use matlab_runtime::{
-    CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue, RuntimeError,
-    StructValue, Value, Workspace,
+    CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue,
+    ObjectClassMetadata, ObjectStorageKind, ObjectValue, RuntimeError, StructValue, Value,
+    Workspace,
 };
 
 pub const CRATE_NAME: &str = "matlab-interop";
@@ -262,6 +270,7 @@ fn encode_mat_matrix_payload(name: &str, value: &Value) -> Result<Vec<u8>, Inter
         Value::Matrix(matrix) => encode_mat_matrix_value(&mut out, name, matrix)?,
         Value::Cell(cell) => encode_mat_cell_value(&mut out, name, cell)?,
         Value::Struct(struct_value) => encode_mat_struct_scalar(&mut out, name, struct_value)?,
+        Value::Object(object) => encode_mat_object_value(&mut out, name, object)?,
         Value::FunctionHandle(handle) => encode_mat_function_handle_object(&mut out, name, handle)?,
     }
     Ok(out)
@@ -421,10 +430,111 @@ fn encode_mat_function_handle_object(
         FunctionHandleTarget::Named(name) => ("named", name.clone()),
         FunctionHandleTarget::ResolvedPath(path) => ("path", path.display().to_string()),
         FunctionHandleTarget::BundleModule(module_id) => ("bundle", module_id.clone()),
+        FunctionHandleTarget::BoundMethod { .. } => {
+            return Err(InteropError::Unsupported(
+                "MAT-file encoding for bound-method handles is not supported".to_string(),
+            ))
+        }
     };
     write_mat_matrix_element(out, "", &Value::CharArray(handle.display_name.clone()))?;
     write_mat_matrix_element(out, "", &Value::CharArray(target_kind.to_string()))?;
     write_mat_matrix_element(out, "", &Value::CharArray(target_value))?;
+    Ok(())
+}
+
+fn encode_mat_object_value(
+    out: &mut Vec<u8>,
+    name: &str,
+    object: &ObjectValue,
+) -> Result<(), InteropError> {
+    write_array_flags(out, MX_OBJECT_CLASS, 0);
+    write_dimensions(out, &[1, 1]);
+    write_name(out, name);
+    write_tagged_element(out, MI_INT8, object.class.class_name.as_bytes());
+
+    let mut field_names = vec![
+        "__matc_package".to_string(),
+        "__matc_storage".to_string(),
+        "__matc_source".to_string(),
+        "__matc_constructor".to_string(),
+        "__matc_inline_methods".to_string(),
+        "__matc_external_methods".to_string(),
+    ];
+    field_names.extend(object.properties().field_names().iter().cloned());
+    let field_name_length = field_names
+        .iter()
+        .map(|field| field.len())
+        .max()
+        .unwrap_or(0)
+        .max(1)
+        + 1;
+
+    let mut field_len_payload = Vec::new();
+    push_i32_le(&mut field_len_payload, field_name_length as i32);
+    write_tagged_element(out, MI_INT32, &field_len_payload);
+
+    let mut field_names_payload = Vec::new();
+    for field_name in &field_names {
+        let mut bytes = vec![0u8; field_name_length];
+        let name_bytes = field_name.as_bytes();
+        let copy_len = name_bytes.len().min(field_name_length.saturating_sub(1));
+        bytes[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        field_names_payload.extend_from_slice(&bytes);
+    }
+    write_tagged_element(out, MI_INT8, &field_names_payload);
+
+    let package = object.class.package.clone().unwrap_or_default();
+    let storage = match object.class.storage_kind {
+        ObjectStorageKind::Value => "value".to_string(),
+        ObjectStorageKind::Handle => "handle".to_string(),
+    };
+    let source = object
+        .class
+        .source_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let constructor = object.class.constructor.clone().unwrap_or_default();
+    let inline_methods = object
+        .class
+        .inline_methods
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let inline_methods = Value::Cell(
+        CellValue::new(1, inline_methods.len(), inline_methods)
+            .map_err(|error| InteropError::Unsupported(error.to_string()))?,
+    );
+    let mut external_fields = BTreeMap::new();
+    for (method, path) in &object.class.external_methods {
+        external_fields.insert(
+            method.clone(),
+            Value::String(path.display().to_string()),
+        );
+    }
+    let external_methods = Value::Struct(StructValue::from_fields(external_fields));
+    let properties = object.properties();
+
+    write_mat_matrix_element(out, "", &Value::CharArray(package))?;
+    write_mat_matrix_element(out, "", &Value::CharArray(storage))?;
+    write_mat_matrix_element(out, "", &Value::CharArray(source))?;
+    write_mat_matrix_element(out, "", &Value::CharArray(constructor))?;
+    write_mat_matrix_element(out, "", &inline_methods)?;
+    write_mat_matrix_element(out, "", &external_methods)?;
+    for property_name in properties.field_names() {
+        let value = properties
+            .fields
+            .get(property_name)
+            .cloned()
+            .unwrap_or_else(|| {
+                Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new())
+                        .expect("empty matrix value should be constructible"),
+                )
+            });
+        write_mat_matrix_element(out, "", &value)?;
+    }
     Ok(())
 }
 
@@ -479,17 +589,20 @@ fn encode_mat_struct_array(
     write_name(out, name);
 
     let mut field_names = BTreeMap::new();
+    let mut ordered_field_names = Vec::new();
     for element in elements {
         let Value::Struct(struct_value) = element else {
             return Err(InteropError::Unsupported(
                 "MAT-file struct array encoding requires struct elements".to_string(),
             ));
         };
-        for field_name in struct_value.fields.keys() {
-            field_names.entry(field_name.clone()).or_insert(());
+        for field_name in struct_value.field_names() {
+            if field_names.insert(field_name.clone(), ()).is_none() {
+                ordered_field_names.push(field_name.clone());
+            }
         }
     }
-    let field_names = field_names.into_keys().collect::<Vec<_>>();
+    let field_names = ordered_field_names;
     let field_name_length = field_names
         .iter()
         .map(|field| field.len())
@@ -745,7 +858,8 @@ fn decode_mat_struct_array(
             let (_, value) = decode_mat_matrix_payload(payload)?;
             fields.insert(field_name.clone(), value);
         }
-        elements[row_major] = Value::Struct(StructValue { fields });
+        elements[row_major] =
+            Value::Struct(StructValue::with_field_order(fields, field_names.clone()));
     }
     if count == 1 {
         return Ok(elements
@@ -798,9 +912,7 @@ fn decode_mat_object_array(
     match class_name.as_str() {
         "string" => decode_mat_string_object(reader, dims, &field_names),
         "function_handle" => decode_mat_function_handle_object(reader, dims, &field_names),
-        other => Err(InteropError::Unsupported(format!(
-            "unsupported MAT-file object class `{other}`"
-        ))),
+        _ => decode_mat_generic_object(reader, dims, &class_name, &field_names),
     }
 }
 
@@ -925,6 +1037,76 @@ fn decode_mat_function_handle_object(
     MatrixValue::with_dimensions(rows, cols, dims.to_vec(), values)
         .map(Value::Matrix)
         .map_err(|error| InteropError::Parse(error.to_string()))
+}
+
+fn decode_mat_generic_object(
+    reader: &mut ByteReader<'_>,
+    dims: &[usize],
+    class_name: &str,
+    field_names: &[String],
+) -> Result<Value, InteropError> {
+    let count = dims.iter().product::<usize>();
+    if count != 1 {
+        return Err(InteropError::Unsupported(
+            "MAT-file object decoding currently supports only scalar objects".to_string(),
+        ));
+    }
+
+    let mut package = None;
+    let mut storage_kind = ObjectStorageKind::Value;
+    let mut source_path = None;
+    let mut constructor = None;
+    let mut inline_methods = BTreeSet::new();
+    let mut external_methods = BTreeMap::new();
+    let mut property_fields = BTreeMap::new();
+    let mut property_order = Vec::new();
+
+    for field_name in field_names {
+        let (data_type, payload) = reader.read_tagged_element()?;
+        if data_type != MI_MATRIX {
+            return Err(InteropError::Unsupported(format!(
+                "unsupported MAT-file object field type `{data_type}`"
+            )));
+        }
+        let (_, value) = decode_mat_matrix_payload(payload)?;
+        match field_name.as_str() {
+            "__matc_package" => package = optional_text_value(&value)?,
+            "__matc_storage" => {
+                storage_kind = match optional_text_value(&value)?.as_deref() {
+                    Some("handle") => ObjectStorageKind::Handle,
+                    _ => ObjectStorageKind::Value,
+                };
+            }
+            "__matc_source" => {
+                source_path = optional_text_value(&value)?.map(Into::into);
+            }
+            "__matc_constructor" => constructor = optional_text_value(&value)?,
+            "__matc_inline_methods" => {
+                inline_methods = decode_text_set(&value)?;
+            }
+            "__matc_external_methods" => {
+                external_methods = decode_text_struct_map(&value)?;
+            }
+            _ => {
+                property_order.push(field_name.clone());
+                property_fields.insert(field_name.clone(), value);
+            }
+        }
+    }
+
+    Ok(Value::Object(ObjectValue::new(
+        ObjectClassMetadata {
+            class_name: class_name.to_string(),
+            package,
+            storage_kind,
+            source_path,
+            property_order: property_order.clone(),
+            inline_methods,
+            external_methods,
+            constructor,
+        },
+        StructValue::with_field_order(property_fields, property_order),
+    )))
 }
 
 fn decode_dims(payload: &[u8]) -> Result<Vec<usize>, InteropError> {
@@ -1061,6 +1243,53 @@ fn row_major_linear_index(index: &[usize], dims: &[usize]) -> usize {
     linear
 }
 
+fn optional_text_value(value: &Value) -> Result<Option<String>, InteropError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) if text.is_empty() => Ok(None),
+        Value::CharArray(text) | Value::String(text) => Ok(Some(text.clone())),
+        other => Err(InteropError::Unsupported(format!(
+            "expected text metadata value, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn decode_text_set(value: &Value) -> Result<BTreeSet<String>, InteropError> {
+    match value {
+        Value::Cell(cell) => {
+            let mut values = BTreeSet::new();
+            for element in &cell.elements {
+                let Some(text) = optional_text_value(element)? else {
+                    continue;
+                };
+                values.insert(text);
+            }
+            Ok(values)
+        }
+        Value::CharArray(text) | Value::String(text) if text.is_empty() => Ok(BTreeSet::new()),
+        other => Err(InteropError::Unsupported(format!(
+            "expected text-cell metadata value, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn decode_text_struct_map(value: &Value) -> Result<BTreeMap<String, PathBuf>, InteropError> {
+    let Value::Struct(struct_value) = value else {
+        return Err(InteropError::Unsupported(format!(
+            "expected struct metadata value, found {}",
+            value.kind_name()
+        )));
+    };
+    let mut values = BTreeMap::new();
+    for (name, value) in struct_value.ordered_entries() {
+        if let Some(text) = optional_text_value(value)? {
+            values.insert(name.to_string(), PathBuf::from(text));
+        }
+    }
+    Ok(values)
+}
+
 struct ByteReader<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -1137,10 +1366,48 @@ fn encode_value(value: &Value) -> Result<String, InteropError> {
         Value::Cell(cell) => encode_sequence("C", cell.rows, cell.cols, &cell.elements),
         Value::Struct(struct_value) => {
             let mut fields = Vec::new();
-            for (name, value) in &struct_value.fields {
+            for (name, value) in struct_value.ordered_entries() {
                 fields.push(format!("{}={}", encode_string(name), encode_value(value)?));
             }
             Ok(format!("T([{}])", fields.join(",")))
+        }
+        Value::Object(object) => {
+            let properties = encode_value(&Value::Struct(object.properties()))?;
+            let inline_methods = object
+                .class
+                .inline_methods
+                .iter()
+                .map(|name| encode_string(name))
+                .collect::<Vec<_>>()
+                .join(",");
+            let external_methods = object
+                .class
+                .external_methods
+                .iter()
+                .map(|(name, path)| format!("{}=>{}", encode_string(name), encode_string(&path.display().to_string())))
+                .collect::<Vec<_>>()
+                .join(",");
+            Ok(format!(
+                "O({},{},{},{},{},[{}],[{}],{})",
+                encode_string(&object.class.class_name),
+                encode_string(object.class.package.as_deref().unwrap_or("")),
+                encode_string(match object.class.storage_kind {
+                    ObjectStorageKind::Value => "value",
+                    ObjectStorageKind::Handle => "handle",
+                }),
+                encode_string(
+                    &object
+                        .class
+                        .source_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                ),
+                encode_string(object.class.constructor.as_deref().unwrap_or("")),
+                inline_methods,
+                external_methods,
+                properties
+            ))
         }
         Value::FunctionHandle(handle) => match &handle.target {
             FunctionHandleTarget::Named(name) => Ok(format!(
@@ -1157,6 +1424,10 @@ fn encode_value(value: &Value) -> Result<String, InteropError> {
                 "H(bundle,{},{})",
                 encode_string(&handle.display_name),
                 encode_string(module_id)
+            )),
+            FunctionHandleTarget::BoundMethod { .. } => Err(InteropError::Unsupported(
+                "workspace snapshot encoding for bound-method handles is not supported"
+                    .to_string(),
             )),
         },
     }
@@ -1234,6 +1505,7 @@ impl<'a> Parser<'a> {
             Some('M') => self.parse_matrix(),
             Some('C') => self.parse_cell(),
             Some('T') => self.parse_struct(),
+            Some('O') => self.parse_object(),
             Some('H') => self.parse_handle(),
             Some(other) => Err(self.error(format!("unexpected value prefix `{other}`"))),
             None => Err(self.error("unexpected end of input".to_string())),
@@ -1330,11 +1602,13 @@ impl<'a> Parser<'a> {
         self.expect_char('(')?;
         self.expect_char('[')?;
         let mut fields = std::collections::BTreeMap::new();
+        let mut field_order = Vec::new();
         if self.peek_char() != Some(']') {
             loop {
                 let name = self.parse_string()?;
                 self.expect_char('=')?;
                 let value = self.parse_value()?;
+                field_order.push(name.clone());
                 fields.insert(name, value);
                 if self.peek_char() == Some(',') {
                     self.expect_char(',')?;
@@ -1345,7 +1619,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_char(']')?;
         self.expect_char(')')?;
-        Ok(Value::Struct(StructValue { fields }))
+        Ok(Value::Struct(StructValue::with_field_order(fields, field_order)))
     }
 
     fn parse_handle(&mut self) -> Result<Value, InteropError> {
@@ -1369,6 +1643,90 @@ impl<'a> Parser<'a> {
             display_name,
             target,
         }))
+    }
+
+    fn parse_object(&mut self) -> Result<Value, InteropError> {
+        self.expect_char('O')?;
+        self.expect_char('(')?;
+        let class_name = self.parse_string()?;
+        self.expect_char(',')?;
+        let package = self.parse_string()?;
+        self.expect_char(',')?;
+        let storage = self.parse_string()?;
+        self.expect_char(',')?;
+        let source_path = self.parse_string()?;
+        self.expect_char(',')?;
+        let constructor = self.parse_string()?;
+        self.expect_char(',')?;
+        let inline_methods = self.parse_string_list()?;
+        self.expect_char(',')?;
+        let external_methods = self.parse_string_pair_list()?;
+        self.expect_char(',')?;
+        let properties = self.parse_value()?;
+        self.expect_char(')')?;
+
+        let Value::Struct(properties) = properties else {
+            return Err(self.error("object payload expected struct properties".to_string()));
+        };
+
+        let storage_kind = match storage.as_str() {
+            "handle" => ObjectStorageKind::Handle,
+            _ => ObjectStorageKind::Value,
+        };
+        Ok(Value::Object(ObjectValue::new(
+            ObjectClassMetadata {
+                class_name,
+                package: (!package.is_empty()).then_some(package),
+                storage_kind,
+                source_path: (!source_path.is_empty()).then_some(source_path.into()),
+                property_order: properties.field_names().to_vec(),
+                inline_methods: inline_methods.into_iter().collect(),
+                external_methods: external_methods
+                    .into_iter()
+                    .map(|(name, path)| (name, path.into()))
+                    .collect(),
+                constructor: (!constructor.is_empty()).then_some(constructor),
+            },
+            properties,
+        )))
+    }
+
+    fn parse_string_list(&mut self) -> Result<Vec<String>, InteropError> {
+        self.expect_char('[')?;
+        let mut values = Vec::new();
+        if self.peek_char() != Some(']') {
+            loop {
+                values.push(self.parse_string()?);
+                if self.peek_char() == Some(',') {
+                    self.expect_char(',')?;
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_char(']')?;
+        Ok(values)
+    }
+
+    fn parse_string_pair_list(&mut self) -> Result<Vec<(String, String)>, InteropError> {
+        self.expect_char('[')?;
+        let mut values = Vec::new();
+        if self.peek_char() != Some(']') {
+            loop {
+                let name = self.parse_string()?;
+                self.expect_char('=')?;
+                self.expect_char('>')?;
+                let value = self.parse_string()?;
+                values.push((name, value));
+                if self.peek_char() == Some(',') {
+                    self.expect_char(',')?;
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_char(']')?;
+        Ok(values)
     }
 
     fn parse_identifier(&mut self) -> Result<String, InteropError> {
@@ -1482,3 +1840,4 @@ impl<'a> Parser<'a> {
         ))
     }
 }
+

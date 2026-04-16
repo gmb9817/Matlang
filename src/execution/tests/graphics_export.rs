@@ -2857,6 +2857,108 @@ fn histogram_exports_binned_rectangles_svg() {
 }
 
 #[test]
+fn histogram_probability_normalization_exports_scaled_rectangles_svg() {
+    let temp_dir = unique_temp_dir("histogram-probability");
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+    let output_path = temp_dir.join("histogram_probability.svg");
+    let source_path = temp_dir.join("graphics_histogram_probability_export.m");
+    let matlab_output_path = output_path.to_string_lossy().replace('\\', "/");
+    let source = format!(
+        "f = figure(164);\n\
+         histogram([0.2, 0.4, 0.8, 1.2, 1.9], [0, 0.5, 1.0, 1.5, 2.0], \"Normalization\", \"probability\");\n\
+         xlim([0, 2]);\n\
+         ylim([0, 1]);\n\
+         saveas(f, \"{matlab_output_path}\", \"svg\");\n"
+    );
+
+    let svg = execute_and_read_svg(
+        ExecutionKind::Interpreter,
+        &source_path,
+        &source,
+        &output_path,
+    );
+    assert!(
+        svg.contains("<rect x=\"92\" y=\"364.4\" width=\"192\" height=\"205.6\" fill=\"#1f77b4\" fill-opacity=\"0.75\" stroke=\"#1f77b4\" stroke-width=\"1\"/>"),
+        "missing probability-normalized first histogram bin rect in SVG: {svg}"
+    );
+    assert!(
+        svg.contains("<rect x=\"284\" y=\"467.2\" width=\"192\" height=\"102.8\" fill=\"#1f77b4\" fill-opacity=\"0.75\" stroke=\"#1f77b4\" stroke-width=\"1\"/>"),
+        "missing probability-normalized second histogram bin rect in SVG: {svg}"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn histogram_binwidth_exports_expected_bin_rectangles_svg() {
+    let temp_dir = unique_temp_dir("histogram-binwidth");
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+    let output_path = temp_dir.join("histogram_binwidth.svg");
+    let source_path = temp_dir.join("graphics_histogram_binwidth_export.m");
+    let matlab_output_path = output_path.to_string_lossy().replace('\\', "/");
+    let source = format!(
+        "f = figure(167);\n\
+         histogram([0, 0.5, 1, 1.5, 2, 2.5, 3], \"BinWidth\", 1);\n\
+         xlim([0, 3]);\n\
+         ylim([0, 3]);\n\
+         saveas(f, \"{matlab_output_path}\", \"svg\");\n"
+    );
+
+    let svg = execute_and_read_svg(
+        ExecutionKind::Interpreter,
+        &source_path,
+        &source,
+        &output_path,
+    );
+    assert!(
+        svg.contains("<rect x=\"92\" y=\"227.3333\" width=\"256\" height=\"342.6667\" fill=\"#1f77b4\" fill-opacity=\"0.75\" stroke=\"#1f77b4\" stroke-width=\"1\"/>"),
+        "missing first BinWidth histogram rect in SVG: {svg}"
+    );
+    assert!(
+        svg.contains("<rect x=\"604\" y=\"56\" width=\"256\" height=\"514\" fill=\"#1f77b4\" fill-opacity=\"0.75\" stroke=\"#1f77b4\" stroke-width=\"1\"/>"),
+        "missing last BinWidth histogram rect in SVG: {svg}"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn histogram_numbins_exports_expected_bin_rectangles_svg() {
+    let temp_dir = unique_temp_dir("histogram-numbins");
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+    let output_path = temp_dir.join("histogram_numbins.svg");
+    let source_path = temp_dir.join("graphics_histogram_numbins_export.m");
+    let matlab_output_path = output_path.to_string_lossy().replace('\\', "/");
+    let source = format!(
+        "f = figure(168);\n\
+         histogram([0, 0.5, 1, 1.5, 2, 2.5, 3], \"NumBins\", 4);\n\
+         xlim([0, 3]);\n\
+         ylim([0, 2]);\n\
+         saveas(f, \"{matlab_output_path}\", \"svg\");\n"
+    );
+
+    let svg = execute_and_read_svg(
+        ExecutionKind::Interpreter,
+        &source_path,
+        &source,
+        &output_path,
+    );
+    assert!(
+        svg.contains("<rect x=\"92\" y=\"56\" width=\"192\" height=\"514\" fill=\"#1f77b4\" fill-opacity=\"0.75\" stroke=\"#1f77b4\" stroke-width=\"1\"/>"),
+        "missing first NumBins histogram rect in SVG: {svg}"
+    );
+    assert!(
+        svg.contains("<rect x=\"284\" y=\"313\" width=\"192\" height=\"257\" fill=\"#1f77b4\" fill-opacity=\"0.75\" stroke=\"#1f77b4\" stroke-width=\"1\"/>"),
+        "missing second NumBins histogram rect in SVG: {svg}"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn histogram2_exports_colormapped_tiles_with_colorbar() {
     let temp_dir = unique_temp_dir("histogram2");
     fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -2889,6 +2991,43 @@ fn histogram2_exports_colormapped_tiles_with_colorbar() {
     assert!(
         svg.matches("stroke=\"#777777\"").count() >= 1,
         "expected histogram2 colorbar outline in SVG: {svg}"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn histogram2_pdf_normalization_exports_normalized_tile_colors() {
+    let temp_dir = unique_temp_dir("histogram2-pdf");
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+    let output_path = temp_dir.join("histogram2_pdf.svg");
+    let source_path = temp_dir.join("graphics_histogram2_pdf_export.m");
+    let matlab_output_path = output_path.to_string_lossy().replace('\\', "/");
+    let source = format!(
+        "f = figure(185);\n\
+         histogram2([0, 0.5, 1, 1.5, 2, 3], [10, 10, 20, 20, 30, 30], [0, 1, 3], [10, 15, 30], \"Normalization\", \"pdf\");\n\
+         title(\"PDF Histogram2\");\n\
+         saveas(f, \"{matlab_output_path}\", \"svg\");\n"
+    );
+
+    let svg = execute_and_read_svg(
+        ExecutionKind::Interpreter,
+        &source_path,
+        &source,
+        &output_path,
+    );
+    assert!(
+        svg.contains("PDF Histogram2"),
+        "missing histogram2 PDF title in SVG: {svg}"
+    );
+    assert!(
+        svg.contains("fill=\"rgb(253,231,37)\" fill-opacity=\"0.82\" stroke=\"#666666\" stroke-width=\"0.8\""),
+        "missing maximum-density histogram2 tile color in SVG: {svg}"
+    );
+    assert!(
+        svg.contains("fill=\"rgb(8,133,187)\" fill-opacity=\"0.82\" stroke=\"#666666\" stroke-width=\"0.8\""),
+        "missing intermediate-density histogram2 tile color in SVG: {svg}"
     );
 
     let _ = fs::remove_dir_all(&temp_dir);

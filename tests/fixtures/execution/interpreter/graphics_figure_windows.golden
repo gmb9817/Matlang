@@ -24,7 +24,7 @@ workspace
   position_after_clf_reset = [11, 22, 333, 444]
   position_initial = [10, 20, 700, 500]
   position_struct = [11, 22, 333, 444]
-  props = struct{Name="Docked Figure", NumberTitle='off', Position=[11, 22, 333, 444], Visible='off', WindowStyle='docked'}
+  props = struct{Name="Docked Figure", NumberTitle='off', Visible='off', Position=[11, 22, 333, 444], WindowStyle='docked'}
   visible_after_clf = 'on'
   visible_after_clf_reset = 'on'
   visible_after_figure = 'on'

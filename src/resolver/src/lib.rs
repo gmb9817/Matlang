@@ -4,6 +4,7 @@ use std::{
     collections::HashSet,
     env,
     ffi::OsString,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -71,6 +72,16 @@ pub enum ResolvedFunctionKind {
     PackageDirectory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedClassKind {
+    CurrentDirectory,
+    SearchPath,
+    PackageDirectory,
+    FolderCurrentDirectory,
+    FolderSearchPath,
+    FolderPackageDirectory,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFunction {
     pub name: String,
@@ -78,6 +89,21 @@ pub struct ResolvedFunction {
     pub path: PathBuf,
     pub root: PathBuf,
     pub package: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedClass {
+    pub name: String,
+    pub kind: ResolvedClassKind,
+    pub path: PathBuf,
+    pub root: PathBuf,
+    pub package: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedCallable {
+    Function(ResolvedFunction),
+    Class(ResolvedClass),
 }
 
 pub fn search_roots_from_env(variable: &str) -> Vec<PathBuf> {
@@ -103,7 +129,7 @@ pub fn resolve_function(name: &str, context: &ResolverContext) -> Option<Resolve
         }
 
         let candidate = root.join(format!("{name}.m"));
-        if candidate.is_file() {
+        if candidate.is_file() && !m_file_looks_like_classdef(&candidate) {
             let kind = if context
                 .source_dir()
                 .is_some_and(|dir| dir == root.as_path())
@@ -125,13 +151,87 @@ pub fn resolve_function(name: &str, context: &ResolverContext) -> Option<Resolve
     None
 }
 
+pub fn resolve_callable(name: &str, context: &ResolverContext) -> Option<ResolvedCallable> {
+    if name.is_empty() {
+        return None;
+    }
+
+    if let Some(source_dir) = context.source_dir() {
+        if let Some(private) = resolve_private_function(name, source_dir) {
+            return Some(ResolvedCallable::Function(private));
+        }
+    }
+
+    for root in context.effective_search_roots() {
+        if let Some(class_def) = resolve_folder_class_definition(name, &root, context) {
+            return Some(ResolvedCallable::Class(class_def));
+        }
+
+        if let Some(package) = resolve_package_function(name, &root) {
+            return Some(ResolvedCallable::Function(package));
+        }
+
+        let candidate = root.join(format!("{name}.m"));
+        if candidate.is_file() && !m_file_looks_like_classdef(&candidate) {
+            let kind = if context
+                .source_dir()
+                .is_some_and(|dir| dir == root.as_path())
+            {
+                ResolvedFunctionKind::CurrentDirectory
+            } else {
+                ResolvedFunctionKind::SearchPath
+            };
+            return Some(ResolvedCallable::Function(ResolvedFunction {
+                name: name.to_string(),
+                kind,
+                path: candidate,
+                root: root.clone(),
+                package: None,
+            }));
+        }
+
+        if let Some(class_def) = resolve_plain_class_definition(name, &root, context) {
+            return Some(ResolvedCallable::Class(class_def));
+        }
+    }
+
+    None
+}
+
+pub fn resolve_class_definition(name: &str, context: &ResolverContext) -> Option<ResolvedClass> {
+    if name.is_empty() {
+        return None;
+    }
+
+    for root in context.effective_search_roots() {
+        if let Some(class_def) = resolve_folder_class_definition(name, &root, context) {
+            return Some(class_def);
+        }
+        if let Some(class_def) = resolve_plain_class_definition(name, &root, context) {
+            return Some(class_def);
+        }
+    }
+
+    None
+}
+
+pub fn resolve_class_folder_method(class_definition_path: &Path, method_name: &str) -> Option<PathBuf> {
+    let class_dir = class_definition_path.parent()?;
+    let folder_name = class_dir.file_name()?.to_str()?;
+    if !folder_name.starts_with('@') {
+        return None;
+    }
+    let candidate = class_dir.join(format!("{method_name}.m"));
+    candidate.is_file().then_some(candidate)
+}
+
 fn resolve_private_function(name: &str, source_dir: &Path) -> Option<ResolvedFunction> {
     if name.contains('.') {
         return None;
     }
 
     let candidate = source_dir.join("private").join(format!("{name}.m"));
-    if !candidate.is_file() {
+    if !candidate.is_file() || m_file_looks_like_classdef(&candidate) {
         return None;
     }
 
@@ -142,6 +242,133 @@ fn resolve_private_function(name: &str, source_dir: &Path) -> Option<ResolvedFun
         root: source_dir.to_path_buf(),
         package: None,
     })
+}
+
+fn resolve_plain_class_definition(
+    name: &str,
+    root: &Path,
+    context: &ResolverContext,
+) -> Option<ResolvedClass> {
+    if name.contains('.') {
+        return resolve_package_class_definition(name, root, context);
+    }
+
+    let candidate = root.join(format!("{name}.m"));
+    if !candidate.is_file() || !m_file_looks_like_classdef(&candidate) {
+        return None;
+    }
+
+    Some(ResolvedClass {
+        name: name.to_string(),
+        kind: if context
+            .source_dir()
+            .is_some_and(|dir| dir == root)
+        {
+            ResolvedClassKind::CurrentDirectory
+        } else {
+            ResolvedClassKind::SearchPath
+        },
+        path: candidate,
+        root: root.to_path_buf(),
+        package: None,
+    })
+}
+
+fn resolve_folder_class_definition(
+    name: &str,
+    root: &Path,
+    context: &ResolverContext,
+) -> Option<ResolvedClass> {
+    if name.contains('.') {
+        return resolve_package_folder_class_definition(name, root, context);
+    }
+
+    let candidate = root.join(format!("@{name}")).join(format!("{name}.m"));
+    if !candidate.is_file() {
+        return None;
+    }
+
+    Some(ResolvedClass {
+        name: name.to_string(),
+        kind: if context
+            .source_dir()
+            .is_some_and(|dir| dir == root)
+        {
+            ResolvedClassKind::FolderCurrentDirectory
+        } else {
+            ResolvedClassKind::FolderSearchPath
+        },
+        path: candidate,
+        root: root.to_path_buf(),
+        package: None,
+    })
+}
+
+fn resolve_package_class_definition(
+    name: &str,
+    root: &Path,
+    _context: &ResolverContext,
+) -> Option<ResolvedClass> {
+    let mut segments = name.split('.').peekable();
+    let mut current = root.to_path_buf();
+    let mut package_parts = Vec::new();
+
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            let candidate = current.join(format!("{segment}.m"));
+            if candidate.is_file() && m_file_looks_like_classdef(&candidate) {
+                return Some(ResolvedClass {
+                    name: name.to_string(),
+                    kind: ResolvedClassKind::PackageDirectory,
+                    path: candidate,
+                    root: root.to_path_buf(),
+                    package: (!package_parts.is_empty()).then(|| package_parts.join(".")),
+                });
+            }
+            return None;
+        }
+        package_parts.push(segment.to_string());
+        current.push(format!("+{segment}"));
+    }
+
+    None
+}
+
+fn resolve_package_folder_class_definition(
+    name: &str,
+    root: &Path,
+    context: &ResolverContext,
+) -> Option<ResolvedClass> {
+    let mut segments = name.split('.').peekable();
+    let mut current = root.to_path_buf();
+    let mut package_parts = Vec::new();
+
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            let candidate = current.join(format!("@{segment}")).join(format!("{segment}.m"));
+            if candidate.is_file() {
+                return Some(ResolvedClass {
+                    name: name.to_string(),
+                    kind: if context
+                        .source_dir()
+                        .is_some_and(|dir| dir == root)
+                    {
+                        ResolvedClassKind::FolderCurrentDirectory
+                    } else {
+                        ResolvedClassKind::FolderPackageDirectory
+                    },
+                    path: candidate,
+                    root: root.to_path_buf(),
+                    package: (!package_parts.is_empty()).then(|| package_parts.join(".")),
+                });
+            }
+            return None;
+        }
+        package_parts.push(segment.to_string());
+        current.push(format!("+{segment}"));
+    }
+
+    None
 }
 
 fn resolve_package_function(name: &str, root: &Path) -> Option<ResolvedFunction> {
@@ -156,7 +383,7 @@ fn resolve_package_function(name: &str, root: &Path) -> Option<ResolvedFunction>
     while let Some(segment) = segments.next() {
         if segments.peek().is_none() {
             let candidate = current.join(format!("{segment}.m"));
-            if candidate.is_file() {
+            if candidate.is_file() && !m_file_looks_like_classdef(&candidate) {
                 return Some(ResolvedFunction {
                     name: name.to_string(),
                     kind: ResolvedFunctionKind::PackageDirectory,
@@ -182,6 +409,27 @@ fn push_unique_path(roots: &mut Vec<PathBuf>, seen: &mut HashSet<OsString>, path
     }
 }
 
+fn m_file_looks_like_classdef(path: &Path) -> bool {
+    let Ok(source) = fs::read_to_string(path) else {
+        return false;
+    };
+    let mut rest = source.as_str();
+    loop {
+        let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        if let Some(comment_rest) = trimmed.strip_prefix('%') {
+            if let Some(newline) = comment_rest.find('\n') {
+                rest = &comment_rest[newline + 1..];
+                continue;
+            }
+            return false;
+        }
+        rest = trimmed;
+        break;
+    }
+    rest.strip_prefix("classdef")
+        .is_some_and(|tail| tail.chars().next().is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_'))
+}
+
 fn normalize_path_key(path: &Path) -> OsString {
     #[cfg(windows)]
     {
@@ -203,7 +451,11 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{resolve_function, search_roots_from_env, ResolvedFunctionKind, ResolverContext};
+    use super::{
+        resolve_callable, resolve_class_definition, resolve_class_folder_method, resolve_function,
+        search_roots_from_env, ResolvedCallable, ResolvedClassKind, ResolvedFunctionKind,
+        ResolverContext,
+    };
 
     #[test]
     fn resolves_function_in_current_directory() {
@@ -320,6 +572,88 @@ mod tests {
         assert_eq!(resolved.kind, ResolvedFunctionKind::PackageDirectory);
         assert_eq!(resolved.package.as_deref(), Some("pkg"));
         assert_eq!(resolved.path, root.join("+pkg").join("helper.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn resolves_plain_class_definition_in_current_directory() {
+        let workspace = temp_test_dir();
+        write_file(&workspace.join("main.m"), "p = Point();\n");
+        write_file(&workspace.join("Point.m"), "classdef Point\nend\n");
+
+        let resolved = resolve_class_definition(
+            "Point",
+            &ResolverContext::from_source_file(workspace.join("main.m")),
+        )
+        .expect("Point class should resolve");
+
+        assert_eq!(resolved.kind, ResolvedClassKind::CurrentDirectory);
+        assert_eq!(resolved.path, workspace.join("Point.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn folder_class_definition_outranks_plain_function_in_callable_resolution() {
+        let workspace = temp_test_dir();
+        fs::create_dir_all(workspace.join("@Point")).expect("create class dir");
+        write_file(&workspace.join("main.m"), "p = Point();\n");
+        write_file(&workspace.join("Point.m"), "function y = Point()\ny = 1;\nend\n");
+        write_file(
+            &workspace.join("@Point").join("Point.m"),
+            "classdef Point\nend\n",
+        );
+
+        let resolved = resolve_callable(
+            "Point",
+            &ResolverContext::from_source_file(workspace.join("main.m")),
+        )
+        .expect("callable should resolve");
+
+        let ResolvedCallable::Class(resolved) = resolved else {
+            panic!("expected class resolution");
+        };
+        assert_eq!(resolved.kind, ResolvedClassKind::FolderCurrentDirectory);
+        assert_eq!(resolved.path, workspace.join("@Point").join("Point.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn resolves_package_class_definition_from_search_root() {
+        let workspace = temp_test_dir();
+        let source = workspace.join("src");
+        let root = workspace.join("packages");
+        fs::create_dir_all(&source).expect("create source dir");
+        fs::create_dir_all(root.join("+pkg")).expect("create package dir");
+        write_file(&source.join("main.m"), "obj = pkg.Point();\n");
+        write_file(&root.join("+pkg").join("Point.m"), "classdef Point\nend\n");
+
+        let resolved = resolve_class_definition(
+            "pkg.Point",
+            &ResolverContext::new(Some(source.join("main.m")), vec![root.clone()]),
+        )
+        .expect("package class should resolve");
+
+        assert_eq!(resolved.kind, ResolvedClassKind::PackageDirectory);
+        assert_eq!(resolved.package.as_deref(), Some("pkg"));
+        assert_eq!(resolved.path, root.join("+pkg").join("Point.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn resolves_class_folder_method_from_definition_path() {
+        let workspace = temp_test_dir();
+        fs::create_dir_all(workspace.join("@Counter")).expect("create class dir");
+        let class_path = workspace.join("@Counter").join("Counter.m");
+        let method_path = workspace.join("@Counter").join("increment.m");
+        write_file(&class_path, "classdef Counter < handle\nend\n");
+        write_file(
+            &method_path,
+            "function obj = increment(obj, delta)\nobj.value = obj.value + delta;\nend\n",
+        );
+
+        let resolved =
+            resolve_class_folder_method(&class_path, "increment").expect("increment method");
+        assert_eq!(resolved, method_path);
         cleanup(&workspace);
     }
 

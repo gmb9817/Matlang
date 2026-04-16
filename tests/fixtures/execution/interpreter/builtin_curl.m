@@ -3,3 +3,7 @@ default = curl([0, 0, 0; -1, -1, -1; -2, -2, -2], [0, 1, 2; 0, 1, 2; 0, 1, 2]);
 matrix_grid = curl(xg, yg, [0, 0, 0; -4, -4, -4; -8, -8, -8], [0, 2, 4; 0, 2, 4; 0, 2, 4]);
 descending = curl([4, 2, 0], [8, 4, 0], [-8, -8, -8; -4, -4, -4; 0, 0, 0], [4, 2, 0; 4, 2, 0; 4, 2, 0]);
 scalar = curl(5, 7);
+empty = curl([], []);
+empty_size = size(empty);
+empty_cols = curl(zeros(3, 0), zeros(3, 0));
+empty_cols_size = size(empty_cols);

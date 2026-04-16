@@ -15,3 +15,5 @@ o = funm([0 1; -1 0], @sec);
 p = funm([1 0; 0 2], @coth);
 q = funm([1 0; 0 2], @asec);
 r = funm([1 0; 0 0.5], @asech);
+s = funm([], "sqrt");
+[t, u] = funm([], @log);

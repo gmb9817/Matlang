@@ -2,9 +2,10 @@
 
 use crate::{
     ast::{
-        AssignmentTarget, BinaryOp, CompilationUnit, CompilationUnitKind, ConditionalBranch,
-        Expression, ExpressionKind, FunctionDef, Identifier, IndexArgument, Item, QualifiedName,
-        Statement, StatementKind, SwitchCase, UnaryOp,
+        AssignmentTarget, BinaryOp, ClassDef, ClassMethodBlock, ClassPropertyBlock,
+        ClassPropertyDef, CompilationUnit, CompilationUnitKind, ConditionalBranch, Expression,
+        ExpressionKind, FunctionDef, Identifier, IndexArgument, Item, QualifiedName, Statement,
+        StatementKind, SwitchCase, UnaryOp,
     },
     diagnostics::Diagnostic,
     lexer::{lex, DelimiterKind, Keyword, OperatorKind, Token, TokenKind, Trivia, TriviaKind},
@@ -15,6 +16,7 @@ use crate::{
 pub enum ParseMode {
     Script,
     FunctionFile,
+    ClassFile,
     AutoDetect,
 }
 
@@ -72,9 +74,12 @@ impl<'a> Parser<'a> {
         let kind = match self.mode {
             ParseMode::Script => CompilationUnitKind::Script,
             ParseMode::FunctionFile => CompilationUnitKind::FunctionFile,
+            ParseMode::ClassFile => CompilationUnitKind::ClassFile,
             ParseMode::AutoDetect => {
                 if self.at_keyword(Keyword::Function) {
                     CompilationUnitKind::FunctionFile
+                } else if self.at_keyword(Keyword::ClassDef) {
+                    CompilationUnitKind::ClassFile
                 } else {
                     CompilationUnitKind::Script
                 }
@@ -84,19 +89,40 @@ impl<'a> Parser<'a> {
         let start = self.current().span;
         let mut items = Vec::new();
 
-        while !self.at_end() {
-            self.skip_separators();
-            if self.at_end() {
-                break;
-            }
+        match kind {
+            CompilationUnitKind::Script | CompilationUnitKind::FunctionFile => {
+                while !self.at_end() {
+                    self.skip_separators();
+                    if self.at_end() {
+                        break;
+                    }
 
-            if self.at_keyword(Keyword::Function) {
-                items.push(Item::Function(self.parse_function_definition()));
-            } else {
-                items.push(Item::Statement(self.parse_statement()));
-            }
+                    if self.at_keyword(Keyword::Function) {
+                        items.push(Item::Function(self.parse_function_definition()));
+                    } else {
+                        items.push(Item::Statement(self.parse_statement()));
+                    }
 
-            self.skip_separators();
+                    self.skip_separators();
+                }
+            }
+            CompilationUnitKind::ClassFile => {
+                if self.at_keyword(Keyword::ClassDef) {
+                    items.push(Item::Class(self.parse_class_definition()));
+                } else if !self.at_end() {
+                    self.error_here("PAR101", "expected `classdef`");
+                }
+
+                self.skip_separators();
+                while !self.at_end() {
+                    self.error_here(
+                        "PAR102",
+                        "top-level content after a class definition is not supported",
+                    );
+                    self.advance_if_not_eof();
+                    self.skip_separators();
+                }
+            }
         }
 
         let span = items
@@ -183,6 +209,169 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_class_definition(&mut self) -> ClassDef {
+        let class_span = self.expect_keyword(Keyword::ClassDef, "PAR103", "expected `classdef`");
+        let name = self.parse_identifier_or_recover("PAR104", "expected class name");
+        let superclass = if self.match_operator(OperatorKind::LessThan) {
+            let qualified =
+                self.parse_qualified_name("PAR105", "expected superclass name after `<`");
+            if self.at_operator(OperatorKind::LogicalAnd) {
+                self.error_here("PAR106", "multiple superclasses are not supported");
+                while !self.at_end() && !self.at_separator() {
+                    self.advance_if_not_eof();
+                }
+            }
+            Some(qualified)
+        } else {
+            None
+        };
+
+        self.skip_separators();
+        let mut property_blocks = Vec::new();
+        let mut method_blocks = Vec::new();
+
+        while !self.at_end() && !self.at_keyword(Keyword::End) {
+            self.skip_separators();
+            if self.at_end() || self.at_keyword(Keyword::End) {
+                break;
+            }
+
+            if self.at_keyword(Keyword::Properties) {
+                property_blocks.push(self.parse_class_property_block());
+            } else if self.at_keyword(Keyword::Methods) {
+                method_blocks.push(self.parse_class_method_block());
+            } else if self.current_identifier_is("events") {
+                self.error_here("PAR107", "`events` blocks are not supported");
+                self.advance_if_not_eof();
+            } else if self.current_identifier_is("enumeration") {
+                self.error_here("PAR108", "`enumeration` blocks are not supported");
+                self.advance_if_not_eof();
+            } else if self.at_keyword(Keyword::Function) {
+                self.error_here(
+                    "PAR109",
+                    "methods must appear inside a `methods` block in a class definition",
+                );
+                self.parse_function_definition();
+            } else {
+                self.error_here("PAR110", "unsupported class body item");
+                self.advance_if_not_eof();
+            }
+
+            self.skip_separators();
+        }
+
+        let end_span =
+            self.expect_keyword(Keyword::End, "PAR111", "expected `end` after class body");
+        ClassDef {
+            name,
+            superclass,
+            property_blocks,
+            method_blocks,
+            span: combine_spans(class_span, end_span),
+        }
+    }
+
+    fn parse_class_property_block(&mut self) -> ClassPropertyBlock {
+        let start = self.expect_keyword(Keyword::Properties, "PAR112", "expected `properties`");
+        self.reject_class_block_attributes("PAR113");
+        self.skip_separators();
+
+        let mut properties = Vec::new();
+        while !self.at_end() && !self.at_keyword(Keyword::End) {
+            self.skip_separators();
+            if self.at_end() || self.at_keyword(Keyword::End) {
+                break;
+            }
+            let name = self.parse_identifier_or_recover("PAR114", "expected property name");
+            let default = if self.match_operator(OperatorKind::Assign) {
+                Some(self.parse_expression())
+            } else {
+                None
+            };
+            let span = default
+                .as_ref()
+                .map(|value| combine_spans(name.span, value.span))
+                .unwrap_or(name.span);
+            properties.push(ClassPropertyDef {
+                name,
+                default,
+                span,
+            });
+            if self.at_delimiter(DelimiterKind::Semicolon) {
+                self.advance();
+            }
+            self.skip_separators();
+        }
+
+        let end = self.expect_keyword(
+            Keyword::End,
+            "PAR115",
+            "expected `end` after properties block",
+        );
+        ClassPropertyBlock {
+            properties,
+            span: combine_spans(start, end),
+        }
+    }
+
+    fn parse_class_method_block(&mut self) -> ClassMethodBlock {
+        let start = self.expect_keyword(Keyword::Methods, "PAR116", "expected `methods`");
+        self.reject_class_block_attributes("PAR117");
+        self.skip_separators();
+
+        let mut methods = Vec::new();
+        while !self.at_end() && !self.at_keyword(Keyword::End) {
+            self.skip_separators();
+            if self.at_end() || self.at_keyword(Keyword::End) {
+                break;
+            }
+            if self.at_keyword(Keyword::Function) {
+                methods.push(self.parse_function_definition());
+            } else {
+                self.error_here(
+                    "PAR118",
+                    "methods blocks currently support only full `function ... end` method definitions",
+                );
+                self.advance_if_not_eof();
+            }
+            self.skip_separators();
+        }
+
+        let end = self.expect_keyword(
+            Keyword::End,
+            "PAR119",
+            "expected `end` after methods block",
+        );
+        ClassMethodBlock {
+            methods,
+            span: combine_spans(start, end),
+        }
+    }
+
+    fn reject_class_block_attributes(&mut self, code: &'static str) {
+        self.skip_trivia_only();
+        if self.at_delimiter(DelimiterKind::LeftParen) {
+            self.error_here(code, "class block attributes are not supported");
+            let mut depth = 0i32;
+            while !self.at_end() {
+                match self.current().kind {
+                    TokenKind::Delimiter(DelimiterKind::LeftParen) => {
+                        depth += 1;
+                    }
+                    TokenKind::Delimiter(DelimiterKind::RightParen) => {
+                        depth -= 1;
+                        if depth <= 0 {
+                            self.advance();
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                self.advance_if_not_eof();
+            }
+        }
+    }
+
     fn parse_statement_block(&mut self, terminators: &[Keyword]) -> Vec<Statement> {
         let mut body = Vec::new();
 
@@ -228,6 +417,7 @@ impl<'a> Parser<'a> {
                 kind: StatementKind::Assignment {
                     targets,
                     value: value.clone(),
+                    list_assignment: true,
                 },
                 span: combine_spans(start, value.span),
                 display_suppressed: false,
@@ -279,6 +469,7 @@ impl<'a> Parser<'a> {
                     kind: StatementKind::Assignment {
                         targets: vec![target],
                         value: value.clone(),
+                        list_assignment: false,
                     },
                     span: combine_spans(expression.span, value.span),
                     display_suppressed: false,
@@ -1613,6 +1804,8 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn skip_trivia_only(&mut self) {}
+
     fn match_operator(&mut self, operator: OperatorKind) -> bool {
         if self.at_operator(operator) {
             self.advance();
@@ -1658,6 +1851,13 @@ impl<'a> Parser<'a> {
 
     fn at_identifier(&self) -> bool {
         matches!(self.current().kind, TokenKind::Identifier)
+    }
+
+    fn current_identifier_is(&self, expected: &str) -> bool {
+        matches!(
+            &self.current().kind,
+            TokenKind::Identifier if self.current().lexeme.eq_ignore_ascii_case(expected)
+        )
     }
 
     fn can_start_expression(&self) -> bool {
@@ -1726,6 +1926,7 @@ fn item_span(item: &Item) -> SourceSpan {
     match item {
         Item::Statement(statement) => statement.span,
         Item::Function(function) => function.span,
+        Item::Class(class_def) => class_def.span,
     }
 }
 
@@ -1875,7 +2076,7 @@ mod tests {
         let Item::Statement(statement) = &unit.items[0] else {
             panic!("expected statement");
         };
-        let StatementKind::Assignment { targets, value } = &statement.kind else {
+        let StatementKind::Assignment { targets, value, .. } = &statement.kind else {
             panic!("expected assignment");
         };
         assert_eq!(targets.len(), 1);
@@ -1907,9 +2108,48 @@ mod tests {
             panic!("expected statement");
         };
         match &statement.kind {
-            StatementKind::Assignment { targets, .. } => assert_eq!(targets.len(), 2),
+            StatementKind::Assignment {
+                targets,
+                list_assignment,
+                ..
+            } => {
+                assert_eq!(targets.len(), 2);
+                assert!(*list_assignment);
+            }
             _ => panic!("expected assignment"),
         }
+    }
+
+    #[test]
+    fn distinguishes_bracketed_single_target_assignment_from_plain_assignment() {
+        let bracketed =
+            parse_source("[s.field] = [1 2]\n", SourceFileId(1), ParseMode::Script);
+        assert!(!bracketed.has_errors(), "{:?}", bracketed.diagnostics);
+        let bracketed_unit = bracketed.unit.expect("compilation unit");
+        let Item::Statement(bracketed_statement) = &bracketed_unit.items[0] else {
+            panic!("expected statement");
+        };
+        let StatementKind::Assignment {
+            list_assignment, ..
+        } = &bracketed_statement.kind
+        else {
+            panic!("expected assignment");
+        };
+        assert!(*list_assignment);
+
+        let plain = parse_source("s.field = [1 2]\n", SourceFileId(1), ParseMode::Script);
+        assert!(!plain.has_errors(), "{:?}", plain.diagnostics);
+        let plain_unit = plain.unit.expect("compilation unit");
+        let Item::Statement(plain_statement) = &plain_unit.items[0] else {
+            panic!("expected statement");
+        };
+        let StatementKind::Assignment {
+            list_assignment, ..
+        } = &plain_statement.kind
+        else {
+            panic!("expected assignment");
+        };
+        assert!(!*list_assignment);
     }
 
     #[test]

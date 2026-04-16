@@ -2,9 +2,15 @@ conv_full = conv([1, 2, 3], [1, 1, 1]);
 conv_same = conv([1, 2, 3, 4], [1, 1, 1], "same");
 conv_valid = conv([1, 2, 3, 4], [1, 1, 1], "valid");
 column_conv = conv([1; 2; 3], [1; 1]);
+conv_same_empty = conv([1, 2, 3], zeros(1, 0), "same");
+conv_valid_empty = conv([1, 2, 3], zeros(1, 0), "valid");
+conv_same_empty_lhs_size = size(conv(zeros(1, 0), [1, 2, 3], "same"));
+conv_valid_empty_col = conv([1; 2; 3], zeros(0, 1), "valid");
 
 conv2_full = conv2([1, 2; 3, 4], [1, 0; 0, -1]);
 conv2_same = conv2([1, 2; 3, 4], [1, 1, 1], "same");
+conv2_same_empty = conv2([1, 2; 3, 4], zeros(0, 1), "same");
+conv2_same_empty_lhs_size = size(conv2(zeros(0, 3), [1, 2; 3, 4], "same"));
 conv2_valid = conv2([1, 2, 3; 4, 5, 6], [1, 0; 0, -1], "valid");
 conv2_separable = conv2([1; 0; -1], [1, 2, 1], [1, 2; 3, 4]);
 conv2_separable_same = conv2([1; 0; -1], [1, 2, 1], [1, 2; 3, 4], "same");

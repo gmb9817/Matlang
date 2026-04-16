@@ -1,14 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 
 use matlab_frontend::ast::{
-    AssignmentTarget, CompilationUnit, Expression, ExpressionKind, FunctionDef, Identifier,
-    IndexArgument, Item, QualifiedName, Statement, StatementKind,
+    AssignmentTarget, ClassDef, CompilationUnit, CompilationUnitKind, Expression, ExpressionKind,
+    FunctionDef, Identifier, IndexArgument, Item, QualifiedName, Statement, StatementKind,
 };
 use matlab_frontend::source::SourceSpan;
 use matlab_semantics::{
     symbols::{
-        Binding, BindingId, ReferenceResolution, ReferenceRole, ResolvedReference, Symbol,
-        SymbolId, SymbolKind, SymbolReference,
+        Binding, BindingId, ClassInfo, ReferenceResolution, ReferenceRole, ResolvedReference,
+        Symbol, SymbolId, SymbolKind, SymbolReference,
     },
     workspace::{ScopeId, WorkspaceId, WorkspaceKind},
     AnalysisResult,
@@ -16,8 +16,8 @@ use matlab_semantics::{
 
 use crate::hir::{
     HirAnonymousFunction, HirAssignmentTarget, HirBinding, HirCallTarget, HirCallableRef,
-    HirCapture, HirConditionalBranch, HirExpression, HirFunction, HirIndexArgument, HirItem,
-    HirModule, HirStatement, HirSwitchCase, HirValueRef,
+    HirCapture, HirClass, HirClassProperty, HirConditionalBranch, HirExpression, HirFunction,
+    HirIndexArgument, HirItem, HirModule, HirStatement, HirSwitchCase, HirValueRef,
 };
 
 pub fn lower_to_hir(unit: &CompilationUnit, analysis: &AnalysisResult) -> HirModule {
@@ -25,6 +25,7 @@ pub fn lower_to_hir(unit: &CompilationUnit, analysis: &AnalysisResult) -> HirMod
 }
 
 struct LoweringContext<'a> {
+    analysis: &'a AnalysisResult,
     symbols_by_id: HashMap<SymbolId, &'a Symbol>,
     bindings_by_id: HashMap<BindingId, &'a Binding>,
     scope_parent: HashMap<ScopeId, Option<ScopeId>>,
@@ -140,6 +141,7 @@ impl<'a> LoweringContext<'a> {
             .collect::<VecDeque<_>>();
 
         Self {
+            analysis,
             symbols_by_id,
             bindings_by_id,
             scope_parent,
@@ -151,16 +153,30 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
+    fn analysis_class(&self, name: &str) -> Option<&ClassInfo> {
+        self.analysis
+            .classes
+            .iter()
+            .find(|class| class.name == name)
+    }
+
     fn lower_module(mut self, unit: &CompilationUnit) -> HirModule {
+        let classes = unit
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(class_def) => Some(self.lower_class(class_def)),
+                Item::Statement(_) | Item::Function(_) => None,
+            })
+            .collect::<Vec<_>>();
         HirModule {
             kind: unit.kind,
             scope_id: ScopeId(0),
             workspace_id: WorkspaceId(0),
-            implicit_ans: Some(self.lookup_current_binding(
-                ScopeId(0),
-                "ans",
-                SymbolKind::Variable,
-            )),
+            implicit_ans: (unit.kind != CompilationUnitKind::ClassFile).then(|| {
+                self.lookup_current_binding(ScopeId(0), "ans", SymbolKind::Variable)
+            }),
+            classes,
             items: self.lower_items(&unit.items, ScopeId(0)),
         }
     }
@@ -168,13 +184,54 @@ impl<'a> LoweringContext<'a> {
     fn lower_items(&mut self, items: &[Item], scope_id: ScopeId) -> Vec<HirItem> {
         items
             .iter()
-            .map(|item| match item {
+            .flat_map(|item| match item {
                 Item::Statement(statement) => {
-                    HirItem::Statement(self.lower_statement(statement, scope_id))
+                    vec![HirItem::Statement(self.lower_statement(statement, scope_id))]
                 }
-                Item::Function(function) => HirItem::Function(self.lower_function(function)),
+                Item::Function(function) => vec![HirItem::Function(self.lower_function(function))],
+                Item::Class(class_def) => class_def
+                    .method_blocks
+                    .iter()
+                    .flat_map(|block| block.methods.iter())
+                    .map(|method| HirItem::Function(self.lower_function(method)))
+                    .collect::<Vec<_>>(),
             })
             .collect()
+    }
+
+    fn lower_class(&mut self, class_def: &ClassDef) -> HirClass {
+        let metadata = self.analysis_class(&class_def.name.name).cloned();
+        HirClass {
+            name: class_def.name.name.clone(),
+            package: metadata.as_ref().and_then(|class| class.package.clone()),
+            inherits_handle: metadata
+                .as_ref()
+                .is_some_and(|class| class.inherits_handle),
+            properties: class_def
+                .property_blocks
+                .iter()
+                .flat_map(|block| block.properties.iter())
+                .map(|property| HirClassProperty {
+                    name: property.name.name.clone(),
+                    default: property
+                        .default
+                        .as_ref()
+                        .map(|expression| self.lower_expression(expression, ScopeId(0))),
+                })
+                .collect(),
+            inline_methods: class_def
+                .method_blocks
+                .iter()
+                .flat_map(|block| block.methods.iter())
+                .map(|method| method.name.name.clone())
+                .collect(),
+            external_methods: metadata
+                .as_ref()
+                .map(|class| class.external_methods.clone())
+                .unwrap_or_default(),
+            constructor: metadata.as_ref().and_then(|class| class.constructor.clone()),
+            source_path: metadata.as_ref().and_then(|class| class.source_path.clone()),
+        }
     }
 
     fn lower_function(&mut self, function: &FunctionDef) -> HirFunction {
@@ -223,12 +280,17 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_statement(&mut self, statement: &Statement, scope_id: ScopeId) -> HirStatement {
         match &statement.kind {
-            StatementKind::Assignment { targets, value } => HirStatement::Assignment {
+            StatementKind::Assignment {
+                targets,
+                value,
+                list_assignment,
+            } => HirStatement::Assignment {
                 targets: targets
                     .iter()
                     .map(|target| self.lower_assignment_target(target, scope_id))
                     .collect(),
                 value: self.lower_expression(value, scope_id),
+                list_assignment: *list_assignment,
                 display_suppressed: statement.display_suppressed,
             },
             StatementKind::Expression(expression) => HirStatement::Expression {

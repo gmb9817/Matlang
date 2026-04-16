@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use matlab_frontend::ast::Expression;
 use matlab_frontend::source::SourceSpan;
 
 use crate::workspace::{ScopeId, WorkspaceId};
@@ -18,13 +19,16 @@ pub enum SymbolKind {
     Parameter,
     Output,
     Function,
+    Class,
+    Method,
+    Property,
     Global,
     Persistent,
 }
 
 impl SymbolKind {
     pub fn is_function(self) -> bool {
-        matches!(self, Self::Function)
+        matches!(self, Self::Function | Self::Method)
     }
 
     pub fn is_capture_eligible(self) -> bool {
@@ -39,9 +43,33 @@ impl SymbolKind {
             Self::Variable | Self::Parameter | Self::Output => Some(BindingStorage::Local),
             Self::Global => Some(BindingStorage::Global),
             Self::Persistent => Some(BindingStorage::Persistent),
-            Self::Function => None,
+            Self::Function | Self::Class | Self::Method | Self::Property => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassPropertyInfo {
+    pub name: String,
+    pub default: Option<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalMethodInfo {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassInfo {
+    pub name: String,
+    pub package: Option<String>,
+    pub inherits_handle: bool,
+    pub properties: Vec<ClassPropertyInfo>,
+    pub inline_methods: Vec<String>,
+    pub external_methods: Vec<ExternalMethodInfo>,
+    pub constructor: Option<String>,
+    pub source_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,4 +195,10 @@ pub enum PathResolutionKind {
     CurrentDirectory,
     SearchPath,
     PackageDirectory,
+    ClassCurrentDirectory,
+    ClassSearchPath,
+    ClassPackageDirectory,
+    ClassFolderCurrentDirectory,
+    ClassFolderSearchPath,
+    ClassFolderPackageDirectory,
 }

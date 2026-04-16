@@ -11,6 +11,7 @@ pub enum ScopeKind {
     CompilationUnit,
     FunctionBody,
     AnonymousFunctionBody,
+    ClassBody,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +19,7 @@ pub enum WorkspaceKind {
     Script,
     Function,
     AnonymousFunction,
+    Class,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

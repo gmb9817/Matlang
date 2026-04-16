@@ -1,6 +1,13 @@
 //! Runtime crate for executable MATLAB semantics.
 
-use std::{collections::BTreeMap, error::Error, fmt, path::PathBuf};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    path::PathBuf,
+    rc::Rc,
+};
 
 pub const CRATE_NAME: &str = "matlab-runtime";
 
@@ -22,6 +29,7 @@ pub enum Value {
     Matrix(MatrixValue),
     Cell(CellValue),
     Struct(StructValue),
+    Object(ObjectValue),
     FunctionHandle(FunctionHandleValue),
 }
 
@@ -50,22 +58,76 @@ pub struct CellValue {
     pub elements: Vec<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct StructValue {
     pub fields: BTreeMap<String, Value>,
+    pub field_order: Vec<String>,
+}
+
+impl PartialEq for StructValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStorageKind {
+    Value,
+    Handle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectClassMetadata {
+    pub class_name: String,
+    pub package: Option<String>,
+    pub storage_kind: ObjectStorageKind,
+    pub source_path: Option<PathBuf>,
+    pub property_order: Vec<String>,
+    pub inline_methods: BTreeSet<String>,
+    pub external_methods: BTreeMap<String, PathBuf>,
+    pub constructor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectInstance {
+    pub properties: StructValue,
+}
+
+#[derive(Debug, Clone)]
+pub enum ObjectStorage {
+    Value(ObjectInstance),
+    Handle(Rc<RefCell<ObjectInstance>>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectValue {
+    pub class: ObjectClassMetadata,
+    pub storage: ObjectStorage,
+}
+
+impl PartialEq for ObjectValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.class == other.class && self.properties() == other.properties()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionHandleValue {
     pub display_name: String,
     pub target: FunctionHandleTarget,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FunctionHandleTarget {
     Named(String),
     ResolvedPath(PathBuf),
     BundleModule(String),
+    BoundMethod {
+        class_name: String,
+        package: Option<String>,
+        method_name: String,
+        receiver: Box<Value>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +325,7 @@ impl Value {
             Self::Matrix(_) => "matrix",
             Self::Cell(_) => "cell",
             Self::Struct(_) => "struct",
+            Self::Object(_) => "object",
             Self::FunctionHandle(_) => "function_handle",
         }
     }
@@ -471,9 +534,114 @@ impl CellValue {
     }
 }
 
+impl StructValue {
+    pub fn from_fields(fields: BTreeMap<String, Value>) -> Self {
+        let field_order = fields.keys().cloned().collect();
+        Self { fields, field_order }
+    }
+
+    pub fn with_field_order(fields: BTreeMap<String, Value>, field_order: Vec<String>) -> Self {
+        let mut normalized_order = Vec::with_capacity(fields.len());
+        let mut seen = BTreeSet::new();
+        for name in field_order {
+            if fields.contains_key(&name) && seen.insert(name.clone()) {
+                normalized_order.push(name);
+            }
+        }
+        for name in fields.keys() {
+            if seen.insert(name.clone()) {
+                normalized_order.push(name.clone());
+            }
+        }
+        Self {
+            fields,
+            field_order: normalized_order,
+        }
+    }
+
+    pub fn field_names(&self) -> &[String] {
+        &self.field_order
+    }
+
+    pub fn ordered_entries(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.field_order.iter().filter_map(|name| {
+            self.fields
+                .get_key_value(name)
+                .map(|(field_name, value)| (field_name.as_str(), value))
+        })
+    }
+
+    pub fn ordered_values(&self) -> impl Iterator<Item = &Value> {
+        self.field_order
+            .iter()
+            .filter_map(|name| self.fields.get(name))
+    }
+
+    pub fn insert_field(&mut self, name: String, value: Value) {
+        if !self.fields.contains_key(&name) {
+            self.field_order.push(name.clone());
+        }
+        self.fields.insert(name, value);
+    }
+
+    pub fn remove_field(&mut self, name: &str) -> Option<Value> {
+        let removed = self.fields.remove(name);
+        if removed.is_some() {
+            self.field_order.retain(|existing| existing != name);
+        }
+        removed
+    }
+}
+
+impl ObjectValue {
+    pub fn new(class: ObjectClassMetadata, properties: StructValue) -> Self {
+        let storage = match class.storage_kind {
+            ObjectStorageKind::Value => ObjectStorage::Value(ObjectInstance { properties }),
+            ObjectStorageKind::Handle => {
+                ObjectStorage::Handle(Rc::new(RefCell::new(ObjectInstance { properties })))
+            }
+        };
+        Self { class, storage }
+    }
+
+    pub fn storage_kind(&self) -> ObjectStorageKind {
+        self.class.storage_kind
+    }
+
+    pub fn properties(&self) -> StructValue {
+        match &self.storage {
+            ObjectStorage::Value(instance) => instance.properties.clone(),
+            ObjectStorage::Handle(shared) => shared.borrow().properties.clone(),
+        }
+    }
+
+    pub fn property_value(&self, name: &str) -> Option<Value> {
+        match &self.storage {
+            ObjectStorage::Value(instance) => instance.properties.fields.get(name).cloned(),
+            ObjectStorage::Handle(shared) => shared.borrow().properties.fields.get(name).cloned(),
+        }
+    }
+
+    pub fn set_property_value(&mut self, name: &str, value: Value) -> Result<(), RuntimeError> {
+        match &mut self.storage {
+            ObjectStorage::Value(instance) => {
+                instance.properties.insert_field(name.to_string(), value);
+            }
+            ObjectStorage::Handle(shared) => {
+                shared
+                    .borrow_mut()
+                    .properties
+                    .insert_field(name.to_string(), value);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ArrayStorageClass, CellValue, ComplexValue, MatrixValue, Value};
+    use super::{ArrayStorageClass, CellValue, ComplexValue, MatrixValue, StructValue, Value};
+    use std::collections::BTreeMap;
 
     #[test]
     fn matrix_with_dimensions_preserves_explicit_metadata() {
@@ -561,6 +729,36 @@ mod tests {
         cell.elements_mut()[0] = Value::String("x".to_string());
         assert_eq!(cell.elements()[0], Value::String("x".to_string()));
     }
+
+    #[test]
+    fn struct_value_preserves_explicit_field_order_and_mutation_order() {
+        let fields = BTreeMap::from([
+            ("a".to_string(), Value::Scalar(1.0)),
+            ("b".to_string(), Value::Scalar(2.0)),
+        ]);
+        let mut struct_value =
+            StructValue::with_field_order(fields, vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(struct_value.field_names(), &["b".to_string(), "a".to_string()]);
+        assert_eq!(
+            struct_value
+                .ordered_entries()
+                .map(|(name, _)| name.to_string())
+                .collect::<Vec<_>>(),
+            vec!["b".to_string(), "a".to_string()]
+        );
+
+        struct_value.insert_field("c".to_string(), Value::Scalar(3.0));
+        assert_eq!(
+            struct_value.field_names(),
+            &["b".to_string(), "a".to_string(), "c".to_string()]
+        );
+
+        struct_value.remove_field("a");
+        assert_eq!(
+            struct_value.field_names(),
+            &["b".to_string(), "c".to_string()]
+        );
+    }
 }
 
 fn normalize_dimensions(
@@ -610,13 +808,22 @@ pub fn render_value(value: &Value) -> String {
         Value::Cell(cell) => render_cell_inline(cell, None),
         Value::Struct(struct_value) => {
             let fields = struct_value
-                .fields
-                .iter()
+                .ordered_entries()
                 .map(|(name, value)| format!("{name}={}", render_value(value)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("struct{{{fields}}}")
         }
+        Value::Object(object) => format!(
+            "{} with properties {{{}}}",
+            object.class.class_name,
+            object
+                .properties()
+                .ordered_entries()
+                .map(|(name, value)| format!("{name}={}", render_value(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Value::FunctionHandle(handle) => format!("@{}", handle.display_name),
     }
 }

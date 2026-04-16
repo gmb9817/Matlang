@@ -95,7 +95,13 @@ fn sample_workspace() -> Workspace {
             target: FunctionHandleTarget::BundleModule("dep7".to_string()),
         }),
     );
-    workspace.insert("s".to_string(), Value::Struct(StructValue { fields }));
+    workspace.insert(
+        "s".to_string(),
+        Value::Struct(StructValue::with_field_order(
+            fields,
+            vec!["name".to_string(), "fn".to_string()],
+        )),
+    );
     workspace
 }
 
@@ -105,6 +111,13 @@ fn workspace_snapshot_roundtrips_values() {
     let encoded = encode_workspace_snapshot(&workspace).expect("encode");
     let decoded = decode_workspace_snapshot(&encoded).expect("decode");
     assert_eq!(decoded, workspace);
+    let Value::Struct(decoded_struct) = decoded.get("s").expect("decoded struct") else {
+        panic!("expected struct value");
+    };
+    assert_eq!(
+        decoded_struct.field_names(),
+        &["name".to_string(), "fn".to_string()]
+    );
 }
 
 fn sample_mat_workspace() -> Workspace {
@@ -166,7 +179,13 @@ fn sample_mat_workspace() -> Workspace {
     let mut fields = std::collections::BTreeMap::new();
     fields.insert("name".to_string(), Value::CharArray("named".to_string()));
     fields.insert("value".to_string(), Value::Scalar(7.0));
-    workspace.insert("s".to_string(), Value::Struct(StructValue { fields }));
+    workspace.insert(
+        "s".to_string(),
+        Value::Struct(StructValue::with_field_order(
+            fields,
+            vec!["value".to_string(), "name".to_string()],
+        )),
+    );
     let mut first = std::collections::BTreeMap::new();
     first.insert("name".to_string(), Value::CharArray("first".to_string()));
     first.insert("value".to_string(), Value::Scalar(1.0));
@@ -180,8 +199,14 @@ fn sample_mat_workspace() -> Workspace {
                 1,
                 2,
                 vec![
-                    Value::Struct(StructValue { fields: first }),
-                    Value::Struct(StructValue { fields: second }),
+                    Value::Struct(StructValue::with_field_order(
+                        first,
+                        vec!["value".to_string(), "name".to_string()],
+                    )),
+                    Value::Struct(StructValue::with_field_order(
+                        second,
+                        vec!["value".to_string(), "name".to_string()],
+                    )),
                 ],
             )
             .expect("struct array"),
@@ -196,6 +221,23 @@ fn mat_file_roundtrips_supported_values() {
     let encoded = encode_mat_file(&workspace).expect("encode mat");
     let decoded = decode_mat_file(&encoded).expect("decode mat");
     assert_eq!(decoded, workspace);
+    let Value::Struct(decoded_struct) = decoded.get("s").expect("decoded scalar struct") else {
+        panic!("expected scalar struct");
+    };
+    assert_eq!(
+        decoded_struct.field_names(),
+        &["value".to_string(), "name".to_string()]
+    );
+    let Value::Matrix(decoded_array) = decoded.get("sa").expect("decoded struct array") else {
+        panic!("expected struct array");
+    };
+    let Value::Struct(first) = decoded_array.elements().first().expect("first struct element") else {
+        panic!("expected struct array element");
+    };
+    assert_eq!(
+        first.field_names(),
+        &["value".to_string(), "name".to_string()]
+    );
 }
 
 #[test]
@@ -267,3 +309,4 @@ fn execution_result_roundtrips_through_snapshot() {
         render_workspace(&result.workspace)
     );
 }
+

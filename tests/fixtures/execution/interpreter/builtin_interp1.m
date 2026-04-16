@@ -1,5 +1,12 @@
 linear = interp1([0, 1, 2, 3], [0, 10, 20, 30], [0.5, 1.5, 2.5]);
 default_x = interp1([0, 10, 20, 30], [1.5, 2.5]);
+default_extrap = interp1([0, 10, 20, 30], [0.5, 3.5], "extrap");
 nearest = interp1([0, 1, 2, 3], [0, 10, 20, 30], [0.49, 0.51, 2.49, 2.51], "nearest");
+linear_extrap = interp1([0, 1, 2, 3], [0, 10, 20, 30], [-1, 0.5, 3.5], "linear", "extrap");
+nearest_fill = interp1([0, 1, 2, 3], [0, 10, 20, 30], [-1, 0.5, 3.5], "nearest", -99);
+previous = interp1([0, 1, 2, 3], [0, 10, 20, 30], [0.25, 1.5, 2.75, 3], "previous");
+next = interp1([0, 1, 2, 3], [0, 10, 20, 30], [0.25, 1.5, 2.75, 3], "next");
+previous_extrap = interp1([1, 2, 4], [17, 100, 17], [0, 3, 5], "previous", "extrap");
+next_extrap = interp1([1, 2, 4], [17, 100, 17], [0, 3, 5], "next", "extrap");
 descending = interp1([3, 2, 1, 0], [30, 20, 10, 0], [2.5, 0.5]);
 matrix_query = interp1([0, 1, 2], [0, 1, 4], [0, 0.5; 1.5, 3]);

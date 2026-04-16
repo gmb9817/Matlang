@@ -2,10 +2,12 @@ workspace
   a = ["alpha", "beta"]
   b = [true, false]
   c = {9}
+  c2 = {10 ; 20}
   d = [0, 5]
   e = 9
   f = "beta"
-  g = [struct{inner=struct{flag=true}, name="alpha"}, struct{inner=struct{flag=false}, name="beta"}]
+  g = [struct{name="alpha", inner=struct{flag=true}}, struct{name="beta", inner=struct{flag=false}}]
+  h = {10 ; 20}
   idx = 2
-  s = [struct{inner=struct{flag=true}, name="alpha"}, struct{inner=struct{flag=false}, name="beta"}]
+  s = [struct{name="alpha", inner=struct{flag=true}}, struct{name="beta", inner=struct{flag=false}}]
   x = [0, 5]

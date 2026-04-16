@@ -1,6 +1,10 @@
 workspace
   default = [2, 3, 4 ; 3, 4, 5 ; 4, 5, 6]
   descending = [6, 8, 10 ; 10, 12, 14 ; 14, 16, 18]
+  empty = []
+  empty_cols = []
+  empty_cols_size = [3, 0]
+  empty_size = [0, 0]
   matrix_grid = [6, 8, 10 ; 10, 12, 14 ; 14, 16, 18]
   scalar = 0
   xg = [0, 2, 4 ; 0, 2, 4 ; 0, 2, 4]

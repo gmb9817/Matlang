@@ -19,3 +19,7 @@ reassigned_row = [assigned_groups{:}{:}];
 explicit_groups = {{0, 0}, {0, 0}};
 [explicit_groups{:}{:}] = {31, 32, 33, 34};
 explicit_row = [explicit_groups{:}{:}];
+
+matrix_groups = {{0, 0}, {0, 0}};
+[matrix_groups{:}{:}] = [5 6; 7 8];
+matrix_row = [matrix_groups{:}{:}];

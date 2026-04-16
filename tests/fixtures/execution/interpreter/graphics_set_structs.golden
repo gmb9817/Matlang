@@ -9,7 +9,7 @@ workspace
   fig_mode = 'manual'
   fig_orientation = 'landscape'
   fig_position = [0.9999999999999999, 1.9999999999999998, 3, 3.9999999999999996]
-  fig_props = struct{PaperOrientation="landscape", PaperPosition=[1, 2, 3, 4], PaperPositionMode="manual", PaperType="a4", PaperUnits="centimeters"}
+  fig_props = struct{PaperUnits="centimeters", PaperType="a4", PaperOrientation="landscape", PaperPositionMode="manual", PaperPosition=[1, 2, 3, 4]}
   fig_type = 'a4'
   fig_units = 'centimeters'
   line_color = [1, 0, 0]

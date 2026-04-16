@@ -1,2 +1,10 @@
 [counts, x_edges, y_edges] = histcounts2([1, 1, 2, 3, 2, 2, 1, 1, 2, 3], [5, 6, 3, 8, 9, 1, 2, 7, 5, 1], [3, 4]);
 edge_counts = histcounts2([0, 0.5, 1, 1.5, 2, 3], [10, 10, 20, 20, 30, 30], [0, 1, 2, 3], [10, 15, 25, 30]);
+[edge_counts2, x_edges2, y_edges2, x_bins, y_bins] = histcounts2([0, 0.5, 1, 1.5, 2, 3], [10, 10, 20, 20, 30, 30], [0, 1, 2, 3], [10, 15, 25, 30]);
+[integer_counts, integer_x_edges, integer_y_edges, integer_x_bins, integer_y_bins] = histcounts2([0, 0.5, 1, 1.5, 2, 3], [0, 0, 1, 1, 2, 2], "BinMethod", "integers");
+[numbins_counts, numbins_x_edges, numbins_y_edges, numbins_x_bins, numbins_y_bins] = histcounts2([0, 0.5, 1, 1.5, 2, 3], [10, 10, 20, 20, 30, 30], "NumBins", 2);
+[width_counts, width_x_edges, width_y_edges, width_x_bins, width_y_bins] = histcounts2([0, 0.5, 1, 1.5, 2, 3], [10, 10, 20, 20, 30, 30], "BinWidth", [1, 10]);
+[limited_counts, limited_x_edges, limited_y_edges, limited_x_bins, limited_y_bins] = histcounts2([0, 0.5, 1, 1.5, 2, 3], [10, 10, 20, 20, 30, 30], [2, 2], "XBinLimits", [0, 2], "YBinLimits", [10, 30]);
+probability_counts = histcounts2([0, 0.5, 1, 1.5, 2, 3], [10, 10, 20, 20, 30, 30], [0, 1, 3], [10, 15, 30], "Normalization", "probability");
+pdf_counts = histcounts2([0, 0.5, 1, 1.5, 2, 3], [10, 10, 20, 20, 30, 30], [0, 1, 3], [10, 15, 30], "Normalization", "pdf");
+cdf_counts = histcounts2([0, 0.5, 1, 1.5, 2, 3], [10, 10, 20, 20, 30, 30], [0, 1, 3], [10, 15, 30], "Normalization", "cdf");

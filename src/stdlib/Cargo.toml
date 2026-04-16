@@ -8,6 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 matlab-runtime = { path = "../runtime" }
+regex = "1"
+statrs = "0.18"
 
 [lib]
 path = "src/lib.rs"

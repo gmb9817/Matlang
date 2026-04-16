@@ -97,7 +97,7 @@ workspace
   do = "alpha <= beta"
   dotted_base = struct{helper=5}
   dotted_div = 2
-  dotted_rhs = struct{items=[1, 2], value=3}
+  dotted_rhs = struct{value=3, items=[1, 2]}
   dp = "alpha >= beta"
   dq = "alpha < beta"
   dr = "alpha > beta"
@@ -124,7 +124,7 @@ workspace
   postfix_base = 10
   q = "name=value"
   r = "alpha==beta"
-  rhs_struct = struct{items=[1, 2], value=3}
+  rhs_struct = struct{value=3, items=[1, 2]}
   s = "lower<=upper"
   sign_base = 5
   t = "left~=right"

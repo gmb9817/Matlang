@@ -1,2 +1,2 @@
 workspace
-  out = struct{count=3, inner=struct{flag=true}, name="alpha"}
+  out = struct{name="alpha", inner=struct{flag=true}, count=3}

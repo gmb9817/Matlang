@@ -6,5 +6,5 @@ workspace
   e = true
   f = false
   idx = 2
-  s = [struct{inner=struct{flag=true}, name="alpha", score=7}, struct{inner=struct{flag=false}, name="BETA", score=9}]
-  snapshot = [struct{inner=struct{flag=true}, name="alpha", score=7}, struct{inner=struct{flag=false}, name="BETA", score=9}]
+  s = [struct{name="alpha", score=7, inner=struct{flag=true}}, struct{name="BETA", score=9, inner=struct{flag=false}}]
+  snapshot = [struct{name="alpha", score=7, inner=struct{flag=true}}, struct{name="BETA", score=9, inner=struct{flag=false}}]

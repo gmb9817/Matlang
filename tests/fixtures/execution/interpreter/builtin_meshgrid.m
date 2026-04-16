@@ -1,5 +1,6 @@
 [xg, yg] = meshgrid([1, 2, 3], [10, 20]);
 [sx, sy] = meshgrid([-1, 0, 1]);
+[sx3, sy3, sz3] = meshgrid([-1, 0, 1]);
 x_only = meshgrid([5, 6], [7, 8, 9]);
 [x3, y3, z3] = meshgrid([1, 2], [10, 20], [100, 200]);
 [a4, b4, c4, d4] = meshgrid([1, 2], [10, 20], [100, 200], [1000, 2000]);

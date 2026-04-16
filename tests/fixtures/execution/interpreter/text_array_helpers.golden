@@ -4,6 +4,14 @@ workspace
   ab = ["1", "true" ; "x", "y"]
   ac = []
   ad = [0, 2]
+  ae = true
+  af = true
+  ag = true
+  ah = false
+  ai = false
+  aj = [4 ; 2]
+  ak = 2
+  al = [2 ; 0]
   b = ["alpha", "beta" ; "Gamma", "delta"]
   c = ["ALPHA", "BETA" ; "GAMMA", "DELTA"]
   d = [true, true ; true, true]

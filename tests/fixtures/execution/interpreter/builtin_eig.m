@@ -4,3 +4,6 @@ b = eig([1 2 3; 0 4 5; 0 0 6], "matrix");
 [e, f] = eig([3 1; 0 3]);
 [g, h] = eig(complex([0 0; 0 1], [1, 0; 0, 0]), "vector");
 [i, j, k] = eig([1 1; 0 2]);
+l = size(eig([]));
+m = size(eig([], "matrix"));
+[n, o] = eig([]);

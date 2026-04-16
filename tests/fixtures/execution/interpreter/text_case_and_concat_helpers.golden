@@ -9,3 +9,8 @@ workspace
   h = [true, false, true, false]
   i = [true, false, true]
   j = [true, true, true]
+  k = [true, true]
+  l = [true, false]
+  m = [true, false]
+  n = false
+  o = [true, true]

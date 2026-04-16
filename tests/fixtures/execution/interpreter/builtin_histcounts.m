@@ -1,3 +1,12 @@
 default_counts = histcounts([1, 1, 2, 3, 5]);
 [bin_counts, bin_edges] = histcounts([1, 1, 2, 3, 5], 4);
 [edge_counts, custom_edges] = histcounts([-1, 0, 0.25, 1.5, 2.0, 2.5, 3.0, 4.0], [0, 1, 2, 3]);
+[edge_counts2, custom_edges2, bin_assignments] = histcounts([-1, 0, 0.25, 1.5, 2.0, 2.5, 3.0, 4.0], [0, 1, 2, 3]);
+[sturges_counts, sturges_edges, sturges_bins] = histcounts([0, 0.5, 1, 1.5, 2, 2.5, 3], "BinMethod", "sturges");
+[integer_counts, integer_edges, integer_bins] = histcounts([0, 0.5, 1, 1.5, 2, 2.5, 3], "BinMethod", "integers");
+[numbins_counts, numbins_edges, numbins_bins] = histcounts([0, 0.5, 1, 1.5, 2, 2.5, 3], "NumBins", 4);
+[width_counts, width_edges, width_bins] = histcounts([0, 0.5, 1, 1.5, 2, 2.5, 3], "BinWidth", 1);
+[limited_counts, limited_edges, limited_bins] = histcounts([0, 0.5, 1, 1.5, 2, 2.5, 3], 2, "BinLimits", [0, 2]);
+probability_counts = histcounts([0, 0.5, 1, 1.5, 2, 2.5, 3], [0, 1, 3], "Normalization", "probability");
+pdf_counts = histcounts([0, 0.5, 1, 1.5, 2, 2.5, 3], [0, 1, 3], "Normalization", "pdf");
+cdf_counts = histcounts([0, 0.5, 1, 1.5, 2, 2.5, 3], [0, 1, 3], "Normalization", "cdf");

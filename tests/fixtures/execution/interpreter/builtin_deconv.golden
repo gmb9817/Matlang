@@ -1,6 +1,9 @@
 workspace
   col_q = [1 ; 2 ; 3]
   col_r = [0 ; 0 ; 0 ; 0]
+  empty_only = 0
+  empty_q = 0
+  empty_r = []
   poly_only = [2, 7]
   poly_q = [2, 7]
   poly_r = [0, 0, 2, 2]

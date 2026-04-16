@@ -20,6 +20,7 @@ struct VmTemp {
     spread: Option<Vec<Value>>,
     bound_method: Option<BoundMethod>,
     list_origin: bool,
+    multi_struct_field_origin: Option<String>,
 }
 
 impl VmTemp {
@@ -30,6 +31,7 @@ impl VmTemp {
             spread: None,
             bound_method: None,
             list_origin: false,
+            multi_struct_field_origin: None,
         }
     }
 
@@ -40,6 +42,7 @@ impl VmTemp {
             spread: None,
             bound_method: None,
             list_origin: false,
+            multi_struct_field_origin: None,
         }
     }
 
@@ -50,6 +53,7 @@ impl VmTemp {
             spread: Some(values),
             bound_method: None,
             list_origin: true,
+            multi_struct_field_origin: None,
         }
     }
 
@@ -60,6 +64,7 @@ impl VmTemp {
             spread: None,
             bound_method: Some(method),
             list_origin: false,
+            multi_struct_field_origin: None,
         }
     }
 
@@ -70,6 +75,7 @@ impl VmTemp {
             spread: None,
             bound_method: None,
             list_origin: true,
+            multi_struct_field_origin: None,
         }
     }
 }
@@ -151,6 +157,7 @@ struct ParsedTarget {
     display_name: String,
     semantic_resolution: Option<String>,
     resolved_path: Option<PathBuf>,
+    resolved_class: bool,
     bundle_module_id: Option<String>,
 }
 
@@ -762,6 +769,14 @@ impl BytecodeVm {
                         args,
                     } => {
                         let target_temp = temp(&temps, *target)?.clone();
+                        let next_needs_struct_cell_selection =
+                            matches!(
+                                function.instructions.get(pc + 1),
+                                Some(BytecodeInstruction::LoadField { target, .. }) if *target == *dst
+                            ) || matches!(
+                                function.instructions.get(pc + 1),
+                                Some(BytecodeInstruction::StoreField { target, .. }) if *target == *dst
+                            );
                         let value = match *kind {
                             "brace" => {
                                 let primary = (|| {
@@ -792,12 +807,26 @@ impl BytecodeVm {
                                             &fallback_target,
                                             args,
                                         )?;
-                                        evaluate_cell_content_index(&fallback_target, &indices)?
+                                        if next_needs_struct_cell_selection {
+                                            if let Some(value) = materialize_default_struct_cell_selection(
+                                                &fallback_target,
+                                                &indices,
+                                            )? {
+                                                value
+                                            } else {
+                                                evaluate_cell_content_index(&fallback_target, &indices)?
+                                            }
+                                        } else {
+                                            evaluate_cell_content_index(&fallback_target, &indices)?
+                                        }
                                     }
                                     Err(error) => return Err(error),
                                 }
                             }
                             "paren" => {
+                                if let Some(field) = target_temp.multi_struct_field_origin.as_ref() {
+                                    return Err(unsupported_multi_struct_field_subindexing_error(field));
+                                }
                                 let indices = evaluate_index_arguments_from_strings(
                                     &temps,
                                     &target_temp.value,
@@ -861,6 +890,9 @@ impl BytecodeVm {
                                 }
                             }
                             "paren" => {
+                                if let Some(field) = target_temp.multi_struct_field_origin.as_ref() {
+                                    return Err(unsupported_multi_struct_field_subindexing_error(field));
+                                }
                                 if let Some(spread) = target_temp.spread.as_ref() {
                                     let mut values = Vec::new();
                                     for target_value in spread {
@@ -920,6 +952,7 @@ impl BytecodeVm {
                             set_temp(&mut temps, *dst, VmTemp::bound_method(handle, bound))?;
                             pc += 1;
                         } else {
+                            let target_had_lvalue = target_temp.lvalue.is_some();
                             let value = if target_temp.lvalue.is_some() {
                                 read_field_lvalue_value(&target_temp.value, field)?
                             } else {
@@ -929,7 +962,18 @@ impl BytecodeVm {
                                 target_temp.lvalue,
                                 TempLValueProjection::Field(field.clone()),
                             );
-                            set_temp(&mut temps, *dst, VmTemp::with_lvalue(value, lvalue))?;
+                            let mut temp_value = VmTemp::with_lvalue(value, lvalue);
+                            if target_had_lvalue
+                                && matches!(
+                                    &target_temp.value,
+                                    Value::Matrix(matrix)
+                                        if matrix_is_struct_array(matrix)
+                                            && matrix.element_count() > 1
+                                )
+                            {
+                                temp_value.multi_struct_field_origin = Some(field.clone());
+                            }
+                            set_temp(&mut temps, *dst, temp_value)?;
                             pc += 1;
                         }
                     }
@@ -943,10 +987,22 @@ impl BytecodeVm {
                         set_temp(&mut temps, *dst, VmTemp::spread(values))?;
                         pc += 1;
                     }
-                    BytecodeInstruction::StoreField { target, field, src } => {
+                    BytecodeInstruction::StoreField {
+                        target,
+                        field,
+                        src,
+                        list_assignment,
+                    } => {
                         let target_temp = temp(&temps, *target)?.clone();
                         let source_temp = temp(&temps, *src)?.clone();
-                        self.store_field(frame, &target_temp, field, &temps, &source_temp)?;
+                        self.store_field(
+                            frame,
+                            &target_temp,
+                            field,
+                            &temps,
+                            &source_temp,
+                            *list_assignment,
+                        )?;
                         pc += 1;
                     }
                     BytecodeInstruction::SplitList { outputs, src } => {
@@ -1095,6 +1151,13 @@ impl BytecodeVm {
             return self
                 .load_and_invoke_external_target(&parsed, &args)
                 .map(wrap_vm_values);
+        }
+        if let Some(Value::Object(object)) = args.first() {
+            if object_has_method(object, &parsed.display_name) {
+                return self
+                    .invoke_object_method_outputs(object, &parsed.display_name, &args[1..])
+                    .map(wrap_vm_values);
+            }
         }
         if matches!(
             parsed.semantic_resolution.as_deref(),
@@ -1567,7 +1630,201 @@ impl BytecodeVm {
                     ))
                 })
             }
+            FunctionHandleTarget::BoundMethod { receiver, method_name, .. } => {
+                let Value::Object(object) = receiver.as_ref() else {
+                    return Err(RuntimeError::Unsupported(format!(
+                        "bound method handle `{}` does not carry an object receiver",
+                        handle.display_name
+                    )));
+                };
+                self.invoke_object_method_outputs(object, method_name, args)
+            }
         }
+    }
+
+    fn find_module_function<'b>(&self, module: &'b HirModule, name: &str) -> Option<&'b HirFunction> {
+        module.items.iter().find_map(|item| match item {
+            HirItem::Function(function) if function.name == name => Some(function),
+            HirItem::Statement(_) | HirItem::Function(_) => None,
+        })
+    }
+
+    fn build_default_object_from_class(
+        &mut self,
+        class_module: &HirModule,
+        class: &matlab_ir::HirClass,
+        module_identity: String,
+    ) -> Result<Value, RuntimeError> {
+        let mut evaluator = Interpreter::with_shared_state(
+            class_module,
+            module_identity,
+            Rc::clone(&self.shared_state),
+            self.call_stack.clone(),
+        );
+        let mut frame = Frame::new(evaluator.module_functions.clone());
+        let mut fields = BTreeMap::new();
+        let mut field_order = Vec::new();
+        for property in &class.properties {
+            let value = if let Some(default) = &property.default {
+                evaluator.evaluate_expression(&mut frame, default)?
+            } else {
+                empty_matrix_value()
+            };
+            field_order.push(property.name.clone());
+            fields.insert(property.name.clone(), value);
+        }
+        Ok(Value::Object(ObjectValue::new(
+            ObjectClassMetadata {
+                class_name: class.name.clone(),
+                package: class.package.clone(),
+                storage_kind: if class.inherits_handle {
+                    ObjectStorageKind::Handle
+                } else {
+                    ObjectStorageKind::Value
+                },
+                source_path: class.source_path.clone(),
+                property_order: field_order.clone(),
+                inline_methods: class.inline_methods.iter().cloned().collect(),
+                external_methods: class
+                    .external_methods
+                    .iter()
+                    .map(|method| (method.name.clone(), method.path.clone()))
+                    .collect(),
+                constructor: class.constructor.clone(),
+            },
+            StructValue::with_field_order(fields, field_order),
+        )))
+    }
+
+    fn construct_class_from_path(
+        &mut self,
+        path: &Path,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let loaded = super::load_class_module_from_path(path)?;
+        let default_object = self.build_default_object_from_class(
+            &loaded.module,
+            &loaded.class,
+            loaded.source_path.display().to_string(),
+        )?;
+        if let Some(constructor_name) = &loaded.class.constructor {
+            let constructor = self.find_module_function(&loaded.module, constructor_name).ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "constructor `{constructor_name}` is not available in class `{}`",
+                    loaded.class.name
+                ))
+            })?;
+            let prebound_outputs = constructor
+                .outputs
+                .first()
+                .map(|binding| vec![(binding.name.clone(), default_object.clone())])
+                .unwrap_or_default();
+            let mut interpreter = Interpreter::with_shared_state(
+                &loaded.module,
+                loaded.source_path.display().to_string(),
+                Rc::clone(&self.shared_state),
+                self.call_stack.clone(),
+            );
+            let mut values = interpreter.invoke_function_with_prebound_outputs(
+                constructor,
+                args,
+                None,
+                &prebound_outputs,
+            )?;
+            if values.is_empty() {
+                values.push(default_object);
+            }
+            return Ok(values);
+        }
+        Ok(vec![default_object])
+    }
+
+    fn invoke_object_method_outputs(
+        &mut self,
+        object: &ObjectValue,
+        method_name: &str,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if object.class.inline_methods.contains(method_name) {
+            let source_path = object.class.source_path.as_ref().ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "class `{}` does not record its source path for inline method dispatch",
+                    object.class.class_name
+                ))
+            })?;
+            let loaded = super::load_class_module_from_path(source_path)?;
+            let method = self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "inline method `{method_name}` is not available in class `{}`",
+                    object.class.class_name
+                ))
+            })?;
+            let mut method_args = Vec::with_capacity(args.len() + 1);
+            method_args.push(Value::Object(object.clone()));
+            method_args.extend(args.iter().cloned());
+            let mut interpreter = Interpreter::with_shared_state(
+                &loaded.module,
+                loaded.source_path.display().to_string(),
+                Rc::clone(&self.shared_state),
+                self.call_stack.clone(),
+            );
+            return interpreter.invoke_function(method, &method_args, None);
+        }
+
+        let path = object
+            .class
+            .external_methods
+            .get(method_name)
+            .ok_or_else(|| {
+                RuntimeError::MissingVariable(format!(
+                    "object method `{method_name}` is not defined for class `{}`",
+                    object.class.class_name
+                ))
+            })?
+            .clone();
+        let source = fs::read_to_string(&path).map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "failed to read external method `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        if parsed.has_errors() {
+            return Err(RuntimeError::Unsupported(format!(
+                "failed to parse external method `{}`: {}",
+                path.display(),
+                format_frontend_diagnostics(&parsed.diagnostics)
+            )));
+        }
+        let unit = parsed.unit.ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "parser produced no compilation unit for external method `{}`",
+                path.display()
+            ))
+        })?;
+        let context =
+            ResolverContext::from_source_file(path.clone()).with_env_search_roots("MATC_PATH");
+        let analysis = analyze_compilation_unit_with_context(&unit, &context);
+        if analysis.has_errors() {
+            return Err(RuntimeError::Unsupported(format!(
+                "failed to analyze external method `{}`: {}",
+                path.display(),
+                format_semantic_diagnostics(&analysis.diagnostics)
+            )));
+        }
+        let hir = lower_to_hir(&unit, &analysis);
+        let mut method_args = Vec::with_capacity(args.len() + 1);
+        method_args.push(Value::Object(object.clone()));
+        method_args.extend(args.iter().cloned());
+        let mut interpreter = Interpreter::with_shared_state(
+            &hir,
+            path.display().to_string(),
+            Rc::clone(&self.shared_state),
+            self.call_stack.clone(),
+        );
+        interpreter.invoke_primary_function(&method_args).map(|values| {
+            values.into_iter().map(|(_, value)| value).collect()
+        })
     }
 
     fn invoke_workspace_builtin_outputs(
@@ -2202,6 +2459,9 @@ impl BytecodeVm {
             return self.load_and_invoke_bundled_module(module_id, args);
         }
         if let Some(path) = &parsed.resolved_path {
+            if parsed.resolved_class {
+                return self.construct_class_from_path(path, args);
+            }
             return self.load_and_invoke_external_function(path, args);
         }
         Err(RuntimeError::Unsupported(format!(
@@ -2378,25 +2638,81 @@ impl BytecodeVm {
         field: &str,
         temps: &[Option<VmTemp>],
         source: &VmTemp,
+        list_assignment: bool,
     ) -> Result<(), RuntimeError> {
         let (root, projections) = lvalue_root_and_projections(&target.lvalue)?;
+        if !list_assignment && temp_field_target_requires_list_assignment(&projections) {
+            if let Some(count) =
+                simple_temp_struct_field_assignment_target_count(frame, target, temps)?
+            {
+                return Err(unsupported_simple_csl_assignment_error(count));
+            }
+        }
         let cell = frame
             .cell_for_reference(root.binding_id, &root.name)
             .ok_or_else(|| {
                 RuntimeError::MissingVariable(format!("variable `{}` is not defined", root.name))
             })?;
-        let current = match cell.borrow().clone() {
-            Some(current) => current,
-            None if source.list_origin
-                && !projections
-                    .iter()
-                    .any(|projection| matches!(projection, TempLValueProjection::Paren(_))) =>
+        if cell.borrow().is_none()
+            && source.list_origin
+            && (list_assignment || temp_field_target_requires_list_assignment(&projections))
+        {
+            if let Some(updated) =
+                list_assignment
+                    .then(|| default_temp_struct_csl_root_value(&projections, field, source))
+                    .transpose()?
+                    .flatten()
+            {
+                *cell.borrow_mut() = Some(updated);
+                return Ok(());
+            }
+            if let Some(updated) =
+                default_temp_indexed_struct_csl_root_value(temps, &projections, field, source)?
+            {
+                *cell.borrow_mut() = Some(updated);
+                return Ok(());
+            }
+            if let Some(updated) =
+                default_temp_cell_struct_csl_root_value(temps, &projections, field, source)?
+            {
+                *cell.borrow_mut() = Some(updated);
+                return Ok(());
+            }
+            if !projections
+                .iter()
+                .any(|projection| matches!(projection, TempLValueProjection::Paren(_)))
             {
                 return Err(RuntimeError::Unsupported(
                     "comma-separated list assignment to a nonexistent struct array requires an explicit indexed receiver"
                         .to_string(),
                 ));
             }
+        }
+        if cell.borrow().is_none() {
+            if let Some(updated) =
+                list_assignment
+                    .then(|| default_temp_struct_direct_root_value(&projections, field, source))
+                    .transpose()?
+                    .flatten()
+            {
+                *cell.borrow_mut() = Some(updated);
+                return Ok(());
+            }
+            if let Some(updated) =
+                default_temp_indexed_struct_direct_root_value(temps, &projections, field, source)?
+            {
+                *cell.borrow_mut() = Some(updated);
+                return Ok(());
+            }
+            if let Some(updated) =
+                default_temp_cell_struct_direct_root_value(temps, &projections, field, source)?
+            {
+                *cell.borrow_mut() = Some(updated);
+                return Ok(());
+            }
+        }
+        let current = match cell.borrow().clone() {
+            Some(current) => current,
             None => default_temp_lvalue_root_value(
                 &projections,
                 &TempLValueLeaf::Field {
@@ -2453,8 +2769,135 @@ impl BytecodeVm {
             args: args.to_vec(),
             value: value.clone(),
         };
-        let current = match cell.borrow().clone() {
+        let current_value = cell.borrow().clone();
+        let current = match current_value {
             Some(current) => current,
+            None
+                if matches!(
+                    leaf,
+                    TempLValueLeaf::Index {
+                        kind: IndexAssignmentKind::Brace,
+                        ..
+                    }
+                )
+                    && projections.iter().any(|projection| {
+                        matches!(projection, TempLValueProjection::Brace(_))
+                    })
+                    && projections.iter().all(|projection| {
+                        matches!(
+                            projection,
+                            TempLValueProjection::Field(_) | TempLValueProjection::Brace(_)
+                        )
+                    }) =>
+            {
+                if let Some(updated) =
+                    try_materialize_undefined_cell_receiver_struct_field_brace_csl_assignment(
+                        &projections,
+                        args,
+                        temps,
+                        &value,
+                    )?
+                {
+                    *cell.borrow_mut() = Some(updated);
+                    return Ok(());
+                }
+                default_temp_lvalue_root_value(&projections, &leaf).ok_or_else(|| {
+                    RuntimeError::MissingVariable(format!(
+                        "variable `{}` is declared but has no runtime value",
+                        root.name
+                    ))
+                })?
+            }
+            None
+                if matches!(
+                    leaf,
+                    TempLValueLeaf::Index {
+                        kind: IndexAssignmentKind::Brace,
+                        ..
+                    }
+                )
+                    && projections
+                        .iter()
+                        .any(|projection| matches!(projection, TempLValueProjection::Paren(_)))
+                    && projections.iter().all(|projection| {
+                        matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Paren(_))
+                    }) =>
+            {
+                if let Some(updated) =
+                    try_materialize_undefined_indexed_struct_field_brace_csl_assignment(
+                        &projections,
+                        args,
+                        temps,
+                        &value,
+                    )?
+                {
+                    *cell.borrow_mut() = Some(updated);
+                    return Ok(());
+                }
+                default_temp_lvalue_root_value(&projections, &leaf).ok_or_else(|| {
+                    RuntimeError::MissingVariable(format!(
+                        "variable `{}` is declared but has no runtime value",
+                        root.name
+                    ))
+                })?
+            }
+            None
+                if matches!(
+                    leaf,
+                    TempLValueLeaf::Index {
+                        kind: IndexAssignmentKind::Brace,
+                        ..
+                    }
+                )
+                    && projections
+                        .iter()
+                        .all(|projection| matches!(projection, TempLValueProjection::Field(_))) =>
+            {
+                if let Some(updated) = try_materialize_undefined_struct_field_brace_csl_assignment(
+                    &projections,
+                    args,
+                    temps,
+                    &value,
+                )? {
+                    *cell.borrow_mut() = Some(updated);
+                    return Ok(());
+                }
+                default_temp_lvalue_root_value(&projections, &leaf).ok_or_else(|| {
+                    RuntimeError::MissingVariable(format!(
+                        "variable `{}` is declared but has no runtime value",
+                        root.name
+                    ))
+                })?
+            }
+            None
+                if matches!(
+                    leaf,
+                    TempLValueLeaf::Index {
+                        kind: IndexAssignmentKind::Brace,
+                        ..
+                    }
+                )
+                    && projections.is_empty() =>
+            {
+                if let Some(updated) =
+                    try_materialize_undefined_root_brace_csl_assignment(temps, args, &value)?
+                {
+                    *cell.borrow_mut() = Some(updated);
+                    return Ok(());
+                }
+                if undefined_temp_brace_assignment_with_colon(&projections, &leaf) {
+                    return Err(RuntimeError::Unsupported(
+                        "comma-separated list assignment to a nonexistent variable is not supported when any index is a colon"
+                            .to_string(),
+                    ));
+                }
+                default_temp_lvalue_root_value(&projections, &leaf).ok_or_else(|| {
+                    RuntimeError::MissingVariable(format!(
+                        "variable `{}` is declared but has no runtime value",
+                        root.name
+                    ))
+                })?
+            }
             None if undefined_temp_brace_assignment_with_colon(&projections, &leaf) => {
                 return Err(RuntimeError::Unsupported(
                     "comma-separated list assignment to a nonexistent variable is not supported when any index is a colon"
@@ -2487,6 +2930,16 @@ impl BytecodeVm {
 
         match projection {
             TempLValueProjection::Field(field) => {
+                if matches!(
+                    &current,
+                    Value::Matrix(matrix)
+                        if matrix_is_struct_array(matrix)
+                            && matrix.element_count() > 1
+                            && (temp_field_subindexing_requires_single_struct(rest)
+                                || matches!(leaf, TempLValueLeaf::Index { kind: IndexAssignmentKind::Paren, .. }))
+                ) {
+                    return Err(unsupported_multi_struct_field_subindexing_error(field));
+                }
                 if let Some(updated) = self.try_assign_distributed_struct_field_projection(
                     &current, field, rest, &leaf, temps,
                 )? {
@@ -3004,19 +3457,19 @@ fn invoke_save_builtin_outputs_vm(
         };
         let mut filtered = Workspace::new();
         let field_names = if let Some(names) = spec.names {
-            names
+            names.into_iter().collect()
         } else if spec.regexes.is_empty() {
-            struct_value.fields.keys().cloned().collect()
+            struct_value.field_names().to_vec()
         } else {
             let mut names = BTreeSet::new();
             for pattern in &spec.regexes {
-                for field_name in struct_value.fields.keys() {
+                for field_name in struct_value.field_names() {
                     if matlab_regexp_is_match(pattern, field_name)? {
                         names.insert(field_name.clone());
                     }
                 }
             }
-            names
+            names.into_iter().collect()
         };
         for field_name in field_names {
             let value = struct_value
@@ -3954,6 +4407,331 @@ fn default_temp_lvalue_root_value(
     }
 }
 
+fn default_temp_struct_csl_root_value(
+    projections: &[TempLValueProjection],
+    field: &str,
+    source: &VmTemp,
+) -> Result<Option<Value>, RuntimeError> {
+    if projections
+        .iter()
+        .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
+    {
+        return Ok(None);
+    }
+
+    let Value::Matrix(matrix) = &source.value else {
+        return Ok(None);
+    };
+    if matrix.rows != 1 {
+        return Ok(None);
+    }
+
+    let nested = if matrix.cols <= 1 {
+        assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &[field.to_string()],
+            matrix
+                .elements()
+                .first()
+                .cloned()
+                .unwrap_or_else(empty_matrix_value),
+        )?
+    } else {
+        assign_struct_path(
+            Value::Matrix(MatrixValue::with_dimensions(
+                1,
+                matrix.cols,
+                vec![1, matrix.cols],
+                vec![Value::Struct(StructValue::default()); matrix.cols],
+            )?),
+            &[field.to_string()],
+            source.value.clone(),
+        )?
+    };
+    if projections.is_empty() {
+        Ok(Some(nested))
+    } else {
+        Ok(Some(assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &projections
+                .iter()
+                .map(|projection| match projection {
+                    TempLValueProjection::Field(field) => field.clone(),
+                    _ => unreachable!("guard restricted to field projections"),
+                })
+                .collect::<Vec<_>>(),
+            nested,
+        )?))
+    }
+}
+
+fn default_temp_struct_direct_root_value(
+    projections: &[TempLValueProjection],
+    field: &str,
+    source: &VmTemp,
+) -> Result<Option<Value>, RuntimeError> {
+    let count = match &source.value {
+        Value::Matrix(matrix) if matrix.element_count() > 1 => matrix.element_count(),
+        Value::Cell(cell) if cell.element_count() > 1 => cell.element_count(),
+        _ => return Ok(None),
+    };
+    if projections
+        .iter()
+        .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
+    {
+        return Ok(None);
+    }
+
+    let nested = assign_struct_path(
+        empty_struct_assignment_target_row(count)?,
+        &[field.to_string()],
+        source.value.clone(),
+    )?;
+    if projections.is_empty() {
+        Ok(Some(nested))
+    } else {
+        Ok(Some(assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &projections
+                .iter()
+                .map(|projection| match projection {
+                    TempLValueProjection::Field(field) => field.clone(),
+                    _ => unreachable!("guard restricted to field projections"),
+                })
+                .collect::<Vec<_>>(),
+            nested,
+        )?))
+    }
+}
+
+fn default_temp_indexed_struct_csl_root_value(
+    temps: &[Option<VmTemp>],
+    projections: &[TempLValueProjection],
+    field: &str,
+    source: &VmTemp,
+) -> Result<Option<Value>, RuntimeError> {
+    let output_count = match &source.value {
+        Value::Matrix(matrix) if matrix.element_count() > 0 => matrix.element_count(),
+        Value::Cell(cell) if cell.element_count() > 0 => cell.element_count(),
+        _ => return Ok(None),
+    };
+    let mut prefix_fields = Vec::new();
+    let mut paren_index = None;
+    for (index, projection) in projections.iter().enumerate() {
+        match projection {
+            TempLValueProjection::Field(field) if paren_index.is_none() => {
+                prefix_fields.push(field.clone());
+            }
+            TempLValueProjection::Paren(_) if paren_index.is_none() => paren_index = Some(index),
+            _ => {}
+        }
+    }
+    let Some(paren_index) = paren_index else {
+        return Ok(None);
+    };
+    let TempLValueProjection::Paren(receiver_args) = &projections[paren_index] else {
+        unreachable!("paren index identified a paren projection");
+    };
+    let field_projections = &projections[paren_index + 1..];
+    if field_projections
+        .iter()
+        .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
+        || projections.iter().any(|projection| {
+            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Paren(_))
+        })
+    {
+        return Ok(None);
+    }
+
+    let Some(receivers) = materialize_missing_root_indexed_struct_receivers(
+        temps,
+        receiver_args,
+        output_count,
+    )? else {
+        return Ok(None);
+    };
+    let receiver_count = match &receivers {
+        Value::Struct(_) => 1,
+        Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
+        _ => return Ok(None),
+    };
+    if receiver_count != output_count {
+        return Ok(None);
+    }
+
+    let mut field_path = field_projections
+        .iter()
+        .map(|projection| match projection {
+            TempLValueProjection::Field(field) => field.clone(),
+            _ => unreachable!("guard restricted to field projections"),
+        })
+        .collect::<Vec<_>>();
+    field_path.push(field.to_string());
+    let mut updated = assign_struct_path(receivers, &field_path, source.value.clone())?;
+    if !prefix_fields.is_empty() {
+        updated =
+            assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+    }
+    Ok(Some(updated))
+}
+
+fn default_temp_indexed_struct_direct_root_value(
+    temps: &[Option<VmTemp>],
+    projections: &[TempLValueProjection],
+    field: &str,
+    source: &VmTemp,
+) -> Result<Option<Value>, RuntimeError> {
+    let count = match &source.value {
+        Value::Matrix(matrix) if matrix.element_count() > 1 => matrix.element_count(),
+        Value::Cell(cell) if cell.element_count() > 1 => cell.element_count(),
+        _ => return Ok(None),
+    };
+
+    let mut prefix_fields = Vec::new();
+    let mut paren_index = None;
+    for (index, projection) in projections.iter().enumerate() {
+        match projection {
+            TempLValueProjection::Field(field) if paren_index.is_none() => {
+                prefix_fields.push(field.clone());
+            }
+            TempLValueProjection::Paren(_) if paren_index.is_none() => paren_index = Some(index),
+            _ => {}
+        }
+    }
+    let Some(paren_index) = paren_index else {
+        return Ok(None);
+    };
+    let TempLValueProjection::Paren(receiver_args) = &projections[paren_index] else {
+        unreachable!("paren index identified a paren projection");
+    };
+    let field_projections = &projections[paren_index + 1..];
+    if field_projections
+        .iter()
+        .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
+        || projections.iter().any(|projection| {
+            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Paren(_))
+        })
+    {
+        return Ok(None);
+    }
+
+    let Some(receivers) = materialize_missing_root_indexed_struct_receivers(
+        temps,
+        receiver_args,
+        count,
+    )? else {
+        return Ok(None);
+    };
+    let receiver_count = match &receivers {
+        Value::Struct(_) => 1,
+        Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
+        _ => return Ok(None),
+    };
+    if receiver_count != count {
+        return Ok(None);
+    }
+
+    let mut field_path = field_projections
+        .iter()
+        .map(|projection| match projection {
+            TempLValueProjection::Field(field) => field.clone(),
+            _ => unreachable!("guard restricted to field projections"),
+        })
+        .collect::<Vec<_>>();
+    field_path.push(field.to_string());
+    let mut updated = assign_struct_path(receivers, &field_path, source.value.clone())?;
+    if !prefix_fields.is_empty() {
+        updated =
+            assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+    }
+    Ok(Some(updated))
+}
+
+fn materialize_missing_root_indexed_struct_receivers(
+    temps: &[Option<VmTemp>],
+    receiver_args: &[String],
+    output_count: usize,
+) -> Result<Option<Value>, RuntimeError> {
+    if output_count == 0 {
+        return Ok(None);
+    }
+
+    let receiver_target = empty_matrix_value();
+    let Value::Matrix(empty_receiver) = &receiver_target else {
+        unreachable!("empty matrix helper should return a matrix value");
+    };
+    let receiver_indices =
+        evaluate_index_arguments_from_strings(temps, &receiver_target, receiver_args)?;
+    if let Some(receivers) =
+        default_struct_selection_value_for_index_update(&receiver_target, &receiver_indices)?
+    {
+        let receiver_count = match &receivers {
+            Value::Struct(_) => 1,
+            Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
+            _ => 0,
+        };
+        if receiver_count > 0 {
+            return Ok(Some(receivers));
+        }
+    }
+
+    if receiver_args.iter().any(|argument| argument.contains("end")) {
+        return Ok(None);
+    }
+
+    let full_slice_axes = receiver_args
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, argument)| (argument == ":").then_some(axis))
+        .collect::<Vec<_>>();
+    if full_slice_axes.len() != 1 {
+        return Ok(None);
+    }
+
+    let effective_dims = indexing_dimensions_from_dims(empty_receiver.dims(), receiver_args.len());
+    let mut target_dims = effective_dims.clone();
+    let mut known_selection_product = 1usize;
+    for (axis, argument) in receiver_indices.iter().enumerate() {
+        if matches!(argument, EvaluatedIndexArgument::FullSlice) {
+            continue;
+        }
+        let label = format!("dimension {}", axis + 1);
+        let (selected, target_extent) =
+            assignment_dimension_indices(argument, effective_dims[axis], &label, "struct array")?;
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        known_selection_product *= selected.len();
+        target_dims[axis] = target_extent;
+    }
+
+    if output_count % known_selection_product != 0 {
+        return Ok(None);
+    }
+    let unknown_selection_count = output_count / known_selection_product;
+    if receiver_args.len() == 1 {
+        target_dims = vec![1, unknown_selection_count];
+    } else {
+        target_dims[full_slice_axes[0]] = unknown_selection_count;
+    }
+
+    let receiver_count = target_dims.iter().product::<usize>();
+    if receiver_count == 0 {
+        return Ok(None);
+    }
+    if receiver_count == 1 {
+        return Ok(Some(Value::Struct(StructValue::default())));
+    }
+
+    let (rows, cols) = storage_shape_from_dimensions(&target_dims);
+    Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+        rows,
+        cols,
+        target_dims,
+        vec![Value::Struct(StructValue::default()); receiver_count],
+    )?)))
+}
+
 fn default_nested_temp_lvalue_value(
     projections: &[TempLValueProjection],
     leaf: &TempLValueLeaf,
@@ -3974,6 +4752,70 @@ fn default_nested_temp_lvalue_value(
             } => Some(empty_cell_value()),
         },
     }
+}
+
+fn temp_field_target_requires_list_assignment(projections: &[TempLValueProjection]) -> bool {
+    projections.iter().any(|projection| {
+        matches!(
+            projection,
+            TempLValueProjection::Paren(_) | TempLValueProjection::Brace(_)
+        )
+    })
+}
+
+fn temp_field_subindexing_requires_single_struct(rest: &[TempLValueProjection]) -> bool {
+    rest.iter()
+        .any(|projection| matches!(projection, TempLValueProjection::Paren(_)))
+}
+
+fn simple_temp_struct_field_assignment_target_count(
+    frame: &VmFrame,
+    target: &VmTemp,
+    temps: &[Option<VmTemp>],
+) -> Result<Option<usize>, RuntimeError> {
+    if let Some(count) = nested_struct_assignment_target_count(&target.value).filter(|&count| count > 1)
+    {
+        return Ok(Some(count));
+    }
+
+    let Ok((root, projections)) = lvalue_root_and_projections(&target.lvalue) else {
+        return Ok(None);
+    };
+    let Some(cell) = frame.cell_for_reference(root.binding_id, &root.name) else {
+        return Ok(None);
+    };
+    if cell.borrow().is_some() || projections.is_empty() {
+        return Ok(None);
+    }
+
+    let mut current = empty_matrix_value();
+    for projection in &projections {
+        match projection {
+            TempLValueProjection::Paren(args) => {
+                let evaluated = evaluate_index_arguments_from_strings(temps, &current, args)?;
+                let Some(selected) =
+                    default_struct_selection_value_for_index_update(&current, &evaluated)?
+                else {
+                    return Ok(None);
+                };
+                current = selected;
+            }
+            TempLValueProjection::Field(field) => {
+                let leaf = TempLValueLeaf::Field {
+                    field: field.clone(),
+                    value: empty_matrix_value(),
+                };
+                let Some(selected) = default_field_projection_value_for_temp(&current, &[], &leaf)
+                else {
+                    return Ok(None);
+                };
+                current = selected;
+            }
+            TempLValueProjection::Brace(_) => return Ok(None),
+        }
+    }
+
+    Ok(nested_struct_assignment_target_count(&current).filter(|&count| count > 1))
 }
 
 fn temp_brace_args_contain_full_slice(args: &[String]) -> bool {
@@ -3997,6 +4839,583 @@ fn undefined_temp_brace_assignment_with_colon(
     )
 }
 
+fn infer_missing_root_receiver_count_from_rhs(args: &[String], value: &Value) -> Option<usize> {
+    let full_slice_axes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, argument)| (argument == ":").then_some(axis))
+        .collect::<Vec<_>>();
+    if full_slice_axes.len() != 1 {
+        return None;
+    }
+
+    let axis = full_slice_axes[0];
+    match value {
+        Value::Matrix(matrix) => match axis {
+            0 => Some(matrix.rows),
+            1 => Some(matrix.cols),
+            _ => None,
+        },
+        Value::Cell(cell) => match axis {
+            0 => Some(cell.rows),
+            1 => Some(cell.cols),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn try_materialize_undefined_root_brace_csl_assignment(
+    temps: &[Option<VmTemp>],
+    args: &[String],
+    value: &Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(rhs_values) = bytecode_csl_values(value)? else {
+        return Ok(None);
+    };
+    let output_count = rhs_values.len();
+    if output_count == 0 {
+        return Ok(None);
+    }
+    if args.iter().any(|argument| argument.contains("end")) {
+        return Ok(None);
+    }
+
+    let full_slice_axes = args
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, argument)| (argument == ":").then_some(axis))
+        .collect::<Vec<_>>();
+    if full_slice_axes.len() > 1 {
+        return Ok(None);
+    }
+
+    let empty = empty_cell_value();
+    let Value::Cell(empty_cell) = &empty else {
+        unreachable!("empty cell helper should return a cell value");
+    };
+    let evaluated = evaluate_index_arguments_from_strings(temps, &empty, args)?;
+    let target_dims = if full_slice_axes.is_empty() {
+        let plan = cell_assignment_plan(empty_cell, &evaluated)?;
+        if plan.selection.positions.len() != output_count {
+            return Ok(None);
+        }
+        plan.target_dims
+    } else {
+        let effective_dims = indexing_dimensions_from_dims(empty_cell.dims(), args.len());
+        let mut target_dims = effective_dims.clone();
+        let mut known_selection_product = 1usize;
+        for (axis, argument) in evaluated.iter().enumerate() {
+            if matches!(argument, EvaluatedIndexArgument::FullSlice) {
+                continue;
+            }
+            let label = format!("dimension {}", axis + 1);
+            let (selected, target_extent) =
+                assignment_dimension_indices(argument, effective_dims[axis], &label, "cell array")?;
+            if selected.is_empty() {
+                return Ok(None);
+            }
+            known_selection_product *= selected.len();
+            target_dims[axis] = target_extent;
+        }
+
+        if output_count % known_selection_product != 0 {
+            return Ok(None);
+        }
+        let unknown_selection_count = output_count / known_selection_product;
+        if args.len() == 1 {
+            vec![1, unknown_selection_count]
+        } else {
+            target_dims[full_slice_axes[0]] = unknown_selection_count;
+            target_dims
+        }
+    };
+
+    let element_count = target_dims.iter().product::<usize>();
+    let (rows, cols) = storage_shape_from_dimensions(&target_dims);
+    let current = CellValue::with_dimensions(
+        rows,
+        cols,
+        target_dims,
+        vec![empty_matrix_value(); element_count],
+    )?;
+    let current_value = Value::Cell(current.clone());
+    let evaluated_indices = evaluate_index_arguments_from_strings(temps, &current_value, args)?;
+    let selection = cell_selection(&current, &evaluated_indices)?;
+    if selection.positions.len() != output_count {
+        return Ok(None);
+    }
+    let rhs = Value::Cell(CellValue::with_dimensions(
+        selection.rows,
+        selection.cols,
+        selection.dims.clone(),
+        rhs_values,
+    )?);
+    Ok(Some(Value::Cell(assign_cell_content_index(
+        current,
+        &evaluated_indices,
+        rhs,
+    )?)))
+}
+
+fn try_materialize_undefined_struct_field_brace_csl_assignment(
+    projections: &[TempLValueProjection],
+    args: &[String],
+    temps: &[Option<VmTemp>],
+    value: &Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let Some(Value::Cell(materialized)) =
+        try_materialize_undefined_root_brace_csl_assignment(temps, args, value)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(assign_struct_path(
+        Value::Struct(StructValue::default()),
+        &projections
+            .iter()
+            .map(|projection| match projection {
+                TempLValueProjection::Field(field) => field.clone(),
+                _ => unreachable!("guard restricted to field projections"),
+            })
+            .collect::<Vec<_>>(),
+        Value::Cell(materialized),
+    )?))
+}
+
+fn default_temp_cell_struct_csl_root_value(
+    temps: &[Option<VmTemp>],
+    projections: &[TempLValueProjection],
+    field: &str,
+    source: &VmTemp,
+) -> Result<Option<Value>, RuntimeError> {
+    let mut prefix_fields = Vec::new();
+    let mut brace_index = None;
+    for (index, projection) in projections.iter().enumerate() {
+        match projection {
+            TempLValueProjection::Field(field) if brace_index.is_none() => {
+                prefix_fields.push(field.clone());
+            }
+            TempLValueProjection::Brace(_) if brace_index.is_none() => brace_index = Some(index),
+            _ => {}
+        }
+    }
+    let Some(brace_index) = brace_index else {
+        return Ok(None);
+    };
+    let TempLValueProjection::Brace(args) = &projections[brace_index] else {
+        unreachable!("brace index identified a brace projection");
+    };
+    let field_projections = &projections[brace_index + 1..];
+    if field_projections
+        .iter()
+        .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
+        || projections.iter().any(|projection| {
+            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Brace(_))
+        })
+    {
+        return Ok(None);
+    }
+
+    let Value::Matrix(matrix) = &source.value else {
+        return Ok(None);
+    };
+    if matrix.rows != 1 {
+        return Ok(None);
+    }
+
+    let receiver_defaults = Value::Cell(CellValue::new(
+        1,
+        matrix.cols,
+        vec![Value::Struct(StructValue::default()); matrix.cols],
+    )?);
+    let Some(Value::Cell(receivers)) =
+        try_materialize_undefined_root_brace_csl_assignment(temps, args, &receiver_defaults)?
+    else {
+        return Ok(None);
+    };
+
+    let mut field_path = field_projections
+        .iter()
+        .map(|projection| match projection {
+            TempLValueProjection::Field(field) => field.clone(),
+            _ => unreachable!("guard restricted to field projections"),
+        })
+        .collect::<Vec<_>>();
+    field_path.push(field.to_string());
+    let mut updated = assign_struct_path(
+        Value::Cell(receivers),
+        &field_path,
+        source.value.clone(),
+    )?;
+    if !prefix_fields.is_empty() {
+        updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+    }
+    Ok(Some(updated))
+}
+
+fn default_temp_cell_struct_direct_root_value(
+    temps: &[Option<VmTemp>],
+    projections: &[TempLValueProjection],
+    field: &str,
+    source: &VmTemp,
+) -> Result<Option<Value>, RuntimeError> {
+    let count = match &source.value {
+        Value::Matrix(matrix) if matrix.element_count() > 1 => matrix.element_count(),
+        Value::Cell(cell) if cell.element_count() > 1 => cell.element_count(),
+        _ => return Ok(None),
+    };
+
+    let mut prefix_fields = Vec::new();
+    let mut brace_index = None;
+    for (index, projection) in projections.iter().enumerate() {
+        match projection {
+            TempLValueProjection::Field(field) if brace_index.is_none() => {
+                prefix_fields.push(field.clone());
+            }
+            TempLValueProjection::Brace(_) if brace_index.is_none() => brace_index = Some(index),
+            _ => {}
+        }
+    }
+    let Some(brace_index) = brace_index else {
+        return Ok(None);
+    };
+    let TempLValueProjection::Brace(args) = &projections[brace_index] else {
+        unreachable!("brace index identified a brace projection");
+    };
+    let field_projections = &projections[brace_index + 1..];
+    if field_projections
+        .iter()
+        .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
+        || projections.iter().any(|projection| {
+            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Brace(_))
+        })
+    {
+        return Ok(None);
+    }
+
+    let receiver_defaults = Value::Cell(CellValue::new(
+        1,
+        count,
+        vec![Value::Struct(StructValue::default()); count],
+    )?);
+    let Some(Value::Cell(receivers)) =
+        try_materialize_undefined_root_brace_csl_assignment(temps, args, &receiver_defaults)?
+    else {
+        return Ok(None);
+    };
+
+    let mut field_path = field_projections
+        .iter()
+        .map(|projection| match projection {
+            TempLValueProjection::Field(field) => field.clone(),
+            _ => unreachable!("guard restricted to field projections"),
+        })
+        .collect::<Vec<_>>();
+    field_path.push(field.to_string());
+    let mut updated = assign_struct_path(
+        Value::Cell(receivers),
+        &field_path,
+        source.value.clone(),
+    )?;
+    if !prefix_fields.is_empty() {
+        updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+    }
+    Ok(Some(updated))
+}
+
+fn try_materialize_undefined_indexed_struct_field_brace_csl_assignment(
+    projections: &[TempLValueProjection],
+    args: &[String],
+    temps: &[Option<VmTemp>],
+    value: &Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let mut prefix_fields = Vec::new();
+    let mut paren_index = None;
+    for (index, projection) in projections.iter().enumerate() {
+        match projection {
+            TempLValueProjection::Field(field) if paren_index.is_none() => {
+                prefix_fields.push(field.clone());
+            }
+            TempLValueProjection::Paren(_) if paren_index.is_none() => paren_index = Some(index),
+            _ => {}
+        }
+    }
+    let Some(paren_index) = paren_index else {
+        return Ok(None);
+    };
+    let TempLValueProjection::Paren(receiver_args) = &projections[paren_index] else {
+        unreachable!("paren index identified a paren projection");
+    };
+    let field_projections = &projections[paren_index + 1..];
+    if field_projections.is_empty()
+        || projections.iter().any(|projection| {
+            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Paren(_))
+        })
+        || field_projections
+            .iter()
+            .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
+    {
+        return Ok(None);
+    }
+
+    let Some(rhs_values) = bytecode_csl_values(value)? else {
+        return Ok(None);
+    };
+    let Some(receivers) = materialize_missing_root_indexed_struct_brace_receivers(
+        temps,
+        receiver_args,
+        args,
+        rhs_values.len(),
+    )? else {
+        return Ok(None);
+    };
+    let receiver_count = match &receivers {
+        Value::Struct(_) => 1,
+        Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
+        _ => return Ok(None),
+    };
+    if receiver_count == 0 || rhs_values.len() % receiver_count != 0 {
+        return Ok(None);
+    }
+
+    let chunk_len = rhs_values.len() / receiver_count;
+    let field_path = field_projections
+        .iter()
+        .map(|projection| match projection {
+            TempLValueProjection::Field(field) => field.clone(),
+            _ => unreachable!("guard restricted to field projections"),
+        })
+        .collect::<Vec<_>>();
+
+    let mut chunks = rhs_values.chunks(chunk_len);
+    let updated = match receivers {
+        Value::Struct(receiver) => {
+            let chunk = chunks.next().expect("single receiver chunk").to_vec();
+            let rhs = Value::Cell(CellValue::new(1, chunk.len(), chunk)?);
+            let Some(Value::Cell(materialized)) =
+                try_materialize_undefined_root_brace_csl_assignment(temps, args, &rhs)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(assign_struct_path(
+                Value::Struct(receiver),
+                &field_path,
+                Value::Cell(materialized),
+            )?))
+        }
+        Value::Matrix(matrix) if matrix_is_struct_array(&matrix) => {
+            let mut elements = Vec::with_capacity(matrix.elements.len());
+            for element in matrix.elements {
+                let chunk = chunks.next().expect("chunk per indexed receiver").to_vec();
+                let rhs = Value::Cell(CellValue::new(1, chunk.len(), chunk)?);
+                let Some(Value::Cell(materialized)) =
+                    try_materialize_undefined_root_brace_csl_assignment(temps, args, &rhs)?
+                else {
+                    return Ok(None);
+                };
+                elements.push(assign_struct_path(
+                    element,
+                    &field_path,
+                    Value::Cell(materialized),
+                )?);
+            }
+            Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+                matrix.rows,
+                matrix.cols,
+                matrix.dims,
+                elements,
+            )?)))
+        }
+        _ => Ok(None),
+    }?;
+
+    let Some(updated) = updated else {
+        return Ok(None);
+    };
+    if prefix_fields.is_empty() {
+        Ok(Some(updated))
+    } else {
+        Ok(Some(assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &prefix_fields,
+            updated,
+        )?))
+    }
+}
+
+fn materialize_missing_root_indexed_struct_brace_receivers(
+    temps: &[Option<VmTemp>],
+    receiver_args: &[String],
+    args: &[String],
+    output_count: usize,
+) -> Result<Option<Value>, RuntimeError> {
+    let receiver_target = empty_matrix_value();
+    let receiver_indices =
+        evaluate_index_arguments_from_strings(temps, &receiver_target, receiver_args)?;
+    if let Some(receivers) =
+        default_struct_selection_value_for_index_update(&receiver_target, &receiver_indices)?
+    {
+        let receiver_count = match &receivers {
+            Value::Struct(_) => 1,
+            Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
+            _ => 0,
+        };
+        if receiver_count > 0 {
+            return Ok(Some(receivers));
+        }
+    }
+
+    let Some(receiver_count) =
+        infer_missing_root_indexed_struct_brace_receiver_count_from_rhs(temps, args, output_count)?
+    else {
+        return Ok(None);
+    };
+    materialize_missing_root_indexed_struct_receivers(temps, receiver_args, receiver_count)
+}
+
+fn infer_missing_root_indexed_struct_brace_receiver_count_from_rhs(
+    temps: &[Option<VmTemp>],
+    args: &[String],
+    output_count: usize,
+) -> Result<Option<usize>, RuntimeError> {
+    if output_count == 0 || args.iter().any(|argument| argument.contains("end")) {
+        return Ok(None);
+    }
+
+    let empty = empty_cell_value();
+    let Value::Cell(empty_cell) = &empty else {
+        unreachable!("empty cell helper should return a cell value");
+    };
+    let evaluated = evaluate_index_arguments_from_strings(temps, &empty, args)?;
+    if evaluated
+        .iter()
+        .any(|argument| matches!(argument, EvaluatedIndexArgument::FullSlice))
+    {
+        return Ok(None);
+    }
+
+    let plan = cell_assignment_plan(empty_cell, &evaluated)?;
+    let per_receiver_count = plan.selection.positions.len();
+    if per_receiver_count == 0 || output_count % per_receiver_count != 0 {
+        return Ok(None);
+    }
+    Ok(Some(output_count / per_receiver_count))
+}
+
+fn try_materialize_undefined_cell_receiver_struct_field_brace_csl_assignment(
+    projections: &[TempLValueProjection],
+    args: &[String],
+    temps: &[Option<VmTemp>],
+    value: &Value,
+) -> Result<Option<Value>, RuntimeError> {
+    let mut prefix_fields = Vec::new();
+    let mut brace_index = None;
+    for (index, projection) in projections.iter().enumerate() {
+        match projection {
+            TempLValueProjection::Field(field) if brace_index.is_none() => {
+                prefix_fields.push(field.clone());
+            }
+            TempLValueProjection::Brace(_) if brace_index.is_none() => brace_index = Some(index),
+            _ => {}
+        }
+    }
+    let Some(brace_index) = brace_index else {
+        return Ok(None);
+    };
+    let TempLValueProjection::Brace(receiver_args) = &projections[brace_index] else {
+        unreachable!("brace index identified a brace projection");
+    };
+    let field_projections = &projections[brace_index + 1..];
+    if field_projections.is_empty()
+        || projections.iter().any(|projection| {
+            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Brace(_))
+        })
+        || field_projections
+            .iter()
+            .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
+        || receiver_args.iter().any(|argument| argument.contains("end"))
+    {
+        return Ok(None);
+    }
+
+    let empty = empty_cell_value();
+    let Value::Cell(empty_cell) = &empty else {
+        unreachable!("empty cell helper should return a cell value");
+    };
+    let evaluated_receiver_indices =
+        evaluate_index_arguments_from_strings(temps, &empty, receiver_args)?;
+    let receiver_plan = cell_assignment_plan(empty_cell, &evaluated_receiver_indices)?;
+    let receiver_count = if receiver_plan.selection.positions.is_empty() {
+        infer_missing_root_receiver_count_from_rhs(receiver_args, value).unwrap_or(0)
+    } else {
+        receiver_plan.selection.positions.len()
+    };
+
+    let Some(rhs_values) = bytecode_csl_values(value)? else {
+        return Ok(None);
+    };
+    if receiver_count == 0 || rhs_values.len() % receiver_count != 0 {
+        return Ok(None);
+    }
+
+    let receiver_defaults = Value::Cell(CellValue::new(
+        1,
+        receiver_count,
+        vec![Value::Struct(StructValue::default()); receiver_count],
+    )?);
+    let Some(Value::Cell(receivers)) =
+        try_materialize_undefined_root_brace_csl_assignment(temps, receiver_args, &receiver_defaults)?
+    else {
+        return Ok(None);
+    };
+
+    let field_path = field_projections
+        .iter()
+        .map(|projection| match projection {
+            TempLValueProjection::Field(field) => field.clone(),
+            _ => unreachable!("guard restricted to field projections"),
+        })
+        .collect::<Vec<_>>();
+    let chunk_len = rhs_values.len() / receiver_count;
+    let mut chunks = rhs_values.chunks(chunk_len);
+    let mut elements = Vec::with_capacity(receivers.elements.len());
+    for element in receivers.elements {
+        let chunk = chunks.next().expect("chunk per cell receiver").to_vec();
+        let rhs = Value::Cell(CellValue::new(1, chunk.len(), chunk)?);
+        let Some(Value::Cell(materialized)) =
+            try_materialize_undefined_root_brace_csl_assignment(temps, args, &rhs)?
+        else {
+            return Ok(None);
+        };
+        elements.push(assign_struct_path(
+            element,
+            &field_path,
+            Value::Cell(materialized),
+        )?);
+    }
+
+    let mut updated = Value::Cell(CellValue::with_dimensions(
+        receivers.rows,
+        receivers.cols,
+        receivers.dims,
+        elements,
+    )?);
+    if !prefix_fields.is_empty() {
+        updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+    }
+    Ok(Some(updated))
+}
+
+fn bytecode_csl_values(value: &Value) -> Result<Option<Vec<Value>>, RuntimeError> {
+    match value {
+        Value::Cell(cell) if cell.element_count() > 1 => Ok(Some(linearized_cell_elements(cell)?)),
+        Value::Matrix(matrix) if matrix.element_count() > 1 => {
+            Ok(Some(linearized_matrix_elements(matrix)?))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn read_field_lvalue_value_for_temp_assignment(
     target: &Value,
     field: &str,
@@ -4016,6 +5435,9 @@ fn read_field_lvalue_value_for_temp_assignment(
             Err(error) => Err(error),
         },
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => {
+            if matrix.element_count() > 1 && temp_field_subindexing_requires_single_struct(rest) {
+                return Err(unsupported_multi_struct_field_subindexing_error(field));
+            }
             let mut elements = Vec::with_capacity(matrix.elements.len());
             let mut all_cells = true;
             for element in &matrix.elements {
@@ -4149,11 +5571,18 @@ fn parse_target(value: &str) -> ParsedTarget {
         .nth(1)
         .map(|rest| rest.split([' ', ']']).next().unwrap_or(rest).to_string());
     let resolved_path = parse_resolved_path(value);
+    let resolved_class = value.contains("ClassCurrentDirectory")
+        || value.contains("ClassSearchPath")
+        || value.contains("ClassPackageDirectory")
+        || value.contains("ClassFolderCurrentDirectory")
+        || value.contains("ClassFolderSearchPath")
+        || value.contains("ClassFolderPackageDirectory");
     let bundle_module_id = parse_bundle_module_id(value);
     ParsedTarget {
         display_name,
         semantic_resolution,
         resolved_path,
+        resolved_class,
         bundle_module_id,
     }
 }
@@ -4203,10 +5632,196 @@ fn temp_value(temps: &[Option<VmTemp>], temp_id: u32) -> Result<Value, RuntimeEr
     Ok(temp.value.clone())
 }
 
+fn materialize_default_struct_cell_selection(
+    target: &Value,
+    indices: &[EvaluatedIndexArgument],
+) -> Result<Option<Value>, RuntimeError> {
+    let Value::Cell(cell) = target else {
+        return Ok(None);
+    };
+    if cell.element_count() != 0 {
+        return Ok(None);
+    }
+    let plan = cell_assignment_plan(cell, indices)?;
+    let count = plan.selection.positions.len();
+    Ok(Some(Value::Cell(CellValue::with_dimensions(
+        plan.selection.rows,
+        plan.selection.cols,
+        plan.selection.dims,
+        vec![Value::Struct(StructValue::default()); count],
+    )?)))
+}
+
 fn set_temp(temps: &mut [Option<VmTemp>], temp: u32, value: VmTemp) -> Result<(), RuntimeError> {
     let slot = temps
         .get_mut(temp as usize)
         .ok_or_else(|| RuntimeError::Unsupported(format!("temp t{temp} is out of range")))?;
     *slot = Some(value);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matlab_codegen::BackendKind;
+
+    #[test]
+    fn default_temp_cell_struct_direct_root_value_materializes_missing_root() {
+        let temps = vec![
+            Some(VmTemp::value(Value::Scalar(1.0))),
+            Some(VmTemp::value(Value::Scalar(2.0))),
+        ];
+        let projections =
+            vec![TempLValueProjection::Brace(vec!["idx:range(t0,t1)".to_string()])];
+        let source = VmTemp::value(
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(171.0), Value::Scalar(173.0)])
+                    .expect("matrix rhs"),
+            ),
+        );
+
+        let updated = default_temp_cell_struct_direct_root_value(
+            &temps,
+            &projections,
+            "score",
+            &source,
+        )
+        .expect("direct root synthesis should not error")
+        .expect("direct root synthesis should materialize a value");
+
+        assert_eq!(
+            render_value(&updated),
+            "{struct{score=171}, struct{score=173}}"
+        );
+    }
+
+    #[test]
+    fn default_temp_struct_direct_root_value_materializes_missing_root() {
+        let projections = vec![TempLValueProjection::Field("inner".to_string())];
+        let source = VmTemp::value(
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(41.0), Value::Scalar(42.0)])
+                    .expect("matrix rhs"),
+            ),
+        );
+
+        let updated = default_temp_struct_direct_root_value(&projections, "score", &source)
+            .expect("direct struct root synthesis should not error")
+            .expect("direct struct root synthesis should materialize a value");
+
+        assert_eq!(
+            render_value(&updated),
+            "struct{inner=[struct{score=41}, struct{score=42}]}"
+        );
+    }
+
+    #[test]
+    fn store_field_direct_root_cell_struct_assignment_materializes_missing_root() {
+        let bytecode = BytecodeModule {
+            backend: BackendKind::Bytecode,
+            unit_kind: "script".to_string(),
+            entry: "<script>".to_string(),
+            functions: Vec::new(),
+        };
+        let mut vm = BytecodeVm {
+            module_identity: "<root>".to_string(),
+            bytecode,
+            functions: HashMap::new(),
+            visible_functions: BTreeMap::new(),
+            bundled_modules: Rc::new(HashMap::new()),
+            bundled_modules_by_id: Rc::new(HashMap::new()),
+            shared_state: Rc::new(RefCell::new(SharedRuntimeState::default())),
+            call_stack: Vec::new(),
+            handle_closures: HashMap::new(),
+            next_handle_id: 0,
+        };
+        let mut frame = VmFrame::new(BTreeMap::new());
+        let spec = BindingSpec {
+            name: "direct_root_cells".to_string(),
+            binding_id: Some(BindingId(1)),
+        };
+        frame
+            .declare_binding_spec(&spec)
+            .expect("binding declaration should succeed");
+        let target = VmTemp::with_lvalue(
+            Value::Cell(
+                CellValue::new(
+                    1,
+                    2,
+                    vec![
+                        Value::Struct(StructValue::default()),
+                        Value::Struct(StructValue::default()),
+                    ],
+                )
+                .expect("receiver cell"),
+            ),
+            Some(TempLValue::Path {
+                root: spec.clone(),
+                projections: vec![TempLValueProjection::Brace(vec!["idx:range(t0,t1)".to_string()])],
+            }),
+        );
+        let source = VmTemp::value(Value::Matrix(
+            MatrixValue::new(1, 2, vec![Value::Scalar(171.0), Value::Scalar(173.0)])
+                .expect("matrix rhs"),
+        ));
+        let temps = vec![
+            Some(VmTemp::value(Value::Scalar(1.0))),
+            Some(VmTemp::value(Value::Scalar(2.0))),
+        ];
+
+        vm.store_field(&frame, &target, "score", &temps, &source, true)
+            .expect("store_field should synthesize the missing root");
+        let stored = frame
+            .read_reference(spec.binding_id, &spec.name)
+            .expect("stored value should be visible");
+        assert_eq!(
+            render_value(&stored),
+            "{struct{score=171}, struct{score=173}}"
+        );
+    }
+
+    #[test]
+    fn default_temp_indexed_struct_direct_root_value_materializes_missing_root() {
+        let temps = vec![
+            Some(VmTemp::value(Value::Scalar(1.0))),
+            Some(VmTemp::value(Value::Scalar(2.0))),
+        ];
+        let projections =
+            vec![TempLValueProjection::Paren(vec!["idx:range(t0,t1)".to_string()])];
+        let source = VmTemp::value(
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(141.0), Value::Scalar(143.0)])
+                    .expect("matrix rhs"),
+            ),
+        );
+
+        let updated = default_temp_indexed_struct_direct_root_value(
+            &temps,
+            &projections,
+            "score",
+            &source,
+        )
+        .expect("direct indexed root synthesis should not error")
+        .expect("direct indexed root synthesis should materialize a value");
+
+        assert_eq!(render_value(&updated), "[struct{score=141}, struct{score=143}]");
+    }
+
+    #[test]
+    fn default_temp_indexed_struct_csl_root_value_materializes_missing_colon_root() {
+        let projections = vec![TempLValueProjection::Paren(vec![":".to_string()])];
+        let source = VmTemp::list_origin_value(
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(51.0), Value::Scalar(53.0)])
+                    .expect("matrix rhs"),
+            ),
+        );
+
+        let updated =
+            default_temp_indexed_struct_csl_root_value(&[], &projections, "score", &source)
+                .expect("colon indexed root synthesis should not error")
+                .expect("colon indexed root synthesis should materialize a value");
+
+        assert_eq!(render_value(&updated), "[struct{score=51}, struct{score=53}]");
+    }
 }

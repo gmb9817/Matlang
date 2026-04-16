@@ -1,12 +1,24 @@
 r_cols = range([1 2; 3 5; 5 6]);
+r_all = range([1 2; 3 5; 5 6], "all");
+r_vec12 = range([1 2; 3 5; 5 6], [1 2]);
 r_rows = range([1 2; 3 5; 5 6], 2);
 r_dim3 = range([1 2; 3 5; 5 6], 3);
 r_row_dim1 = range([1 2 3], 1);
 r_col_dim2 = range([1; 2; 3], 2);
+cube = cat(3, [1 2; 3 4], [5 6; 7 8], [9 10; 11 12]);
+r_cube = range(cube);
+r_cube_dim3 = range(cube, 3);
 
 [iqr_cols, q_cols] = iqr([1 2; 3 5; 5 6]);
+[iqr_all, q_all] = iqr([1 2; 3 5; 5 6], "all");
+[iqr_vec12, q_vec12] = iqr([1 2; 3 5; 5 6], [1 2]);
 [iqr_rows, q_rows] = iqr([1 2; 3 5; 5 6], 2);
 [iqr_row_dim1, q_row_dim1] = iqr([1 2 3], 1);
 [iqr_col_dim2, q_col_dim2] = iqr([1; 2; 3], 2);
+[iqr_cube, q_cube] = iqr(cube);
 iqr_dim3 = iqr([1 2; 3 5; 5 6], 3);
 [iqr_dim3_full, q_dim3_full] = iqr([1 2; 3 5; 5 6], 3);
+[iqr_cube_dim3, q_cube_dim3] = iqr(cube, 3);
+iqr_empty = iqr([]);
+[iqr_empty_cols, q_empty_cols] = iqr(zeros(0, 3));
+[iqr_empty_rows, q_empty_rows] = iqr(zeros(3, 0));
