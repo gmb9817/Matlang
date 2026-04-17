@@ -1,0 +1,36 @@
+codegen
+  backend = bytecode
+  functions = 1
+  instructions = 20
+  anonymous_functions = 0
+  nested_functions = 0
+  max_temps = 15
+  max_labels = 0
+
+verification
+  ok = true
+  functions_checked = 1
+  issues = 0
+
+bytecode module backend=bytecode unit_kind=FunctionFile entry=handle_receivers_codegen#s1w1
+function handle_receivers_codegen#s1w1 role=function owner_class=None params=[objs#2, s#3] outputs=[y#4] captures=[] temps=15 labels=0
+  t1 = const number(2)
+  t2 = load objs#2
+  [t0] = call t2 (:, t1)
+  t3 = field t0.total
+  store f#5 <- t3
+  t5 = const number(3)
+  t7 = load objs#2
+  t8 = field t7.duplicate
+  [t6] = call t8 ()
+  [t4] = call t6 (t5)
+  t9 = field t4.total
+  store g#6 <- t9
+  t10 = load s#3
+  t11 = field t10.item
+  t12 = field t11.total
+  store h#7 <- t12
+  t13 = load f#5
+  store y#4 <- t13
+  t14 = load y#4
+  return [t14]

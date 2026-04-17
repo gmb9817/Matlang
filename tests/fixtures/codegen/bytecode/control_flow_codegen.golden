@@ -13,7 +13,7 @@ verification
   issues = 0
 
 bytecode module backend=bytecode unit_kind=FunctionFile entry=control_flow_codegen#s1w1
-function control_flow_codegen#s1w1 role=function params=[mode#2, x#3] outputs=[y#4] captures=[] temps=28 labels=6
+function control_flow_codegen#s1w1 role=function owner_class=None params=[mode#2, x#3] outputs=[y#4] captures=[] temps=28 labels=6
   t0 = load mode#2
   t1 = const number(0)
   t2 = binary GreaterThan t0, t1
@@ -31,7 +31,7 @@ function control_flow_codegen#s1w1 role=function params=[mode#2, x#3] outputs=[y
   L0:
   t9 = const number(1)
   t10 = const number(2)
-  t11 = matrix 1x2 [t9, t10]
+  t11 = matrix_list rows=[2] [t9, t10]
   t12 = iter_start t11
   L2:
   t13 = iter_has_next t12

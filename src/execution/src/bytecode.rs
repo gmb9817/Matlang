@@ -8,7 +8,8 @@ use std::{
 
 use super::*;
 use matlab_codegen::{
-    emit_bytecode, verify_bytecode, BytecodeFunction, BytecodeInstruction, BytecodeModule,
+    emit_bytecode, verify_bytecode, BytecodeExternalMethod, BytecodeFunction,
+    BytecodeInstruction, BytecodeModule,
 };
 use matlab_platform::BytecodeBundle;
 use matlab_runtime::RuntimeStackFrame;
@@ -21,6 +22,7 @@ struct VmTemp {
     bound_method: Option<BoundMethod>,
     list_origin: bool,
     multi_struct_field_origin: Option<String>,
+    method_result_origin: Option<String>,
 }
 
 impl VmTemp {
@@ -32,6 +34,7 @@ impl VmTemp {
             bound_method: None,
             list_origin: false,
             multi_struct_field_origin: None,
+            method_result_origin: None,
         }
     }
 
@@ -43,6 +46,7 @@ impl VmTemp {
             bound_method: None,
             list_origin: false,
             multi_struct_field_origin: None,
+            method_result_origin: None,
         }
     }
 
@@ -54,6 +58,7 @@ impl VmTemp {
             bound_method: None,
             list_origin: true,
             multi_struct_field_origin: None,
+            method_result_origin: None,
         }
     }
 
@@ -65,6 +70,7 @@ impl VmTemp {
             bound_method: Some(method),
             list_origin: false,
             multi_struct_field_origin: None,
+            method_result_origin: None,
         }
     }
 
@@ -76,6 +82,7 @@ impl VmTemp {
             bound_method: None,
             list_origin: true,
             multi_struct_field_origin: None,
+            method_result_origin: None,
         }
     }
 }
@@ -130,6 +137,7 @@ struct CaptureSpec {
 struct VmFrame {
     cells: HashMap<BindingId, Cell>,
     names: BTreeMap<String, BindingId>,
+    declared_names: BTreeMap<String, BindingId>,
     global_names: BTreeSet<String>,
     persistent_names: BTreeSet<String>,
     visible_functions: BTreeMap<String, String>,
@@ -156,6 +164,8 @@ struct VmIterator {
 struct ParsedTarget {
     display_name: String,
     semantic_resolution: Option<String>,
+    binding_id: Option<BindingId>,
+    super_constructor: bool,
     resolved_path: Option<PathBuf>,
     resolved_class: bool,
     bundle_module_id: Option<String>,
@@ -224,12 +234,14 @@ pub fn execute_script_bytecode_bundle(
         )));
     }
 
+    let shared_state = Rc::new(RefCell::new(SharedRuntimeState::default()));
+    install_bundled_modules(&shared_state, &bundle.dependency_modules);
     let mut vm = BytecodeVm::from_bytecode_with_bundle(
         bundle.root_module.clone(),
         bundle.root_source_path.clone(),
         Rc::new(bundle_registry(bundle)),
         Rc::new(bundle_registry_by_id(bundle)),
-        Rc::new(RefCell::new(SharedRuntimeState::default())),
+        shared_state,
         Vec::new(),
     )?;
     vm.execute_script()
@@ -267,15 +279,325 @@ pub fn execute_function_file_bytecode_bundle(
         )));
     }
 
+    let shared_state = Rc::new(RefCell::new(SharedRuntimeState::default()));
+    install_bundled_modules(&shared_state, &bundle.dependency_modules);
     let mut vm = BytecodeVm::from_bytecode_with_bundle(
         bundle.root_module.clone(),
         bundle.root_source_path.clone(),
         Rc::new(bundle_registry(bundle)),
         Rc::new(bundle_registry_by_id(bundle)),
-        Rc::new(RefCell::new(SharedRuntimeState::default())),
+        shared_state,
         Vec::new(),
     )?;
     vm.execute_function_file(args)
+}
+
+pub(crate) fn construct_bundle_object_value_from_registry(
+    module_id: &str,
+    bundled_modules: Rc<HashMap<PathBuf, BytecodeModule>>,
+    bundled_modules_by_id: Rc<HashMap<String, BytecodeModule>>,
+    shared_state: Rc<RefCell<SharedRuntimeState>>,
+    call_stack: Vec<RuntimeStackFrame>,
+) -> Result<Value, RuntimeError> {
+    let module = bundled_modules_by_id
+        .get(module_id)
+        .cloned()
+        .ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "bundle module `{module_id}` is not available in the current runtime"
+            ))
+        })?;
+    let mut vm = BytecodeVm::from_bytecode_with_bundle(
+        module,
+        format!("<bundle:{module_id}>"),
+        bundled_modules,
+        bundled_modules_by_id,
+        shared_state,
+        call_stack,
+    )?;
+    let value = vm
+        .construct_class_from_bytecode(
+            &[],
+            Some(ObjectMethodTarget::BundleModule(module_id.to_string())),
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_else(empty_matrix_value);
+    if matches!(value, Value::Object(_)) {
+        Ok(value)
+    } else {
+        Err(RuntimeError::TypeError(format!(
+            "default construction for bundled class `{module_id}` did not produce an object value, found {}",
+            value.kind_name()
+        )))
+    }
+}
+
+pub(crate) fn construct_bundle_object_value_from_path_registry(
+    path: &Path,
+    bundled_modules: Rc<HashMap<PathBuf, BytecodeModule>>,
+    bundled_modules_by_id: Rc<HashMap<String, BytecodeModule>>,
+    shared_state: Rc<RefCell<SharedRuntimeState>>,
+    call_stack: Vec<RuntimeStackFrame>,
+) -> Result<Value, RuntimeError> {
+    let module = bundled_modules.get(path).cloned().ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "bundle module for path `{}` is not available in the current runtime",
+            path.display()
+        ))
+    })?;
+    let mut vm = BytecodeVm::from_bytecode_with_bundle(
+        module,
+        path.display().to_string(),
+        bundled_modules,
+        bundled_modules_by_id,
+        shared_state,
+        call_stack,
+    )?;
+    let value = vm
+        .construct_class_from_bytecode(
+            &[],
+            Some(ObjectMethodTarget::Path(path.to_path_buf())),
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_else(empty_matrix_value);
+    if matches!(value, Value::Object(_)) {
+        Ok(value)
+    } else {
+        Err(RuntimeError::TypeError(format!(
+            "default construction for bundled class `{}` did not produce an object value, found {}",
+            path.display(),
+            value.kind_name()
+        )))
+    }
+}
+
+pub(crate) fn invoke_bundle_object_method_outputs_from_registry(
+    receiver: &Value,
+    method_name: &str,
+    args: &[Value],
+    bundled_modules: Rc<HashMap<PathBuf, BytecodeModule>>,
+    bundled_modules_by_id: Rc<HashMap<String, BytecodeModule>>,
+    shared_state: Rc<RefCell<SharedRuntimeState>>,
+    call_stack: Vec<RuntimeStackFrame>,
+) -> Result<Vec<Value>, RuntimeError> {
+    let class = receiver_class_metadata(receiver).ok_or_else(|| {
+        RuntimeError::TypeError(format!(
+            "object method dispatch expects an object receiver, found {}",
+            receiver.kind_name()
+        ))
+    })?;
+    let Some(ObjectMethodTarget::BundleModule(module_id)) = class.module_target.as_ref() else {
+        return Err(RuntimeError::Unsupported(format!(
+            "class `{}` does not carry a bundle-backed module target",
+            class.qualified_name()
+        )));
+    };
+    let module = bundled_modules_by_id
+        .get(module_id)
+        .cloned()
+        .ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "bundle module `{module_id}` is not available in the current runtime"
+            ))
+        })?;
+    let mut vm = BytecodeVm::from_bytecode_with_bundle(
+        module,
+        format!("<bundle:{module_id}>"),
+        bundled_modules,
+        bundled_modules_by_id,
+        shared_state,
+        call_stack,
+    )?;
+    vm.invoke_object_method_outputs(receiver, method_name, args)
+}
+
+pub(crate) fn invoke_bundle_function_handle_outputs_from_registry(
+    handle: &FunctionHandleValue,
+    args: &[Value],
+    requested_outputs: usize,
+    bundled_modules: Rc<HashMap<PathBuf, BytecodeModule>>,
+    bundled_modules_by_id: Rc<HashMap<String, BytecodeModule>>,
+    shared_state: Rc<RefCell<SharedRuntimeState>>,
+    call_stack: Vec<RuntimeStackFrame>,
+) -> Result<Vec<Value>, RuntimeError> {
+    let mut frame = VmFrame::new(BTreeMap::new());
+    let FunctionHandleTarget::BundleModule(module_id) = &handle.target else {
+        return Err(RuntimeError::Unsupported(format!(
+            "function handle `{}` is not bundle-backed",
+            handle.display_name
+        )));
+    };
+    let module = bundled_modules_by_id
+        .get(module_id)
+        .cloned()
+        .ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "bundle module `{module_id}` is not available in the current runtime"
+            ))
+        })?;
+    let mut vm = BytecodeVm::from_bytecode_with_bundle(
+        module,
+        format!("<bundle:{module_id}>"),
+        bundled_modules,
+        bundled_modules_by_id,
+        shared_state,
+        call_stack,
+    )?;
+    vm.call_function_value_outputs(&mut frame, handle, args, requested_outputs)
+}
+
+fn resolve_bundled_class_callable(
+    bundled_modules_by_id: &HashMap<String, BytecodeModule>,
+    name: &str,
+) -> Option<(String, BytecodeModule, Option<String>)> {
+    for (module_id, module) in bundled_modules_by_id {
+        let Some(class) = module.classes.first() else {
+            continue;
+        };
+        let qualified = qualified_object_class_name(&class.name, class.package.as_deref());
+        let constructor_match = if name.contains('.') {
+            qualified.eq_ignore_ascii_case(name)
+        } else {
+            class.package.is_none() && class.name.eq_ignore_ascii_case(name)
+        };
+        if constructor_match {
+            return Some((module_id.clone(), module.clone(), None));
+        }
+    }
+
+    let (class_name, method_name) = name.rsplit_once('.')?;
+    for (module_id, module) in bundled_modules_by_id {
+        let Some(class) = module.classes.first() else {
+            continue;
+        };
+        let qualified = qualified_object_class_name(&class.name, class.package.as_deref());
+        let class_match = if class_name.contains('.') {
+            qualified.eq_ignore_ascii_case(class_name)
+        } else {
+            class.package.is_none() && class.name.eq_ignore_ascii_case(class_name)
+        };
+        if class_match {
+            return Some((
+                module_id.clone(),
+                module.clone(),
+                Some(method_name.to_string()),
+            ));
+        }
+    }
+    None
+}
+
+fn split_package_qualified_function_name(name: &str) -> (Vec<&str>, &str) {
+    let mut parts = name.split('.').collect::<Vec<_>>();
+    let function = parts.pop().unwrap_or(name);
+    (parts, function)
+}
+
+fn bundled_function_path_matches(path: &Path, name: &str) -> bool {
+    let (expected_packages, expected_function) = split_package_qualified_function_name(name);
+    let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !stem.eq_ignore_ascii_case(expected_function) {
+        return false;
+    }
+
+    let mut actual_packages = Vec::new();
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        let Some(name) = parent.file_name().and_then(|name| name.to_str()) else {
+            break;
+        };
+        if name.eq_ignore_ascii_case("private") || name.starts_with('@') {
+            return false;
+        }
+        if let Some(package) = name.strip_prefix('+') {
+            actual_packages.push(package.to_string());
+            current = parent.parent();
+            continue;
+        }
+        break;
+    }
+    actual_packages.reverse();
+    actual_packages.len() == expected_packages.len()
+        && actual_packages
+            .iter()
+            .zip(expected_packages.iter())
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+}
+
+fn resolve_bundled_function_callable(
+    bundled_modules: &HashMap<PathBuf, BytecodeModule>,
+    name: &str,
+) -> Option<(PathBuf, BytecodeModule)> {
+    for (path, module) in bundled_modules {
+        if module.unit_kind != "FunctionFile" || !bundled_function_path_matches(path, name) {
+            continue;
+        }
+        return Some((path.clone(), module.clone()));
+    }
+    None
+}
+
+pub(crate) fn invoke_bundle_named_callable_from_registry(
+    name: &str,
+    args: &[Value],
+    bundled_modules: Rc<HashMap<PathBuf, BytecodeModule>>,
+    bundled_modules_by_id: Rc<HashMap<String, BytecodeModule>>,
+    shared_state: Rc<RefCell<SharedRuntimeState>>,
+    call_stack: Vec<RuntimeStackFrame>,
+) -> Result<Option<Vec<Value>>, RuntimeError> {
+    if let Some((module_id, module, method_name)) =
+        resolve_bundled_class_callable(&bundled_modules_by_id, name)
+    {
+        let mut vm = BytecodeVm::from_bytecode_with_bundle(
+            module,
+            format!("<bundle:{module_id}>"),
+            Rc::clone(&bundled_modules),
+            Rc::clone(&bundled_modules_by_id),
+            Rc::clone(&shared_state),
+            call_stack.clone(),
+        )?;
+        if let Some(method_name) = method_name {
+            return match vm.invoke_static_class_method_from_bytecode(&method_name, args) {
+                Ok(values) => Ok(Some(values)),
+                Err(error) if super::is_missing_static_method_error(&error, &method_name) => {
+                    if let Some(receiver) = args.first() {
+                        if value_has_object_method(receiver, &method_name) {
+                            return vm
+                                .invoke_object_method_outputs(receiver, &method_name, &args[1..])
+                                .map(Some);
+                        }
+                    }
+                    Err(error)
+                }
+                Err(error) => Err(error),
+            };
+        }
+        return vm
+            .construct_class_from_bytecode(args, Some(ObjectMethodTarget::BundleModule(module_id)))
+            .map(Some);
+    }
+
+    let Some((path, module)) = resolve_bundled_function_callable(&bundled_modules, name) else {
+        return Ok(None);
+    };
+    let mut vm = BytecodeVm::from_bytecode_with_bundle(
+        module,
+        path.display().to_string(),
+        bundled_modules,
+        bundled_modules_by_id,
+        shared_state,
+        call_stack,
+    )?;
+    Ok(Some(
+        vm.invoke_primary_function(args)?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect(),
+    ))
 }
 
 struct BytecodeVm {
@@ -372,6 +694,47 @@ impl BytecodeVm {
         }
     }
 
+    fn lookup_bundle_module_by_id(&self, module_id: &str) -> Option<BytecodeModule> {
+        self.bundled_modules_by_id
+            .get(module_id)
+            .cloned()
+            .or_else(|| {
+                self.shared_state
+                    .borrow()
+                    .bundled_modules_by_id
+                    .get(module_id)
+                    .cloned()
+            })
+    }
+
+    fn lookup_bundle_module_by_path(&self, path: &Path) -> Option<BytecodeModule> {
+        self.bundled_modules
+            .get(path)
+            .cloned()
+            .or_else(|| self.shared_state.borrow().bundled_modules.get(path).cloned())
+    }
+
+    fn current_bundle_registries(
+        &self,
+    ) -> (
+        Rc<HashMap<PathBuf, BytecodeModule>>,
+        Rc<HashMap<String, BytecodeModule>>,
+    ) {
+        let mut bundled_modules = self.shared_state.borrow().bundled_modules.clone();
+        bundled_modules.extend(
+            self.bundled_modules
+                .iter()
+                .map(|(path, module)| (path.clone(), module.clone())),
+        );
+        let mut bundled_modules_by_id = self.shared_state.borrow().bundled_modules_by_id.clone();
+        bundled_modules_by_id.extend(
+            self.bundled_modules_by_id
+                .iter()
+                .map(|(module_id, module)| (module_id.clone(), module.clone())),
+        );
+        (Rc::new(bundled_modules), Rc::new(bundled_modules_by_id))
+    }
+
     fn with_stack_frame<T>(
         &mut self,
         frame: RuntimeStackFrame,
@@ -391,6 +754,7 @@ impl BytecodeVm {
             workspace: frame.export_workspace()?,
             displayed_outputs: take_displayed_outputs(&self.shared_state),
             figures: rendered_figures(&self.shared_state.borrow().graphics),
+            bundle_modules: snapshot_bundle_modules(&self.shared_state),
             display_format: current_display_format(&self.shared_state),
         })
     }
@@ -402,6 +766,7 @@ impl BytecodeVm {
             workspace: outputs.into_iter().collect(),
             displayed_outputs: take_displayed_outputs(&self.shared_state),
             figures: rendered_figures(&self.shared_state.borrow().graphics),
+            bundle_modules: snapshot_bundle_modules(&self.shared_state),
             display_format: current_display_format(&self.shared_state),
         })
     }
@@ -421,7 +786,8 @@ impl BytecodeVm {
                 ))
             })?;
         let output_specs = parse_binding_specs(&function.outputs)?;
-        let (values, _) = self.invoke_function_with_frame(&function.name, args, None, None)?;
+        let (values, _) =
+            self.invoke_function_with_prebound_outputs(&function.name, args, None, None, &[])?;
         Ok(output_specs
             .into_iter()
             .zip(values)
@@ -435,6 +801,17 @@ impl BytecodeVm {
         args: &[Value],
         caller: Option<&VmFrame>,
         captured_cells: Option<&HashMap<BindingId, Cell>>,
+    ) -> Result<(Vec<Value>, VmFrame), RuntimeError> {
+        self.invoke_function_with_prebound_outputs(function_name, args, caller, captured_cells, &[])
+    }
+
+    fn invoke_function_with_prebound_outputs(
+        &mut self,
+        function_name: &str,
+        args: &[Value],
+        caller: Option<&VmFrame>,
+        captured_cells: Option<&HashMap<BindingId, Cell>>,
+        prebound_outputs: &[(String, Value)],
     ) -> Result<(Vec<Value>, VmFrame), RuntimeError> {
         let function = self.functions.get(function_name).cloned().ok_or_else(|| {
             RuntimeError::Unsupported(format!(
@@ -490,11 +867,17 @@ impl BytecodeVm {
                     frame.declare_binding_spec(output)?;
                 }
             }
+            for (name, value) in prebound_outputs {
+                if let Some(output) = outputs.iter().find(|output| output.name == *name) {
+                    frame.assign_binding_spec(output, value.clone())?;
+                }
+            }
 
             let values = this.execute_function_body(&function, &mut frame)?;
             Ok((values, frame))
         };
-        if function.role == "script"
+        push_class_access_context(function.owner_class_name.clone());
+        let result = if function.role == "script"
             && self
                 .call_stack
                 .last()
@@ -509,7 +892,9 @@ impl BytecodeVm {
             };
             let stack_frame = self.make_stack_frame(frame_name);
             self.with_stack_frame(stack_frame, run)
-        }
+        };
+        pop_class_access_context();
+        result
     }
 
     fn execute_function_body(
@@ -564,13 +949,10 @@ impl BytecodeVm {
                     }
                     BytecodeInstruction::LoadBindingLValue { dst, binding } => {
                         let spec = parse_binding_spec(binding)?;
-                        frame.declare_binding_spec(&spec)?;
-                        let value = match frame.read_reference(spec.binding_id, &spec.name) {
-                            Ok(value) => value,
-                            Err(RuntimeError::MissingVariable(_)) => {
-                                Value::Struct(StructValue::default())
-                            }
-                            Err(error) => return Err(error),
+                        let cell = frame.ensure_reference_cell(spec.binding_id, &spec.name);
+                        let value = match cell.and_then(|cell| cell.borrow().clone()) {
+                            Some(value) => value,
+                            None => Value::Struct(StructValue::default()),
                         };
                         set_temp(
                             &mut temps,
@@ -650,7 +1032,7 @@ impl BytecodeVm {
                     } => {
                         let rows =
                             literal_rows_from_temp_sources(&temps, row_item_counts, elements)?;
-                        let value = Value::Matrix(MatrixValue::from_rows(rows)?);
+                        let value = build_matrix_literal_value(rows)?;
                         set_temp(&mut temps, *dst, VmTemp::value(value))?;
                         pc += 1;
                     }
@@ -743,8 +1125,25 @@ impl BytecodeVm {
                         target,
                         args,
                     } => {
-                        let values =
-                            self.execute_call(frame, &temps, target, args, outputs.len())?;
+                        let indexed_bound_receiver = if outputs.len() == 1 {
+                            match function.instructions.get(pc + 1) {
+                                Some(BytecodeInstruction::LoadField { target: next_target, .. })
+                                    if *next_target == outputs[0] =>
+                                {
+                                    self.try_execute_indexed_receiver_bound_handle_call(
+                                        frame, &temps, target, args,
+                                    )?
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let values = if let Some(value) = indexed_bound_receiver {
+                            vec![VmTemp::value(value)]
+                        } else {
+                            self.execute_call(frame, &temps, target, args, outputs.len())?
+                        };
                         let list_origin = parse_target(target).display_name == "deal";
                         for (dst, temp_value) in outputs.iter().zip(values.into_iter()) {
                             set_temp(
@@ -843,17 +1242,22 @@ impl BytecodeVm {
                         set_temp(
                             &mut temps,
                             *dst,
-                            VmTemp::with_lvalue(
-                                value,
-                                append_temp_lvalue_projection(
-                                    target_temp.lvalue,
-                                    match *kind {
-                                        "brace" => TempLValueProjection::Brace(args.clone()),
-                                        "paren" => TempLValueProjection::Paren(args.clone()),
-                                        _ => unreachable!("kind already matched"),
-                                    },
-                                ),
-                            ),
+                            {
+                                let mut temp_value = VmTemp::with_lvalue(
+                                    value,
+                                    append_temp_lvalue_projection(
+                                        target_temp.lvalue,
+                                        match *kind {
+                                            "brace" => TempLValueProjection::Brace(args.clone()),
+                                            "paren" => TempLValueProjection::Paren(args.clone()),
+                                            _ => unreachable!("kind already matched"),
+                                        },
+                                    ),
+                                );
+                                temp_value.method_result_origin =
+                                    target_temp.method_result_origin.clone();
+                                temp_value
+                            },
                         )?;
                         pc += 1;
                     }
@@ -953,7 +1357,11 @@ impl BytecodeVm {
                             pc += 1;
                         } else {
                             let target_had_lvalue = target_temp.lvalue.is_some();
-                            let value = if target_temp.lvalue.is_some() {
+                            let value = if target_had_lvalue
+                                && field_resolves_to_object_method(&target_temp.value, field)
+                            {
+                                bound_method_value(&target_temp.value, field)
+                            } else if target_temp.lvalue.is_some() {
                                 read_field_lvalue_value(&target_temp.value, field)?
                             } else {
                                 read_field_value(&target_temp.value, field)?
@@ -963,6 +1371,14 @@ impl BytecodeVm {
                                 TempLValueProjection::Field(field.clone()),
                             );
                             let mut temp_value = VmTemp::with_lvalue(value, lvalue);
+                            temp_value.method_result_origin = target_temp
+                                .method_result_origin
+                                .clone()
+                                .or_else(|| {
+                                    (target_had_lvalue
+                                        && field_resolves_to_object_method(&target_temp.value, field))
+                                    .then(|| field.clone())
+                                });
                             if target_had_lvalue
                                 && matches!(
                                     &target_temp.value,
@@ -1147,15 +1563,29 @@ impl BytecodeVm {
 
         let parsed = parse_target(target);
         let args = evaluate_function_arguments_from_strings(temps, args)?;
+        if parsed.super_constructor && parsed.resolved_class {
+            if let Some(path) = parsed.resolved_path.as_ref() {
+                if let Some(values) =
+                    self.try_construct_superclass_into_existing_object(
+                        frame,
+                        Some(path),
+                        parsed.bundle_module_id.as_deref(),
+                        &args,
+                    )?
+                {
+                    return Ok(wrap_vm_values(values));
+                }
+            }
+        }
         if parsed.bundle_module_id.is_some() || parsed.resolved_path.is_some() {
             return self
                 .load_and_invoke_external_target(&parsed, &args)
                 .map(wrap_vm_values);
         }
-        if let Some(Value::Object(object)) = args.first() {
-            if object_has_method(object, &parsed.display_name) {
+        if let Some(receiver) = args.first() {
+            if value_has_object_method(receiver, &parsed.display_name) {
                 return self
-                    .invoke_object_method_outputs(object, &parsed.display_name, &args[1..])
+                    .invoke_object_method_outputs(receiver, &parsed.display_name, &args[1..])
                     .map(wrap_vm_values);
             }
         }
@@ -1272,7 +1702,30 @@ impl BytecodeVm {
                 &args,
                 requested_outputs,
             )
-            .map(wrap_vm_values);
+            .map(wrap_vm_values)
+            .or_else(|error| match error {
+                RuntimeError::Unsupported(_) => {
+                    let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
+                    invoke_bundle_named_callable_from_registry(
+                        &parsed.display_name,
+                        &args,
+                        bundled_modules,
+                        bundled_modules_by_id,
+                        Rc::clone(&self.shared_state),
+                        self.call_stack.clone(),
+                    )
+                    .map(|maybe_values| maybe_values.map(wrap_vm_values))
+                    .and_then(|maybe_values| {
+                        maybe_values.ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "call target `{}` is not executable in the current bytecode VM",
+                                parsed.display_name
+                            ))
+                        })
+                    })
+                }
+                other => Err(other),
+            });
         }
         if let Some(function_name) = frame
             .visible_functions
@@ -1396,11 +1849,28 @@ impl BytecodeVm {
             requested_outputs,
         )
         .map(wrap_vm_values)
-        .map_err(|_| {
-            RuntimeError::Unsupported(format!(
-                "call target `{}` is not executable in the current bytecode VM",
-                parsed.display_name
-            ))
+        .or_else(|error| match error {
+            RuntimeError::Unsupported(_) => {
+                let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
+                invoke_bundle_named_callable_from_registry(
+                    &parsed.display_name,
+                    &args,
+                    bundled_modules,
+                    bundled_modules_by_id,
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                )
+                .map(|maybe_values| maybe_values.map(wrap_vm_values))
+                .and_then(|maybe_values| {
+                    maybe_values.ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "call target `{}` is not executable in the current bytecode VM",
+                            parsed.display_name
+                        ))
+                    })
+                })
+            }
+            other => Err(other),
         })
     }
 
@@ -1470,7 +1940,13 @@ impl BytecodeVm {
             Value::FunctionHandle(handle) => {
                 let args = evaluate_function_arguments_from_strings(temps, args)?;
                 self.call_function_value_outputs(frame, handle, &args, requested_outputs)
-                    .map(wrap_vm_values)
+                    .map(|values| {
+                        let mut wrapped = wrap_vm_values(values);
+                        for temp in &mut wrapped {
+                            temp.method_result_origin = target.method_result_origin.clone();
+                        }
+                        wrapped
+                    })
             }
             _ => {
                 let evaluated = evaluate_index_arguments_from_strings(temps, &target.value, args)?;
@@ -1481,15 +1957,45 @@ impl BytecodeVm {
                     }
                     Err(error) => return Err(error),
                 };
-                Ok(vec![VmTemp::with_lvalue(
+                let mut temp_value = VmTemp::with_lvalue(
                     value,
                     append_temp_lvalue_projection(
                         target.lvalue.clone(),
                         TempLValueProjection::Paren(args.to_vec()),
                     ),
-                )])
+                );
+                temp_value.method_result_origin = target.method_result_origin.clone();
+                Ok(vec![temp_value])
             }
         }
+    }
+
+    fn try_execute_indexed_receiver_bound_handle_call(
+        &self,
+        frame: &VmFrame,
+        temps: &[Option<VmTemp>],
+        target: &str,
+        args: &[String],
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some(temp_id) = parse_temp_ref(target) else {
+            return Ok(None);
+        };
+        let target_temp = temp(temps, temp_id)?;
+        let Value::FunctionHandle(handle) = &target_temp.value else {
+            return Ok(None);
+        };
+        let segments = handle.display_name.split('.').collect::<Vec<_>>();
+        let Some(root_name) = segments.first().copied() else {
+            return Ok(None);
+        };
+        let receiver = match frame.read_reference(None, root_name) {
+            Ok(receiver) => receiver,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let receiver_target = super::resolve_dotted_receiver_from_root(receiver, &segments[1..])?;
+        let evaluated = evaluate_index_arguments_from_strings(temps, &receiver_target, args)?;
+        evaluate_expression_call(&receiver_target, &evaluated).map(Some)
     }
 
     fn call_function_value_outputs(
@@ -1501,9 +2007,77 @@ impl BytecodeVm {
     ) -> Result<Vec<Value>, RuntimeError> {
         match &handle.target {
             FunctionHandleTarget::ResolvedPath(path) => {
-                self.load_and_invoke_external_function(path, args)
+                if let Some(method_name) =
+                    resolved_path_static_method_name(path, &handle.display_name)
+                {
+                    match self.invoke_static_class_method_from_path(path, method_name, args) {
+                        Ok(values) => Ok(values),
+                        Err(error) if is_missing_static_method_error(&error, method_name) => {
+                            if let Some(receiver) = args.first() {
+                                if value_has_object_method(receiver, method_name) {
+                                    return self.invoke_object_method_outputs(
+                                        receiver,
+                                        method_name,
+                                        &args[1..],
+                                    );
+                                }
+                            }
+                            Err(RuntimeError::Unsupported(format!(
+                                "class-qualified instance method handle `{}` expects an object receiver as the first argument",
+                                handle.display_name
+                            )))
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    self.load_and_invoke_external_function(path, args)
+                }
             }
             FunctionHandleTarget::BundleModule(module_id) => {
+                let module = self.lookup_bundle_module_by_id(module_id).ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "bundle module `{module_id}` is not available in the current runtime"
+                    ))
+                })?;
+                let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
+                if module.unit_kind == "ClassFile" {
+                    if let Some((_, method_name)) = handle.display_name.rsplit_once('.') {
+                        let class_name = module
+                            .classes
+                            .first()
+                            .map(|class| class.name.as_str())
+                            .unwrap_or_default();
+                        if class_name != method_name {
+                            let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                                module,
+                                format!("<bundle:{module_id}>"),
+                                Rc::clone(&bundled_modules),
+                                Rc::clone(&bundled_modules_by_id),
+                                Rc::clone(&self.shared_state),
+                                self.call_stack.clone(),
+                            )?;
+                            match vm.invoke_static_class_method_from_bytecode(method_name, args) {
+                                Ok(values) => return Ok(values),
+                                Err(error) if is_missing_static_method_error(&error, method_name) => {
+                                    if let Some(receiver) = args.first() {
+                                        if value_has_object_method(receiver, method_name) {
+                                            return self.invoke_object_method_outputs(
+                                                receiver,
+                                                method_name,
+                                                &args[1..],
+                                            );
+                                        }
+                                    }
+                                    return Err(RuntimeError::Unsupported(format!(
+                                        "class-qualified instance method handle `{}` expects an object receiver as the first argument",
+                                        handle.display_name
+                                    )));
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                }
                 self.load_and_invoke_bundled_module(module_id, args)
             }
             FunctionHandleTarget::Named(name) => {
@@ -1616,28 +2190,52 @@ impl BytecodeVm {
                 if name == "fcontour3" {
                     return self.invoke_fcontour3_builtin_outputs(frame, args, requested_outputs);
                 }
-                invoke_runtime_builtin_outputs(
+                match invoke_runtime_builtin_outputs(
                     &self.shared_state,
                     None,
                     name,
                     args,
                     requested_outputs,
-                )
-                .map_err(|_| {
-                    RuntimeError::Unsupported(format!(
-                        "function handle `{}` is not executable in the current bytecode VM",
-                        handle.display_name
-                    ))
-                })
+                ) {
+                    Ok(values) => Ok(values),
+                    Err(RuntimeError::Unsupported(_)) => {
+                        let (bundled_modules, bundled_modules_by_id) =
+                            self.current_bundle_registries();
+                        if let Some(values) = invoke_bundle_named_callable_from_registry(
+                            name,
+                            args,
+                            bundled_modules,
+                            bundled_modules_by_id,
+                            Rc::clone(&self.shared_state),
+                            self.call_stack.clone(),
+                        )? {
+                            return Ok(values);
+                        }
+                        if let Some(receiver) = args.first() {
+                            if value_has_object_method(receiver, name) {
+                                return self.invoke_object_method_outputs(
+                                    receiver,
+                                    name,
+                                    &args[1..],
+                                );
+                            }
+                        }
+                        Err(RuntimeError::Unsupported(format!(
+                            "function handle `{}` is not executable in the current bytecode VM",
+                            handle.display_name
+                        )))
+                    }
+                    Err(error) => Err(error),
+                }
             }
             FunctionHandleTarget::BoundMethod { receiver, method_name, .. } => {
-                let Value::Object(object) = receiver.as_ref() else {
+                if !matches!(receiver.as_ref(), Value::Object(_) | Value::Matrix(_)) {
                     return Err(RuntimeError::Unsupported(format!(
                         "bound method handle `{}` does not carry an object receiver",
                         handle.display_name
                     )));
-                };
-                self.invoke_object_method_outputs(object, method_name, args)
+                }
+                self.invoke_object_method_outputs(receiver.as_ref(), method_name, args)
             }
         }
     }
@@ -1664,32 +2262,278 @@ impl BytecodeVm {
         let mut frame = Frame::new(evaluator.module_functions.clone());
         let mut fields = BTreeMap::new();
         let mut field_order = Vec::new();
+        let mut ancestor_class_names = BTreeSet::new();
+        let mut storage_kind = if class.inherits_handle {
+            ObjectStorageKind::Handle
+        } else {
+            ObjectStorageKind::Value
+        };
+        let module_target = class
+            .source_path
+            .clone()
+            .map(ObjectMethodTarget::Path);
+        let mut external_methods = BTreeMap::new();
+        let mut private_property_owners = BTreeMap::new();
+        let mut private_instance_method_owners = BTreeMap::new();
+
+        if let Some(superclass_name) = &class.superclass_name {
+            if !superclass_name.eq_ignore_ascii_case("handle") {
+                let source_path = class.source_path.as_ref().ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "class `{}` does not record a source path for superclass resolution",
+                        class.name
+                    ))
+                })?;
+                let superclass_path = super::resolve_superclass_path(source_path, superclass_name)?;
+                let loaded_super = super::load_class_module_from_path(&superclass_path)?;
+                let Value::Object(parent_object) = self.build_default_object_from_class(
+                    &loaded_super.module,
+                    &loaded_super.class,
+                    loaded_super.source_path.display().to_string(),
+                )?
+                else {
+                    unreachable!("class default construction should yield an object value");
+                };
+                let parent_properties = parent_object.properties();
+                field_order = parent_properties.field_names().to_vec();
+                fields = parent_properties.fields.clone();
+                ancestor_class_names = parent_object.class.ancestor_class_names.clone();
+                ancestor_class_names.insert(parent_object.class.qualified_name());
+                private_property_owners = parent_object.class.private_property_owners.clone();
+                private_instance_method_owners =
+                    parent_object.class.private_instance_method_owners.clone();
+                if parent_object.class.storage_kind == ObjectStorageKind::Handle {
+                    storage_kind = ObjectStorageKind::Handle;
+                }
+                if let Some(parent_target) = parent_object.class.module_target.clone() {
+                    for method in &parent_object.class.inline_methods {
+                        external_methods
+                            .entry(method.clone())
+                            .or_insert(parent_target.clone());
+                    }
+                }
+                for (name, target) in &parent_object.class.external_methods {
+                    external_methods.entry(name.clone()).or_insert(target.clone());
+                }
+            }
+        }
         for property in &class.properties {
             let value = if let Some(default) = &property.default {
                 evaluator.evaluate_expression(&mut frame, default)?
             } else {
                 empty_matrix_value()
             };
-            field_order.push(property.name.clone());
+            if !field_order.iter().any(|name| name == &property.name) {
+                field_order.push(property.name.clone());
+            }
             fields.insert(property.name.clone(), value);
+        }
+        let qualified_class_name =
+            qualified_object_class_name(&class.name, class.package.as_deref());
+        for property in &class.private_properties {
+            private_property_owners.insert(property.clone(), qualified_class_name.clone());
+        }
+        for method in &class.private_inline_methods {
+            private_instance_method_owners.insert(method.clone(), qualified_class_name.clone());
         }
         Ok(Value::Object(ObjectValue::new(
             ObjectClassMetadata {
                 class_name: class.name.clone(),
                 package: class.package.clone(),
-                storage_kind: if class.inherits_handle {
-                    ObjectStorageKind::Handle
-                } else {
-                    ObjectStorageKind::Value
-                },
+                superclass_name: class.superclass_name.clone(),
+                ancestor_class_names,
+                storage_kind,
                 source_path: class.source_path.clone(),
+                module_target: module_target.clone(),
                 property_order: field_order.clone(),
+                private_properties: class.private_properties.iter().cloned().collect(),
+                private_property_owners,
                 inline_methods: class.inline_methods.iter().cloned().collect(),
-                external_methods: class
-                    .external_methods
+                private_inline_methods: class.private_inline_methods.iter().cloned().collect(),
+                private_instance_method_owners,
+                private_static_inline_methods: class
+                    .private_static_inline_methods
                     .iter()
-                    .map(|method| (method.name.clone(), method.path.clone()))
+                    .cloned()
                     .collect(),
+                external_methods: {
+                    for method in &class.external_methods {
+                        external_methods.insert(
+                            method.name.clone(),
+                            ObjectMethodTarget::Path(method.path.clone()),
+                        );
+                    }
+                    external_methods
+                },
+                constructor: class.constructor.clone(),
+            },
+            StructValue::with_field_order(fields, field_order),
+        )))
+    }
+
+    fn build_default_object_from_bytecode_class(
+        &mut self,
+        class: &matlab_codegen::BytecodeClass,
+        module_target: Option<ObjectMethodTarget>,
+    ) -> Result<Value, RuntimeError> {
+        let defaults = if let Some(initializer) = &class.default_initializer {
+            let (values, _) =
+                self.invoke_function_with_prebound_outputs(initializer, &[], None, None, &[])?;
+            values
+        } else {
+            Vec::new()
+        };
+        let mut fields = BTreeMap::new();
+        let mut field_order = Vec::new();
+        let mut ancestor_class_names = BTreeSet::new();
+        let mut storage_kind = if class.inherits_handle {
+            ObjectStorageKind::Handle
+        } else {
+            ObjectStorageKind::Value
+        };
+        let mut external_methods = bytecode_external_method_targets(&class.external_methods);
+        let mut private_property_owners = BTreeMap::new();
+        let mut private_instance_method_owners = BTreeMap::new();
+
+        if let Some(superclass_name) = &class.superclass_name {
+            if !superclass_name.eq_ignore_ascii_case("handle") {
+                let parent_object = if let Some(module_id) = &class.superclass_bundle_module_id {
+                    let module = self
+                        .bundled_modules_by_id
+                        .get(module_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "bundle module `{module_id}` is not available for superclass `{superclass_name}`"
+                            ))
+                        })?;
+                    let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                        module,
+                        format!("<bundle:{module_id}>"),
+                        Rc::clone(&self.bundled_modules),
+                        Rc::clone(&self.bundled_modules_by_id),
+                        Rc::clone(&self.shared_state),
+                        self.call_stack.clone(),
+                    )?;
+                    let parent_class = vm.bytecode.classes.first().cloned().ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "bundle module `{module_id}` does not carry class metadata"
+                        ))
+                    })?;
+                    let Value::Object(object) = vm.build_default_object_from_bytecode_class(
+                        &parent_class,
+                        Some(ObjectMethodTarget::BundleModule(module_id.clone())),
+                    )?
+                    else {
+                        unreachable!("parent bytecode class default construction should yield object");
+                    };
+                    object
+                } else if let Some(path) = &class.superclass_path {
+                    if let Some(module) = self.lookup_bundle_module_by_path(Path::new(path)) {
+                        let (bundled_modules, bundled_modules_by_id) =
+                            self.current_bundle_registries();
+                        let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                            module,
+                            path.clone(),
+                            bundled_modules,
+                            bundled_modules_by_id,
+                            Rc::clone(&self.shared_state),
+                            self.call_stack.clone(),
+                        )?;
+                        let parent_class = vm.bytecode.classes.first().cloned().ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "bundled superclass `{path}` does not carry class metadata"
+                            ))
+                        })?;
+                        let Value::Object(object) = vm.build_default_object_from_bytecode_class(
+                            &parent_class,
+                            Some(ObjectMethodTarget::Path(PathBuf::from(path))),
+                        )?
+                        else {
+                            unreachable!("parent bundled class default construction should yield object");
+                        };
+                        object
+                    } else {
+                        let loaded = super::load_class_module_from_path(Path::new(path))?;
+                        let Value::Object(object) = self.build_default_object_from_class(
+                            &loaded.module,
+                            &loaded.class,
+                            loaded.source_path.display().to_string(),
+                        )?
+                        else {
+                            unreachable!("parent source class default construction should yield object");
+                        };
+                        object
+                    }
+                } else {
+                    return Err(RuntimeError::MissingVariable(format!(
+                        "superclass `{superclass_name}` is missing packaged target information"
+                    )));
+                };
+
+                let parent_properties = parent_object.properties();
+                field_order = parent_properties.field_names().to_vec();
+                fields = parent_properties.fields.clone();
+                ancestor_class_names = parent_object.class.ancestor_class_names.clone();
+                ancestor_class_names.insert(parent_object.class.qualified_name());
+                private_property_owners = parent_object.class.private_property_owners.clone();
+                private_instance_method_owners =
+                    parent_object.class.private_instance_method_owners.clone();
+                if parent_object.class.storage_kind == ObjectStorageKind::Handle {
+                    storage_kind = ObjectStorageKind::Handle;
+                }
+                if let Some(parent_target) = parent_object.class.module_target.clone() {
+                    for method in &parent_object.class.inline_methods {
+                        external_methods
+                            .entry(method.clone())
+                            .or_insert(parent_target.clone());
+                    }
+                }
+                for (name, target) in &parent_object.class.external_methods {
+                    external_methods.entry(name.clone()).or_insert(target.clone());
+                }
+            }
+        }
+
+        for (index, property_name) in class.property_names.iter().enumerate() {
+            if !field_order.iter().any(|name| name == property_name) {
+                field_order.push(property_name.clone());
+            }
+            fields.insert(
+                property_name.clone(),
+                defaults.get(index).cloned().unwrap_or_else(empty_matrix_value),
+            );
+        }
+        let qualified_class_name =
+            qualified_object_class_name(&class.name, class.package.as_deref());
+        for property in &class.private_property_names {
+            private_property_owners.insert(property.clone(), qualified_class_name.clone());
+        }
+        for method in &class.private_inline_methods {
+            private_instance_method_owners.insert(method.clone(), qualified_class_name.clone());
+        }
+
+        Ok(Value::Object(ObjectValue::new(
+            ObjectClassMetadata {
+                class_name: class.name.clone(),
+                package: class.package.clone(),
+                superclass_name: class.superclass_name.clone(),
+                ancestor_class_names,
+                storage_kind,
+                source_path: class.source_path.as_ref().map(PathBuf::from),
+                module_target,
+                property_order: field_order.clone(),
+                private_properties: class.private_property_names.iter().cloned().collect(),
+                private_property_owners,
+                inline_methods: class.inline_methods.iter().cloned().collect(),
+                private_inline_methods: class.private_inline_methods.iter().cloned().collect(),
+                private_instance_method_owners,
+                private_static_inline_methods: class
+                    .private_static_inline_methods
+                    .iter()
+                    .cloned()
+                    .collect(),
+                external_methods,
                 constructor: class.constructor.clone(),
             },
             StructValue::with_field_order(fields, field_order),
@@ -1739,92 +2583,776 @@ impl BytecodeVm {
         Ok(vec![default_object])
     }
 
-    fn invoke_object_method_outputs(
+    fn construct_loaded_class_with_existing_object(
         &mut self,
-        object: &ObjectValue,
-        method_name: &str,
+        loaded: &super::LoadedClassModule,
         args: &[Value],
+        existing_object: Value,
     ) -> Result<Vec<Value>, RuntimeError> {
-        if object.class.inline_methods.contains(method_name) {
-            let source_path = object.class.source_path.as_ref().ok_or_else(|| {
+        if let Some(constructor_name) = &loaded.class.constructor {
+            let constructor = self.find_module_function(&loaded.module, constructor_name).ok_or_else(|| {
                 RuntimeError::Unsupported(format!(
-                    "class `{}` does not record its source path for inline method dispatch",
-                    object.class.class_name
+                    "constructor `{constructor_name}` is not available in class `{}`",
+                    loaded.class.name
                 ))
             })?;
-            let loaded = super::load_class_module_from_path(source_path)?;
-            let method = self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "inline method `{method_name}` is not available in class `{}`",
-                    object.class.class_name
-                ))
-            })?;
-            let mut method_args = Vec::with_capacity(args.len() + 1);
-            method_args.push(Value::Object(object.clone()));
-            method_args.extend(args.iter().cloned());
+            let prebound_outputs = constructor
+                .outputs
+                .first()
+                .map(|binding| vec![(binding.name.clone(), existing_object.clone())])
+                .unwrap_or_default();
             let mut interpreter = Interpreter::with_shared_state(
                 &loaded.module,
                 loaded.source_path.display().to_string(),
                 Rc::clone(&self.shared_state),
                 self.call_stack.clone(),
             );
-            return interpreter.invoke_function(method, &method_args, None);
+            let mut values = interpreter.invoke_function_with_prebound_outputs(
+                constructor,
+                args,
+                None,
+                &prebound_outputs,
+            )?;
+            if values.is_empty() {
+                values.push(existing_object);
+            }
+            return Ok(values);
+        }
+        Ok(vec![existing_object])
+    }
+
+    fn try_construct_superclass_into_existing_object(
+        &mut self,
+        frame: &VmFrame,
+        path: Option<&Path>,
+        bundle_module_id: Option<&str>,
+        args: &[Value],
+    ) -> Result<Option<Vec<Value>>, RuntimeError> {
+        let current_obj = match frame.read_reference(None, "obj") {
+            Ok(value) => value,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Value::Object(object) = &current_obj else {
+            return Ok(None);
+        };
+        let Some(current_class) = self.bytecode.classes.first() else {
+            return Ok(None);
+        };
+        let current_class_name =
+            qualified_object_class_name(&current_class.name, current_class.package.as_deref());
+
+        if let Some(module_id) = bundle_module_id {
+            let module = self
+                .bundled_modules_by_id
+                .get(module_id)
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "bundle module `{module_id}` is not available for superclass construction"
+                    ))
+                })?;
+            let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                module,
+                format!("<bundle:{module_id}>"),
+                Rc::clone(&self.bundled_modules),
+                Rc::clone(&self.bundled_modules_by_id),
+                Rc::clone(&self.shared_state),
+                self.call_stack.clone(),
+            )?;
+            let class = vm.bytecode.classes.first().cloned().ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "bundle module `{module_id}` does not carry class metadata"
+                ))
+            })?;
+            let qualified_superclass =
+                qualified_object_class_name(&class.name, class.package.as_deref());
+            let matches_super = super::super_constructor_matches_declaring_class(
+                object,
+                &current_class_name,
+                current_class.superclass_name.as_deref(),
+                &qualified_superclass,
+            );
+            if !matches_super {
+                return Ok(None);
+            }
+            return vm
+                .construct_class_from_bytecode_with_existing_object(args, current_obj)
+                .map(Some);
         }
 
-        let path = object
+        if let Some(path) = path {
+            if let Some(module) = self.lookup_bundle_module_by_path(path) {
+                let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
+                let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                    module,
+                    path.display().to_string(),
+                    bundled_modules,
+                    bundled_modules_by_id,
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                )?;
+                let class = vm.bytecode.classes.first().cloned().ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "bundled module `{}` does not carry class metadata",
+                        path.display()
+                    ))
+                })?;
+                let qualified_superclass =
+                    qualified_object_class_name(&class.name, class.package.as_deref());
+                let matches_super = super::super_constructor_matches_declaring_class(
+                    object,
+                    &current_class_name,
+                    current_class.superclass_name.as_deref(),
+                    &qualified_superclass,
+                );
+                if !matches_super {
+                    return Ok(None);
+                }
+                return vm
+                    .construct_class_from_bytecode_with_existing_object(args, current_obj)
+                    .map(Some);
+            }
+
+            let loaded = super::load_class_module_from_path(path)?;
+            let qualified_superclass =
+                qualified_object_class_name(&loaded.class.name, loaded.class.package.as_deref());
+            let matches_super = super::super_constructor_matches_declaring_class(
+                object,
+                &current_class_name,
+                current_class.superclass_name.as_deref(),
+                &qualified_superclass,
+            );
+            if !matches_super {
+                return Ok(None);
+            }
+            return self
+                .construct_loaded_class_with_existing_object(&loaded, args, current_obj)
+                .map(Some);
+        }
+
+        Ok(None)
+    }
+
+    fn invoke_static_class_method_from_path(
+        &mut self,
+        path: &Path,
+        method_name: &str,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let loaded = super::load_class_module_from_path(path)?;
+        if !loaded.class.static_inline_methods.iter().any(|name| name == method_name) {
+            if let Some(superclass_name) = &loaded.class.superclass_name {
+                if !superclass_name.eq_ignore_ascii_case("handle") {
+                    let superclass_path =
+                        super::resolve_superclass_path(&loaded.source_path, superclass_name)?;
+                    return self.invoke_static_class_method_from_path(
+                        &superclass_path,
+                        method_name,
+                        args,
+                    );
+                }
+            }
+            return Err(RuntimeError::MissingVariable(format!(
+                "static method `{method_name}` is not defined for class `{}`",
+                loaded.class.name
+            )));
+        }
+        let private_static = loaded
             .class
+            .private_static_inline_methods
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let qualified_class_name =
+            qualified_object_class_name(&loaded.class.name, loaded.class.package.as_deref());
+        if !private_static_method_access_allowed(
+            &qualified_class_name,
+            &private_static,
+            method_name,
+        ) {
+            return Err(RuntimeError::MissingVariable(format!(
+                "static method `{method_name}` has private access for class `{}`",
+                qualified_class_name
+            )));
+        }
+        let method = self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "static method `{method_name}` is not available in class `{}`",
+                loaded.class.name
+            ))
+        })?;
+        let mut interpreter = Interpreter::with_shared_state(
+            &loaded.module,
+            loaded.source_path.display().to_string(),
+            Rc::clone(&self.shared_state),
+            self.call_stack.clone(),
+        );
+        interpreter.invoke_function(method, args, None)
+    }
+
+    fn invoke_object_method_outputs(
+        &mut self,
+        receiver: &Value,
+        method_name: &str,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let class = receiver_class_metadata(receiver).ok_or_else(|| {
+            RuntimeError::TypeError(format!(
+                "object method dispatch expects an object receiver, found {}",
+                receiver.kind_name()
+            ))
+        })?;
+
+        if class.inline_methods.contains(method_name) {
+            if !private_instance_method_access_allowed(&class, method_name) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "method `{method_name}` has private access for class `{}`",
+                    private_instance_method_owner_name(&class, method_name)
+                )));
+            }
+            let mut method_args = Vec::with_capacity(args.len() + 1);
+            method_args.push(receiver.clone());
+            method_args.extend(args.iter().cloned());
+            match class.module_target.as_ref() {
+                Some(ObjectMethodTarget::BundleModule(module_id)) => {
+                    let module = self.lookup_bundle_module_by_id(module_id).ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "bundle module `{module_id}` is not available for class `{}`",
+                            class.class_name
+                        ))
+                    })?;
+                    let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
+                    let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                        module,
+                        format!("<bundle:{module_id}>"),
+                        bundled_modules,
+                        bundled_modules_by_id,
+                        Rc::clone(&self.shared_state),
+                        self.call_stack.clone(),
+                    )?;
+                    let function_name = vm
+                        .visible_functions
+                        .get(method_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "inline method `{method_name}` is not available in bundled class `{}`",
+                                class.class_name
+                            ))
+                        })?;
+                    let (values, _) = vm.invoke_function_with_prebound_outputs(
+                        &function_name,
+                        &method_args,
+                        None,
+                        None,
+                        &[],
+                    )?;
+                    return Ok(values);
+                }
+                Some(ObjectMethodTarget::Path(source_path)) => {
+                    let loaded = super::load_class_module_from_path(source_path)?;
+                    let method =
+                        self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "inline method `{method_name}` is not available in class `{}`",
+                                class.class_name
+                            ))
+                        })?;
+                    let mut interpreter = Interpreter::with_shared_state(
+                        &loaded.module,
+                        loaded.source_path.display().to_string(),
+                        Rc::clone(&self.shared_state),
+                        self.call_stack.clone(),
+                    );
+                    return interpreter.invoke_function(method, &method_args, None);
+                }
+                None => {
+                    return Err(RuntimeError::Unsupported(format!(
+                        "class `{}` does not record a module target for inline method dispatch",
+                        class.class_name
+                    )));
+                }
+            }
+        }
+
+        let target = class
             .external_methods
             .get(method_name)
             .ok_or_else(|| {
                 RuntimeError::MissingVariable(format!(
                     "object method `{method_name}` is not defined for class `{}`",
-                    object.class.class_name
+                    class.class_name
                 ))
             })?
             .clone();
-        let source = fs::read_to_string(&path).map_err(|error| {
-            RuntimeError::Unsupported(format!(
-                "failed to read external method `{}`: {error}",
-                path.display()
-            ))
-        })?;
-        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
-        if parsed.has_errors() {
-            return Err(RuntimeError::Unsupported(format!(
-                "failed to parse external method `{}`: {}",
-                path.display(),
-                format_frontend_diagnostics(&parsed.diagnostics)
+        if !private_instance_method_access_allowed(&class, method_name) {
+            return Err(RuntimeError::MissingVariable(format!(
+                "method `{method_name}` has private access for class `{}`",
+                private_instance_method_owner_name(&class, method_name)
             )));
         }
-        let unit = parsed.unit.ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "parser produced no compilation unit for external method `{}`",
-                path.display()
-            ))
-        })?;
-        let context =
-            ResolverContext::from_source_file(path.clone()).with_env_search_roots("MATC_PATH");
-        let analysis = analyze_compilation_unit_with_context(&unit, &context);
-        if analysis.has_errors() {
-            return Err(RuntimeError::Unsupported(format!(
-                "failed to analyze external method `{}`: {}",
-                path.display(),
-                format_semantic_diagnostics(&analysis.diagnostics)
-            )));
-        }
-        let hir = lower_to_hir(&unit, &analysis);
         let mut method_args = Vec::with_capacity(args.len() + 1);
-        method_args.push(Value::Object(object.clone()));
+        method_args.push(receiver.clone());
         method_args.extend(args.iter().cloned());
-        let mut interpreter = Interpreter::with_shared_state(
-            &hir,
-            path.display().to_string(),
+        match target {
+            ObjectMethodTarget::BundleModule(module_id) => {
+                let module = self.lookup_bundle_module_by_id(&module_id).ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "bundle module `{module_id}` is not available for object method `{method_name}`"
+                    ))
+                })?;
+                let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
+                let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                    module,
+                    format!("<bundle:{module_id}>"),
+                    bundled_modules,
+                    bundled_modules_by_id,
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                )?;
+                if vm.bytecode.unit_kind == "ClassFile" {
+                    let function_name = vm
+                        .visible_functions
+                        .get(method_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            RuntimeError::Unsupported(format!(
+                                "method `{method_name}` is not available in bundled class module `{module_id}`"
+                            ))
+                        })?;
+                    let (values, _) = vm.invoke_function_with_prebound_outputs(
+                        &function_name,
+                        &method_args,
+                        None,
+                        None,
+                        &[],
+                    )?;
+                    Ok(values)
+                } else {
+                    vm.load_and_invoke_bundled_module(&module_id, &method_args)
+                }
+            }
+            ObjectMethodTarget::Path(path) => {
+                let source = fs::read_to_string(&path).map_err(|error| {
+                    RuntimeError::Unsupported(format!(
+                        "failed to read external method `{}`: {error}",
+                        path.display()
+                    ))
+                })?;
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                if parsed.has_errors() {
+                    return Err(RuntimeError::Unsupported(format!(
+                        "failed to parse external method `{}`: {}",
+                        path.display(),
+                        format_frontend_diagnostics(&parsed.diagnostics)
+                    )));
+                }
+                let unit = parsed.unit.ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "parser produced no compilation unit for external method `{}`",
+                        path.display()
+                    ))
+                })?;
+                let context = ResolverContext::from_source_file(path.clone())
+                    .with_env_search_roots("MATC_PATH");
+                let analysis = analyze_compilation_unit_with_context(&unit, &context);
+                if analysis.has_errors() {
+                    return Err(RuntimeError::Unsupported(format!(
+                        "failed to analyze external method `{}`: {}",
+                        path.display(),
+                        format_semantic_diagnostics(&analysis.diagnostics)
+                    )));
+                }
+                let hir = lower_to_hir(&unit, &analysis);
+                let method = if unit.kind == CompilationUnitKind::ClassFile {
+                    Some(self.find_module_function(&hir, method_name).ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "method `{method_name}` is not available in class module `{}`",
+                            path.display()
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                let mut interpreter = Interpreter::with_shared_state(
+                    &hir,
+                    path.display().to_string(),
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                );
+                if unit.kind == CompilationUnitKind::ClassFile {
+                    interpreter.invoke_function(
+                        method.expect("class-file method lookup"),
+                        &method_args,
+                        None,
+                    )
+                } else {
+                    interpreter.invoke_primary_function(&method_args).map(|values| {
+                        values.into_iter().map(|(_, value)| value).collect()
+                    })
+                }
+            }
+        }
+    }
+
+    fn construct_class_from_bytecode(
+        &mut self,
+        args: &[Value],
+        module_target: Option<ObjectMethodTarget>,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let class = self.bytecode.classes.first().cloned().ok_or_else(|| {
+            RuntimeError::Unsupported(
+                "class bytecode module does not carry class metadata".to_string(),
+            )
+        })?;
+        let object = self.build_default_object_from_bytecode_class(&class, module_target)?;
+        if let Some(constructor_name) = &class.constructor {
+            let function_name = self
+                .visible_functions
+                .get(constructor_name)
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "constructor `{constructor_name}` is not available in bytecode class `{}`",
+                        class.name
+                    ))
+                })?;
+            let output_name = self
+                .functions
+                .get(&function_name)
+                .and_then(|function| parse_binding_specs(&function.outputs).ok())
+                .and_then(|outputs| outputs.first().cloned())
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "constructor `{constructor_name}` does not expose an output binding"
+                    ))
+                })?;
+            let (values, _) = self.invoke_function_with_prebound_outputs(
+                &function_name,
+                args,
+                None,
+                None,
+                &[(output_name.name, object.clone())],
+            )?;
+            if values.is_empty() {
+                return Ok(vec![object]);
+            }
+            return Ok(values);
+        }
+        Ok(vec![object])
+    }
+
+    fn construct_class_from_bytecode_with_existing_object(
+        &mut self,
+        args: &[Value],
+        existing_object: Value,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let class = self.bytecode.classes.first().cloned().ok_or_else(|| {
+            RuntimeError::Unsupported(
+                "class bytecode module does not carry class metadata".to_string(),
+            )
+        })?;
+        if let Some(constructor_name) = &class.constructor {
+            let function_name = self
+                .visible_functions
+                .get(constructor_name)
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "constructor `{constructor_name}` is not available in bytecode class `{}`",
+                        class.name
+                    ))
+                })?;
+            let output_name = self
+                .functions
+                .get(&function_name)
+                .and_then(|function| parse_binding_specs(&function.outputs).ok())
+                .and_then(|outputs| outputs.first().cloned())
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "constructor `{constructor_name}` does not expose an output binding"
+                    ))
+                })?;
+            let (values, _) = self.invoke_function_with_prebound_outputs(
+                &function_name,
+                args,
+                None,
+                None,
+                &[(output_name.name, existing_object.clone())],
+            )?;
+            if values.is_empty() {
+                return Ok(vec![existing_object]);
+            }
+            return Ok(values);
+        }
+        Ok(vec![existing_object])
+    }
+
+    fn construct_object_value_from_path(&mut self, path: &Path) -> Result<Value, RuntimeError> {
+        let value = self
+            .construct_class_from_path(path, &[])?
+            .into_iter()
+            .next()
+            .unwrap_or_else(empty_matrix_value);
+        if matches!(value, Value::Object(_)) {
+            Ok(value)
+        } else {
+            Err(RuntimeError::TypeError(format!(
+                "default construction for class `{}` did not produce an object value, found {}",
+                path.display(),
+                value.kind_name()
+            )))
+        }
+    }
+
+    fn construct_object_value_from_bundle_module(
+        &mut self,
+        module_id: &str,
+    ) -> Result<Value, RuntimeError> {
+        let module = self.lookup_bundle_module_by_id(module_id).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "bundle module `{module_id}` is not available for default object construction"
+            ))
+        })?;
+        let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
+        let mut vm = BytecodeVm::from_bytecode_with_bundle(
+            module,
+            format!("<bundle:{module_id}>"),
+            bundled_modules,
+            bundled_modules_by_id,
             Rc::clone(&self.shared_state),
             self.call_stack.clone(),
-        );
-        interpreter.invoke_primary_function(&method_args).map(|values| {
-            values.into_iter().map(|(_, value)| value).collect()
-        })
+        )?;
+        let value = vm
+            .construct_class_from_bytecode(
+                &[],
+                Some(ObjectMethodTarget::BundleModule(module_id.to_string())),
+            )?
+            .into_iter()
+            .next()
+            .unwrap_or_else(empty_matrix_value);
+        if matches!(value, Value::Object(_)) {
+            Ok(value)
+        } else {
+            Err(RuntimeError::TypeError(format!(
+                "default construction for bundle module `{module_id}` did not produce an object value, found {}",
+                value.kind_name()
+            )))
+        }
+    }
+
+    fn construct_object_value_from_bundled_path(&mut self, path: &Path) -> Result<Value, RuntimeError> {
+        let module = self.lookup_bundle_module_by_path(path).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "bundled class module `{}` is not available for default object construction",
+                path.display()
+            ))
+        })?;
+        let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
+        let mut vm = BytecodeVm::from_bytecode_with_bundle(
+            module,
+            path.display().to_string(),
+            bundled_modules,
+            bundled_modules_by_id,
+            Rc::clone(&self.shared_state),
+            self.call_stack.clone(),
+        )?;
+        let value = vm
+            .construct_class_from_bytecode(&[], Some(ObjectMethodTarget::Path(path.to_path_buf())))?
+            .into_iter()
+            .next()
+            .unwrap_or_else(empty_matrix_value);
+        if matches!(value, Value::Object(_)) {
+            Ok(value)
+        } else {
+            Err(RuntimeError::TypeError(format!(
+                "default construction for bundled class `{}` did not produce an object value, found {}",
+                path.display(),
+                value.kind_name()
+            )))
+        }
+    }
+
+    fn construct_default_object_from_metadata(
+        &mut self,
+        class: &ObjectClassMetadata,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(ObjectMethodTarget::BundleModule(module_id)) = class.module_target.as_ref() {
+            return self.construct_object_value_from_bundle_module(module_id);
+        }
+        if let Some(ObjectMethodTarget::Path(path)) = class.module_target.as_ref() {
+            if self.lookup_bundle_module_by_path(path).is_some() {
+                return self.construct_object_value_from_bundled_path(path);
+            }
+            return self.construct_object_value_from_path(path);
+        }
+        if let Some(path) = class.source_path.as_ref() {
+            if self.lookup_bundle_module_by_path(path).is_some() {
+                return self.construct_object_value_from_bundled_path(path);
+            }
+            if path.exists() {
+                return self.construct_object_value_from_path(path);
+            }
+        }
+        Err(RuntimeError::Unsupported(format!(
+            "class `{}` does not record a usable source or bundle target for default object construction",
+            class.qualified_name()
+        )))
+    }
+
+    fn assign_object_matrix_index(
+        &mut self,
+        matrix: MatrixValue,
+        args: &[EvaluatedIndexArgument],
+        value: Value,
+        class: ObjectClassMetadata,
+    ) -> Result<MatrixValue, RuntimeError> {
+        if is_empty_matrix_value(&value) {
+            return delete_matrix_index(matrix, args);
+        }
+
+        let expected_class_name = class.qualified_name();
+        let plan = matrix_assignment_plan(&matrix, args)?;
+        let mut matrix = resize_object_matrix_to_dims_with(matrix, &plan.target_dims, || {
+            self.construct_default_object_from_metadata(&class)
+                .map_err(|error| object_array_fill_error(&class, error))
+        })?;
+        let values = matrix_assignment_values(&value, &plan.selection)?;
+        validate_object_assignment_values(&values, &expected_class_name)?;
+        for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
+            matrix.elements_mut()[position] = value;
+        }
+        Ok(matrix)
+    }
+
+    fn apply_index_update(
+        &mut self,
+        current: Value,
+        indices: &[EvaluatedIndexArgument],
+        value: Value,
+        kind: IndexAssignmentKind,
+    ) -> Result<Value, RuntimeError> {
+        match (kind, current) {
+            (IndexAssignmentKind::Paren, Value::Object(object)) => {
+                let matrix = MatrixValue::new(1, 1, vec![Value::Object(object)])
+                    .expect("single object matrix is valid");
+                let class = object_array_class_metadata(&matrix)
+                    .expect("single object matrix should be homogeneous");
+                let updated = self.assign_object_matrix_index(matrix, indices, value, class)?;
+                if updated.rows == 1
+                    && updated.cols == 1
+                    && matches!(updated.elements.first(), Some(Value::Object(_)))
+                {
+                    Ok(updated.elements.into_iter().next().expect("single object element"))
+                } else {
+                    Ok(Value::Matrix(updated))
+                }
+            }
+            (IndexAssignmentKind::Paren, Value::Matrix(matrix)) => {
+                if let Some(class) = object_assignment_target_class(&matrix, &value)? {
+                    Ok(Value::Matrix(
+                        self.assign_object_matrix_index(matrix, indices, value, class)?,
+                    ))
+                } else {
+                    apply_index_update(
+                        Value::Matrix(matrix),
+                        indices,
+                        value,
+                        IndexAssignmentKind::Paren,
+                    )
+                }
+            }
+            (kind, current) => apply_index_update(current, indices, value, kind),
+        }
+    }
+
+    fn invoke_static_class_method_from_bytecode(
+        &mut self,
+        method_name: &str,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let class = self.bytecode.classes.first().cloned().ok_or_else(|| {
+            RuntimeError::Unsupported(
+                "class bytecode module does not carry class metadata".to_string(),
+            )
+        })?;
+        if !class.static_inline_methods.iter().any(|name| name == method_name) {
+            if let Some(superclass_name) = &class.superclass_name {
+                if !superclass_name.eq_ignore_ascii_case("handle") {
+                    if let Some(module_id) = &class.superclass_bundle_module_id {
+                        let module = self
+                            .bundled_modules_by_id
+                            .get(module_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                RuntimeError::Unsupported(format!(
+                                    "bundle module `{module_id}` is not available for superclass `{superclass_name}`"
+                                ))
+                            })?;
+                        let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                            module,
+                            format!("<bundle:{module_id}>"),
+                            Rc::clone(&self.bundled_modules),
+                            Rc::clone(&self.bundled_modules_by_id),
+                            Rc::clone(&self.shared_state),
+                            self.call_stack.clone(),
+                        )?;
+                        return vm.invoke_static_class_method_from_bytecode(method_name, args);
+                    }
+                    if let Some(path) = &class.superclass_path {
+                        if let Some(module) = self.lookup_bundle_module_by_path(Path::new(path)) {
+                            let (bundled_modules, bundled_modules_by_id) =
+                                self.current_bundle_registries();
+                            let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                                module,
+                                path.clone(),
+                                bundled_modules,
+                                bundled_modules_by_id,
+                                Rc::clone(&self.shared_state),
+                                self.call_stack.clone(),
+                            )?;
+                            return vm.invoke_static_class_method_from_bytecode(method_name, args);
+                        }
+                        return self.invoke_static_class_method_from_path(
+                            Path::new(path),
+                            method_name,
+                            args,
+                        );
+                    }
+                }
+            }
+            return Err(RuntimeError::MissingVariable(format!(
+                "static method `{method_name}` is not defined for class `{}`",
+                class.name
+            )));
+        }
+        let private_static = class
+            .private_static_inline_methods
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let qualified_class_name =
+            qualified_object_class_name(&class.name, class.package.as_deref());
+        if !private_static_method_access_allowed(&qualified_class_name, &private_static, method_name) {
+            return Err(RuntimeError::MissingVariable(format!(
+                "static method `{method_name}` has private access for class `{}`",
+                qualified_class_name
+            )));
+        }
+        let function_name = self
+            .visible_functions
+            .get(method_name)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "static method `{method_name}` is not available in bytecode class `{}`",
+                    class.name
+                ))
+            })?;
+        let (values, _) =
+            self.invoke_function_with_prebound_outputs(&function_name, args, None, None, &[])?;
+        Ok(values)
     }
 
     fn invoke_workspace_builtin_outputs(
@@ -2385,6 +3913,22 @@ impl BytecodeVm {
         target: &str,
     ) -> Result<Value, RuntimeError> {
         let parsed = parse_target(target);
+        if parsed.display_name.contains('.') {
+            let segments = parsed.display_name.split('.').collect::<Vec<_>>();
+            if let Some(root_name) = segments.first().copied() {
+                match frame.read_reference(parsed.binding_id, root_name) {
+                    Ok(receiver) => {
+                        if let Some(handle) =
+                            super::try_build_bound_method_handle_from_dotted_name(receiver, &segments)?
+                        {
+                            return Ok(handle);
+                        }
+                    }
+                    Err(RuntimeError::MissingVariable(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         if let Some(module_id) = parsed.bundle_module_id {
             return Ok(Value::FunctionHandle(FunctionHandleValue {
                 display_name: parsed.display_name,
@@ -2435,19 +3979,10 @@ impl BytecodeVm {
             }));
         }
 
-        if matches!(
-            parsed.semantic_resolution.as_deref(),
-            Some("BuiltinFunction")
-        ) {
-            return Ok(Value::FunctionHandle(FunctionHandleValue {
-                display_name: parsed.display_name.clone(),
-                target: FunctionHandleTarget::Named(parsed.display_name),
-            }));
-        }
-
-        Err(RuntimeError::Unsupported(format!(
-            "function handle target `{target}` is not executable in the current bytecode VM"
-        )))
+        Ok(Value::FunctionHandle(FunctionHandleValue {
+            display_name: parsed.display_name.clone(),
+            target: FunctionHandleTarget::Named(parsed.display_name),
+        }))
     }
 
     fn load_and_invoke_external_target(
@@ -2456,10 +3991,52 @@ impl BytecodeVm {
         args: &[Value],
     ) -> Result<Vec<Value>, RuntimeError> {
         if let Some(module_id) = &parsed.bundle_module_id {
+            if parsed.resolved_class {
+                let module = self
+                    .bundled_modules_by_id
+                    .get(module_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "bundle module `{module_id}` is not available in the current bytecode bundle"
+                        ))
+                    })?;
+                let mut vm = BytecodeVm::from_bytecode_with_bundle(
+                    module,
+                    format!("<bundle:{module_id}>"),
+                    Rc::clone(&self.bundled_modules),
+                    Rc::clone(&self.bundled_modules_by_id),
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                )?;
+                if let Some((_, method_name)) = parsed.display_name.rsplit_once('.') {
+                    let is_static = vm
+                        .bytecode
+                        .classes
+                        .first()
+                        .is_some_and(|class| class.name != method_name);
+                    if is_static {
+                        return vm.invoke_static_class_method_from_bytecode(method_name, args);
+                    }
+                }
+                return vm.construct_class_from_bytecode(
+                    args,
+                    Some(ObjectMethodTarget::BundleModule(module_id.clone())),
+                );
+            }
             return self.load_and_invoke_bundled_module(module_id, args);
         }
         if let Some(path) = &parsed.resolved_path {
             if parsed.resolved_class {
+                if let Some((_, method_name)) = parsed.display_name.rsplit_once('.') {
+                    let is_static = path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|class_name| class_name != method_name);
+                    if is_static {
+                        return self.invoke_static_class_method_from_path(path, method_name, args);
+                    }
+                }
                 return self.construct_class_from_path(path, args);
             }
             return self.load_and_invoke_external_function(path, args);
@@ -2475,28 +4052,29 @@ impl BytecodeVm {
         module_id: &str,
         args: &[Value],
     ) -> Result<Vec<Value>, RuntimeError> {
-        let module = self
-            .bundled_modules_by_id
-            .get(module_id)
-            .cloned()
-            .ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "bundle module `{module_id}` is not available in the current bytecode bundle"
-                ))
-            })?;
+        let module = self.lookup_bundle_module_by_id(module_id).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "bundle module `{module_id}` is not available in the current runtime"
+            ))
+        })?;
+        let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
         let mut vm = BytecodeVm::from_bytecode_with_bundle(
             module,
             format!("<bundle:{module_id}>"),
-            Rc::clone(&self.bundled_modules),
-            Rc::clone(&self.bundled_modules_by_id),
+            bundled_modules,
+            bundled_modules_by_id,
             Rc::clone(&self.shared_state),
             self.call_stack.clone(),
         )?;
-        Ok(vm
-            .invoke_primary_function(args)?
-            .into_iter()
-            .map(|(_, value)| value)
-            .collect())
+        if vm.bytecode.unit_kind == "ClassFile" {
+            vm.construct_class_from_bytecode(args, Some(ObjectMethodTarget::BundleModule(module_id.to_string())))
+        } else {
+            Ok(vm
+                .invoke_primary_function(args)?
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect())
+        }
     }
 
     fn load_and_invoke_external_function(
@@ -2504,15 +4082,22 @@ impl BytecodeVm {
         path: &Path,
         args: &[Value],
     ) -> Result<Vec<Value>, RuntimeError> {
-        if let Some(module) = self.bundled_modules.get(path).cloned() {
+        if let Some(module) = self.lookup_bundle_module_by_path(path) {
+            let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
             let mut vm = BytecodeVm::from_bytecode_with_bundle(
                 module,
                 path.display().to_string(),
-                Rc::clone(&self.bundled_modules),
-                Rc::clone(&self.bundled_modules_by_id),
+                bundled_modules,
+                bundled_modules_by_id,
                 Rc::clone(&self.shared_state),
                 self.call_stack.clone(),
             )?;
+            if vm.bytecode.unit_kind == "ClassFile" {
+                return vm.construct_class_from_bytecode(
+                    args,
+                    Some(ObjectMethodTarget::Path(path.to_path_buf())),
+                );
+            }
             return Ok(vm
                 .invoke_primary_function(args)?
                 .into_iter()
@@ -2553,6 +4138,9 @@ impl BytecodeVm {
         }
 
         let hir = lower_to_hir(&unit, &analysis);
+        if unit.kind == CompilationUnitKind::ClassFile {
+            return self.construct_class_from_path(path, args);
+        }
         let mut vm = BytecodeVm::from_hir(
             &hir,
             path.display().to_string(),
@@ -2640,6 +4228,9 @@ impl BytecodeVm {
         source: &VmTemp,
         list_assignment: bool,
     ) -> Result<(), RuntimeError> {
+        if let Some(method) = &target.method_result_origin {
+            return Err(unsupported_method_result_assignment_error(method));
+        }
         let (root, projections) = lvalue_root_and_projections(&target.lvalue)?;
         if !list_assignment && temp_field_target_requires_list_assignment(&projections) {
             if let Some(count) =
@@ -2750,6 +4341,9 @@ impl BytecodeVm {
         temps: &[Option<VmTemp>],
         value: Value,
     ) -> Result<(), RuntimeError> {
+        if let Some(method) = &target.method_result_origin {
+            return Err(unsupported_method_result_assignment_error(method));
+        }
         let (root, projections) = lvalue_root_and_projections(&target.lvalue)?;
         let cell = frame
             .cell_for_reference(root.binding_id, &root.name)
@@ -2945,6 +4539,26 @@ impl BytecodeVm {
                 )? {
                     return Ok(updated);
                 }
+                if let Some(updated) = self.try_assign_object_array_element_field_projection(
+                    &current, field, rest, &leaf, temps,
+                )? {
+                    return Ok(updated);
+                }
+                if let Some(updated) = self.try_assign_object_array_object_field_projection(
+                    &current, field, rest, &leaf, temps,
+                )? {
+                    return Ok(updated);
+                }
+                if let Some(updated) = self.try_assign_object_array_matrix_field_projection(
+                    &current, field, rest, &leaf, temps,
+                )? {
+                    return Ok(updated);
+                }
+                if let Some(updated) = self.try_assign_object_array_cell_field_projection(
+                    &current, field, rest, &leaf, temps,
+                )? {
+                    return Ok(updated);
+                }
                 let next =
                     read_field_lvalue_value_for_temp_assignment(&current, field, rest, &leaf)?;
                 let updated_next = self.assign_lvalue_path(next, rest, true, leaf, temps)?;
@@ -2979,7 +4593,7 @@ impl BytecodeVm {
                     Err(error) => return Err(error),
                 };
                 let updated_next = self.assign_lvalue_path(next, rest, true, leaf, temps)?;
-                apply_index_update(
+                self.apply_index_update(
                     current,
                     &evaluated_indices,
                     updated_next,
@@ -3013,7 +4627,7 @@ impl BytecodeVm {
                                 &next, leaf_args, value, temps,
                             )?
                         {
-                            return apply_index_update(
+                            return self.apply_index_update(
                                 current,
                                 &evaluated_indices,
                                 updated_next,
@@ -3023,7 +4637,7 @@ impl BytecodeVm {
                     }
                 }
                 let updated_next = self.assign_lvalue_path(next, rest, true, leaf, temps)?;
-                apply_index_update(
+                self.apply_index_update(
                     current,
                     &evaluated_indices,
                     updated_next,
@@ -3061,7 +4675,7 @@ impl BytecodeVm {
                         return Ok(updated);
                     }
                 }
-                apply_index_update(current, &evaluated_indices, value, kind)
+                self.apply_index_update(current, &evaluated_indices, value, kind)
             }
         }
     }
@@ -3102,7 +4716,7 @@ impl BytecodeVm {
             let count = selection.positions.len();
             let chunk = rhs_values.by_ref().take(count).collect::<Vec<_>>();
             let rhs_value = pack_cell_assignment_rhs(&selection, chunk)?;
-            updated_elements.push(apply_index_update(
+            updated_elements.push(self.apply_index_update(
                 element,
                 &evaluated_indices,
                 rhs_value,
@@ -3192,6 +4806,322 @@ impl BytecodeVm {
             _ => Ok(None),
         }
     }
+
+    fn try_assign_object_array_matrix_field_projection(
+        &mut self,
+        current: &Value,
+        field: &String,
+        rest: &[TempLValueProjection],
+        leaf: &TempLValueLeaf,
+        temps: &[Option<VmTemp>],
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Matrix(object_matrix) = current else {
+            return Ok(None);
+        };
+        if !matrix_is_object_array(object_matrix) {
+            return Ok(None);
+        }
+
+        let mut property_matrices = Vec::with_capacity(object_matrix.elements.len());
+        let mut property_dims = None::<Vec<usize>>;
+        for element in &object_matrix.elements {
+            let Value::Object(object) = element else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            let Some(value) = object.property_value(field) else {
+                return Ok(None);
+            };
+            if !private_property_access_allowed(&object.class, field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "property `{field}` has private access for class `{}`",
+                    private_property_owner_name(&object.class, field)
+                )));
+            }
+            let Value::Matrix(property_matrix) = value else {
+                return Ok(None);
+            };
+            match &property_dims {
+                Some(dims) if !equivalent_dimensions(property_matrix.dims(), dims) => {
+                    return Ok(None);
+                }
+                None => property_dims = Some(property_matrix.dims().to_vec()),
+                _ => {}
+            }
+            property_matrices.push(property_matrix);
+        }
+        let Some(property_dims) = property_dims else {
+            return Ok(None);
+        };
+
+        let aggregated = Value::Matrix(super::concatenate_object_array_property_matrices(
+            &property_matrices,
+            object_matrix.rows,
+            object_matrix.cols,
+        )?);
+        let updated_aggregated =
+            self.assign_lvalue_path(aggregated, rest, false, leaf.clone(), temps)?;
+        let Value::Matrix(updated_matrix) = updated_aggregated else {
+            return Ok(None);
+        };
+        let reassigned = super::split_concatenated_object_array_property_matrix(
+            &updated_matrix,
+            &property_dims,
+            object_matrix.rows,
+            object_matrix.cols,
+        )?;
+        let mut updated_elements = Vec::with_capacity(object_matrix.elements.len());
+        for (element, assigned_value) in object_matrix
+            .elements
+            .iter()
+            .cloned()
+            .zip(reassigned.into_iter())
+        {
+            updated_elements.push(assign_struct_path(
+                element,
+                std::slice::from_ref(field),
+                assigned_value,
+            )?);
+        }
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            updated_elements,
+        )?)))
+    }
+
+    fn try_assign_object_array_object_field_projection(
+        &mut self,
+        current: &Value,
+        field: &String,
+        rest: &[TempLValueProjection],
+        leaf: &TempLValueLeaf,
+        temps: &[Option<VmTemp>],
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Matrix(object_matrix) = current else {
+            return Ok(None);
+        };
+        if !matrix_is_object_array(object_matrix) {
+            return Ok(None);
+        }
+
+        let mut property_objects = Vec::with_capacity(object_matrix.elements.len());
+        for element in &object_matrix.elements {
+            let Value::Object(object) = element else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            let Some(value) = object.property_value(field) else {
+                return Ok(None);
+            };
+            if !private_property_access_allowed(&object.class, field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "property `{field}` has private access for class `{}`",
+                    private_property_owner_name(&object.class, field)
+                )));
+            }
+            let Value::Object(property_object) = value else {
+                return Ok(None);
+            };
+            property_objects.push(Value::Object(property_object));
+        }
+
+        let aggregated = Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            property_objects,
+        )?);
+        let updated_aggregated =
+            self.assign_lvalue_path(aggregated, rest, true, leaf.clone(), temps)?;
+        let Value::Matrix(updated_matrix) = updated_aggregated else {
+            return Ok(None);
+        };
+        if updated_matrix.element_count() != object_matrix.element_count()
+            || !equivalent_dimensions(updated_matrix.dims(), &object_matrix.dims)
+        {
+            return Err(RuntimeError::ShapeError(format!(
+                "object-valued property assignment expects shape {:?}, found {:?}",
+                object_matrix.dims, updated_matrix.dims()
+            )));
+        }
+        if !matrix_is_object_array(&updated_matrix) {
+            return Err(RuntimeError::TypeError(
+                "object-valued property assignment must preserve object values".to_string(),
+            ));
+        }
+
+        let mut updated_elements = Vec::with_capacity(object_matrix.elements.len());
+        for (element, assigned_value) in object_matrix
+            .elements
+            .iter()
+            .cloned()
+            .zip(updated_matrix.elements.into_iter())
+        {
+            updated_elements.push(assign_struct_path(
+                element,
+                std::slice::from_ref(field),
+                assigned_value,
+            )?);
+        }
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            updated_elements,
+        )?)))
+    }
+
+    fn try_assign_object_array_element_field_projection(
+        &mut self,
+        current: &Value,
+        field: &String,
+        rest: &[TempLValueProjection],
+        leaf: &TempLValueLeaf,
+        temps: &[Option<VmTemp>],
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Matrix(object_matrix) = current else {
+            return Ok(None);
+        };
+        if !matrix_is_object_array(object_matrix) {
+            return Ok(None);
+        }
+
+        let mut property_values = Vec::with_capacity(object_matrix.elements.len());
+        for element in &object_matrix.elements {
+            let Value::Object(object) = element else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            let Some(value) = object.property_value(field) else {
+                return Ok(None);
+            };
+            if !private_property_access_allowed(&object.class, field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "property `{field}` has private access for class `{}`",
+                    private_property_owner_name(&object.class, field)
+                )));
+            }
+            if matches!(value, Value::Matrix(_) | Value::Cell(_) | Value::Object(_)) {
+                return Ok(None);
+            }
+            property_values.push(value);
+        }
+
+        let aggregated = Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            property_values,
+        )?);
+        let updated_aggregated =
+            self.assign_lvalue_path(aggregated, rest, true, leaf.clone(), temps)?;
+        let Value::Matrix(updated_matrix) = updated_aggregated else {
+            return Ok(None);
+        };
+        if updated_matrix.element_count() != object_matrix.element_count()
+            || !equivalent_dimensions(updated_matrix.dims(), &object_matrix.dims)
+        {
+            return Err(RuntimeError::ShapeError(format!(
+                "object-array property aggregate assignment expects shape {:?}, found {:?}",
+                object_matrix.dims, updated_matrix.dims()
+            )));
+        }
+
+        let mut updated_elements = Vec::with_capacity(object_matrix.elements.len());
+        for (element, assigned_value) in object_matrix
+            .elements
+            .iter()
+            .cloned()
+            .zip(updated_matrix.elements.into_iter())
+        {
+            updated_elements.push(assign_struct_path(
+                element,
+                std::slice::from_ref(field),
+                assigned_value,
+            )?);
+        }
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            updated_elements,
+        )?)))
+    }
+
+    fn try_assign_object_array_cell_field_projection(
+        &mut self,
+        current: &Value,
+        field: &String,
+        rest: &[TempLValueProjection],
+        leaf: &TempLValueLeaf,
+        temps: &[Option<VmTemp>],
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Matrix(object_matrix) = current else {
+            return Ok(None);
+        };
+        if !matrix_is_object_array(object_matrix) {
+            return Ok(None);
+        }
+
+        let mut property_cells = Vec::with_capacity(object_matrix.elements.len());
+        for element in &object_matrix.elements {
+            let Value::Object(object) = element else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            let Some(value) = object.property_value(field) else {
+                return Ok(None);
+            };
+            if !private_property_access_allowed(&object.class, field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "property `{field}` has private access for class `{}`",
+                    private_property_owner_name(&object.class, field)
+                )));
+            }
+            let Value::Cell(property_cell) = value else {
+                return Ok(None);
+            };
+            property_cells.push(property_cell);
+        }
+
+        let aggregated = Value::Cell(CellValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            property_cells.into_iter().map(Value::Cell).collect::<Vec<_>>(),
+        )?);
+        let updated_aggregated =
+            self.assign_lvalue_path(aggregated, rest, true, leaf.clone(), temps)?;
+        let Value::Cell(updated_cell) = updated_aggregated else {
+            return Ok(None);
+        };
+        if updated_cell.element_count() != object_matrix.element_count()
+            || !equivalent_dimensions(updated_cell.dims(), &object_matrix.dims)
+        {
+            return Err(RuntimeError::ShapeError(format!(
+                "cell-valued object property assignment expects shape {:?}, found {:?}",
+                object_matrix.dims, updated_cell.dims()
+            )));
+        }
+
+        let mut updated_elements = Vec::with_capacity(object_matrix.elements.len());
+        for (element, assigned_value) in object_matrix
+            .elements
+            .iter()
+            .cloned()
+            .zip(updated_cell.elements().iter().cloned())
+        {
+            updated_elements.push(assign_struct_path(
+                element,
+                std::slice::from_ref(field),
+                assigned_value,
+            )?);
+        }
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            updated_elements,
+        )?)))
+    }
 }
 
 fn bundle_registry(bundle: &BytecodeBundle) -> HashMap<PathBuf, BytecodeModule> {
@@ -3215,6 +5145,7 @@ impl VmFrame {
         Self {
             cells: HashMap::new(),
             names: BTreeMap::new(),
+            declared_names: BTreeMap::new(),
             global_names: BTreeSet::new(),
             persistent_names: BTreeSet::new(),
             visible_functions,
@@ -3228,6 +5159,7 @@ impl VmFrame {
                 binding.name
             ))
         })?;
+        self.declared_names.insert(binding.name.clone(), binding_id);
         self.names.insert(binding.name.clone(), binding_id);
         self.cells
             .entry(binding_id)
@@ -3240,6 +5172,30 @@ impl VmFrame {
         if !name.starts_with('<') {
             self.names.insert(name.to_string(), binding_id);
         }
+    }
+
+    fn ensure_reference_cell(&mut self, binding_id: Option<BindingId>, name: &str) -> Option<Cell> {
+        if let Some(binding_id) = binding_id {
+            self.declared_names.insert(name.to_string(), binding_id);
+            if let Some(existing_binding_id) = self.names.get(name).copied() {
+                if let Some(cell) = self.cells.get(&existing_binding_id).cloned() {
+                    if existing_binding_id != binding_id {
+                        self.cells.insert(binding_id, cell.clone());
+                    }
+                    self.names.insert(name.to_string(), binding_id);
+                    return Some(cell);
+                }
+            }
+            self.names.insert(name.to_string(), binding_id);
+            return Some(
+                self.cells
+                    .entry(binding_id)
+                    .or_insert_with(|| Rc::new(RefCell::new(None)))
+                    .clone(),
+            );
+        }
+
+        self.cell_for_reference(binding_id, name)
     }
 
     fn inherit_hidden_cells_from(&mut self, caller: &VmFrame) {
@@ -3270,11 +5226,21 @@ impl VmFrame {
     ) -> Result<Value, RuntimeError> {
         if let Some(binding_id) = binding_id {
             if let Some(cell) = self.cells.get(&binding_id) {
-                return cell.borrow().clone().ok_or_else(|| {
-                    RuntimeError::MissingVariable(format!(
-                        "variable `{name}` is declared but has no runtime value"
-                    ))
-                });
+                if let Some(value) = cell.borrow().clone() {
+                    return Ok(value);
+                }
+                if let Some(existing_binding_id) = self.names.get(name).copied() {
+                    if existing_binding_id != binding_id {
+                        if let Some(existing_cell) = self.cells.get(&existing_binding_id) {
+                            if let Some(value) = existing_cell.borrow().clone() {
+                                return Ok(value);
+                            }
+                        }
+                    }
+                }
+                return Err(RuntimeError::MissingVariable(format!(
+                    "variable `{name}` is declared but has no runtime value"
+                )));
             }
         }
         if let Some(binding_id) = self.names.get(name).copied() {
@@ -3299,15 +5265,23 @@ impl VmFrame {
     }
 
     fn cell_for_reference(&self, binding_id: Option<BindingId>, name: &str) -> Option<Cell> {
+        let named_cell = self
+            .names
+            .get(name)
+            .and_then(|binding_id| self.cells.get(binding_id))
+            .cloned();
         if let Some(binding_id) = binding_id {
             if let Some(cell) = self.cells.get(&binding_id) {
+                if cell.borrow().is_some() {
+                    return Some(cell.clone());
+                }
+                if let Some(existing_cell) = named_cell {
+                    return Some(existing_cell);
+                }
                 return Some(cell.clone());
             }
         }
-        self.names
-            .get(name)
-            .and_then(|binding_id| self.cells.get(binding_id))
-            .cloned()
+        named_cell
     }
 
     fn export_workspace(&self) -> Result<Workspace, RuntimeError> {
@@ -3356,6 +5330,16 @@ impl VmFrame {
         name: String,
         value: Value,
     ) {
+        if let Some(binding_id) = self.declared_names.get(&name).copied() {
+            let cell = self
+                .cells
+                .entry(binding_id)
+                .or_insert_with(|| Rc::new(RefCell::new(None)))
+                .clone();
+            *cell.borrow_mut() = Some(value);
+            self.names.insert(name, binding_id);
+            return;
+        }
         if let Some(binding_id) = self.names.get(&name).copied() {
             if let Some(cell) = self.cells.get(&binding_id) {
                 *cell.borrow_mut() = Some(value);
@@ -3433,7 +5417,7 @@ fn invoke_clearvars_builtin_outputs_vm(
 
 fn invoke_save_builtin_outputs_vm(
     frame: &mut VmFrame,
-    _shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
@@ -3505,23 +5489,57 @@ fn invoke_save_builtin_outputs_vm(
         }
         filtered
     };
-    let merged = if spec.append && spec.path.exists() {
-        let mut existing = if workspace_snapshot_extension(&spec.path) {
-            read_workspace_snapshot(&spec.path)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+    let (merged, snapshot_bundle_modules) = if spec.append && spec.path.exists() {
+        let (mut existing, mut existing_bundle_modules) = if workspace_snapshot_extension(&spec.path) {
+            let snapshot = read_workspace_snapshot_with_modules(&spec.path)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            (
+                snapshot.workspace,
+                decode_snapshot_bundle_modules(&snapshot.bundle_modules)?,
+            )
         } else {
-            read_mat_file(&spec.path)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+            (
+                read_mat_file(&spec.path)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                Vec::new(),
+            )
         };
         for (name, value) in selected {
             existing.insert(name, value);
         }
-        existing
+        if workspace_snapshot_extension(&spec.path)
+            && workspace_contains_bundle_backed_modules(shared_state, &existing)
+        {
+            let mut merged_bundle_modules = existing_bundle_modules
+                .drain(..)
+                .map(|module| (module.module_id.clone(), module))
+                .collect::<BTreeMap<_, _>>();
+            for module in snapshot_bundle_modules(shared_state) {
+                merged_bundle_modules.insert(module.module_id.clone(), module);
+            }
+            (
+                existing,
+                merged_bundle_modules.into_values().collect::<Vec<_>>(),
+            )
+        } else {
+            (existing, existing_bundle_modules)
+        }
     } else {
-        selected
+        let bundle_modules = if workspace_snapshot_extension(&spec.path)
+            && workspace_contains_bundle_backed_modules(shared_state, &selected)
+        {
+            snapshot_bundle_modules(shared_state)
+        } else {
+            Vec::new()
+        };
+        (selected, bundle_modules)
     };
     if workspace_snapshot_extension(&spec.path) {
-        write_workspace_snapshot(&spec.path, &merged)
+        write_workspace_snapshot_with_modules(
+            &spec.path,
+            &merged,
+            &encode_snapshot_bundle_modules(&snapshot_bundle_modules),
+        )
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     } else {
         write_mat_file(&spec.path, &merged)
@@ -3538,8 +5556,13 @@ fn invoke_load_builtin_outputs_vm(
 ) -> Result<Vec<Value>, RuntimeError> {
     let spec = parse_load_arguments(args)?;
     let mut workspace = if workspace_snapshot_extension(&spec.path) {
-        read_workspace_snapshot(&spec.path)
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+        let snapshot = read_workspace_snapshot_with_modules(&spec.path)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        install_bundled_modules(
+            shared_state,
+            &decode_snapshot_bundle_modules(&snapshot.bundle_modules)?,
+        );
+        snapshot.workspace
     } else {
         read_mat_file(&spec.path).map_err(|error| RuntimeError::Unsupported(error.to_string()))?
     };
@@ -3882,12 +5905,23 @@ fn evaluate_function_arguments_from_strings(
     args: &[String],
 ) -> Result<Vec<Value>, RuntimeError> {
     let mut values = Vec::new();
+    let dummy_target = empty_matrix_value();
     for arg in args {
-        if is_encoded_index_expression(arg) || matches!(arg.as_str(), ":" | "end") {
+        if matches!(arg.as_str(), ":" | "end") {
             return Err(RuntimeError::Unsupported(
                 "`end` and slice selectors are not implemented for function-call arguments in the current bytecode VM"
                     .to_string(),
             ));
+        }
+        if is_encoded_index_expression(arg) {
+            values.push(evaluate_encoded_index_expression(
+                temps,
+                &dummy_target,
+                arg,
+                0,
+                1,
+            )?);
+            continue;
         }
         let temp_id = parse_temp_ref(arg).ok_or_else(|| {
             RuntimeError::Unsupported(format!(
@@ -4126,7 +6160,7 @@ fn evaluate_index_expression_text(
         .and_then(|value| value.strip_suffix(')'))
     {
         let rows = index_literal_rows(temps, target, inner, position, total_arguments, "matrix")?;
-        return Ok(Value::Matrix(MatrixValue::from_rows(rows)?));
+        return build_matrix_literal_value(rows);
     }
     if let Some(inner) = expression
         .strip_prefix("cell(")
@@ -4773,6 +6807,9 @@ fn simple_temp_struct_field_assignment_target_count(
     target: &VmTemp,
     temps: &[Option<VmTemp>],
 ) -> Result<Option<usize>, RuntimeError> {
+    if matches!(&target.value, Value::Matrix(matrix) if matrix_is_object_array(matrix)) {
+        return Ok(None);
+    }
     if let Some(count) = nested_struct_assignment_target_count(&target.value).filter(|&count| count > 1)
     {
         return Ok(Some(count));
@@ -5429,6 +7466,40 @@ fn read_field_lvalue_value_for_temp_assignment(
     };
 
     match target {
+        Value::Object(object) => {
+            if !rest.is_empty()
+                && object.property_value(field).is_none()
+                && object_has_method(object, field)
+            {
+                return Err(unsupported_method_result_assignment_error(field));
+            }
+            read_field_value(target, field)
+        }
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            let Value::Object(first_object) = &matrix.elements[0] else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            if !rest.is_empty()
+                && first_object.property_value(field).is_none()
+                && value_has_object_method(target, field)
+            {
+                return Err(unsupported_method_result_assignment_error(field));
+            }
+            let mut elements = Vec::with_capacity(matrix.elements.len());
+            for element in &matrix.elements {
+                let value = match read_field_value(element, field) {
+                    Ok(value) => value,
+                    Err(error) => return Err(error),
+                };
+                elements.push(value);
+            }
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                matrix.rows,
+                matrix.cols,
+                matrix.dims.clone(),
+                elements,
+            )?))
+        }
         Value::Struct(_) => match read_field_value(target, field) {
             Ok(value) => Ok(value),
             Err(RuntimeError::MissingVariable(_)) => fallback(),
@@ -5570,6 +7641,13 @@ fn parse_target(value: &str) -> ParsedTarget {
         .split("semantic=")
         .nth(1)
         .map(|rest| rest.split([' ', ']']).next().unwrap_or(rest).to_string());
+    let binding_id = value
+        .split("binding=")
+        .nth(1)
+        .and_then(|rest| rest.split([' ', ']']).next())
+        .and_then(|text| text.parse::<u32>().ok())
+        .map(BindingId);
+    let super_constructor = value.contains("super_ctor=true");
     let resolved_path = parse_resolved_path(value);
     let resolved_class = value.contains("ClassCurrentDirectory")
         || value.contains("ClassSearchPath")
@@ -5581,10 +7659,35 @@ fn parse_target(value: &str) -> ParsedTarget {
     ParsedTarget {
         display_name,
         semantic_resolution,
+        binding_id,
+        super_constructor,
         resolved_path,
         resolved_class,
         bundle_module_id,
     }
+}
+
+fn bytecode_external_method_targets(
+    methods: &[BytecodeExternalMethod],
+) -> BTreeMap<String, ObjectMethodTarget> {
+    methods
+        .iter()
+        .filter_map(|method| {
+            if let Some(module_id) = &method.bundle_module_id {
+                Some((
+                    method.name.clone(),
+                    ObjectMethodTarget::BundleModule(module_id.clone()),
+                ))
+            } else {
+                method.path.as_ref().map(|path| {
+                    (
+                        method.name.clone(),
+                        ObjectMethodTarget::Path(PathBuf::from(path)),
+                    )
+                })
+            }
+        })
+        .collect()
 }
 
 fn parse_bundle_module_id(value: &str) -> Option<String> {
@@ -5721,6 +7824,7 @@ mod tests {
             backend: BackendKind::Bytecode,
             unit_kind: "script".to_string(),
             entry: "<script>".to_string(),
+            classes: Vec::new(),
             functions: Vec::new(),
         };
         let mut vm = BytecodeVm {

@@ -77,3 +77,23 @@ fn try_catch_fixture_matches_golden() {
 fn classdef_basic_fixture_matches_golden() {
     assert_fixture("classdef_basic", ParseMode::AutoDetect);
 }
+
+#[test]
+fn classdef_static_fixture_matches_golden() {
+    assert_fixture("classdef_static", ParseMode::AutoDetect);
+}
+
+#[test]
+fn classdef_private_fixture_matches_golden() {
+    assert_fixture("classdef_private", ParseMode::AutoDetect);
+}
+
+#[test]
+fn indexed_receiver_handle_fixture_matches_golden() {
+    assert_fixture("indexed_receiver_handle", ParseMode::AutoDetect);
+}
+
+#[test]
+fn receiver_expression_handle_fixture_matches_golden() {
+    assert_fixture("receiver_expression_handle", ParseMode::AutoDetect);
+}

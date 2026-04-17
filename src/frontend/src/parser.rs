@@ -3,9 +3,10 @@
 use crate::{
     ast::{
         AssignmentTarget, BinaryOp, ClassDef, ClassMethodBlock, ClassPropertyBlock,
-        ClassPropertyDef, CompilationUnit, CompilationUnitKind, ConditionalBranch, Expression,
-        ExpressionKind, FunctionDef, Identifier, IndexArgument, Item, QualifiedName, Statement,
-        StatementKind, SwitchCase, UnaryOp,
+        ClassMemberAccess, ClassPropertyDef, CompilationUnit, CompilationUnitKind,
+        ConditionalBranch, Expression, ExpressionKind, FunctionDef, FunctionHandleTarget,
+        Identifier, IndexArgument, Item, QualifiedName, Statement, StatementKind, SwitchCase,
+        UnaryOp,
     },
     diagnostics::Diagnostic,
     lexer::{lex, DelimiterKind, Keyword, OperatorKind, Token, TokenKind, Trivia, TriviaKind},
@@ -211,6 +212,7 @@ impl<'a> Parser<'a> {
 
     fn parse_class_definition(&mut self) -> ClassDef {
         let class_span = self.expect_keyword(Keyword::ClassDef, "PAR103", "expected `classdef`");
+        self.parse_class_definition_attributes();
         let name = self.parse_identifier_or_recover("PAR104", "expected class name");
         let superclass = if self.match_operator(OperatorKind::LessThan) {
             let qualified =
@@ -241,17 +243,17 @@ impl<'a> Parser<'a> {
             } else if self.at_keyword(Keyword::Methods) {
                 method_blocks.push(self.parse_class_method_block());
             } else if self.current_identifier_is("events") {
-                self.error_here("PAR107", "`events` blocks are not supported");
-                self.advance_if_not_eof();
+                self.parse_unsupported_class_block("events", "PAR107");
             } else if self.current_identifier_is("enumeration") {
-                self.error_here("PAR108", "`enumeration` blocks are not supported");
-                self.advance_if_not_eof();
+                self.parse_unsupported_class_block("enumeration", "PAR108");
             } else if self.at_keyword(Keyword::Function) {
                 self.error_here(
                     "PAR109",
                     "methods must appear inside a `methods` block in a class definition",
                 );
                 self.parse_function_definition();
+            } else if self.can_start_class_statement_recovery() {
+                self.parse_unsupported_class_statement();
             } else {
                 self.error_here("PAR110", "unsupported class body item");
                 self.advance_if_not_eof();
@@ -271,9 +273,201 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_unsupported_class_block(
+        &mut self,
+        block_name: &str,
+        code: &'static str,
+    ) {
+        let start = self.current().span;
+        self.diagnostics.push(Diagnostic::error(
+            code,
+            format!("`{block_name}` blocks are not supported"),
+            start,
+        ));
+        self.advance_if_not_eof();
+        self.parse_unsupported_member_attribute_list(block_name, "PAR125", "PAR126");
+        self.skip_separators();
+        while !self.at_end() && !self.at_keyword(Keyword::End) {
+            self.advance_if_not_eof();
+        }
+        self.expect_keyword(
+            Keyword::End,
+            "PAR127",
+            "expected `end` after unsupported class block",
+        );
+    }
+
+    fn parse_unsupported_class_statement(&mut self) {
+        let span = self.current().span;
+        self.diagnostics.push(Diagnostic::error(
+            "PAR128",
+            "top-level executable statements are not supported in class definitions",
+            span,
+        ));
+        let _ = self.parse_statement();
+    }
+
+    fn parse_class_definition_attributes(&mut self) {
+        self.skip_trivia_only();
+        if !self.at_delimiter(DelimiterKind::LeftParen) {
+            return;
+        }
+
+        self.advance();
+        let mut saw_any = false;
+        while !self.at_end() && !self.at_delimiter(DelimiterKind::RightParen) {
+            self.skip_newlines_only();
+            if self.at_delimiter(DelimiterKind::Comma) {
+                self.advance();
+                continue;
+            }
+
+            saw_any = true;
+            if self.at_identifier() {
+                let attribute = self.parse_identifier();
+                self.diagnostics.push(Diagnostic::error(
+                    "PAR122",
+                    format!(
+                        "`classdef` attribute `{}` is not supported in the current parser",
+                        attribute.name
+                    ),
+                    attribute.span,
+                ));
+            } else {
+                let span = self.current().span;
+                self.diagnostics.push(Diagnostic::error(
+                    "PAR122",
+                    "expected a `classdef` attribute name",
+                    span,
+                ));
+                self.advance_if_not_eof();
+            }
+
+            self.skip_newlines_only();
+            if self.match_operator(OperatorKind::Assign) {
+                self.consume_attribute_value();
+            }
+            self.skip_newlines_only();
+            if self.at_delimiter(DelimiterKind::Comma) {
+                self.advance();
+            }
+        }
+
+        self.expect_delimiter(
+            DelimiterKind::RightParen,
+            "PAR123",
+            "expected `)` after classdef attribute list",
+        );
+        if !saw_any {
+            self.diagnostics.push(Diagnostic::error(
+                "PAR124",
+                "empty `classdef` attribute lists are not supported",
+                self.current().span,
+            ));
+        }
+    }
+
+    fn parse_unsupported_member_attribute_list(
+        &mut self,
+        context_name: &str,
+        code: &'static str,
+        empty_code: &'static str,
+    ) {
+        self.skip_trivia_only();
+        if !self.at_delimiter(DelimiterKind::LeftParen) {
+            return;
+        }
+
+        self.advance();
+        let mut saw_any = false;
+        while !self.at_end() && !self.at_delimiter(DelimiterKind::RightParen) {
+            self.skip_newlines_only();
+            if self.at_delimiter(DelimiterKind::Comma) {
+                self.advance();
+                continue;
+            }
+
+            saw_any = true;
+            if self.at_identifier() {
+                let attribute = self.parse_identifier();
+                self.diagnostics.push(Diagnostic::error(
+                    code,
+                    format!(
+                        "`{context_name}` block attribute `{}` is not supported in the current parser",
+                        attribute.name
+                    ),
+                    attribute.span,
+                ));
+            } else {
+                let span = self.current().span;
+                self.diagnostics.push(Diagnostic::error(
+                    code,
+                    format!("expected a `{context_name}` block attribute name"),
+                    span,
+                ));
+                self.advance_if_not_eof();
+            }
+
+            self.skip_newlines_only();
+            if self.match_operator(OperatorKind::Assign) {
+                self.consume_attribute_value();
+            }
+            self.skip_newlines_only();
+            if self.at_delimiter(DelimiterKind::Comma) {
+                self.advance();
+            }
+        }
+
+        self.expect_delimiter(
+            DelimiterKind::RightParen,
+            code,
+            "expected `)` after unsupported class block attributes",
+        );
+        if !saw_any {
+            self.diagnostics.push(Diagnostic::error(
+                empty_code,
+                format!("empty `{context_name}` attribute lists are not supported"),
+                self.current().span,
+            ));
+        }
+    }
+
+    fn consume_attribute_value(&mut self) {
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+
+        while !self.at_end() {
+            match self.current().kind {
+                TokenKind::Delimiter(DelimiterKind::LeftParen) => paren_depth += 1,
+                TokenKind::Delimiter(DelimiterKind::RightParen) => {
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                        break;
+                    }
+                    paren_depth = paren_depth.saturating_sub(1);
+                }
+                TokenKind::Delimiter(DelimiterKind::LeftBracket) => bracket_depth += 1,
+                TokenKind::Delimiter(DelimiterKind::RightBracket) => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                }
+                TokenKind::Delimiter(DelimiterKind::LeftBrace) => brace_depth += 1,
+                TokenKind::Delimiter(DelimiterKind::RightBrace) => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                }
+                TokenKind::Delimiter(DelimiterKind::Comma)
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            self.advance_if_not_eof();
+        }
+    }
+
     fn parse_class_property_block(&mut self) -> ClassPropertyBlock {
         let start = self.expect_keyword(Keyword::Properties, "PAR112", "expected `properties`");
-        self.reject_class_block_attributes("PAR113");
+        let access = self.parse_class_property_block_attributes();
         self.skip_separators();
 
         let mut properties = Vec::new();
@@ -288,6 +482,14 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            if !self.at_separator() && !self.at_keyword(Keyword::End) {
+                self.diagnostics.push(Diagnostic::error(
+                    "PAR129",
+                    "property validation, size/type constraints, and trailing declaration syntax are not supported in the current parser",
+                    self.current().span,
+                ));
+                self.consume_class_property_declaration_tail();
+            }
             let span = default
                 .as_ref()
                 .map(|value| combine_spans(name.span, value.span))
@@ -309,14 +511,56 @@ impl<'a> Parser<'a> {
             "expected `end` after properties block",
         );
         ClassPropertyBlock {
+            access,
             properties,
             span: combine_spans(start, end),
         }
     }
 
+    fn consume_class_property_declaration_tail(&mut self) {
+        while !self.at_end() && !self.at_separator() && !self.at_keyword(Keyword::End) {
+            self.advance_if_not_eof();
+        }
+    }
+
+    fn consume_class_member_declaration_tail(&mut self) {
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+
+        while !self.at_end() {
+            match self.current().kind {
+                TokenKind::Delimiter(DelimiterKind::LeftParen) => paren_depth += 1,
+                TokenKind::Delimiter(DelimiterKind::RightParen) => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                }
+                TokenKind::Delimiter(DelimiterKind::LeftBracket) => bracket_depth += 1,
+                TokenKind::Delimiter(DelimiterKind::RightBracket) => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                }
+                TokenKind::Delimiter(DelimiterKind::LeftBrace) => brace_depth += 1,
+                TokenKind::Delimiter(DelimiterKind::RightBrace) => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                }
+                TokenKind::Newline | TokenKind::Delimiter(DelimiterKind::Semicolon)
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    break;
+                }
+                TokenKind::Keyword(Keyword::End)
+                    if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            self.advance_if_not_eof();
+        }
+    }
+
     fn parse_class_method_block(&mut self) -> ClassMethodBlock {
         let start = self.expect_keyword(Keyword::Methods, "PAR116", "expected `methods`");
-        self.reject_class_block_attributes("PAR117");
+        let (is_static, access) = self.parse_class_method_block_attributes();
         self.skip_separators();
 
         let mut methods = Vec::new();
@@ -328,11 +572,12 @@ impl<'a> Parser<'a> {
             if self.at_keyword(Keyword::Function) {
                 methods.push(self.parse_function_definition());
             } else {
-                self.error_here(
+                self.diagnostics.push(Diagnostic::error(
                     "PAR118",
-                    "methods blocks currently support only full `function ... end` method definitions",
-                );
-                self.advance_if_not_eof();
+                    "methods blocks currently support only full `function ... end` method definitions; signature-only or abstract declarations are not supported",
+                    self.current().span,
+                ));
+                self.consume_class_member_declaration_tail();
             }
             self.skip_separators();
         }
@@ -343,33 +588,176 @@ impl<'a> Parser<'a> {
             "expected `end` after methods block",
         );
         ClassMethodBlock {
+            access,
+            is_static,
             methods,
             span: combine_spans(start, end),
         }
     }
 
-    fn reject_class_block_attributes(&mut self, code: &'static str) {
+    fn parse_class_property_block_attributes(&mut self) -> ClassMemberAccess {
         self.skip_trivia_only();
-        if self.at_delimiter(DelimiterKind::LeftParen) {
-            self.error_here(code, "class block attributes are not supported");
-            let mut depth = 0i32;
-            while !self.at_end() {
-                match self.current().kind {
-                    TokenKind::Delimiter(DelimiterKind::LeftParen) => {
-                        depth += 1;
-                    }
-                    TokenKind::Delimiter(DelimiterKind::RightParen) => {
-                        depth -= 1;
-                        if depth <= 0 {
-                            self.advance();
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                self.advance_if_not_eof();
-            }
+        if !self.at_delimiter(DelimiterKind::LeftParen) {
+            return ClassMemberAccess::Public;
         }
+
+        self.advance();
+        let mut access = ClassMemberAccess::Public;
+        let mut saw_any = false;
+        while !self.at_end() && !self.at_delimiter(DelimiterKind::RightParen) {
+            if self.at_delimiter(DelimiterKind::Comma) {
+                self.advance();
+                continue;
+            }
+
+            if self.current_identifier_is("Access") {
+                saw_any = true;
+                self.advance();
+                self.expect_operator(
+                    OperatorKind::Assign,
+                    "PAR117",
+                    "expected `=` after `Access`",
+                );
+                if self.current_identifier_is("private") {
+                    access = ClassMemberAccess::Private;
+                    self.advance();
+                } else if self.current_identifier_is("public") {
+                    access = ClassMemberAccess::Public;
+                    self.advance();
+                } else {
+                    self.error_here(
+                        "PAR117",
+                        "only `Access=private` or `Access=public` is supported",
+                    );
+                    self.consume_attribute_value();
+                }
+                continue;
+            }
+
+            if self.at_identifier() {
+                saw_any = true;
+                let attribute = self.parse_identifier();
+                self.diagnostics.push(Diagnostic::error(
+                    "PAR117",
+                    format!(
+                        "property block attribute `{}` is not supported in the current parser",
+                        attribute.name
+                    ),
+                    attribute.span,
+                ));
+                if self.match_operator(OperatorKind::Assign) {
+                    self.consume_attribute_value();
+                }
+                continue;
+            }
+
+            saw_any = true;
+            self.error_here("PAR117", "expected a property block attribute name");
+            self.advance_if_not_eof();
+        }
+
+        self.expect_delimiter(
+            DelimiterKind::RightParen,
+            "PAR120",
+            "expected `)` after properties block attributes",
+        );
+        if !saw_any {
+            self.error_here("PAR121", "empty properties attribute lists are not supported");
+        }
+        access
+    }
+
+    fn parse_class_method_block_attributes(&mut self) -> (bool, ClassMemberAccess) {
+        self.skip_trivia_only();
+        if !self.at_delimiter(DelimiterKind::LeftParen) {
+            return (false, ClassMemberAccess::Public);
+        }
+
+        self.advance();
+        let mut is_static = false;
+        let mut access = ClassMemberAccess::Public;
+        let mut saw_any = false;
+        while !self.at_end() && !self.at_delimiter(DelimiterKind::RightParen) {
+            if self.at_delimiter(DelimiterKind::Comma) {
+                self.advance();
+                continue;
+            }
+
+            if self.current_identifier_is("Static") {
+                saw_any = true;
+                self.advance();
+                if self.match_operator(OperatorKind::Assign) {
+                    if self.current_identifier_is("true") {
+                        is_static = true;
+                        self.advance();
+                    } else {
+                        self.error_here(
+                            "PAR117",
+                            "`Static=true` is the only supported explicit Static form",
+                        );
+                        self.consume_attribute_value();
+                    }
+                } else {
+                    is_static = true;
+                }
+                continue;
+            }
+
+            if self.current_identifier_is("Access") {
+                saw_any = true;
+                self.advance();
+                self.expect_operator(
+                    OperatorKind::Assign,
+                    "PAR117",
+                    "expected `=` after `Access`",
+                );
+                if self.current_identifier_is("private") {
+                    access = ClassMemberAccess::Private;
+                    self.advance();
+                } else if self.current_identifier_is("public") {
+                    access = ClassMemberAccess::Public;
+                    self.advance();
+                } else {
+                    self.error_here(
+                        "PAR117",
+                        "only `Access=private` or `Access=public` is supported",
+                    );
+                    self.consume_attribute_value();
+                }
+                continue;
+            }
+
+            if self.at_identifier() {
+                saw_any = true;
+                let attribute = self.parse_identifier();
+                self.diagnostics.push(Diagnostic::error(
+                    "PAR117",
+                    format!(
+                        "method block attribute `{}` is not supported in the current parser",
+                        attribute.name
+                    ),
+                    attribute.span,
+                ));
+                if self.match_operator(OperatorKind::Assign) {
+                    self.consume_attribute_value();
+                }
+                continue;
+            }
+
+            saw_any = true;
+            self.error_here("PAR117", "expected a method block attribute name");
+            self.advance_if_not_eof();
+        }
+
+        self.expect_delimiter(
+            DelimiterKind::RightParen,
+            "PAR120",
+            "expected `)` after methods block attributes",
+        );
+        if !saw_any {
+            self.error_here("PAR121", "empty methods attribute lists are not supported");
+        }
+        (is_static, access)
     }
 
     fn parse_statement_block(&mut self, terminators: &[Keyword]) -> Vec<Statement> {
@@ -822,7 +1210,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_postfix_expression(&mut self) -> Expression {
-        let mut expression = self.parse_primary_expression();
+        let expression = self.parse_primary_expression();
+        self.parse_postfix_suffixes(expression, true)
+    }
+
+    fn parse_postfix_suffixes(
+        &mut self,
+        mut expression: Expression,
+        allow_transpose: bool,
+    ) -> Expression {
         loop {
             if self.match_delimiter(DelimiterKind::LeftParen) {
                 let indices = self.parse_index_argument_list(DelimiterKind::RightParen);
@@ -872,7 +1268,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            if self.at_operator(OperatorKind::DotTranspose) {
+            if allow_transpose && self.at_operator(OperatorKind::DotTranspose) {
                 let end = self.advance().span;
                 expression = Expression {
                     span: combine_spans(expression.span, end),
@@ -884,7 +1280,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            if self.at_operator(OperatorKind::Transpose) {
+            if allow_transpose && self.at_operator(OperatorKind::Transpose) {
                 let end = self.advance().span;
                 expression = Expression {
                     span: combine_spans(expression.span, end),
@@ -1009,11 +1405,95 @@ impl<'a> Parser<'a> {
             };
         }
 
-        let name = self.parse_qualified_name("PAR023", "expected function name after `@`");
+        let target = self.parse_function_handle_target();
         Expression {
-            span: combine_spans(start, name.span),
-            kind: ExpressionKind::FunctionHandle(name),
+            span: combine_spans(start, function_handle_target_span(&target)),
+            kind: ExpressionKind::FunctionHandle(target),
         }
+    }
+
+    fn parse_function_handle_target(&mut self) -> FunctionHandleTarget {
+        let identifier = self.parse_identifier_or_recover(
+            "PAR023",
+            "expected function name or receiver expression after `@`",
+        );
+        let expression = self.parse_function_handle_target_expression(
+            Expression {
+                span: identifier.span,
+                kind: ExpressionKind::Identifier(identifier),
+            },
+        );
+        expression_as_qualified_name(&expression)
+            .map(FunctionHandleTarget::Name)
+            .unwrap_or_else(|| FunctionHandleTarget::Expression(Box::new(expression)))
+    }
+
+    fn parse_function_handle_target_expression(&mut self, mut expression: Expression) -> Expression {
+        loop {
+            if self.at_delimiter(DelimiterKind::LeftParen)
+                && self.function_handle_index_continues_receiver_chain(
+                    DelimiterKind::LeftParen,
+                    DelimiterKind::RightParen,
+                )
+            {
+                self.advance();
+                let indices = self.parse_index_argument_list(DelimiterKind::RightParen);
+                let end = self.expect_delimiter(
+                    DelimiterKind::RightParen,
+                    "PAR011",
+                    "expected `)` after argument list",
+                );
+                expression = Expression {
+                    span: combine_spans(expression.span, end),
+                    kind: ExpressionKind::ParenApply {
+                        target: Box::new(expression),
+                        indices,
+                    },
+                };
+                continue;
+            }
+
+            if self.at_delimiter(DelimiterKind::LeftBrace)
+                && self.function_handle_index_continues_receiver_chain(
+                    DelimiterKind::LeftBrace,
+                    DelimiterKind::RightBrace,
+                )
+            {
+                self.advance();
+                let indices = self.parse_index_argument_list(DelimiterKind::RightBrace);
+                let end = self.expect_delimiter(
+                    DelimiterKind::RightBrace,
+                    "PAR012",
+                    "expected `}` after cell index list",
+                );
+                expression = Expression {
+                    span: combine_spans(expression.span, end),
+                    kind: ExpressionKind::CellIndex {
+                        target: Box::new(expression),
+                        indices,
+                    },
+                };
+                continue;
+            }
+
+            if self.match_operator(OperatorKind::Dot) {
+                let field =
+                    self.parse_identifier_or_recover("PAR013", "expected field name after `.`");
+                let span = combine_spans(expression.span, field.span);
+                expression = Expression {
+                    span,
+                    kind: ExpressionKind::FieldAccess {
+                        target: Box::new(expression),
+                        field,
+                    },
+                };
+                continue;
+            }
+
+            break;
+        }
+
+        expression
     }
 
     fn parse_qualified_name(&mut self, code: &'static str, message: &'static str) -> QualifiedName {
@@ -1860,6 +2340,25 @@ impl<'a> Parser<'a> {
         )
     }
 
+    fn can_start_class_statement_recovery(&self) -> bool {
+        self.can_start_expression()
+            || matches!(
+                self.current().kind,
+                TokenKind::Keyword(
+                    Keyword::If
+                        | Keyword::Switch
+                        | Keyword::Try
+                        | Keyword::For
+                        | Keyword::While
+                        | Keyword::Break
+                        | Keyword::Continue
+                        | Keyword::Return
+                        | Keyword::Global
+                        | Keyword::Persistent
+                )
+            )
+    }
+
     fn can_start_expression(&self) -> bool {
         token_can_start_expression_kind(&self.current().kind)
     }
@@ -2056,13 +2555,93 @@ fn token_can_continue_command_argument(kind: &TokenKind) -> bool {
         )
 }
 
+fn expression_as_qualified_name(expression: &Expression) -> Option<QualifiedName> {
+    match &expression.kind {
+        ExpressionKind::Identifier(identifier) => Some(QualifiedName {
+            segments: vec![identifier.clone()],
+            span: identifier.span,
+        }),
+        ExpressionKind::FieldAccess { target, field } => {
+            let mut qualified = expression_as_qualified_name(target)?;
+            qualified.segments.push(field.clone());
+            qualified.span = expression.span;
+            Some(qualified)
+        }
+        _ => None,
+    }
+}
+
+fn function_handle_target_span(target: &FunctionHandleTarget) -> SourceSpan {
+    match target {
+        FunctionHandleTarget::Name(name) => name.span,
+        FunctionHandleTarget::Expression(expression) => expression.span,
+    }
+}
+
+impl Parser<'_> {
+    fn function_handle_index_continues_receiver_chain(&self, open: DelimiterKind, close: DelimiterKind) -> bool {
+        if !self.at_delimiter(open) {
+            return false;
+        }
+
+        let mut cursor = self.cursor;
+        let mut current_open = open;
+        let mut current_close = close;
+
+        loop {
+            let mut depth = 0usize;
+            let mut index = cursor;
+            let Some(token) = self.tokens.get(index) else {
+                return false;
+            };
+            if token.kind != TokenKind::Delimiter(current_open) {
+                return false;
+            }
+
+            while let Some(token) = self.tokens.get(index) {
+                match token.kind {
+                    TokenKind::Delimiter(kind) if kind == current_open => depth += 1,
+                    TokenKind::Delimiter(kind) if kind == current_close => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            match self.tokens.get(index + 1).map(|next| &next.kind) {
+                                Some(TokenKind::Operator(OperatorKind::Dot)) => return true,
+                                Some(TokenKind::Delimiter(DelimiterKind::LeftParen)) => {
+                                    cursor = index + 1;
+                                    current_open = DelimiterKind::LeftParen;
+                                    current_close = DelimiterKind::RightParen;
+                                    break;
+                                }
+                                Some(TokenKind::Delimiter(DelimiterKind::LeftBrace)) => {
+                                    cursor = index + 1;
+                                    current_open = DelimiterKind::LeftBrace;
+                                    current_close = DelimiterKind::RightBrace;
+                                    break;
+                                }
+                                _ => return false,
+                            }
+                        }
+                    }
+                    TokenKind::EndOfFile => return false,
+                    _ => {}
+                }
+                index += 1;
+            }
+
+            if index >= self.tokens.len() {
+                return false;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_source, ParseMode};
     use crate::{
         ast::{
-            AssignmentTarget, BinaryOp, CompilationUnitKind, ExpressionKind, IndexArgument, Item,
-            StatementKind,
+            AssignmentTarget, BinaryOp, ClassMemberAccess, CompilationUnitKind, ExpressionKind,
+            FunctionHandleTarget, IndexArgument, Item, StatementKind,
         },
         source::SourceFileId,
     };
@@ -2273,7 +2852,7 @@ mod tests {
         let StatementKind::Assignment { value, .. } = &first.kind else {
             panic!("expected first assignment");
         };
-        let ExpressionKind::FunctionHandle(name) = &value.kind else {
+        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Name(name)) = &value.kind else {
             panic!("expected function handle");
         };
         assert_eq!(
@@ -2301,6 +2880,75 @@ mod tests {
         };
         assert_eq!(root.name, "pkg");
         assert_eq!(field.name, "helper");
+    }
+
+    #[test]
+    fn parses_indexed_receiver_function_handle_targets() {
+        let source = "f = @objs(:,2).total;\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("compilation unit");
+
+        let Item::Statement(statement) = &unit.items[0] else {
+            panic!("expected statement");
+        };
+        let StatementKind::Assignment { value, .. } = &statement.kind else {
+            panic!("expected assignment");
+        };
+        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Expression(target)) = &value.kind else {
+            panic!("expected expression-backed function handle");
+        };
+        let ExpressionKind::FieldAccess { target, field } = &target.kind else {
+            panic!("expected field access");
+        };
+        let ExpressionKind::ParenApply { target, indices } = &target.kind else {
+            panic!("expected indexed receiver");
+        };
+        let ExpressionKind::Identifier(root) = &target.kind else {
+            panic!("expected root identifier");
+        };
+        assert_eq!(root.name, "objs");
+        assert_eq!(field.name, "total");
+        assert_eq!(indices.len(), 2);
+        assert!(matches!(indices[0], IndexArgument::FullSlice));
+    }
+
+    #[test]
+    fn parses_method_produced_indexed_receiver_function_handle_targets() {
+        let source = "f = @objs.duplicate()(3).total;\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("compilation unit");
+
+        let Item::Statement(statement) = &unit.items[0] else {
+            panic!("expected statement");
+        };
+        let StatementKind::Assignment { value, .. } = &statement.kind else {
+            panic!("expected assignment");
+        };
+        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Expression(target)) = &value.kind else {
+            panic!("expected expression-backed function handle");
+        };
+        let ExpressionKind::FieldAccess { target, field } = &target.kind else {
+            panic!("expected field access");
+        };
+        let ExpressionKind::ParenApply { target, indices } = &target.kind else {
+            panic!("expected indexed receiver after method result");
+        };
+        let ExpressionKind::ParenApply { target, indices: first_indices } = &target.kind else {
+            panic!("expected method call receiver");
+        };
+        let ExpressionKind::FieldAccess { target, field: method } = &target.kind else {
+            panic!("expected method field access");
+        };
+        let ExpressionKind::Identifier(root) = &target.kind else {
+            panic!("expected root identifier");
+        };
+        assert_eq!(root.name, "objs");
+        assert_eq!(method.name, "duplicate");
+        assert_eq!(field.name, "total");
+        assert_eq!(first_indices.len(), 0);
+        assert_eq!(indices.len(), 1);
     }
 
     #[test]
@@ -3431,5 +4079,326 @@ mod tests {
             panic!("expected statement");
         };
         assert!(!second.display_suppressed);
+    }
+
+    #[test]
+    fn classdef_top_level_attributes_emit_explicit_diagnostics() {
+        let source = "classdef (Sealed, ConstructOnLoad=true) Point\nend\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        let messages = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| {
+            message.contains("`classdef` attribute `Sealed` is not supported")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.contains("`classdef` attribute `ConstructOnLoad` is not supported")
+        }));
+
+        let unit = parsed.unit.expect("compilation unit");
+        assert_eq!(unit.kind, CompilationUnitKind::ClassFile);
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.name.name, "Point");
+    }
+
+    #[test]
+    fn classdef_top_level_attributes_do_not_break_supported_block_attributes() {
+        let source = "classdef (Sealed) Point\n\
+                      properties (Access=private)\n\
+                      secret\n\
+                      end\n\
+                      methods (Static, Access=private)\n\
+                      function out = hidden()\n\
+                      out = 1;\n\
+                      end\n\
+                      end\n\
+                      end\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.property_blocks.len(), 1);
+        assert_eq!(class_def.property_blocks[0].access, ClassMemberAccess::Private);
+        assert_eq!(class_def.method_blocks.len(), 1);
+        assert!(class_def.method_blocks[0].is_static);
+        assert_eq!(class_def.method_blocks[0].access, ClassMemberAccess::Private);
+    }
+
+    #[test]
+    fn property_block_attributes_emit_explicit_diagnostics_for_unsupported_names() {
+        let source = "classdef Point\n\
+                      properties (Constant, Access=private, Dependent=true)\n\
+                      value\n\
+                      end\n\
+                      end\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        let messages = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| {
+            message.contains("property block attribute `Constant` is not supported")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.contains("property block attribute `Dependent` is not supported")
+        }));
+
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.property_blocks.len(), 1);
+        assert_eq!(class_def.property_blocks[0].access, ClassMemberAccess::Private);
+        assert_eq!(class_def.property_blocks[0].properties.len(), 1);
+        assert_eq!(class_def.property_blocks[0].properties[0].name.name, "value");
+    }
+
+    #[test]
+    fn method_block_attributes_emit_explicit_diagnostics_for_unsupported_names() {
+        let source = "classdef Point\n\
+                      methods (Static, Sealed, Access=private, Abstract=true)\n\
+                      function out = demo()\n\
+                      out = 1;\n\
+                      end\n\
+                      end\n\
+                      end\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        let messages = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| {
+            message.contains("method block attribute `Sealed` is not supported")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.contains("method block attribute `Abstract` is not supported")
+        }));
+
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.method_blocks.len(), 1);
+        assert!(class_def.method_blocks[0].is_static);
+        assert_eq!(class_def.method_blocks[0].access, ClassMemberAccess::Private);
+        assert_eq!(class_def.method_blocks[0].methods.len(), 1);
+        assert_eq!(class_def.method_blocks[0].methods[0].name.name, "demo");
+    }
+
+    #[test]
+    fn unsupported_events_blocks_do_not_break_later_methods_blocks() {
+        let source = "classdef Point\n\
+                      events (ListenAccess=private)\n\
+                      Changed\n\
+                      end\n\
+                      methods\n\
+                      function out = demo(obj)\n\
+                      out = 1;\n\
+                      end\n\
+                      end\n\
+                      end\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        let messages = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("`events` blocks are not supported")));
+        assert!(messages.iter().any(|message| {
+            message.contains("`events` block attribute `ListenAccess` is not supported")
+        }));
+
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.method_blocks.len(), 1);
+        assert_eq!(class_def.method_blocks[0].methods.len(), 1);
+        assert_eq!(class_def.method_blocks[0].methods[0].name.name, "demo");
+    }
+
+    #[test]
+    fn unsupported_enumeration_blocks_do_not_break_later_methods_blocks() {
+        let source = "classdef Point\n\
+                      enumeration (Hidden=true)\n\
+                      Red(1)\n\
+                      end\n\
+                      methods (Static)\n\
+                      function out = demo()\n\
+                      out = 1;\n\
+                      end\n\
+                      end\n\
+                      end\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        let messages = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("`enumeration` blocks are not supported")));
+        assert!(messages.iter().any(|message| {
+            message.contains("`enumeration` block attribute `Hidden` is not supported")
+        }));
+
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.method_blocks.len(), 1);
+        assert!(class_def.method_blocks[0].is_static);
+        assert_eq!(class_def.method_blocks[0].methods.len(), 1);
+        assert_eq!(class_def.method_blocks[0].methods[0].name.name, "demo");
+    }
+
+    #[test]
+    fn unsupported_top_level_class_statements_do_not_break_later_methods_blocks() {
+        let source = "classdef Point\n\
+                      value = 1;\n\
+                      methods\n\
+                      function out = demo(obj)\n\
+                      out = 1;\n\
+                      end\n\
+                      end\n\
+                      end\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        assert!(parsed.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("top-level executable statements are not supported in class definitions")
+        }));
+
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.method_blocks.len(), 1);
+        assert_eq!(class_def.method_blocks[0].methods.len(), 1);
+        assert_eq!(class_def.method_blocks[0].methods[0].name.name, "demo");
+    }
+
+    #[test]
+    fn unsupported_property_validation_syntax_does_not_break_later_members() {
+        let source = "classdef Point\n\
+                      properties\n\
+                      x (1,1) double\n\
+                      y {mustBeNumeric}\n\
+                      z = 3;\n\
+                      end\n\
+                      methods\n\
+                      function out = demo(obj)\n\
+                      out = obj.z;\n\
+                      end\n\
+                      end\n\
+                      end\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        let validation_errors = parsed
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.message.contains(
+                    "property validation, size/type constraints, and trailing declaration syntax are not supported",
+                )
+            })
+            .count();
+        assert_eq!(validation_errors, 2);
+
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.property_blocks.len(), 1);
+        assert_eq!(class_def.property_blocks[0].properties.len(), 3);
+        assert_eq!(class_def.property_blocks[0].properties[0].name.name, "x");
+        assert_eq!(class_def.property_blocks[0].properties[1].name.name, "y");
+        assert_eq!(class_def.property_blocks[0].properties[2].name.name, "z");
+        assert_eq!(class_def.method_blocks.len(), 1);
+        assert_eq!(class_def.method_blocks[0].methods.len(), 1);
+        assert_eq!(class_def.method_blocks[0].methods[0].name.name, "demo");
+    }
+
+    #[test]
+    fn unsupported_signature_only_method_declarations_do_not_break_later_methods() {
+        let source = "classdef Point\n\
+                      methods (Abstract)\n\
+                      result = build(obj, x)\n\
+                      end\n\
+                      methods\n\
+                      function out = demo(obj)\n\
+                      out = 1;\n\
+                      end\n\
+                      end\n\
+                      end\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        let messages = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| {
+            message.contains("method block attribute `Abstract` is not supported")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.contains(
+                "methods blocks currently support only full `function ... end` method definitions",
+            )
+        }));
+
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.method_blocks.len(), 2);
+        assert_eq!(class_def.method_blocks[0].methods.len(), 0);
+        assert_eq!(class_def.method_blocks[1].methods.len(), 1);
+        assert_eq!(class_def.method_blocks[1].methods[0].name.name, "demo");
+    }
+
+    #[test]
+    fn static_false_attribute_does_not_mark_method_block_static() {
+        let source = "classdef Point\n\
+                      methods (Static=false, Access=private)\n\
+                      function out = demo(obj)\n\
+                      out = 1;\n\
+                      end\n\
+                      end\n\
+                      end\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(parsed.has_errors(), "expected parse diagnostics");
+        assert!(parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("`Static=true` is the only supported explicit Static form")));
+
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Class(class_def) = &unit.items[0] else {
+            panic!("expected class item");
+        };
+        assert_eq!(class_def.method_blocks.len(), 1);
+        assert!(!class_def.method_blocks[0].is_static);
+        assert_eq!(class_def.method_blocks[0].access, ClassMemberAccess::Private);
+        assert_eq!(class_def.method_blocks[0].methods.len(), 1);
+        assert_eq!(class_def.method_blocks[0].methods[0].name.name, "demo");
     }
 }

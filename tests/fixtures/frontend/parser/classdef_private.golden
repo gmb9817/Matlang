@@ -1,0 +1,17 @@
+unit ClassFile
+class Vault
+  properties (Access=private)
+    property secret = number(41)
+  end_properties
+  methods
+    function reveal(obj) -> [out]
+      assign [out] = field(obj, secret)
+  end_methods
+  methods (Access=private)
+    function hidden(obj) -> [out]
+      assign [out] = binary(Add, field(obj, secret), number(1))
+  end_methods
+  methods (Static, Access=private)
+    function code() -> [out]
+      assign [out] = number(7)
+  end_methods

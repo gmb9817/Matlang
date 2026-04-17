@@ -69,9 +69,14 @@ fn render_class(class: &HirClass, depth: usize, out: &mut String) {
         out,
         depth,
         format!(
-            "class {} package={:?} handle={} constructor={:?} source_path={:?}",
+            "class {} package={:?} superclass={:?} superclass_path={:?} handle={} constructor={:?} source_path={:?}",
             class.name,
             class.package,
+            class.superclass_name,
+            class.superclass_path
+                .as_ref()
+                .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+                .map(|name| name.to_string()),
             class.inherits_handle,
             class.constructor,
             class.source_path
@@ -99,6 +104,46 @@ fn render_class(class: &HirClass, depth: usize, out: &mut String) {
             out,
             depth + 1,
             format!("inline_methods [{}]", class.inline_methods.join(", ")),
+        );
+    }
+    if !class.static_inline_methods.is_empty() {
+        push_line(
+            out,
+            depth + 1,
+            format!(
+                "static_inline_methods [{}]",
+                class.static_inline_methods.join(", ")
+            ),
+        );
+    }
+    if !class.private_properties.is_empty() {
+        push_line(
+            out,
+            depth + 1,
+            format!(
+                "private_properties [{}]",
+                class.private_properties.join(", ")
+            ),
+        );
+    }
+    if !class.private_inline_methods.is_empty() {
+        push_line(
+            out,
+            depth + 1,
+            format!(
+                "private_inline_methods [{}]",
+                class.private_inline_methods.join(", ")
+            ),
+        );
+    }
+    if !class.private_static_inline_methods.is_empty() {
+        push_line(
+            out,
+            depth + 1,
+            format!(
+                "private_static_inline_methods [{}]",
+                class.private_static_inline_methods.join(", ")
+            ),
         );
     }
     if !class.external_methods.is_empty() {
@@ -278,9 +323,14 @@ fn render_expression(expression: &HirExpression) -> String {
                 .collect::<Vec<_>>()
                 .join(" ; ")
         ),
-        HirExpression::FunctionHandle(reference) => {
-            format!("handle({})", render_callable_ref(reference))
-        }
+        HirExpression::FunctionHandle(target) => match target {
+            crate::hir::HirFunctionHandleTarget::Callable(reference) => {
+                format!("handle({})", render_callable_ref(reference))
+            }
+            crate::hir::HirFunctionHandleTarget::Expression(expression) => {
+                format!("handle_expr({})", render_expression(expression))
+            }
+        },
         HirExpression::EndKeyword => "end".to_string(),
         HirExpression::Unary { op, rhs } => {
             format!("unary({op:?}, {})", render_expression(rhs))

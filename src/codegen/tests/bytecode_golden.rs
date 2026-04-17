@@ -97,14 +97,21 @@ fn try_catch_fixture_matches_golden() {
 }
 
 #[test]
+fn handle_receivers_fixture_matches_golden() {
+    assert_fixture("handle_receivers_codegen");
+}
+
+#[test]
 fn verifier_reports_invalid_jump_target() {
     let module = BytecodeModule {
         backend: BackendKind::Bytecode,
         unit_kind: "Script".to_string(),
         entry: "<script>".to_string(),
+        classes: Vec::new(),
         functions: vec![BytecodeFunction {
             name: "<script>".to_string(),
             role: "script_entry".to_string(),
+            owner_class_name: None,
             params: Vec::new(),
             outputs: Vec::new(),
             captures: Vec::new(),

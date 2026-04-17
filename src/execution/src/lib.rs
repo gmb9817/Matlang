@@ -23,25 +23,28 @@ use graphics::{
     figure_close_request_callback, figure_resize_callback_snapshot,
     invoke_graphics_builtin_outputs, rendered_figures, select_current_figure_handle, GraphicsState,
 };
+use matlab_codegen::BytecodeModule;
 use matlab_frontend::ast::CompilationUnitKind;
 use matlab_frontend::{
     parser::{parse_source, ParseMode},
     source::SourceFileId,
 };
 use matlab_interop::{
-    read_mat_file, read_workspace_snapshot, write_mat_file, write_workspace_snapshot,
+    read_mat_file, read_workspace_snapshot, read_workspace_snapshot_with_modules, write_mat_file,
+    write_workspace_snapshot_with_modules, WorkspaceSnapshotBundleModule,
 };
 use matlab_ir::{
     lower_to_hir, HirAnonymousFunction, HirAssignmentTarget, HirBinding, HirCallTarget,
     HirCallableRef, HirConditionalBranch, HirExpression, HirFunction, HirIndexArgument, HirItem,
     HirModule, HirStatement, HirSwitchCase,
 };
-use matlab_resolver::ResolverContext;
+use matlab_platform::{decode_bytecode_module, encode_bytecode_module, PackagedBytecodeModule};
+use matlab_resolver::{resolve_class_definition, ResolverContext};
 use matlab_runtime::{
-    render_named_value, render_value, render_workspace, ArrayStorageClass, CellValue,
-    ComplexValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue, ObjectClassMetadata,
-    ObjectStorageKind, ObjectValue, RuntimeError, RuntimeStackFrame, StructValue, Value,
-    Workspace,
+    qualified_object_class_name, render_named_value, render_value, render_workspace,
+    ArrayStorageClass, CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue,
+    MatrixValue, ObjectClassMetadata, ObjectMethodTarget, ObjectStorageKind, ObjectValue,
+    RuntimeError, RuntimeStackFrame, StructValue, Value, Workspace,
 };
 use matlab_semantics::{
     analyze_compilation_unit_with_context,
@@ -53,6 +56,10 @@ use matlab_stdlib::{
 };
 
 type Cell = Rc<RefCell<Option<Value>>>;
+
+thread_local! {
+    static CLASS_ACCESS_CONTEXT: RefCell<Vec<Option<String>>> = RefCell::new(Vec::new());
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -67,7 +74,14 @@ pub struct ExecutionResult {
     pub workspace: Workspace,
     pub displayed_outputs: Vec<DisplayedOutput>,
     pub figures: Vec<RenderedFigure>,
+    bundle_modules: Vec<PackagedBytecodeModule>,
     display_format: DisplayFormatState,
+}
+
+impl ExecutionResult {
+    pub fn bundle_modules(&self) -> &[PackagedBytecodeModule] {
+        &self.bundle_modules
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -215,6 +229,7 @@ struct SelectorPlan {
 struct Frame<'a> {
     cells: HashMap<BindingId, Cell>,
     names: BTreeMap<String, BindingId>,
+    declared_names: BTreeMap<String, BindingId>,
     global_names: BTreeSet<String>,
     persistent_names: BTreeSet<String>,
     visible_functions: BTreeMap<String, &'a HirFunction>,
@@ -224,6 +239,9 @@ struct Frame<'a> {
 struct SharedRuntimeState {
     globals: HashMap<String, Cell>,
     persistents: HashMap<PersistentKey, Cell>,
+    bundled_modules: HashMap<PathBuf, BytecodeModule>,
+    bundled_modules_by_id: HashMap<String, BytecodeModule>,
+    bundled_module_source_paths: HashMap<String, String>,
     last_warning: Option<WarningState>,
     last_tic_seconds: Option<f64>,
     next_dynamic_binding_id: u32,
@@ -245,6 +263,9 @@ impl Default for SharedRuntimeState {
         Self {
             globals: HashMap::new(),
             persistents: HashMap::new(),
+            bundled_modules: HashMap::new(),
+            bundled_modules_by_id: HashMap::new(),
+            bundled_module_source_paths: HashMap::new(),
             last_warning: None,
             last_tic_seconds: None,
             next_dynamic_binding_id: 1_000_000,
@@ -261,6 +282,177 @@ impl Default for SharedRuntimeState {
             figure_backend: figure_backend_from_env(),
         }
     }
+}
+
+fn install_bundled_modules(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    modules: &[PackagedBytecodeModule],
+) {
+    if modules.is_empty() {
+        return;
+    }
+    let mut state = shared_state.borrow_mut();
+    for module in modules {
+        let path = PathBuf::from(&module.source_path);
+        state
+            .bundled_modules
+            .insert(path, module.module.clone());
+        state
+            .bundled_modules_by_id
+            .insert(module.module_id.clone(), module.module.clone());
+        state
+            .bundled_module_source_paths
+            .insert(module.module_id.clone(), module.source_path.clone());
+    }
+}
+
+fn bundled_module_registries(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+) -> (
+    Rc<HashMap<PathBuf, BytecodeModule>>,
+    Rc<HashMap<String, BytecodeModule>>,
+) {
+    let state = shared_state.borrow();
+    (
+        Rc::new(state.bundled_modules.clone()),
+        Rc::new(state.bundled_modules_by_id.clone()),
+    )
+}
+
+fn snapshot_bundle_modules(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+) -> Vec<PackagedBytecodeModule> {
+    let state = shared_state.borrow();
+    let mut module_ids = state
+        .bundled_modules_by_id
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    module_ids.sort();
+    module_ids
+        .into_iter()
+        .filter_map(|module_id| {
+            let module = state.bundled_modules_by_id.get(&module_id)?.clone();
+            let source_path = state
+                .bundled_module_source_paths
+                .get(&module_id)
+                .cloned()
+                .unwrap_or_default();
+            Some(PackagedBytecodeModule {
+                module_id,
+                source_path,
+                module,
+            })
+        })
+        .collect()
+}
+
+fn encode_snapshot_bundle_modules(
+    modules: &[PackagedBytecodeModule],
+) -> Vec<WorkspaceSnapshotBundleModule> {
+    modules
+        .iter()
+        .map(|module| WorkspaceSnapshotBundleModule {
+            module_id: module.module_id.clone(),
+            source_path: module.source_path.clone(),
+            encoded_module: encode_bytecode_module(&module.module),
+        })
+        .collect()
+}
+
+fn decode_snapshot_bundle_modules(
+    modules: &[WorkspaceSnapshotBundleModule],
+) -> Result<Vec<PackagedBytecodeModule>, RuntimeError> {
+    modules
+        .iter()
+        .map(|module| {
+            decode_bytecode_module(&module.encoded_module)
+                .map(|decoded| PackagedBytecodeModule {
+                    module_id: module.module_id.clone(),
+                    source_path: module.source_path.clone(),
+                    module: decoded,
+                })
+                .map_err(|error| {
+                    RuntimeError::Unsupported(format!(
+                        "failed to decode embedded bundle module `{}` from workspace snapshot: {error}",
+                        module.module_id
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn object_method_target_is_bundle_backed(
+    target: &ObjectMethodTarget,
+    state: &SharedRuntimeState,
+) -> bool {
+    match target {
+        ObjectMethodTarget::BundleModule(_) => true,
+        ObjectMethodTarget::Path(path) => state.bundled_modules.contains_key(path),
+    }
+}
+
+fn function_handle_target_is_bundle_backed(
+    target: &FunctionHandleTarget,
+    state: &SharedRuntimeState,
+) -> bool {
+    match target {
+        FunctionHandleTarget::BundleModule(_) => true,
+        FunctionHandleTarget::ResolvedPath(path) => state.bundled_modules.contains_key(path),
+        FunctionHandleTarget::BoundMethod { receiver, .. } => {
+            value_contains_bundle_backed_modules(receiver, state)
+        }
+        FunctionHandleTarget::Named(_) => false,
+    }
+}
+
+fn value_contains_bundle_backed_modules(value: &Value, state: &SharedRuntimeState) -> bool {
+    match value {
+        Value::FunctionHandle(handle) => function_handle_target_is_bundle_backed(&handle.target, state),
+        Value::Object(object) => {
+            object
+                .class
+                .module_target
+                .as_ref()
+                .is_some_and(|target| object_method_target_is_bundle_backed(target, state))
+                || object
+                    .class
+                    .source_path
+                    .as_ref()
+                    .is_some_and(|path| state.bundled_modules.contains_key(path))
+                || object
+                    .class
+                    .external_methods
+                    .values()
+                    .any(|target| object_method_target_is_bundle_backed(target, state))
+                || object
+                    .properties()
+                    .fields
+                    .values()
+                    .any(|value| value_contains_bundle_backed_modules(value, state))
+        }
+        Value::Matrix(matrix) => matrix
+            .iter()
+            .any(|value| value_contains_bundle_backed_modules(value, state)),
+        Value::Cell(cell) => cell
+            .iter()
+            .any(|value| value_contains_bundle_backed_modules(value, state)),
+        Value::Struct(struct_value) => struct_value
+            .fields
+            .values()
+            .any(|value| value_contains_bundle_backed_modules(value, state)),
+        _ => false,
+    }
+}
+
+fn workspace_contains_bundle_backed_modules(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    workspace: &Workspace,
+) -> bool {
+    let state = shared_state.borrow();
+    workspace
+        .values()
+        .any(|value| value_contains_bundle_backed_modules(value, &state))
 }
 
 #[derive(Debug, Clone)]
@@ -365,16 +557,202 @@ fn object_has_method(object: &ObjectValue, method_name: &str) -> bool {
         || object.class.external_methods.contains_key(method_name)
 }
 
-fn bound_method_value(object: &ObjectValue, method_name: &str) -> Value {
+fn object_array_class_metadata(matrix: &MatrixValue) -> Option<ObjectClassMetadata> {
+    let Value::Object(first_object) = matrix.elements.first()? else {
+        return None;
+    };
+    matrix
+        .iter()
+        .all(|value| {
+            matches!(
+                value,
+                Value::Object(object)
+                    if object
+                        .class
+                        .qualified_name()
+                        .eq_ignore_ascii_case(&first_object.class.qualified_name())
+            )
+        })
+        .then(|| first_object.class.clone())
+}
+
+fn receiver_class_metadata(value: &Value) -> Option<ObjectClassMetadata> {
+    match value {
+        Value::Object(object) => Some(object.class.clone()),
+        Value::Matrix(matrix) => object_array_class_metadata(matrix),
+        _ => None,
+    }
+}
+
+fn value_has_object_method(value: &Value, method_name: &str) -> bool {
+    receiver_class_metadata(value).is_some_and(|class| {
+        class.inline_methods.contains(method_name)
+            || class.external_methods.contains_key(method_name)
+    })
+}
+
+fn field_resolves_to_object_method(value: &Value, field: &str) -> bool {
+    match value {
+        Value::Object(object) => object.property_value(field).is_none() && object_has_method(object, field),
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            let Value::Object(first_object) = &matrix.elements[0] else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            first_object.property_value(field).is_none() && value_has_object_method(value, field)
+        }
+        _ => false,
+    }
+}
+
+fn push_class_access_context(class_name: Option<String>) {
+    CLASS_ACCESS_CONTEXT.with(|stack| stack.borrow_mut().push(class_name));
+}
+
+fn pop_class_access_context() {
+    CLASS_ACCESS_CONTEXT.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+}
+
+fn current_class_access_context() -> Option<String> {
+    CLASS_ACCESS_CONTEXT.with(|stack| stack.borrow().last().cloned().flatten())
+}
+
+fn private_property_access_allowed(class: &ObjectClassMetadata, property: &str) -> bool {
+    class.private_property_owner(property).is_none_or(|owner| {
+        current_class_access_context()
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(&owner))
+    })
+}
+
+fn private_instance_method_access_allowed(class: &ObjectClassMetadata, method: &str) -> bool {
+    class.private_instance_method_owner(method).is_none_or(|owner| {
+        current_class_access_context()
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(&owner))
+    })
+}
+
+fn private_static_method_access_allowed(
+    qualified_class_name: &str,
+    private_methods: &BTreeSet<String>,
+    method: &str,
+) -> bool {
+    !private_methods.contains(method)
+        || current_class_access_context()
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(qualified_class_name))
+}
+
+fn class_has_static_method(class: &matlab_ir::HirClass, method_name: &str) -> bool {
+    class.static_inline_methods.iter().any(|name| name == method_name)
+}
+
+fn private_property_owner_name(class: &ObjectClassMetadata, property: &str) -> String {
+    class
+        .private_property_owner(property)
+        .unwrap_or_else(|| class.qualified_name())
+}
+
+fn private_instance_method_owner_name(class: &ObjectClassMetadata, method: &str) -> String {
+    class
+        .private_instance_method_owner(method)
+        .unwrap_or_else(|| class.qualified_name())
+}
+
+fn resolved_path_static_method_name<'a>(path: &Path, display_name: &'a str) -> Option<&'a str> {
+    let (_, method_name) = display_name.rsplit_once('.')?;
+    let class_name = path.file_stem()?.to_str()?;
+    (class_name != method_name).then_some(method_name)
+}
+
+fn is_missing_static_method_error(error: &RuntimeError, method_name: &str) -> bool {
+    matches!(
+        error,
+        RuntimeError::MissingVariable(message)
+            if message.contains(&format!("static method `{method_name}` is not defined"))
+    )
+}
+
+fn resolve_superclass_path(source_path: &Path, superclass_name: &str) -> Result<PathBuf, RuntimeError> {
+    let context =
+        ResolverContext::from_source_file(source_path.to_path_buf()).with_env_search_roots("MATC_PATH");
+    resolve_class_definition(superclass_name, &context)
+        .map(|resolved| resolved.path)
+        .ok_or_else(|| {
+            RuntimeError::MissingVariable(format!(
+                "superclass `{superclass_name}` is not available from `{}`",
+                source_path.display()
+            ))
+        })
+}
+
+fn object_matches_declaring_class_or_subclass(
+    object: &ObjectValue,
+    declaring_class_name: &str,
+) -> bool {
+    object
+        .class
+        .qualified_name()
+        .eq_ignore_ascii_case(declaring_class_name)
+        || object
+            .class
+            .ancestor_class_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(declaring_class_name))
+}
+
+fn super_constructor_matches_declaring_class(
+    object: &ObjectValue,
+    declaring_class_name: &str,
+    declaring_superclass_name: Option<&str>,
+    target_class_name: &str,
+) -> bool {
+    object_matches_declaring_class_or_subclass(object, declaring_class_name)
+        && declaring_superclass_name
+            .is_some_and(|name| name.eq_ignore_ascii_case(target_class_name))
+}
+
+fn bound_method_value(receiver: &Value, method_name: &str) -> Value {
+    let class = receiver_class_metadata(receiver).expect("bound method receiver class metadata");
     Value::FunctionHandle(FunctionHandleValue {
-        display_name: format!("@{}.{}", object.class.class_name, method_name),
+        display_name: format!("{}.{}", class.qualified_name(), method_name),
         target: FunctionHandleTarget::BoundMethod {
-            class_name: object.class.class_name.clone(),
-            package: object.class.package.clone(),
+            class_name: class.class_name,
+            package: class.package,
             method_name: method_name.to_string(),
-            receiver: Box::new(Value::Object(object.clone())),
+            receiver: Box::new(receiver.clone()),
         },
     })
+}
+
+fn resolve_dotted_receiver_from_root(
+    mut receiver: Value,
+    segments_after_root: &[&str],
+) -> Result<Value, RuntimeError> {
+    for field in segments_after_root {
+        receiver = read_field_value(&receiver, field)?;
+    }
+    Ok(receiver)
+}
+
+fn try_build_bound_method_handle_from_dotted_name(
+    receiver: Value,
+    segments: &[&str],
+) -> Result<Option<Value>, RuntimeError> {
+    if segments.len() < 2 {
+        return Ok(None);
+    }
+
+    let current = resolve_dotted_receiver_from_root(receiver, &segments[1..segments.len() - 1])?;
+
+    let method_name = segments[segments.len() - 1];
+    if value_has_object_method(&current, method_name) {
+        Ok(Some(bound_method_value(&current, method_name)))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn execute_script(module: &HirModule) -> Result<ExecutionResult, RuntimeError> {
@@ -1280,7 +1658,7 @@ fn invoke_clearvars_builtin_outputs(
 
 fn invoke_save_builtin_outputs(
     frame: &mut Frame<'_>,
-    _shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
@@ -1352,23 +1730,57 @@ fn invoke_save_builtin_outputs(
         }
         filtered
     };
-    let merged = if spec.append && spec.path.exists() {
-        let mut existing = if workspace_snapshot_extension(&spec.path) {
-            read_workspace_snapshot(&spec.path)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+    let (merged, snapshot_bundle_modules) = if spec.append && spec.path.exists() {
+        let (mut existing, mut existing_bundle_modules) = if workspace_snapshot_extension(&spec.path) {
+            let snapshot = read_workspace_snapshot_with_modules(&spec.path)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            (
+                snapshot.workspace,
+                decode_snapshot_bundle_modules(&snapshot.bundle_modules)?,
+            )
         } else {
-            read_mat_file(&spec.path)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+            (
+                read_mat_file(&spec.path)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                Vec::new(),
+            )
         };
         for (name, value) in selected {
             existing.insert(name, value);
         }
-        existing
+        if workspace_snapshot_extension(&spec.path)
+            && workspace_contains_bundle_backed_modules(shared_state, &existing)
+        {
+            let mut merged_bundle_modules = existing_bundle_modules
+                .drain(..)
+                .map(|module| (module.module_id.clone(), module))
+                .collect::<BTreeMap<_, _>>();
+            for module in snapshot_bundle_modules(shared_state) {
+                merged_bundle_modules.insert(module.module_id.clone(), module);
+            }
+            (
+                existing,
+                merged_bundle_modules.into_values().collect::<Vec<_>>(),
+            )
+        } else {
+            (existing, existing_bundle_modules)
+        }
     } else {
-        selected
+        let bundle_modules = if workspace_snapshot_extension(&spec.path)
+            && workspace_contains_bundle_backed_modules(shared_state, &selected)
+        {
+            snapshot_bundle_modules(shared_state)
+        } else {
+            Vec::new()
+        };
+        (selected, bundle_modules)
     };
     if workspace_snapshot_extension(&spec.path) {
-        write_workspace_snapshot(&spec.path, &merged)
+        write_workspace_snapshot_with_modules(
+            &spec.path,
+            &merged,
+            &encode_snapshot_bundle_modules(&snapshot_bundle_modules),
+        )
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     } else {
         write_mat_file(&spec.path, &merged)
@@ -1385,8 +1797,10 @@ fn invoke_load_builtin_outputs(
 ) -> Result<Vec<Value>, RuntimeError> {
     let spec = parse_load_arguments(args)?;
     let mut workspace = if workspace_snapshot_extension(&spec.path) {
-        read_workspace_snapshot(&spec.path)
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+        let snapshot = read_workspace_snapshot_with_modules(&spec.path)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        install_bundled_modules(shared_state, &decode_snapshot_bundle_modules(&snapshot.bundle_modules)?);
+        snapshot.workspace
     } else {
         read_mat_file(&spec.path).map_err(|error| RuntimeError::Unsupported(error.to_string()))?
     };
@@ -1781,27 +2195,32 @@ fn matlab_class_name(value: &Value) -> String {
         Value::Logical(_) => "logical".to_string(),
         Value::CharArray(_) => "char".to_string(),
         Value::String(_) => "string".to_string(),
-        Value::Matrix(matrix) => matrix_class_name(matrix).to_string(),
+        Value::Matrix(matrix) => matrix_class_name(matrix),
         Value::Cell(_) => "cell".to_string(),
         Value::Struct(_) => "struct".to_string(),
-        Value::Object(object) => object.class.class_name.clone(),
+        Value::Object(object) => object.class.qualified_name(),
         Value::FunctionHandle(_) => "function_handle".to_string(),
     }
 }
 
-fn matrix_class_name(matrix: &MatrixValue) -> &'static str {
+fn matrix_class_name(matrix: &MatrixValue) -> String {
     match matrix.storage_class() {
-        ArrayStorageClass::Logical => "logical",
-        ArrayStorageClass::String => "string",
+        ArrayStorageClass::Logical => "logical".to_string(),
+        ArrayStorageClass::String => "string".to_string(),
         _ => {
             let Some(first) = matrix.elements().first() else {
-                return "double";
+                return "double".to_string();
             };
             match first {
                 Value::Struct(_) if matrix.iter().all(|value| matches!(value, Value::Struct(_))) => {
-                    "struct"
+                    "struct".to_string()
                 }
-                _ => "double",
+                Value::Object(_) if object_array_class_metadata(matrix).is_some() => {
+                    object_array_class_metadata(matrix)
+                        .expect("guard ensured homogeneous object array")
+                        .qualified_name()
+                }
+                _ => "double".to_string(),
             }
         }
     }
@@ -3554,7 +3973,7 @@ fn render_value_with_format(value: &Value, format: DisplayFormatState) -> String
         }
         Value::Object(object) => format!(
             "{} with properties {{{}}}",
-            object.class.class_name,
+            object.class.qualified_name(),
             object
                 .properties()
                 .ordered_entries()
@@ -4113,6 +4532,7 @@ impl<'a> Interpreter<'a> {
                 workspace: frame.export_workspace()?,
                 displayed_outputs: take_displayed_outputs(&this.shared_state),
                 figures: rendered_figures(&this.shared_state.borrow().graphics),
+                bundle_modules: snapshot_bundle_modules(&this.shared_state),
                 display_format: current_display_format(&this.shared_state),
             })
         })
@@ -4128,6 +4548,7 @@ impl<'a> Interpreter<'a> {
             workspace,
             displayed_outputs: take_displayed_outputs(&self.shared_state),
             figures: rendered_figures(&self.shared_state.borrow().graphics),
+            bundle_modules: snapshot_bundle_modules(&self.shared_state),
             display_format: current_display_format(&self.shared_state),
         })
     }
@@ -4176,7 +4597,8 @@ impl<'a> Interpreter<'a> {
         prebound_outputs: &[(String, Value)],
     ) -> Result<Vec<Value>, RuntimeError> {
         let stack_frame = self.make_stack_frame(function.name.clone());
-        self.with_stack_frame(stack_frame, |this| {
+        push_class_access_context(function.owner_class_name.clone());
+        let result = self.with_stack_frame(stack_frame, |this| {
             if args.len() != function.inputs.len() {
                 return Err(RuntimeError::Unsupported(format!(
                     "function `{}` expects {} input(s), got {}",
@@ -4230,7 +4652,9 @@ impl<'a> Interpreter<'a> {
                 .iter()
                 .map(|binding| frame.read_binding(binding))
                 .collect()
-        })
+        });
+        pop_class_access_context();
+        result
     }
 
     fn find_module_function<'b>(
@@ -4260,33 +4684,113 @@ impl<'a> Interpreter<'a> {
         let mut frame = Frame::new(evaluator.module_functions.clone());
         let mut fields = BTreeMap::new();
         let mut field_order = Vec::new();
+        let mut ancestor_class_names = BTreeSet::new();
+        let mut storage_kind = if class.inherits_handle {
+            ObjectStorageKind::Handle
+        } else {
+            ObjectStorageKind::Value
+        };
+        let module_target = class
+            .source_path
+            .clone()
+            .map(ObjectMethodTarget::Path);
+        let mut external_methods = BTreeMap::new();
+        let mut private_property_owners = BTreeMap::new();
+        let mut private_instance_method_owners = BTreeMap::new();
+
+        if let Some(superclass_name) = &class.superclass_name {
+            if !superclass_name.eq_ignore_ascii_case("handle") {
+                let source_path = class.source_path.as_ref().ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "class `{}` does not record a source path for superclass resolution",
+                        class.name
+                    ))
+                })?;
+                let superclass_path = resolve_superclass_path(source_path, superclass_name)?;
+                let loaded_super = load_class_module_from_path(&superclass_path)?;
+                let Value::Object(parent_object) = self.build_default_object_from_class(
+                    &loaded_super.module,
+                    &loaded_super.class,
+                    loaded_super.source_path.display().to_string(),
+                )?
+                else {
+                    unreachable!("class default construction should yield an object value");
+                };
+                let parent_properties = parent_object.properties();
+                field_order = parent_properties.field_names().to_vec();
+                fields = parent_properties.fields.clone();
+                ancestor_class_names = parent_object.class.ancestor_class_names.clone();
+                ancestor_class_names.insert(parent_object.class.qualified_name());
+                private_property_owners = parent_object.class.private_property_owners.clone();
+                private_instance_method_owners =
+                    parent_object.class.private_instance_method_owners.clone();
+                if parent_object.class.storage_kind == ObjectStorageKind::Handle {
+                    storage_kind = ObjectStorageKind::Handle;
+                }
+                if let Some(parent_target) = parent_object.class.module_target.clone() {
+                    for method in &parent_object.class.inline_methods {
+                        external_methods
+                            .entry(method.clone())
+                            .or_insert(parent_target.clone());
+                    }
+                }
+                for (name, target) in &parent_object.class.external_methods {
+                    external_methods
+                        .entry(name.clone())
+                        .or_insert(target.clone());
+                }
+            }
+        }
+
         for property in &class.properties {
             let value = if let Some(default) = &property.default {
                 evaluator.evaluate_expression(&mut frame, default)?
             } else {
                 empty_matrix_value()
             };
-            field_order.push(property.name.clone());
+            if !field_order.iter().any(|name| name == &property.name) {
+                field_order.push(property.name.clone());
+            }
             fields.insert(property.name.clone(), value);
         }
         let inline_methods = class.inline_methods.iter().cloned().collect::<BTreeSet<_>>();
+        let qualified_class_name =
+            qualified_object_class_name(&class.name, class.package.as_deref());
+        for property in &class.private_properties {
+            private_property_owners.insert(property.clone(), qualified_class_name.clone());
+        }
+        for method in &class.private_inline_methods {
+            private_instance_method_owners.insert(method.clone(), qualified_class_name.clone());
+        }
         Ok(Value::Object(ObjectValue::new(
             ObjectClassMetadata {
                 class_name: class.name.clone(),
                 package: class.package.clone(),
-                storage_kind: if class.inherits_handle {
-                    ObjectStorageKind::Handle
-                } else {
-                    ObjectStorageKind::Value
-                },
+                superclass_name: class.superclass_name.clone(),
+                ancestor_class_names,
+                storage_kind,
                 source_path: class.source_path.clone(),
+                module_target: module_target.clone(),
                 property_order: field_order.clone(),
+                private_properties: class.private_properties.iter().cloned().collect(),
+                private_property_owners,
                 inline_methods,
-                external_methods: class
-                    .external_methods
+                private_inline_methods: class.private_inline_methods.iter().cloned().collect(),
+                private_instance_method_owners,
+                private_static_inline_methods: class
+                    .private_static_inline_methods
                     .iter()
-                    .map(|method| (method.name.clone(), method.path.clone()))
+                    .cloned()
                     .collect(),
+                external_methods: {
+                    for method in &class.external_methods {
+                        external_methods.insert(
+                            method.name.clone(),
+                            ObjectMethodTarget::Path(method.path.clone()),
+                        );
+                    }
+                    external_methods
+                },
                 constructor: class.constructor.clone(),
             },
             StructValue::with_field_order(fields, field_order),
@@ -4336,28 +4840,333 @@ impl<'a> Interpreter<'a> {
         Ok(vec![default_object])
     }
 
-    fn invoke_object_method_outputs(
+    fn construct_loaded_class_with_existing_object(
         &mut self,
-        object: &ObjectValue,
+        loaded: &LoadedClassModule,
+        args: &[Value],
+        existing_object: Value,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if let Some(constructor_name) = &loaded.class.constructor {
+            let constructor = self.find_module_function(&loaded.module, constructor_name).ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "constructor `{constructor_name}` is not available in class `{}`",
+                    loaded.class.name
+                ))
+            })?;
+            let prebound_outputs = constructor
+                .outputs
+                .first()
+                .map(|binding| vec![(binding.name.clone(), existing_object.clone())])
+                .unwrap_or_default();
+            let mut interpreter = Interpreter::with_shared_state(
+                &loaded.module,
+                loaded.source_path.display().to_string(),
+                Rc::clone(&self.shared_state),
+                self.call_stack.clone(),
+            );
+            let mut values = interpreter.invoke_function_with_prebound_outputs(
+                constructor,
+                args,
+                None,
+                &prebound_outputs,
+            )?;
+            if values.is_empty() {
+                values.push(existing_object);
+            }
+            return Ok(values);
+        }
+        Ok(vec![existing_object])
+    }
+
+    fn try_construct_superclass_into_existing_object(
+        &mut self,
+        frame: &Frame<'a>,
+        path: &Path,
+        args: &[Value],
+    ) -> Result<Option<Vec<Value>>, RuntimeError> {
+        let current_obj = match frame.read_reference(None, "obj") {
+            Ok(value) => value,
+            Err(RuntimeError::MissingVariable(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Value::Object(object) = &current_obj else {
+            return Ok(None);
+        };
+        let Some(current_class) = self.module.classes.first() else {
+            return Ok(None);
+        };
+        let loaded = load_class_module_from_path(path)?;
+        let qualified_superclass =
+            qualified_object_class_name(&loaded.class.name, loaded.class.package.as_deref());
+        let current_class_name =
+            qualified_object_class_name(&current_class.name, current_class.package.as_deref());
+        let matches_super = super_constructor_matches_declaring_class(
+            object,
+            &current_class_name,
+            current_class.superclass_name.as_deref(),
+            &qualified_superclass,
+        );
+        if !matches_super {
+            return Ok(None);
+        }
+        self.construct_loaded_class_with_existing_object(&loaded, args, current_obj)
+            .map(Some)
+    }
+
+    fn construct_object_value_from_path(&mut self, path: &Path) -> Result<Value, RuntimeError> {
+        let value = self
+            .construct_class_from_path(path, &[])?
+            .into_iter()
+            .next()
+            .unwrap_or_else(empty_matrix_value);
+        if matches!(value, Value::Object(_)) {
+            Ok(value)
+        } else {
+            Err(RuntimeError::TypeError(format!(
+                "default construction for class `{}` did not produce an object value, found {}",
+                path.display(),
+                value.kind_name()
+            )))
+        }
+    }
+
+    fn construct_default_object_from_metadata(
+        &mut self,
+        class: &ObjectClassMetadata,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(ObjectMethodTarget::Path(path)) = class.module_target.as_ref() {
+            let (bundled_modules, bundled_modules_by_id) =
+                bundled_module_registries(&self.shared_state);
+            if bundled_modules.contains_key(path) {
+                return bytecode::construct_bundle_object_value_from_path_registry(
+                    path,
+                    bundled_modules,
+                    bundled_modules_by_id,
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                );
+            }
+            return self.construct_object_value_from_path(path);
+        }
+        if let Some(path) = class.source_path.as_ref() {
+            let (bundled_modules, bundled_modules_by_id) =
+                bundled_module_registries(&self.shared_state);
+            if bundled_modules.contains_key(path) {
+                return bytecode::construct_bundle_object_value_from_path_registry(
+                    path,
+                    bundled_modules,
+                    bundled_modules_by_id,
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                );
+            }
+            if path.exists() {
+                return self.construct_object_value_from_path(path);
+            }
+        }
+        if let Some(ObjectMethodTarget::BundleModule(module_id)) = class.module_target.as_ref() {
+            let (bundled_modules, bundled_modules_by_id) =
+                bundled_module_registries(&self.shared_state);
+            return bytecode::construct_bundle_object_value_from_registry(
+                module_id,
+                bundled_modules,
+                bundled_modules_by_id,
+                Rc::clone(&self.shared_state),
+                self.call_stack.clone(),
+            );
+        }
+        Err(RuntimeError::Unsupported(format!(
+            "class `{}` does not record a usable source path for default object construction",
+            class.qualified_name()
+        )))
+    }
+
+    fn assign_object_matrix_index(
+        &mut self,
+        matrix: MatrixValue,
+        args: &[EvaluatedIndexArgument],
+        value: Value,
+        class: ObjectClassMetadata,
+    ) -> Result<MatrixValue, RuntimeError> {
+        if is_empty_matrix_value(&value) {
+            return delete_matrix_index(matrix, args);
+        }
+
+        let expected_class_name = class.qualified_name();
+        let plan = matrix_assignment_plan(&matrix, args)?;
+        let mut matrix = resize_object_matrix_to_dims_with(matrix, &plan.target_dims, || {
+            self.construct_default_object_from_metadata(&class)
+                .map_err(|error| object_array_fill_error(&class, error))
+        })?;
+        let values = matrix_assignment_values(&value, &plan.selection)?;
+        validate_object_assignment_values(&values, &expected_class_name)?;
+        for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
+            matrix.elements_mut()[position] = value;
+        }
+        Ok(matrix)
+    }
+
+    fn apply_index_update(
+        &mut self,
+        current: Value,
+        indices: &[EvaluatedIndexArgument],
+        value: Value,
+        kind: IndexAssignmentKind,
+    ) -> Result<Value, RuntimeError> {
+        match (kind, current) {
+            (IndexAssignmentKind::Paren, Value::Object(object)) => {
+                let matrix = MatrixValue::new(1, 1, vec![Value::Object(object)])
+                    .expect("single object matrix is valid");
+                let class = object_array_class_metadata(&matrix)
+                    .expect("single object matrix should be homogeneous");
+                let updated = self.assign_object_matrix_index(matrix, indices, value, class)?;
+                if updated.rows == 1
+                    && updated.cols == 1
+                    && matches!(updated.elements.first(), Some(Value::Object(_)))
+                {
+                    Ok(updated.elements.into_iter().next().expect("single object element"))
+                } else {
+                    Ok(Value::Matrix(updated))
+                }
+            }
+            (IndexAssignmentKind::Paren, Value::Matrix(matrix)) => {
+                if let Some(class) = object_assignment_target_class(&matrix, &value)? {
+                    Ok(Value::Matrix(
+                        self.assign_object_matrix_index(matrix, indices, value, class)?,
+                    ))
+                } else {
+                    apply_index_update(
+                        Value::Matrix(matrix),
+                        indices,
+                        value,
+                        IndexAssignmentKind::Paren,
+                    )
+                }
+            }
+            (kind, current) => apply_index_update(current, indices, value, kind),
+        }
+    }
+
+    fn invoke_static_class_method_from_path(
+        &mut self,
+        path: &Path,
         method_name: &str,
         args: &[Value],
     ) -> Result<Vec<Value>, RuntimeError> {
-        if object.class.inline_methods.contains(method_name) {
-            let source_path = object.class.source_path.as_ref().ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "class `{}` does not record its source path for inline method dispatch",
-                    object.class.class_name
-                ))
-            })?;
+        let loaded = load_class_module_from_path(path)?;
+        if !class_has_static_method(&loaded.class, method_name) {
+            if let Some(superclass_name) = &loaded.class.superclass_name {
+                if !superclass_name.eq_ignore_ascii_case("handle") {
+                    let superclass_path =
+                        resolve_superclass_path(&loaded.source_path, superclass_name)?;
+                    return self.invoke_static_class_method_from_path(
+                        &superclass_path,
+                        method_name,
+                        args,
+                    );
+                }
+            }
+            return Err(RuntimeError::MissingVariable(format!(
+                "static method `{method_name}` is not defined for class `{}`",
+                loaded.class.name
+            )));
+        }
+        let private_static = loaded
+            .class
+            .private_static_inline_methods
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let qualified_class_name =
+            qualified_object_class_name(&loaded.class.name, loaded.class.package.as_deref());
+        if !private_static_method_access_allowed(
+            &qualified_class_name,
+            &private_static,
+            method_name,
+        ) {
+            return Err(RuntimeError::MissingVariable(format!(
+                "static method `{method_name}` has private access for class `{}`",
+                qualified_class_name
+            )));
+        }
+        let method = self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "static method `{method_name}` is not available in class `{}`",
+                loaded.class.name
+            ))
+        })?;
+        let mut interpreter = Interpreter::with_shared_state(
+            &loaded.module,
+            loaded.source_path.display().to_string(),
+            Rc::clone(&self.shared_state),
+            self.call_stack.clone(),
+        );
+        interpreter.invoke_function(method, args, None)
+    }
+
+    fn invoke_object_method_outputs(
+        &mut self,
+        receiver: &Value,
+        method_name: &str,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let class = receiver_class_metadata(receiver).ok_or_else(|| {
+            RuntimeError::TypeError(format!(
+                "object method dispatch expects an object receiver, found {}",
+                receiver.kind_name()
+            ))
+        })?;
+
+        if class.inline_methods.contains(method_name) {
+            if !private_instance_method_access_allowed(&class, method_name) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "method `{method_name}` has private access for class `{}`",
+                    private_instance_method_owner_name(&class, method_name)
+                )));
+            }
+            let source_path = match class.module_target.as_ref() {
+                Some(ObjectMethodTarget::Path(path)) => path,
+                Some(ObjectMethodTarget::BundleModule(module_id)) => {
+                    let (bundled_modules, bundled_modules_by_id) =
+                        bundled_module_registries(&self.shared_state);
+                    return bytecode::invoke_bundle_object_method_outputs_from_registry(
+                        receiver,
+                        method_name,
+                        args,
+                        bundled_modules,
+                        bundled_modules_by_id,
+                        Rc::clone(&self.shared_state),
+                        self.call_stack.clone(),
+                    )
+                    .map_err(|error| {
+                        if matches!(error, RuntimeError::Unsupported(_))
+                            && !error.to_string().contains(module_id.as_str())
+                        {
+                            RuntimeError::Unsupported(format!(
+                                "inline method `{method_name}` for class `{}` could not execute from bundled runtime metadata ({module_id}): {error}",
+                                class.class_name
+                            ))
+                        } else {
+                            error
+                        }
+                    });
+                }
+                None => class.source_path.as_ref().ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "class `{}` does not record its source path for inline method dispatch",
+                        class.class_name
+                    ))
+                })?,
+            };
             let loaded = load_class_module_from_path(source_path)?;
             let method = self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
                 RuntimeError::Unsupported(format!(
                     "inline method `{method_name}` is not available in class `{}`",
-                    object.class.class_name
+                    class.class_name
                 ))
             })?;
             let mut method_args = Vec::with_capacity(args.len() + 1);
-            method_args.push(Value::Object(object.clone()));
+            method_args.push(receiver.clone());
             method_args.extend(args.iter().cloned());
             let mut interpreter = Interpreter::with_shared_state(
                 &loaded.module,
@@ -4368,17 +5177,50 @@ impl<'a> Interpreter<'a> {
             return interpreter.invoke_function(method, &method_args, None);
         }
 
-        let path = object
-            .class
+        let target = class
             .external_methods
             .get(method_name)
             .ok_or_else(|| {
                 RuntimeError::MissingVariable(format!(
                     "object method `{method_name}` is not defined for class `{}`",
-                    object.class.class_name
+                    class.class_name
                 ))
             })?
             .clone();
+        if !private_instance_method_access_allowed(&class, method_name) {
+            return Err(RuntimeError::MissingVariable(format!(
+                "method `{method_name}` has private access for class `{}`",
+                private_instance_method_owner_name(&class, method_name)
+            )));
+        }
+        let path = match target {
+            ObjectMethodTarget::Path(path) => path,
+            ObjectMethodTarget::BundleModule(module_id) => {
+                let (bundled_modules, bundled_modules_by_id) =
+                    bundled_module_registries(&self.shared_state);
+                return bytecode::invoke_bundle_object_method_outputs_from_registry(
+                    receiver,
+                    method_name,
+                    args,
+                    bundled_modules,
+                    bundled_modules_by_id,
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                )
+                .map_err(|error| {
+                    if matches!(error, RuntimeError::Unsupported(_))
+                        && !error.to_string().contains(module_id.as_str())
+                    {
+                        RuntimeError::Unsupported(format!(
+                            "object method `{method_name}` for class `{}` could not execute from bundled runtime metadata ({module_id}): {error}",
+                            class.class_name
+                        ))
+                    } else {
+                        error
+                    }
+                });
+            }
+        };
         let source = fs::read_to_string(&path).map_err(|error| {
             RuntimeError::Unsupported(format!(
                 "failed to read external method `{}`: {error}",
@@ -4410,8 +5252,18 @@ impl<'a> Interpreter<'a> {
             )));
         }
         let hir = lower_to_hir(&unit, &analysis);
+        let method = if unit.kind == CompilationUnitKind::ClassFile {
+            Some(self.find_module_function(&hir, method_name).ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "method `{method_name}` is not available in class module `{}`",
+                    path.display()
+                ))
+            })?)
+        } else {
+            None
+        };
         let mut method_args = Vec::with_capacity(args.len() + 1);
-        method_args.push(Value::Object(object.clone()));
+        method_args.push(receiver.clone());
         method_args.extend(args.iter().cloned());
         let mut interpreter = Interpreter::with_shared_state(
             &hir,
@@ -4419,9 +5271,13 @@ impl<'a> Interpreter<'a> {
             Rc::clone(&self.shared_state),
             self.call_stack.clone(),
         );
-        interpreter.invoke_primary_function(&method_args).map(|values| {
-            values.into_iter().map(|(_, value)| value).collect()
-        })
+        if unit.kind == CompilationUnitKind::ClassFile {
+            interpreter.invoke_function(method.expect("class-file method lookup"), &method_args, None)
+        } else {
+            interpreter.invoke_primary_function(&method_args).map(|values| {
+                values.into_iter().map(|(_, value)| value).collect()
+            })
+        }
     }
 
     fn invoke_anonymous(
@@ -4430,7 +5286,9 @@ impl<'a> Interpreter<'a> {
         args: &[Value],
     ) -> Result<Value, RuntimeError> {
         let stack_frame = self.make_stack_frame("@anonymous");
-        self.with_stack_frame(stack_frame, |this| {
+        let inherited_class_context = current_class_access_context();
+        push_class_access_context(inherited_class_context);
+        let result = self.with_stack_frame(stack_frame, |this| {
             if args.len() != closure.function.params.len() {
                 return Err(RuntimeError::Unsupported(format!(
                     "anonymous function expects {} input(s), got {}",
@@ -4448,7 +5306,9 @@ impl<'a> Interpreter<'a> {
             }
 
             this.evaluate_expression(&mut frame, &closure.function.body)
-        })
+        });
+        pop_class_access_context();
+        result
     }
 
     fn execute_statement_builtin_call(
@@ -4535,6 +5395,11 @@ impl<'a> Interpreter<'a> {
                 list_assignment,
                 display_suppressed,
             } => {
+                if let Some(method) =
+                    self.unsupported_method_result_assignment_target(frame, targets)?
+                {
+                    return Err(unsupported_method_result_assignment_error(&method));
+                }
                 if let Some(field) =
                     self.unsupported_multi_struct_field_subindex_target(frame, targets)?
                 {
@@ -6278,23 +7143,51 @@ impl<'a> Interpreter<'a> {
             }
             HirExpression::MatrixLiteral(rows) => {
                 let rows = self.evaluate_literal_rows(frame, rows)?;
-                Ok(Value::Matrix(MatrixValue::from_rows(rows)?))
+                build_matrix_literal_value(rows)
             }
             HirExpression::CellLiteral(rows) => {
                 let rows = self.evaluate_literal_rows(frame, rows)?;
                 Ok(Value::Cell(CellValue::from_rows(rows)?))
             }
-            HirExpression::FunctionHandle(reference) => {
-                Ok(Value::FunctionHandle(FunctionHandleValue {
-                    display_name: reference.name.clone(),
-                    target: match &reference.final_resolution {
-                        Some(FinalReferenceResolution::ResolvedPath { path, .. }) => {
-                            FunctionHandleTarget::ResolvedPath(path.clone())
+            HirExpression::FunctionHandle(target) => match target {
+                matlab_ir::HirFunctionHandleTarget::Callable(reference) => {
+                    if reference.name.contains('.') {
+                        let segments = reference.name.split('.').collect::<Vec<_>>();
+                        if let Some(root_name) = segments.first().copied() {
+                            match frame.read_reference(reference.binding_id, root_name) {
+                                Ok(receiver) => {
+                                    if let Some(handle) =
+                                        try_build_bound_method_handle_from_dotted_name(receiver, &segments)?
+                                    {
+                                        return Ok(handle);
+                                    }
+                                }
+                                Err(RuntimeError::MissingVariable(_)) => {}
+                                Err(error) => return Err(error),
+                            }
                         }
-                        _ => FunctionHandleTarget::Named(reference.name.clone()),
-                    },
-                }))
-            }
+                    }
+                    Ok(Value::FunctionHandle(FunctionHandleValue {
+                        display_name: reference.name.clone(),
+                        target: match &reference.final_resolution {
+                            Some(FinalReferenceResolution::ResolvedPath { path, .. }) => {
+                                FunctionHandleTarget::ResolvedPath(path.clone())
+                            }
+                            _ => FunctionHandleTarget::Named(reference.name.clone()),
+                        },
+                    }))
+                }
+                matlab_ir::HirFunctionHandleTarget::Expression(expression) => {
+                    let value = self.evaluate_expression(frame, expression)?;
+                    match value {
+                        Value::FunctionHandle(_) => Ok(value),
+                        other => Err(RuntimeError::Unsupported(format!(
+                            "function handle target expression did not evaluate to a function handle, found {}",
+                            other.kind_name()
+                        ))),
+                    }
+                }
+            },
             HirExpression::EndKeyword => Err(RuntimeError::Unsupported(
                 "`end` execution is not implemented outside indexing".to_string(),
             )),
@@ -6419,6 +7312,33 @@ impl<'a> Interpreter<'a> {
                 evaluate_cell_content_index(&target, &indices)
             }
             HirExpression::FieldAccess { target, field } => {
+                if let HirExpression::Call {
+                    target: HirCallTarget::Expression(index_target),
+                    args,
+                } = target.as_ref()
+                {
+                    if let HirExpression::FunctionHandle(
+                        matlab_ir::HirFunctionHandleTarget::Callable(reference),
+                    ) = index_target.as_ref()
+                    {
+                        let segments = reference.name.split('.').collect::<Vec<_>>();
+                        if let Some(root_name) = segments.first().copied() {
+                            match frame.read_reference(reference.binding_id, root_name) {
+                                Ok(receiver) => {
+                                    let receiver_target =
+                                        resolve_dotted_receiver_from_root(receiver, &segments[1..])?;
+                                    let evaluated =
+                                        self.evaluate_index_arguments(frame, &receiver_target, args)?;
+                                    let indexed_receiver =
+                                        evaluate_expression_call(&receiver_target, &evaluated)?;
+                                    return read_field_value(&indexed_receiver, field);
+                                }
+                                Err(RuntimeError::MissingVariable(_)) => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                }
                 let target = self.evaluate_expression(frame, target)?;
                 read_field_value(&target, field)
             }
@@ -6576,6 +7496,22 @@ impl<'a> Interpreter<'a> {
         target: &HirExpression,
         indices: &[HirIndexArgument],
     ) -> Result<Option<usize>, RuntimeError> {
+        if let HirExpression::FieldAccess { target: receiver, .. } = target {
+            match self.evaluate_expression(frame, receiver) {
+                Ok(Value::Matrix(matrix)) if matrix_is_object_array(&matrix) => {
+                    return Ok(None);
+                }
+                Ok(_) => {}
+                Err(RuntimeError::MissingVariable(_))
+                | Err(RuntimeError::InvalidIndex(_))
+                | Err(RuntimeError::TypeError(_)) => return Ok(None),
+                Err(error) if is_single_output_dot_or_brace_result_error(&error) => {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
         let target_values = match self.evaluate_expression_outputs(frame, target) {
             Ok(values) => values,
             Err(RuntimeError::MissingVariable(_))
@@ -6702,12 +7638,64 @@ impl<'a> Interpreter<'a> {
         let [HirAssignmentTarget::Field { target, .. }] = targets else {
             return Ok(None);
         };
+        match self.evaluate_expression(frame, target) {
+            Ok(Value::Matrix(matrix)) if matrix_is_object_array(&matrix) => return Ok(None),
+            Ok(_) | Err(RuntimeError::MissingVariable(_)) | Err(RuntimeError::InvalidIndex(_)) => {}
+            Err(error) if is_single_output_dot_or_brace_result_error(&error) => {}
+            Err(error) => return Err(error),
+        }
         if let Some(count) = self.list_expanded_struct_assignment_target_count(frame, target)? {
             if count > 1 {
                 return Ok(Some(count));
             }
         }
         self.undefined_explicit_struct_assignment_target_count(frame, target)
+    }
+
+    fn unsupported_method_result_assignment_target(
+        &mut self,
+        frame: &mut Frame<'a>,
+        targets: &[HirAssignmentTarget],
+    ) -> Result<Option<String>, RuntimeError> {
+        fn find_method_result<'a>(
+            interpreter: &mut Interpreter<'a>,
+            frame: &mut Frame<'a>,
+            expression: &HirExpression,
+        ) -> Result<Option<String>, RuntimeError> {
+            match expression {
+                HirExpression::Call {
+                    target: HirCallTarget::Expression(target),
+                    ..
+                } => {
+                    if let HirExpression::FieldAccess { target: receiver, field } = target.as_ref() {
+                        let receiver_value = match interpreter.evaluate_expression(frame, receiver) {
+                            Ok(value) => value,
+                            Err(RuntimeError::MissingVariable(_))
+                            | Err(RuntimeError::InvalidIndex(_))
+                            | Err(RuntimeError::TypeError(_)) => return Ok(None),
+                            Err(error) if is_single_output_dot_or_brace_result_error(&error) => {
+                                return Ok(None)
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        if field_resolves_to_object_method(&receiver_value, field) {
+                            return Ok(Some(field.clone()));
+                        }
+                    }
+                    find_method_result(interpreter, frame, target)
+                }
+                HirExpression::FieldAccess { target, .. } | HirExpression::CellIndex { target, .. } => {
+                    find_method_result(interpreter, frame, target)
+                }
+                _ => Ok(None),
+            }
+        }
+
+        let target = match targets {
+            [HirAssignmentTarget::Field { target, .. }] => target,
+            _ => return Ok(None),
+        };
+        find_method_result(self, frame, target)
     }
 
     fn unsupported_multi_struct_field_subindex_target(
@@ -6783,6 +7771,15 @@ impl<'a> Interpreter<'a> {
         argument: &HirIndexArgument,
     ) -> Result<Vec<Value>, RuntimeError> {
         match argument {
+            HirIndexArgument::Expression(expression) if expression_contains_end_keyword(expression) => {
+                Ok(vec![self.evaluate_index_expression_value(
+                    frame,
+                    &empty_matrix_value(),
+                    expression,
+                    0,
+                    1,
+                )?])
+            }
             HirIndexArgument::Expression(expression) => {
                 self.evaluate_expression_outputs(frame, expression)
             }
@@ -6985,7 +7982,7 @@ impl<'a> Interpreter<'a> {
                     position,
                     total_arguments,
                 )?;
-                Ok(Value::Matrix(MatrixValue::from_rows(rows)?))
+                build_matrix_literal_value(rows)
             }
             HirExpression::CellLiteral(rows) => {
                 let rows = self.evaluate_index_literal_rows(
@@ -7256,6 +8253,26 @@ impl<'a> Interpreter<'a> {
                 )? {
                     return Ok(updated);
                 }
+                if let Some(updated) = self.try_assign_object_array_element_field_projection(
+                    frame, &current, field, rest, &leaf,
+                )? {
+                    return Ok(updated);
+                }
+                if let Some(updated) = self.try_assign_object_array_object_field_projection(
+                    frame, &current, field, rest, &leaf,
+                )? {
+                    return Ok(updated);
+                }
+                if let Some(updated) = self.try_assign_object_array_matrix_field_projection(
+                    frame, &current, field, rest, &leaf,
+                )? {
+                    return Ok(updated);
+                }
+                if let Some(updated) = self.try_assign_object_array_cell_field_projection(
+                    frame, &current, field, rest, &leaf,
+                )? {
+                    return Ok(updated);
+                }
                 let next = read_field_lvalue_value_for_assignment(&current, field, rest, &leaf)?;
                 let updated_next = self.assign_lvalue_path(frame, next, rest, true, leaf)?;
                 assign_struct_path(current, std::slice::from_ref(field), updated_next)
@@ -7286,7 +8303,7 @@ impl<'a> Interpreter<'a> {
                     Err(error) => return Err(error),
                 };
                 let updated_next = self.assign_lvalue_path(frame, next, rest, true, leaf)?;
-                apply_index_update(
+                self.apply_index_update(
                     current,
                     &evaluated_indices,
                     updated_next,
@@ -7322,7 +8339,7 @@ impl<'a> Interpreter<'a> {
                                 value,
                             )?
                         {
-                            return apply_index_update(
+                            return self.apply_index_update(
                                 current,
                                 &evaluated_indices,
                                 updated_next,
@@ -7332,7 +8349,7 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 let updated_next = self.assign_lvalue_path(frame, next, rest, true, leaf)?;
-                apply_index_update(
+                self.apply_index_update(
                     current,
                     &evaluated_indices,
                     updated_next,
@@ -7373,7 +8390,7 @@ impl<'a> Interpreter<'a> {
                         return Ok(updated);
                     }
                 }
-                apply_index_update(current, &evaluated_indices, value, kind)
+                self.apply_index_update(current, &evaluated_indices, value, kind)
             }
         }
     }
@@ -7414,7 +8431,7 @@ impl<'a> Interpreter<'a> {
             let count = selection.positions.len();
             let chunk = rhs_values.by_ref().take(count).collect::<Vec<_>>();
             let rhs_value = pack_cell_assignment_rhs(&selection, chunk)?;
-            updated_elements.push(apply_index_update(
+            updated_elements.push(self.apply_index_update(
                 element,
                 &evaluated_indices,
                 rhs_value,
@@ -7426,6 +8443,323 @@ impl<'a> Interpreter<'a> {
             outer_cell.rows,
             outer_cell.cols,
             outer_cell.dims.clone(),
+            updated_elements,
+        )?)))
+    }
+
+    fn try_assign_object_array_matrix_field_projection(
+        &mut self,
+        frame: &mut Frame<'a>,
+        current: &Value,
+        field: &String,
+        rest: &[LValueProjection],
+        leaf: &LValueLeaf,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Matrix(object_matrix) = current else {
+            return Ok(None);
+        };
+        if !matrix_is_object_array(object_matrix) {
+            return Ok(None);
+        }
+
+        let mut property_matrices = Vec::with_capacity(object_matrix.elements.len());
+        let mut property_dims = None::<Vec<usize>>;
+        for element in &object_matrix.elements {
+            let Value::Object(object) = element else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            let Some(value) = object.property_value(field) else {
+                return Ok(None);
+            };
+            if !private_property_access_allowed(&object.class, field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "property `{field}` has private access for class `{}`",
+                    private_property_owner_name(&object.class, field)
+                )));
+            }
+            let Value::Matrix(property_matrix) = value else {
+                return Ok(None);
+            };
+            match &property_dims {
+                Some(dims) if !equivalent_dimensions(property_matrix.dims(), dims) => {
+                    return Ok(None);
+                }
+                None => property_dims = Some(property_matrix.dims().to_vec()),
+                _ => {}
+            }
+            property_matrices.push(property_matrix);
+        }
+        let Some(property_dims) = property_dims else {
+            return Ok(None);
+        };
+
+        let aggregated = Value::Matrix(concatenate_object_array_property_matrices(
+            &property_matrices,
+            object_matrix.rows,
+            object_matrix.cols,
+        )?);
+        let updated_aggregated = self.assign_lvalue_path(
+            frame,
+            aggregated,
+            rest,
+            true,
+            leaf.clone(),
+        )?;
+        let Value::Matrix(updated_matrix) = updated_aggregated else {
+            return Ok(None);
+        };
+        let reassigned =
+            split_concatenated_object_array_property_matrix(&updated_matrix, &property_dims, object_matrix.rows, object_matrix.cols)?;
+        let mut updated_elements = Vec::with_capacity(object_matrix.elements.len());
+        for (element, assigned_value) in object_matrix
+            .elements
+            .iter()
+            .cloned()
+            .zip(reassigned.into_iter())
+        {
+            updated_elements.push(assign_struct_path(
+                element,
+                std::slice::from_ref(field),
+                assigned_value,
+            )?);
+        }
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            updated_elements,
+        )?)))
+    }
+
+    fn try_assign_object_array_object_field_projection(
+        &mut self,
+        frame: &mut Frame<'a>,
+        current: &Value,
+        field: &String,
+        rest: &[LValueProjection],
+        leaf: &LValueLeaf,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Matrix(object_matrix) = current else {
+            return Ok(None);
+        };
+        if !matrix_is_object_array(object_matrix) {
+            return Ok(None);
+        }
+
+        let mut property_objects = Vec::with_capacity(object_matrix.elements.len());
+        for element in &object_matrix.elements {
+            let Value::Object(object) = element else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            let Some(value) = object.property_value(field) else {
+                return Ok(None);
+            };
+            if !private_property_access_allowed(&object.class, field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "property `{field}` has private access for class `{}`",
+                    private_property_owner_name(&object.class, field)
+                )));
+            }
+            let Value::Object(property_object) = value else {
+                return Ok(None);
+            };
+            property_objects.push(Value::Object(property_object));
+        }
+
+        let aggregated = Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            property_objects,
+        )?);
+        let updated_aggregated =
+            self.assign_lvalue_path(frame, aggregated, rest, true, leaf.clone())?;
+        let Value::Matrix(updated_matrix) = updated_aggregated else {
+            return Ok(None);
+        };
+        if updated_matrix.element_count() != object_matrix.element_count()
+            || !equivalent_dimensions(updated_matrix.dims(), &object_matrix.dims)
+        {
+            return Err(RuntimeError::ShapeError(format!(
+                "object-valued property assignment expects shape {:?}, found {:?}",
+                object_matrix.dims, updated_matrix.dims()
+            )));
+        }
+        if !matrix_is_object_array(&updated_matrix) {
+            return Err(RuntimeError::TypeError(
+                "object-valued property assignment must preserve object values".to_string(),
+            ));
+        }
+
+        let mut updated_elements = Vec::with_capacity(object_matrix.elements.len());
+        for (element, assigned_value) in object_matrix
+            .elements
+            .iter()
+            .cloned()
+            .zip(updated_matrix.elements.into_iter())
+        {
+            updated_elements.push(assign_struct_path(
+                element,
+                std::slice::from_ref(field),
+                assigned_value,
+            )?);
+        }
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            updated_elements,
+        )?)))
+    }
+
+    fn try_assign_object_array_element_field_projection(
+        &mut self,
+        frame: &mut Frame<'a>,
+        current: &Value,
+        field: &String,
+        rest: &[LValueProjection],
+        leaf: &LValueLeaf,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Matrix(object_matrix) = current else {
+            return Ok(None);
+        };
+        if !matrix_is_object_array(object_matrix) {
+            return Ok(None);
+        }
+
+        let mut property_values = Vec::with_capacity(object_matrix.elements.len());
+        for element in &object_matrix.elements {
+            let Value::Object(object) = element else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            let Some(value) = object.property_value(field) else {
+                return Ok(None);
+            };
+            if !private_property_access_allowed(&object.class, field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "property `{field}` has private access for class `{}`",
+                    private_property_owner_name(&object.class, field)
+                )));
+            }
+            if matches!(value, Value::Matrix(_) | Value::Cell(_) | Value::Object(_)) {
+                return Ok(None);
+            }
+            property_values.push(value);
+        }
+
+        let aggregated = Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            property_values,
+        )?);
+        let updated_aggregated =
+            self.assign_lvalue_path(frame, aggregated, rest, true, leaf.clone())?;
+        let Value::Matrix(updated_matrix) = updated_aggregated else {
+            return Ok(None);
+        };
+        if updated_matrix.element_count() != object_matrix.element_count()
+            || !equivalent_dimensions(updated_matrix.dims(), &object_matrix.dims)
+        {
+            return Err(RuntimeError::ShapeError(format!(
+                "object-array property aggregate assignment expects shape {:?}, found {:?}",
+                object_matrix.dims, updated_matrix.dims()
+            )));
+        }
+
+        let mut updated_elements = Vec::with_capacity(object_matrix.elements.len());
+        for (element, assigned_value) in object_matrix
+            .elements
+            .iter()
+            .cloned()
+            .zip(updated_matrix.elements.into_iter())
+        {
+            updated_elements.push(assign_struct_path(
+                element,
+                std::slice::from_ref(field),
+                assigned_value,
+            )?);
+        }
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            updated_elements,
+        )?)))
+    }
+
+    fn try_assign_object_array_cell_field_projection(
+        &mut self,
+        frame: &mut Frame<'a>,
+        current: &Value,
+        field: &String,
+        rest: &[LValueProjection],
+        leaf: &LValueLeaf,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Matrix(object_matrix) = current else {
+            return Ok(None);
+        };
+        if !matrix_is_object_array(object_matrix) {
+            return Ok(None);
+        }
+
+        let mut property_cells = Vec::with_capacity(object_matrix.elements.len());
+        for element in &object_matrix.elements {
+            let Value::Object(object) = element else {
+                unreachable!("matrix_is_object_array checked every element");
+            };
+            let Some(value) = object.property_value(field) else {
+                return Ok(None);
+            };
+            if !private_property_access_allowed(&object.class, field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "property `{field}` has private access for class `{}`",
+                    private_property_owner_name(&object.class, field)
+                )));
+            }
+            let Value::Cell(property_cell) = value else {
+                return Ok(None);
+            };
+            property_cells.push(property_cell);
+        }
+
+        let aggregated = Value::Cell(CellValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
+            property_cells.into_iter().map(Value::Cell).collect::<Vec<_>>(),
+        )?);
+        let updated_aggregated =
+            self.assign_lvalue_path(frame, aggregated, rest, false, leaf.clone())?;
+        let Value::Cell(updated_cell) = updated_aggregated else {
+            return Ok(None);
+        };
+        if updated_cell.element_count() != object_matrix.element_count()
+            || !equivalent_dimensions(updated_cell.dims(), &object_matrix.dims)
+        {
+            return Err(RuntimeError::ShapeError(format!(
+                "cell-valued object property assignment expects shape {:?}, found {:?}",
+                object_matrix.dims, updated_cell.dims()
+            )));
+        }
+
+        let mut updated_elements = Vec::with_capacity(object_matrix.elements.len());
+        for (element, assigned_value) in object_matrix
+            .elements
+            .iter()
+            .cloned()
+            .zip(updated_cell.elements().iter().cloned())
+        {
+            updated_elements.push(assign_struct_path(
+                element,
+                std::slice::from_ref(field),
+                assigned_value,
+            )?);
+        }
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            object_matrix.rows,
+            object_matrix.cols,
+            object_matrix.dims.clone(),
             updated_elements,
         )?)))
     }
@@ -7457,6 +8791,10 @@ impl<'a> Interpreter<'a> {
                             requested_outputs.unwrap_or(1),
                         );
                     }
+                    if value_has_object_method(&receiver, field) {
+                        let evaluated_args = self.evaluate_function_arguments(frame, args)?;
+                        return self.invoke_object_method_outputs(&receiver, field, &evaluated_args);
+                    }
                 }
             }
         }
@@ -7473,6 +8811,20 @@ impl<'a> Interpreter<'a> {
                 self.call_callable_reference_outputs(frame, reference, &args, requested_outputs)
             }
             HirCallTarget::Expression(target) => {
+                if !expression_supports_list_expansion(target) {
+                    match self.evaluate_expression(frame, target) {
+                        Ok(target_value) => {
+                            return self.call_runtime_value_outputs(
+                                frame,
+                                &target_value,
+                                args,
+                                requested_outputs,
+                            );
+                        }
+                        Err(error) if is_single_output_dot_or_brace_result_error(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 let targets = self.evaluate_expression_outputs(frame, target)?;
                 let mut outputs = Vec::new();
                 for target in targets {
@@ -7610,15 +8962,51 @@ impl<'a> Interpreter<'a> {
                     unreachable!("guard ensured resolved path final resolution");
                 };
                 if path_resolution_is_class(*kind) {
+                    if let Some((_, method_name)) = reference.name.rsplit_once('.') {
+                        let is_static = path
+                            .file_stem()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|class_name| class_name != method_name);
+                        if is_static {
+                            return self.invoke_static_class_method_from_path(
+                                path,
+                                method_name,
+                                args,
+                            );
+                        }
+                    }
+                    if reference.super_constructor {
+                        if let Some(values) =
+                            self.try_construct_superclass_into_existing_object(frame, path, args)?
+                        {
+                            return Ok(values);
+                        }
+                    }
                     self.construct_class_from_path(path, args)
                 } else {
                     self.load_and_invoke_external_function(path, args)
                 }
             }
             _ => {
-                if let Some(Value::Object(object)) = args.first() {
-                    if object_has_method(object, &reference.name) {
-                        return self.invoke_object_method_outputs(object, &reference.name, &args[1..]);
+                let (bundled_modules, bundled_modules_by_id) =
+                    bundled_module_registries(&self.shared_state);
+                if let Some(values) = bytecode::invoke_bundle_named_callable_from_registry(
+                    &reference.name,
+                    args,
+                    bundled_modules,
+                    bundled_modules_by_id,
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                )? {
+                    return Ok(values);
+                }
+                if let Some(receiver) = args.first() {
+                    if value_has_object_method(receiver, &reference.name) {
+                        return self.invoke_object_method_outputs(
+                            receiver,
+                            &reference.name,
+                            &args[1..],
+                        );
                     }
                 }
                 invoke_runtime_builtin_outputs(
@@ -8233,39 +9621,104 @@ impl<'a> Interpreter<'a> {
                                 requested_outputs.unwrap_or(1),
                             );
                         }
-                        invoke_runtime_builtin_outputs(
+                        match invoke_runtime_builtin_outputs(
                             &self.shared_state,
                             Some(frame),
                             name,
                             args,
                             requested_outputs.unwrap_or(1),
-                        ).map_err(
-                            |_| {
-                                RuntimeError::Unsupported(format!(
-                                "function handle `{}` is not executable in the current interpreter",
-                                handle.display_name
-                            ))
-                            },
-                        )
+                        ) {
+                            Ok(values) => Ok(values),
+                            Err(RuntimeError::Unsupported(_)) => {
+                                let (bundled_modules, bundled_modules_by_id) =
+                                    bundled_module_registries(&self.shared_state);
+                                if let Some(values) =
+                                    bytecode::invoke_bundle_named_callable_from_registry(
+                                        name,
+                                        args,
+                                        bundled_modules,
+                                        bundled_modules_by_id,
+                                        Rc::clone(&self.shared_state),
+                                        self.call_stack.clone(),
+                                    )?
+                                {
+                                    return Ok(values);
+                                }
+                                if let Some(receiver) = args.first() {
+                                    if value_has_object_method(receiver, name) {
+                                        return self.invoke_object_method_outputs(
+                                            receiver,
+                                            name,
+                                            &args[1..],
+                                        );
+                                    }
+                                }
+                                Err(RuntimeError::Unsupported(format!(
+                                    "function handle `{}` is not executable in the current interpreter",
+                                    handle.display_name
+                                )))
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
                 }
                 FunctionHandleTarget::ResolvedPath(path) => {
-                    self.load_and_invoke_external_function(path, args)
+                    if let Some(method_name) =
+                        resolved_path_static_method_name(path, &handle.display_name)
+                    {
+                        match self.invoke_static_class_method_from_path(path, method_name, args) {
+                            Ok(values) => Ok(values),
+                            Err(error) if is_missing_static_method_error(&error, method_name) => {
+                                if let Some(receiver) = args.first() {
+                                    if value_has_object_method(receiver, method_name) {
+                                        return self.invoke_object_method_outputs(
+                                            receiver,
+                                            method_name,
+                                            &args[1..],
+                                        );
+                                    }
+                                }
+                                Err(RuntimeError::Unsupported(format!(
+                                    "class-qualified instance method handle `{}` expects an object receiver as the first argument",
+                                    handle.display_name
+                                )))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        self.load_and_invoke_external_function(path, args)
+                    }
                 }
-                FunctionHandleTarget::BundleModule(module_id) => Err(RuntimeError::Unsupported(
-                    format!(
-                        "bundle-backed function handle `{}` ({module_id}) is only executable in the bytecode VM",
-                        handle.display_name
-                    ),
-                )),
+                FunctionHandleTarget::BundleModule(module_id) => {
+                    let (bundled_modules, bundled_modules_by_id) =
+                        bundled_module_registries(&self.shared_state);
+                    match bytecode::invoke_bundle_function_handle_outputs_from_registry(
+                        handle,
+                        args,
+                        requested_outputs.unwrap_or(1),
+                        bundled_modules,
+                        bundled_modules_by_id,
+                        Rc::clone(&self.shared_state),
+                        self.call_stack.clone(),
+                    ) {
+                        Ok(values) => Ok(values),
+                        Err(RuntimeError::Unsupported(error)) => Err(RuntimeError::Unsupported(
+                            format!(
+                                "bundle-backed function handle `{}` could not execute from bundled runtime metadata ({module_id}): {error}",
+                                handle.display_name
+                            ),
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
                 FunctionHandleTarget::BoundMethod { receiver, method_name, .. } => {
-                    let Value::Object(object) = receiver.as_ref() else {
+                    if !matches!(receiver.as_ref(), Value::Object(_) | Value::Matrix(_)) {
                         return Err(RuntimeError::Unsupported(format!(
                             "bound method handle `{}` does not carry an object receiver",
                             handle.display_name
                         )));
-                    };
-                    self.invoke_object_method_outputs(object, method_name, args)
+                    }
+                    self.invoke_object_method_outputs(receiver.as_ref(), method_name, args)
                 }
             },
             _ => Err(RuntimeError::Unsupported(format!(
@@ -8325,6 +9778,9 @@ impl<'a> Interpreter<'a> {
         }
 
         let hir = lower_to_hir(&unit, &analysis);
+        if unit.kind == CompilationUnitKind::ClassFile {
+            return self.construct_class_from_path(path, args);
+        }
         let mut interpreter = Interpreter::with_shared_state(
             &hir,
             path.display().to_string(),
@@ -8363,6 +9819,7 @@ impl<'a> Frame<'a> {
         Self {
             cells: HashMap::new(),
             names: BTreeMap::new(),
+            declared_names: BTreeMap::new(),
             global_names: BTreeSet::new(),
             persistent_names: BTreeSet::new(),
             visible_functions,
@@ -8376,6 +9833,7 @@ impl<'a> Frame<'a> {
                 binding.name
             ))
         })?;
+        self.declared_names.insert(binding.name.clone(), binding_id);
         self.names.insert(binding.name.clone(), binding_id);
         self.cells
             .entry(binding_id)
@@ -8468,6 +9926,16 @@ impl<'a> Frame<'a> {
         name: String,
         value: Value,
     ) {
+        if let Some(binding_id) = self.declared_names.get(&name).copied() {
+            let cell = self
+                .cells
+                .entry(binding_id)
+                .or_insert_with(|| Rc::new(RefCell::new(None)))
+                .clone();
+            *cell.borrow_mut() = Some(value);
+            self.names.insert(name, binding_id);
+            return;
+        }
         if let Some(binding_id) = self.names.get(&name).copied() {
             if let Some(cell) = self.cells.get(&binding_id) {
                 *cell.borrow_mut() = Some(value);
@@ -8528,6 +9996,14 @@ impl<'a> Frame<'a> {
 
     fn ensure_reference_cell(&mut self, binding_id: Option<BindingId>, name: &str) -> Option<Cell> {
         if let Some(binding_id) = binding_id {
+            if let Some(existing_binding_id) = self.names.get(name).copied() {
+                if let Some(cell) = self.cells.get(&existing_binding_id).cloned() {
+                    if existing_binding_id != binding_id {
+                        self.cells.insert(binding_id, cell.clone());
+                    }
+                    return Some(cell);
+                }
+            }
             self.names.entry(name.to_string()).or_insert(binding_id);
             return Some(
                 self.cells
@@ -9046,10 +10522,11 @@ fn transpose_value(value: &Value, conjugate: bool) -> Result<Value, RuntimeError
             }
             .conjugate_if(conjugate),
         )),
+        Value::Object(object) => Ok(Value::Object(object.clone())),
         Value::Matrix(matrix) => transpose_matrix_value(matrix, conjugate),
         Value::Cell(cell) => transpose_cell_value(cell),
         other => Err(RuntimeError::TypeError(format!(
-            "transpose expects scalar, logical, complex, matrix, or cell input, found {}",
+            "transpose expects scalar, logical, complex, object, matrix, or cell input, found {}",
             other.kind_name()
         ))),
     }
@@ -9705,9 +11182,11 @@ fn evaluate_expression_call(
                 .expect("single struct matrix is valid"),
             args,
         ),
-        Value::Object(_) => Err(RuntimeError::Unsupported(
-            "expression-call execution is not defined for object values".to_string(),
-        )),
+        Value::Object(object) => read_matrix_selection(
+            &MatrixValue::new(1, 1, vec![Value::Object(object.clone())])
+                .expect("single object matrix is valid"),
+            args,
+        ),
         _ => Err(RuntimeError::Unsupported(format!(
             "expression-call execution is not defined for {} values",
             target.kind_name()
@@ -9725,9 +11204,10 @@ fn end_index_extent(
         Value::Matrix(matrix) => (matrix.dims().to_vec(), "matrix"),
         Value::Cell(cell) => (cell.dims().to_vec(), "cell array"),
         Value::Struct(_) => (vec![1, 1], "struct array"),
+        Value::Object(_) => (vec![1, 1], "object array"),
         _ => {
             return Err(RuntimeError::TypeError(format!(
-                "`end` indexing is only defined for matrix, char, cell, and current struct-array values in the current interpreter, found {}",
+                "`end` indexing is only defined for matrix, char, cell, object, and current struct-array values in the current interpreter, found {}",
                 target.kind_name()
             )))
         }
@@ -10642,6 +12122,162 @@ fn expand_matrix_assignment_values(
     )))
 }
 
+fn validate_object_assignment_values(
+    values: &[Value],
+    expected_class_name: &str,
+) -> Result<(), RuntimeError> {
+    for value in values {
+        match value {
+            Value::Object(object)
+                if object
+                    .class
+                    .qualified_name()
+                    .eq_ignore_ascii_case(expected_class_name) => {}
+            Value::Object(object) => {
+                return Err(RuntimeError::TypeError(format!(
+                    "object-array assignment for class `{expected_class_name}` expects rhs objects of the same class, found `{}`",
+                    object.class.qualified_name()
+                )))
+            }
+            other => {
+                return Err(RuntimeError::TypeError(format!(
+                    "object-array assignment for class `{expected_class_name}` expects object rhs values, found {}",
+                    other.kind_name()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn object_array_fill_error(class: &ObjectClassMetadata, error: RuntimeError) -> RuntimeError {
+    let rendered = error.to_string();
+    if let Some(constructor_name) = &class.constructor {
+        if rendered.contains(&format!("function `{constructor_name}` expects"))
+            && rendered.contains("got 0")
+        {
+            return RuntimeError::Unsupported(format!(
+                "growing object arrays for class `{}` requires a zero-argument constructor for intermediate elements",
+                class.qualified_name()
+            ));
+        }
+    }
+    RuntimeError::Unsupported(format!(
+        "growing object arrays for class `{}` failed while default-constructing intermediate elements: {error}",
+        class.qualified_name()
+    ))
+}
+
+fn object_assignment_target_class(
+    matrix: &MatrixValue,
+    value: &Value,
+) -> Result<Option<ObjectClassMetadata>, RuntimeError> {
+    if let Some(class) = object_array_class_metadata(matrix) {
+        return Ok(Some(class));
+    }
+    if matrix.element_count() != 0 {
+        return Ok(None);
+    }
+
+    match value {
+        Value::Object(object) => Ok(Some(object.class.clone())),
+        Value::Matrix(rhs) => {
+            if let Some(class) = object_array_class_metadata(rhs) {
+                Ok(Some(class))
+            } else if rhs.iter().all(|element| matches!(element, Value::Object(_))) {
+                Err(RuntimeError::TypeError(
+                    "object-array assignment from an empty matrix root currently expects homogeneous object rhs values"
+                        .to_string(),
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn matrix_literal_concat_compatible(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Scalar(_)
+            | Value::Complex(_)
+            | Value::Logical(_)
+            | Value::String(_)
+            | Value::Struct(_)
+            | Value::Object(_)
+            | Value::FunctionHandle(_)
+            | Value::Matrix(_)
+    )
+}
+
+fn matrix_literal_concat_operand(value: Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Matrix(_) => Ok(value),
+        Value::Scalar(_)
+        | Value::Complex(_)
+        | Value::Logical(_)
+        | Value::String(_)
+        | Value::Struct(_)
+        | Value::Object(_)
+        | Value::FunctionHandle(_) => Ok(Value::Matrix(MatrixValue::new(1, 1, vec![value])?)),
+        other => Err(RuntimeError::TypeError(format!(
+            "matrix literals currently cannot concatenate {} values as matrix blocks",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn build_matrix_literal_value(rows: Vec<Vec<Value>>) -> Result<Value, RuntimeError> {
+    if rows.is_empty() {
+        return Ok(empty_matrix_value());
+    }
+    if !rows
+        .iter()
+        .flatten()
+        .all(matrix_literal_concat_compatible)
+    {
+        return Ok(Value::Matrix(MatrixValue::from_rows(rows)?));
+    }
+
+    let mut row_values = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row_value = if row.is_empty() {
+            Value::Matrix(MatrixValue::new(1, 0, Vec::new())?)
+        } else {
+            let operands = row
+                .into_iter()
+                .map(matrix_literal_concat_operand)
+                .collect::<Result<Vec<_>, _>>()?;
+            invoke_stdlib_builtin_outputs("horzcat", &operands, 1)?
+                .into_iter()
+                .next()
+                .unwrap_or_else(empty_matrix_value)
+        };
+        if !matches!(row_value, Value::Matrix(_)) {
+            return Err(RuntimeError::TypeError(
+                "matrix literal row concatenation did not produce matrix output".to_string(),
+            ));
+        }
+        row_values.push(row_value);
+    }
+
+    if row_values.len() == 1 {
+        return Ok(row_values.into_iter().next().expect("single row value"));
+    }
+
+    let value = invoke_stdlib_builtin_outputs("vertcat", &row_values, 1)?
+        .into_iter()
+        .next()
+        .unwrap_or_else(empty_matrix_value);
+    if !matches!(value, Value::Matrix(_)) {
+        return Err(RuntimeError::TypeError(
+            "matrix literal concatenation did not produce matrix output".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
 fn char_array_assignment_values(
     value: &Value,
     selection: &IndexSelection,
@@ -11481,6 +13117,48 @@ fn resize_matrix_to_dims(matrix: MatrixValue, target_dims: &[usize], fill: Value
     }
 }
 
+fn resize_object_matrix_to_dims_with<F>(
+    matrix: MatrixValue,
+    target_dims: &[usize],
+    mut make_fill: F,
+) -> Result<MatrixValue, RuntimeError>
+where
+    F: FnMut() -> Result<Value, RuntimeError>,
+{
+    let (target_rows, target_cols) = storage_shape_from_dimensions(target_dims);
+    if equivalent_dimensions(&matrix.dims, target_dims) {
+        return Ok(MatrixValue {
+            rows: target_rows,
+            cols: target_cols,
+            dims: target_dims.to_vec(),
+            elements: matrix.elements,
+        });
+    }
+
+    let (source_dims, source_elements) =
+        resize_source_layout(&matrix.dims, &matrix.elements, target_dims);
+    let mut elements = vec![None; target_rows * target_cols];
+    for linear in 0..source_elements.len() {
+        let source_index = row_major_multi_index(linear, &source_dims);
+        let destination = row_major_linear_index(&source_index, target_dims);
+        elements[destination] = Some(source_elements[linear].clone());
+    }
+
+    let elements = elements
+        .into_iter()
+        .map(|value| match value {
+            Some(value) => Ok(value),
+            None => make_fill(),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MatrixValue {
+        rows: target_rows,
+        cols: target_cols,
+        dims: target_dims.to_vec(),
+        elements,
+    })
+}
+
 fn resize_cell_to_dims(cell: CellValue, target_dims: &[usize], fill: Value) -> CellValue {
     let (target_rows, target_cols) = storage_shape_from_dimensions(target_dims);
     if equivalent_dimensions(&cell.dims, target_dims) {
@@ -11930,14 +13608,40 @@ fn read_field_value(target: &Value, field: &str) -> Result<Value, RuntimeError> 
         }),
         Value::Object(object) => {
             if let Some(value) = object.property_value(field) {
+                if !private_property_access_allowed(&object.class, field) {
+                    return Err(RuntimeError::MissingVariable(format!(
+                        "property `{field}` has private access for class `{}`",
+                        private_property_owner_name(&object.class, field)
+                    )));
+                }
                 Ok(value)
             } else if object_has_method(object, field) {
-                Ok(bound_method_value(object, field))
+                if !private_instance_method_access_allowed(&object.class, field) {
+                    return Err(RuntimeError::MissingVariable(format!(
+                        "method `{field}` has private access for class `{}`",
+                        private_instance_method_owner_name(&object.class, field)
+                    )));
+                }
+                Ok(bound_method_value(target, field))
             } else {
                 Err(RuntimeError::MissingVariable(format!(
                     "object property or method `{field}` is not defined for class `{}`",
                     object.class.class_name
                 )))
+            }
+        }
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            if matrix.rows == 1 && matrix.cols == 1 {
+                let Value::Object(object) = &matrix.elements[0] else {
+                    unreachable!("matrix_is_object_array checked every element");
+                };
+                read_field_value(&Value::Object(object.clone()), field)
+            } else if let Some(value) = aggregate_object_array_property_value(matrix, field)? {
+                Ok(value)
+            } else if value_has_object_method(target, field) {
+                Ok(bound_method_value(target, field))
+            } else {
+                Err(single_output_dot_or_brace_result_error(matrix.elements.len()))
             }
         }
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => {
@@ -11959,6 +13663,153 @@ fn read_field_value(target: &Value, field: &str) -> Result<Value, RuntimeError> 
     }
 }
 
+fn aggregate_object_array_property_value(
+    matrix: &MatrixValue,
+    field: &str,
+) -> Result<Option<Value>, RuntimeError> {
+    let mut elements = Vec::with_capacity(matrix.elements.len());
+    let mut all_cells = true;
+    let mut all_matrices = true;
+    let mut matrix_values = Vec::with_capacity(matrix.elements.len());
+    for element in &matrix.elements {
+        let Value::Object(object) = element else {
+            unreachable!("matrix_is_object_array checked every element");
+        };
+        let Some(value) = object.property_value(field) else {
+            return Ok(None);
+        };
+        if !private_property_access_allowed(&object.class, field) {
+            return Err(RuntimeError::MissingVariable(format!(
+                "property `{field}` has private access for class `{}`",
+                private_property_owner_name(&object.class, field)
+            )));
+        }
+        all_cells &= matches!(value, Value::Cell(_));
+        if let Value::Matrix(property_matrix) = &value {
+            matrix_values.push(property_matrix.clone());
+        } else {
+            all_matrices = false;
+        }
+        elements.push(value);
+    }
+
+    if all_cells {
+        Ok(Some(Value::Cell(CellValue::with_dimensions(
+            matrix.rows,
+            matrix.cols,
+            matrix.dims.clone(),
+            elements,
+        )?)))
+    } else if all_matrices {
+        Ok(Some(Value::Matrix(concatenate_object_array_property_matrices(
+            &matrix_values,
+            matrix.rows,
+            matrix.cols,
+        )?)))
+    } else {
+        Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
+            matrix.rows,
+            matrix.cols,
+            matrix.dims.clone(),
+            elements,
+        )?)))
+    }
+}
+
+fn concatenate_object_array_property_matrices(
+    values: &[MatrixValue],
+    outer_rows: usize,
+    outer_cols: usize,
+) -> Result<MatrixValue, RuntimeError> {
+    let Some(first) = values.first() else {
+        return MatrixValue::new(0, 0, Vec::new());
+    };
+    let inner_dims = first.dims().to_vec();
+    let (inner_rows, inner_cols) = storage_shape_from_dimensions(&inner_dims);
+    if values
+        .iter()
+        .any(|value| !equivalent_dimensions(value.dims(), &inner_dims))
+    {
+        return MatrixValue::with_dimensions(
+            outer_rows,
+            outer_cols,
+            vec![outer_rows, outer_cols],
+            values
+                .iter()
+                .cloned()
+                .map(Value::Matrix)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    let result_rows = outer_rows * inner_rows;
+    let result_cols = outer_cols * inner_cols;
+    let mut elements = vec![empty_matrix_value(); result_rows * result_cols];
+    for (block_index, value) in values.iter().enumerate() {
+        let outer_row = block_index / outer_cols;
+        let outer_col = block_index % outer_cols;
+        for inner_row in 0..inner_rows {
+            for inner_col in 0..inner_cols {
+                let destination_row = outer_row * inner_rows + inner_row;
+                let destination_col = outer_col * inner_cols + inner_col;
+                let destination = destination_row * result_cols + destination_col;
+                elements[destination] = value.get(inner_row, inner_col).clone();
+            }
+        }
+    }
+    MatrixValue::new(result_rows, result_cols, elements)
+}
+
+fn split_concatenated_object_array_property_matrix(
+    value: &MatrixValue,
+    property_dims: &[usize],
+    outer_rows: usize,
+    outer_cols: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    let (inner_rows, inner_cols) = storage_shape_from_dimensions(property_dims);
+    let expected_rows = outer_rows * inner_rows;
+    let expected_cols = outer_cols * inner_cols;
+    let block_dims = if value.rows == expected_rows && value.cols == expected_cols {
+        property_dims.to_vec()
+    } else {
+        let trailing_non_singleton = property_dims.iter().skip(2).any(|dim| *dim != 1);
+        if trailing_non_singleton
+            || outer_rows == 0
+            || outer_cols == 0
+            || value.rows % outer_rows != 0
+            || value.cols % outer_cols != 0
+        {
+            return Err(RuntimeError::ShapeError(format!(
+                "matrix-valued object property assignment expects concatenated shape {}x{}, found {}x{}",
+                expected_rows, expected_cols, value.rows, value.cols
+            )));
+        }
+        vec![value.rows / outer_rows, value.cols / outer_cols]
+    };
+    let (block_rows, block_cols) = storage_shape_from_dimensions(&block_dims);
+
+    let mut blocks = Vec::with_capacity(outer_rows * outer_cols);
+    for outer_row in 0..outer_rows {
+        for outer_col in 0..outer_cols {
+            let mut elements = Vec::with_capacity(block_rows * block_cols);
+            for inner_row in 0..block_rows {
+                for inner_col in 0..block_cols {
+                    let source_row = outer_row * block_rows + inner_row;
+                    let source_col = outer_col * block_cols + inner_col;
+                    elements.push(value.get(source_row, source_col).clone());
+                }
+            }
+            blocks.push(Value::Matrix(MatrixValue::with_dimensions(
+                block_rows,
+                block_cols,
+                block_dims.clone(),
+                elements,
+            )?));
+        }
+    }
+    Ok(blocks)
+}
+
 fn read_field_outputs(target: &Value, field: &str) -> Result<Vec<Value>, RuntimeError> {
     match target {
         Value::Struct(struct_value) => {
@@ -11968,6 +13819,18 @@ fn read_field_outputs(target: &Value, field: &str) -> Result<Vec<Value>, Runtime
             Ok(vec![value])
         }
         Value::Object(object) => Ok(vec![read_field_value(&Value::Object(object.clone()), field)?]),
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            let mut values = Vec::with_capacity(matrix.elements.len());
+            for index in 1..=matrix.rows * matrix.cols {
+                let position =
+                    linear_column_major_position(index, matrix.rows, matrix.cols, "object array")?;
+                let Value::Object(object) = &matrix.elements[position] else {
+                    unreachable!("matrix_is_object_array checked every element");
+                };
+                values.push(read_field_value(&Value::Object(object.clone()), field)?);
+            }
+            Ok(values)
+        }
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => {
             let mut values = Vec::with_capacity(matrix.elements.len());
             for index in 1..=matrix.rows * matrix.cols {
@@ -12003,6 +13866,22 @@ fn read_field_outputs_from_values(
 fn read_field_lvalue_value(target: &Value, field: &str) -> Result<Value, RuntimeError> {
     match target {
         Value::Object(_) => read_field_value(target, field),
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            let mut elements = Vec::with_capacity(matrix.elements.len());
+            for element in &matrix.elements {
+                let value = match read_field_value(element, field) {
+                    Ok(value) => value,
+                    Err(error) => return Err(error),
+                };
+                elements.push(value);
+            }
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                matrix.rows,
+                matrix.cols,
+                matrix.dims.clone(),
+                elements,
+            )?))
+        }
         Value::Matrix(matrix) if matrix_is_struct_array(matrix) => {
             let mut elements = Vec::with_capacity(matrix.elements.len());
             for element in &matrix.elements {
@@ -12067,7 +13946,31 @@ fn read_field_lvalue_value_for_assignment(
     };
 
     match target {
-        Value::Object(_) => read_field_value(target, field),
+        Value::Object(_) => {
+            if !rest.is_empty() && field_resolves_to_object_method(target, field) {
+                return Err(unsupported_method_result_assignment_error(field));
+            }
+            read_field_value(target, field)
+        }
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            if !rest.is_empty() && field_resolves_to_object_method(target, field) {
+                return Err(unsupported_method_result_assignment_error(field));
+            }
+            let mut elements = Vec::with_capacity(matrix.elements.len());
+            for element in &matrix.elements {
+                let value = match read_field_value(element, field) {
+                    Ok(value) => value,
+                    Err(error) => return Err(error),
+                };
+                elements.push(value);
+            }
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                matrix.rows,
+                matrix.cols,
+                matrix.dims.clone(),
+                elements,
+            )?))
+        }
         Value::Struct(_) => match read_field_value(target, field) {
             Ok(value) => Ok(value),
             Err(RuntimeError::MissingVariable(_)) => fallback(),
@@ -12155,6 +14058,12 @@ fn assign_struct_path(target: Value, path: &[String], value: Value) -> Result<Va
                     object.class.class_name
                 )));
             }
+            if !private_property_access_allowed(&object.class, field) {
+                return Err(RuntimeError::MissingVariable(format!(
+                    "property `{field}` has private access for class `{}`",
+                    private_property_owner_name(&object.class, field)
+                )));
+            }
             let assigned = if path.len() == 1 {
                 value
             } else {
@@ -12179,6 +14088,52 @@ fn assign_struct_path(target: Value, path: &[String], value: Value) -> Result<Va
             Ok(Value::Struct(struct_value))
         }
         Value::Matrix(matrix) if matrix_is_struct_array(&matrix) => {
+            if path.len() == 1 {
+                if let Some(assigned_values) =
+                    split_concatenated_matrix_field_assignment_values(&matrix, &path[0], &value)?
+                {
+                    let mut elements = Vec::with_capacity(matrix.elements.len());
+                    for (element, assigned_value) in matrix.elements.into_iter().zip(assigned_values) {
+                        elements.push(assign_struct_path(element, path, assigned_value)?);
+                    }
+                    return Ok(Value::Matrix(MatrixValue::with_dimensions(
+                        matrix.rows,
+                        matrix.cols,
+                        matrix.dims.clone(),
+                        elements,
+                    )?));
+                }
+            }
+            let assigned_values =
+                struct_assignment_values(&value, &matrix.dims, matrix.rows, matrix.cols)?;
+            let mut elements = Vec::with_capacity(matrix.elements.len());
+            for (element, assigned_value) in matrix.elements.into_iter().zip(assigned_values) {
+                elements.push(assign_struct_path(element, path, assigned_value)?);
+            }
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                matrix.rows,
+                matrix.cols,
+                matrix.dims.clone(),
+                elements,
+            )?))
+        }
+        Value::Matrix(matrix) if matrix_is_object_array(&matrix) => {
+            if path.len() == 1 {
+                if let Some(assigned_values) =
+                    split_concatenated_matrix_field_assignment_values(&matrix, &path[0], &value)?
+                {
+                    let mut elements = Vec::with_capacity(matrix.elements.len());
+                    for (element, assigned_value) in matrix.elements.into_iter().zip(assigned_values) {
+                        elements.push(assign_struct_path(element, path, assigned_value)?);
+                    }
+                    return Ok(Value::Matrix(MatrixValue::with_dimensions(
+                        matrix.rows,
+                        matrix.cols,
+                        matrix.dims.clone(),
+                        elements,
+                    )?));
+                }
+            }
             let assigned_values =
                 struct_assignment_values(&value, &matrix.dims, matrix.rows, matrix.cols)?;
             let mut elements = Vec::with_capacity(matrix.elements.len());
@@ -12219,10 +14174,62 @@ fn assign_struct_path(target: Value, path: &[String], value: Value) -> Result<Va
     }
 }
 
+fn split_concatenated_matrix_field_assignment_values(
+    target: &MatrixValue,
+    field: &str,
+    value: &Value,
+) -> Result<Option<Vec<Value>>, RuntimeError> {
+    let Value::Matrix(rhs_matrix) = value else {
+        return Ok(None);
+    };
+
+    let mut property_dims = None::<Vec<usize>>;
+    for element in &target.elements {
+        let field_value = match element {
+            Value::Object(object) => {
+                let Some(value) = object.property_value(field) else {
+                    return Ok(None);
+                };
+                value
+            }
+            Value::Struct(struct_value) => {
+                let Some(value) = struct_value.fields.get(field).cloned() else {
+                    return Ok(None);
+                };
+                value
+            }
+            _ => return Ok(None),
+        };
+        let Value::Matrix(property_matrix) = field_value else {
+            return Ok(None);
+        };
+        match &property_dims {
+            Some(dims) if !equivalent_dimensions(property_matrix.dims(), dims) => return Ok(None),
+            None => property_dims = Some(property_matrix.dims().to_vec()),
+            _ => {}
+        }
+    }
+
+    let Some(property_dims) = property_dims else {
+        return Ok(None);
+    };
+    split_concatenated_object_array_property_matrix(
+        rhs_matrix,
+        &property_dims,
+        target.rows,
+        target.cols,
+    )
+    .map(Some)
+}
+
 fn matrix_is_struct_array(matrix: &MatrixValue) -> bool {
     matrix
         .iter()
         .all(|element| matches!(element, Value::Struct(_)))
+}
+
+fn matrix_is_object_array(matrix: &MatrixValue) -> bool {
+    object_array_class_metadata(matrix).is_some()
 }
 
 fn value_is_struct_assignment_target(value: &Value) -> bool {
@@ -12232,7 +14239,11 @@ fn value_is_struct_assignment_target(value: &Value) -> bool {
 fn nested_struct_assignment_target_count(value: &Value) -> Option<usize> {
     match value {
         Value::Struct(_) | Value::Object(_) => Some(1),
-        Value::Matrix(matrix) if matrix_is_struct_array(matrix) => Some(matrix.elements.len()),
+        Value::Matrix(matrix)
+            if matrix_is_struct_array(matrix) || matrix_is_object_array(matrix) =>
+        {
+            Some(matrix.elements.len())
+        }
         Value::Cell(cell) => {
             let mut total = 0;
             for element in &cell.elements {
@@ -12506,6 +14517,12 @@ fn unsupported_simple_csl_assignment_error(count: usize) -> RuntimeError {
 fn unsupported_multi_struct_field_subindexing_error(field: &str) -> RuntimeError {
     RuntimeError::Unsupported(format!(
         "indexing into part of field `{field}` for multiple struct-array elements is not supported; index a single struct element first"
+    ))
+}
+
+fn unsupported_method_result_assignment_error(method: &str) -> RuntimeError {
+    RuntimeError::Unsupported(format!(
+        "assignment through method result `{method}(...)` is not supported; assign the result to a variable first"
     ))
 }
 
@@ -12805,8 +14822,21 @@ fn apply_index_update(
                 Ok(Value::Matrix(updated))
             }
         }
+        (IndexAssignmentKind::Paren, Value::Object(object)) => {
+            let matrix = MatrixValue::new(1, 1, vec![Value::Object(object)])
+                .expect("single object matrix is valid");
+            let updated = assign_matrix_index(matrix, indices, value)?;
+            if updated.rows == 1
+                && updated.cols == 1
+                && matches!(updated.elements.first(), Some(Value::Object(_)))
+            {
+                Ok(updated.elements.into_iter().next().expect("single object element"))
+            } else {
+                Ok(Value::Matrix(updated))
+            }
+        }
         (IndexAssignmentKind::Paren, other) => Err(RuntimeError::TypeError(format!(
-            "indexed assignment with `()` is only defined for matrix, char, cell, or current struct-array values in the current interpreter, found {}",
+            "indexed assignment with `()` is only defined for matrix, char, cell, object, or current struct-array values in the current interpreter, found {}",
             other.kind_name()
         ))),
         (IndexAssignmentKind::Brace, other) => Err(RuntimeError::TypeError(format!(
@@ -12869,7 +14899,7 @@ mod tests {
         consume_figure_backend_events, distributed_cell_assignment_values,
         distributed_struct_assignment_values, execute_function_file,
         execute_function_file_bytecode_module, execute_script, execute_script_bytecode,
-        execute_script_bytecode_module,
+        execute_script_bytecode_bundle, execute_script_bytecode_module,
         invoke_graphics_builtin_outputs, linearized_cell_elements, linearized_matrix_elements,
         logical_value, plan_dimension_selector, plan_linear_selector, render_execution_result,
         render_figure_backend_index, render_matlab_execution_result,
@@ -12886,15 +14916,21 @@ mod tests {
     use matlab_ir::lower_to_hir;
     use matlab_codegen::emit_bytecode;
     use matlab_optimizer::optimize_module;
+    use matlab_platform::{
+        collect_bytecode_dependency_paths, read_bytecode_artifact, rewrite_bytecode_bundle_targets,
+        write_bytecode_artifact, BytecodeBundle, PackagedBytecodeModule,
+    };
     use matlab_resolver::ResolverContext;
     use matlab_runtime::{
-        CellValue, FunctionHandleTarget, MatrixValue, RuntimeError, Value, Workspace,
+        CellValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue, ObjectStorage,
+        RuntimeError, Value, Workspace,
     };
     use matlab_semantics::analyze_compilation_unit_with_context;
     use std::{
         collections::BTreeSet,
         fs,
         path::PathBuf,
+        rc::Rc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -12992,6 +15028,160 @@ mod tests {
 
     fn execute_path_bytecode(path: &std::path::Path, args: &[Value]) -> super::ExecutionResult {
         execute_path_bytecode_result(path, args).expect("execute bytecode source path")
+    }
+
+    fn compile_bytecode_module(path: &std::path::Path) -> matlab_codegen::BytecodeModule {
+        let source = fs::read_to_string(path).expect("read source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("compilation unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(path.to_path_buf()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        emit_bytecode(&optimized.module)
+    }
+
+    fn compile_bytecode_bundle(path: &std::path::Path) -> BytecodeBundle {
+        let root_bytecode = compile_bytecode_module(path);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let bytecode = compile_bytecode_module(&next_path);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        BytecodeBundle {
+            root_source_path: path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        }
+    }
+
+    fn write_private_access_class(path: &std::path::Path) {
+        fs::write(
+            path,
+            "classdef Vault\n\
+             properties (Access=private)\n\
+             secret = 41;\n\
+             end\n\
+             methods\n\
+             function out = reveal(obj)\n\
+             out = obj.secret + 1;\n\
+             end\n\
+             function out = callHidden(obj)\n\
+             out = obj.hidden() + 1;\n\
+             end\n\
+             end\n\
+             methods (Access=private)\n\
+             function out = hidden(obj)\n\
+             out = obj.secret;\n\
+             end\n\
+             end\n\
+             methods (Static)\n\
+             function out = callCode()\n\
+             out = Vault.code();\n\
+             end\n\
+             end\n\
+             methods (Static, Access=private)\n\
+             function out = code()\n\
+             out = 7;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write private-access class");
+    }
+
+    fn write_inherited_private_access_classes(base_path: &std::path::Path, child_path: &std::path::Path) {
+        fs::write(
+            base_path,
+            "classdef Base\n\
+             properties (Access=private)\n\
+             secret = 41;\n\
+             end\n\
+             methods\n\
+             function out = reveal(obj)\n\
+             out = obj.secret;\n\
+             end\n\
+             function out = callHidden(obj)\n\
+             out = obj.hidden();\n\
+             end\n\
+             end\n\
+             methods (Access=private)\n\
+             function out = hidden(obj)\n\
+             out = obj.secret + 1;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write inherited private base class");
+        fs::write(
+            child_path,
+            "classdef Child < Base\n\
+             methods\n\
+             function out = childPeek(obj)\n\
+             out = obj.secret;\n\
+             end\n\
+             function out = childCallHidden(obj)\n\
+             out = obj.hidden();\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write inherited private child class");
+    }
+
+    fn write_handle_counter_class(path: &std::path::Path) {
+        fs::write(
+            path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             function increment(obj, delta)\n\
+             obj.value = obj.value + delta;\n\
+             end\n\
+             function out = current(obj)\n\
+             out = obj.value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write handle counter class");
     }
 
     #[test]
@@ -13147,6 +15337,28 @@ mod tests {
             result.workspace.get("y"),
             Some(&Value::CharArray("hello".to_string()))
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_without_output_allows_later_assignment_to_loaded_variables() {
+        let path = unique_temp_mat_path("load-workspace-assign");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        let source = format!(
+            "x = 1;\n\
+             save('{matlab_path}', 'x');\n\
+             clear('x');\n\
+             load('{matlab_path}');\n\
+             x = 2;\n\
+             y = x;\n"
+        );
+        let expected = "workspace\n  x = 2\n  y = 2\n";
+        let interpreted = execute_script_source(&source);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_script_source_bytecode(&source);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
         let _ = fs::remove_file(path);
     }
 
@@ -13408,6 +15620,616 @@ mod tests {
             FunctionHandleTarget::Named("sin".to_string())
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_and_load_bound_method_handle_roundtrip() {
+        let temp_dir = unique_temp_script_dir("save-load-bound-method-handle");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let path = unique_temp_mat_path("save-load-bound-method-handle");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bound handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "p = pkg.Point(5, 6);\n\
+                 f = p.total;\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.f();\n"
+            ),
+        )
+        .expect("write bound handle script");
+
+        let expected =
+            "workspace\n  out = 11\n  p = pkg.Point with properties {x=5, y=6}\n  s = struct{f=@pkg.Point.total}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn save_and_load_indexed_bound_method_handle_roundtrip() {
+        let temp_dir = unique_temp_script_dir("save-load-indexed-bound-method-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let path = unique_temp_mat_path("save-load-indexed-bound-method-handle");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write indexed bound-handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Point(1) Point(2); Point(3) Point(4)];\n\
+                 f = @objs(:,2).total;\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f', 'objs');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.f();\n"
+            ),
+        )
+        .expect("write indexed bound-handle script");
+
+        let expected = "workspace\n  out = 6\n  s = struct{f=@Point.total}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn save_and_load_method_produced_indexed_bound_method_handle_roundtrip() {
+        let temp_dir = unique_temp_script_dir("save-load-method-produced-indexed-bound-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let path = unique_temp_mat_path("save-load-method-produced-indexed-bound-handle");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function dup = duplicate(obj)\n\
+             dup = [obj obj];\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write method-produced indexed bound-handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Point(2), Point(5)];\n\
+                 f = @objs.duplicate()(3).total;\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f', 'objs');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.f();\n"
+            ),
+        )
+        .expect("write method-produced indexed bound-handle script");
+
+        let expected = "workspace\n  out = 2\n  s = struct{f=@Point.total}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn constructor_handles_support_dispatch_and_roundtrip() {
+        let temp_dir = unique_temp_script_dir("constructor-handle");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let point_path = temp_dir.join("Point.m");
+        let package_point_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let path = unique_temp_mat_path("constructor-handle");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write constructor handle class");
+        fs::write(
+            &package_point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write packaged constructor handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "f0 = @Point;\n\
+                 f1 = @pkg.Point;\n\
+                 p0 = f0(1, 2);\n\
+                 p1 = f1(3, 4);\n\
+                 save('{matlab_path}', 'f0', 'f1');\n\
+                 clear('f0', 'f1');\n\
+                 s = load('{matlab_path}');\n\
+                 q0 = s.f0(5, 6);\n\
+                 q1 = s.f1(7, 8);\n\
+                 out = [p0.total() p1.total() q0.total() q1.total()];\n"
+            ),
+        )
+        .expect("write constructor handle script");
+
+        let expected = "workspace\n  out = [3, 7, 11, 15]\n  p0 = Point with properties {x=1, y=2}\n  p1 = pkg.Point with properties {x=3, y=4}\n  q0 = Point with properties {x=5, y=6}\n  q1 = pkg.Point with properties {x=7, y=8}\n  s = struct{f0=@Point, f1=@pkg.Point}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_artifact_execution_preserves_constructor_and_bound_method_handles() {
+        let temp_dir = unique_temp_script_dir("classdef-artifact-handles");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let artifact_path = temp_dir.join("main.matbc");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write artifact class");
+        fs::write(
+            &main_path,
+            "ctor = @Point;\n\
+             p = Point(5, 6);\n\
+             bound = @p.total;\n\
+             q = ctor(1, 2);\n\
+             out = [q.total() bound()];\n",
+        )
+        .expect("write artifact script");
+
+        let bytecode = compile_bytecode_module(&main_path);
+        write_bytecode_artifact(&artifact_path, &bytecode).expect("write artifact");
+        let decoded = read_bytecode_artifact(&artifact_path).expect("read artifact");
+        let result = execute_script_bytecode_module(&decoded, artifact_path.display().to_string())
+            .expect("execute artifact");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  bound = @Point.total\n  ctor = @Point\n  out = [3, 11]\n  p = Point with properties {x=5, y=6}\n  q = Point with properties {x=1, y=2}\n"
+        );
+
+        let _ = fs::remove_file(artifact_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_artifact_execution_preserves_workspace_and_unqualified_method_handles() {
+        let temp_dir = unique_temp_script_dir("classdef-artifact-method-handles");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let artifact_path = temp_dir.join("main.matbc");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write artifact method-handle class");
+        fs::write(
+            &main_path,
+            "p = pkg.Point(5, 6);\n\
+             fb = @p.total;\n\
+             fu = @total;\n\
+             out = [fb() fu(p)];\n",
+        )
+        .expect("write artifact method-handle script");
+
+        let bytecode = compile_bytecode_module(&main_path);
+        write_bytecode_artifact(&artifact_path, &bytecode).expect("write artifact");
+        let decoded = read_bytecode_artifact(&artifact_path).expect("read artifact");
+        let result = execute_script_bytecode_module(&decoded, artifact_path.display().to_string())
+            .expect("execute artifact");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  fb = @pkg.Point.total\n  fu = @total\n  out = [11, 11]\n  p = pkg.Point with properties {x=5, y=6}\n"
+        );
+
+        let _ = fs::remove_file(artifact_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn folder_class_constructor_handles_support_dispatch() {
+        let temp_dir = unique_temp_script_dir("folder-constructor-handle");
+        let class_dir = temp_dir.join("@Counter");
+        fs::create_dir_all(&class_dir).expect("create class dir");
+        let class_path = class_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write folder constructor class");
+        fs::write(
+            &main_path,
+            "f = @Counter;\n\
+             c = f(10);\n\
+             out = c.value;\n",
+        )
+        .expect("write folder constructor handle script");
+
+        let expected =
+            "workspace\n  c = Counter with properties {value=10}\n  f = @Counter\n  out = 10\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn package_folder_class_constructor_handles_support_dispatch_and_roundtrip() {
+        let temp_dir = unique_temp_script_dir("package-folder-constructor-handle");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        fs::create_dir_all(&class_dir).expect("create package class dir");
+        let class_path = class_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let path = unique_temp_mat_path("package-folder-constructor-handle");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package folder constructor class");
+        fs::write(
+            &main_path,
+            format!(
+                "f = @pkg.Counter;\n\
+                 c = f(10);\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f');\n\
+                 s = load('{matlab_path}');\n\
+                 d = s.f(20);\n\
+                 out = [c.value d.value];\n"
+            ),
+        )
+        .expect("write package folder constructor handle script");
+
+        let expected = "workspace\n  c = pkg.Counter with properties {value=10}\n  d = pkg.Counter with properties {value=20}\n  out = [10, 20]\n  s = struct{f=@pkg.Counter}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bundle_package_folder_constructor_handles_support_dispatch_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("bundle-package-folder-constructor-handle");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        fs::create_dir_all(&class_dir).expect("create package class dir");
+        let class_path = class_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package folder constructor class");
+        fs::write(
+            &main_path,
+            "f = @pkg.Counter;\n\
+             c = f(20);\n\
+             out = c.value;\n",
+        )
+        .expect("write bundled package folder constructor script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled package folder constructor handle script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = pkg.Counter with properties {value=20}\n  f = @pkg.Counter\n  out = 20\n"
+        );
+    }
+
+    #[test]
+    fn save_and_load_static_method_handle_roundtrip() {
+        let temp_dir = unique_temp_script_dir("save-load-static-method-handle");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let path = unique_temp_mat_path("save-load-static-method-handle");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = unit()\n\
+             out = [6 7];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write static method handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "f = @pkg.Point.unit;\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.f();\n"
+            ),
+        )
+        .expect("write static method handle script");
+
+        let expected = "workspace\n  out = [6, 7]\n  s = struct{f=@pkg.Point.unit}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn save_and_load_unbound_instance_method_handle_roundtrip() {
+        let temp_dir = unique_temp_script_dir("save-load-instance-method-handle");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package folder class dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        let path = unique_temp_mat_path("save-load-instance-method-handle");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write instance method handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write instance method handle method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write instance method handle helper");
+        fs::write(
+            &main_path,
+            format!(
+                "f = @pkg.Counter.plusWithOffset;\n\
+                 c = pkg.Counter(10);\n\
+                 save('{matlab_path}', 'f', 'c');\n\
+                 clear('f', 'c');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.f(s.c, 5);\n"
+            ),
+        )
+        .expect("write instance method handle script");
+
+        let expected =
+            "workspace\n  out = 17\n  s = struct{c=pkg.Counter with properties {value=10}, f=@pkg.Counter.plusWithOffset}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -15438,6 +18260,558 @@ mod tests {
     }
 
     #[test]
+    fn classdef_handle_aliasing_survives_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-save-load-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-handle-alias");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 d = c;\n\
+                 save('{matlab_path}', 'c', 'd');\n\
+                 clear('c', 'd');\n\
+                 s = load('{matlab_path}');\n\
+                 s.d.increment(2);\n\
+                 out = s.c.value;\n"
+            ),
+        )
+        .expect("write handle alias save/load script");
+
+        let expected =
+            "workspace\n  out = 7\n  s = struct{c=Counter with properties {value=7}, d=Counter with properties {value=7}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_artifact_execution_preserves_handle_aliasing_across_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-artifact-handle-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let artifact_path = temp_dir.join("main.matbc");
+        let mat_path = unique_temp_mat_path("classdef-artifact-handle-alias");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 d = c;\n\
+                 save('{matlab_path}', 'c', 'd');\n\
+                 clear('c', 'd');\n\
+                 s = load('{matlab_path}');\n\
+                 s.d.increment(2);\n\
+                 out = s.c.value;\n"
+            ),
+        )
+        .expect("write artifact handle alias script");
+
+        let bytecode = compile_bytecode_module(&main_path);
+        write_bytecode_artifact(&artifact_path, &bytecode).expect("write artifact");
+        let decoded = read_bytecode_artifact(&artifact_path).expect("read artifact");
+        let result = execute_script_bytecode_module(&decoded, artifact_path.display().to_string())
+            .expect("execute artifact");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  out = 7\n  s = struct{c=Counter with properties {value=7}, d=Counter with properties {value=7}}\n"
+        );
+
+        let _ = fs::remove_file(artifact_path);
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_artifact_execution_preserves_handle_aliasing_across_save_append() {
+        let temp_dir = unique_temp_script_dir("classdef-artifact-handle-append-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let artifact_path = temp_dir.join("main.matbc");
+        let mat_path = unique_temp_mat_path("classdef-artifact-handle-append-alias");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 save('{matlab_path}', 'c');\n\
+                 d = c;\n\
+                 save('{matlab_path}', '-append', 'd');\n\
+                 clear('c', 'd');\n\
+                 s = load('{matlab_path}');\n\
+                 s.d.increment(2);\n\
+                 out = s.c.value;\n"
+            ),
+        )
+        .expect("write artifact handle append script");
+
+        let bytecode = compile_bytecode_module(&main_path);
+        write_bytecode_artifact(&artifact_path, &bytecode).expect("write artifact");
+        let decoded = read_bytecode_artifact(&artifact_path).expect("read artifact");
+        let result = execute_script_bytecode_module(&decoded, artifact_path.display().to_string())
+            .expect("execute artifact");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  out = 7\n  s = struct{c=Counter with properties {value=7}, d=Counter with properties {value=7}}\n"
+        );
+
+        let _ = fs::remove_file(artifact_path);
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_aliasing_in_structs_survives_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-save-load-struct-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-handle-struct-alias");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 s = struct('left', c, 'right', c);\n\
+                 save('{matlab_path}', 's');\n\
+                 clear('s', 'c');\n\
+                 loaded = load('{matlab_path}');\n\
+                 loaded.s.right.increment(2);\n\
+                 out = loaded.s.left.value;\n"
+            ),
+        )
+        .expect("write handle struct alias save/load script");
+
+        let expected =
+            "workspace\n  loaded = struct{s=struct{left=Counter with properties {value=7}, right=Counter with properties {value=7}}}\n  out = 7\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_aliasing_in_object_arrays_survives_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-save-load-array-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-handle-array-alias");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 refs = [c c];\n\
+                 save('{matlab_path}', 'refs');\n\
+                 clear('refs', 'c');\n\
+                 loaded = load('{matlab_path}');\n\
+                 loaded.refs(2).increment(2);\n\
+                 out = loaded.refs(1).value;\n"
+            ),
+        )
+        .expect("write handle array alias save/load script");
+
+        let expected =
+            "workspace\n  loaded = struct{refs=[Counter with properties {value=7}, Counter with properties {value=7}]}\n  out = 7\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bound_method_handles_preserve_handle_receiver_aliasing_across_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-save-load-bound-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-handle-bound-alias");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 f = c.increment;\n\
+                 save('{matlab_path}', 'c', 'f');\n\
+                 clear('c', 'f');\n\
+                 load('{matlab_path}');\n\
+                 f(2);\n\
+                 out = c.value;\n"
+            ),
+        )
+        .expect("write bound handle alias save/load script");
+
+        let expected =
+            "workspace\n  c = Counter with properties {value=7}\n  f = @Counter.increment\n  out = 7\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bound_method_handles_support_value_object_array_receivers_and_roundtrip() {
+        let temp_dir = unique_temp_script_dir("classdef-value-array-bound-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-value-array-bound-handle");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write value array bound-handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Point(2), Point(5), Point(7)];\n\
+                 f = @objs.total;\n\
+                 first = f();\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f', 'objs');\n\
+                 s = load('{matlab_path}');\n\
+                 second = s.f();\n\
+                 out = [first second];\n"
+            ),
+        )
+        .expect("write value array bound-handle script");
+
+        let expected =
+            "workspace\n  first = 14\n  out = [14, 14]\n  s = struct{f=@Point.total}\n  second = 14\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bound_method_handles_support_property_produced_object_array_receivers_and_roundtrip() {
+        let temp_dir = unique_temp_script_dir("classdef-property-produced-bound-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-property-produced-bound-handle");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write property-produced bound-handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Point(1, Point(10, [])), Point(2, Point(20, [])), Point(3, Point(30, []))];\n\
+                 f = @objs.child.total;\n\
+                 first = f();\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f', 'objs');\n\
+                 s = load('{matlab_path}');\n\
+                 second = s.f();\n\
+                 out = [first second];\n"
+            ),
+        )
+        .expect("write property-produced bound-handle script");
+
+        let expected =
+            "workspace\n  first = 60\n  out = [60, 60]\n  s = struct{f=@Point.total}\n  second = 60\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bound_method_handles_support_indexed_object_array_receivers() {
+        let temp_dir = unique_temp_script_dir("classdef-indexed-bound-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write indexed bound-handle class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1) Point(2); Point(3) Point(4)];\n\
+             f = @objs(:,2).total;\n\
+             out = f();\n",
+        )
+        .expect("write indexed bound-handle script");
+
+        let expected =
+            "workspace\n  f = @Point.total\n  objs = [Point with properties {x=1}, Point with properties {x=2} ; Point with properties {x=3}, Point with properties {x=4}]\n  out = 6\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bound_method_handles_support_indexed_property_produced_object_array_receivers() {
+        let temp_dir = unique_temp_script_dir("classdef-indexed-property-bound-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write indexed property bound-handle class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])), Point(2, Point(20, [])), Point(3, Point(30, []))];\n\
+             f = @objs.child(1:2).total;\n\
+             out = f();\n",
+        )
+        .expect("write indexed property bound-handle script");
+
+        let expected =
+            "workspace\n  f = @Point.total\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=20, child=[]}}, Point with properties {x=3, child=Point with properties {x=30, child=[]}}]\n  out = 30\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bound_method_handles_support_method_produced_indexed_object_array_receivers() {
+        let temp_dir = unique_temp_script_dir("classdef-method-produced-indexed-bound-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function dup = duplicate(obj)\n\
+             dup = [obj obj];\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write method-produced indexed bound-handle class");
+        fs::write(
+            &main_path,
+            "objs = [Point(2), Point(5)];\n\
+             f = @objs.duplicate()(3).total;\n\
+             out = f();\n",
+        )
+        .expect("write method-produced indexed bound-handle script");
+
+        let expected =
+            "workspace\n  f = @Point.total\n  objs = [Point with properties {x=2}, Point with properties {x=5}]\n  out = 2\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn bound_method_handles_preserve_handle_object_array_receiver_aliasing_across_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-array-bound-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-handle-array-bound-alias");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 arr = [c c];\n\
+                 f = @arr.increment;\n\
+                 save('{matlab_path}', 'arr', 'f');\n\
+                 clear('arr', 'f', 'c');\n\
+                 load('{matlab_path}');\n\
+                 f(2);\n\
+                 out = arr.value;\n"
+            ),
+        )
+        .expect("write handle array bound-handle alias script");
+
+        let expected =
+            "workspace\n  arr = [Counter with properties {value=7}, Counter with properties {value=7}]\n  f = @Counter.increment\n  out = [7, 7]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_aliasing_survives_save_append() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-save-append-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-handle-append-alias");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 save('{matlab_path}', 'c');\n\
+                 d = c;\n\
+                 save('{matlab_path}', '-append', 'd');\n\
+                 clear('c', 'd');\n\
+                 s = load('{matlab_path}');\n\
+                 s.d.increment(2);\n\
+                 out = s.c.value;\n"
+            ),
+        )
+        .expect("write handle append alias script");
+
+        let expected =
+            "workspace\n  out = 7\n  s = struct{c=Counter with properties {value=7}, d=Counter with properties {value=7}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_ids_stay_distinct_after_loading_and_appending_new_handles() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-save-append-distinct");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-handle-append-distinct");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 save('{matlab_path}', 'c');\n\
+                 clear('c');\n\
+                 load('{matlab_path}');\n\
+                 d = Counter(20);\n\
+                 save('{matlab_path}', '-append', 'd');\n\
+                 clear('c', 'd');\n\
+                 s = load('{matlab_path}');\n\
+                 s.d.increment(2);\n\
+                 out = [s.c.value s.d.value];\n"
+            ),
+        )
+        .expect("write handle append distinct script");
+
+        let expected =
+            "workspace\n  out = [5, 22]\n  s = struct{c=Counter with properties {value=5}, d=Counter with properties {value=22}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn classdef_objects_roundtrip_through_save_and_load() {
         let temp_dir = unique_temp_script_dir("classdef-save-load");
         let class_path = temp_dir.join("Pair.m");
@@ -15478,6 +18852,10501 @@ mod tests {
 
         let _ = fs::remove_file(mat_path);
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn package_classdef_objects_roundtrip_through_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-save-load-package");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Pair.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-pkg-pair");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Pair\n\
+             properties\n\
+             left = 1;\n\
+             right = 2;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package pair class");
+        fs::write(
+            &main_path,
+            format!(
+                "p = pkg.Pair();\n\
+                 save('{matlab_path}', 'p');\n\
+                 clear('p');\n\
+                 s = load('{matlab_path}');\n\
+                 kind = class(s.p);\n\
+                 ok = isa(s.p, 'pkg.Pair');\n\
+                 out = [s.p.left s.p.right];\n"
+            ),
+        )
+        .expect("write package pair script");
+
+        let expected =
+            "workspace\n  kind = 'pkg.Pair'\n  ok = true\n  out = [1, 2]\n  s = struct{p=pkg.Pair with properties {left=1, right=2}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_roundtrip_through_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-save-load-array");
+        let class_path = temp_dir.join("Pair.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-pair-array");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Pair\n\
+             properties\n\
+             left = 1;\n\
+             right = 2;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write pair class");
+        fs::write(
+            &main_path,
+            format!(
+                "p = [Pair(), Pair()];\n\
+                 p(2).left = 9;\n\
+                 save('{matlab_path}', 'p');\n\
+                 clear('p');\n\
+                 s = load('{matlab_path}');\n\
+                 kind = class(s.p);\n\
+                 ok = isa(s.p, 'Pair');\n\
+                 out = [s.p.left];\n"
+            ),
+        )
+        .expect("write pair array script");
+
+        let expected =
+            "workspace\n  kind = 'Pair'\n  ok = true\n  out = [1, 9]\n  s = struct{p=[Pair with properties {left=1, right=2}, Pair with properties {left=9, right=2}]}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn package_classdef_inherited_objects_roundtrip_through_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-save-load-package-inherit");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let base_path = package_dir.join("Base.m");
+        let child_path = package_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-pkg-child");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             methods\n\
+             function total = total(obj)\n\
+             total = obj.x + 3;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package base class");
+        fs::write(
+            &child_path,
+            "classdef Child < pkg.Base\n\
+             properties\n\
+             y = 4;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package child class");
+        fs::write(
+            &main_path,
+            format!(
+                "c = pkg.Child();\n\
+                 save('{matlab_path}', 'c');\n\
+                 clear('c');\n\
+                 s = load('{matlab_path}');\n\
+                 kind = class(s.c);\n\
+                 ok_child = isa(s.c, 'pkg.Child');\n\
+                 ok_base = isa(s.c, 'pkg.Base');\n\
+                 out = [s.c.x s.c.y s.c.total()];\n"
+            ),
+        )
+        .expect("write package child save/load script");
+
+        let expected =
+            "workspace\n  kind = 'pkg.Child'\n  ok_base = true\n  ok_child = true\n  out = [1, 4, 4]\n  s = struct{c=pkg.Child with properties {x=1, y=4}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_inherited_objects_roundtrip_through_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-save-load-inherit");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-child");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             methods\n\
+             function total = total(obj)\n\
+             total = obj.x + 3;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write base class");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             properties\n\
+             y = 4;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write child class");
+        fs::write(
+            &main_path,
+            format!(
+                "c = Child();\n\
+                 save('{matlab_path}', 'c');\n\
+                 clear('c');\n\
+                 s = load('{matlab_path}');\n\
+                 kind = class(s.c);\n\
+                 ok_child = isa(s.c, 'Child');\n\
+                 ok_base = isa(s.c, 'Base');\n\
+                 out = [s.c.x s.c.y s.c.total()];\n"
+            ),
+        )
+        .expect("write child save/load script");
+
+        let expected =
+            "workspace\n  kind = 'Child'\n  ok_base = true\n  ok_child = true\n  out = [1, 4, 4]\n  s = struct{c=Child with properties {x=1, y=4}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_private_property_access_remains_enforced_after_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-save-load-private-property");
+        let class_path = temp_dir.join("Vault.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-private-property");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_private_access_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "v = Vault();\n\
+                 save('{matlab_path}', 'v');\n\
+                 clear('v');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.v.secret;\n"
+            ),
+        )
+        .expect("write private property save/load script");
+
+        let interpreted = execute_path_result(&main_path, &[])
+            .expect_err("interpreted private property after load should fail");
+        assert!(
+            interpreted
+                .to_string()
+                .contains("property `secret` has private access for class `Vault`"),
+            "{interpreted}"
+        );
+
+        let bytecode = execute_path_bytecode_result(&main_path, &[])
+            .expect_err("bytecode private property after load should fail");
+        assert!(
+            bytecode
+                .to_string()
+                .contains("property `secret` has private access for class `Vault`"),
+            "{bytecode}"
+        );
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_private_method_access_remains_enforced_after_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-save-load-private-method");
+        let class_path = temp_dir.join("Vault.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-private-method");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_private_access_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "v = Vault();\n\
+                 save('{matlab_path}', 'v');\n\
+                 clear('v');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.v.hidden();\n"
+            ),
+        )
+        .expect("write private method save/load script");
+
+        let interpreted = execute_path_result(&main_path, &[])
+            .expect_err("interpreted private method after load should fail");
+        assert!(
+            interpreted
+                .to_string()
+                .contains("method `hidden` has private access for class `Vault`"),
+            "{interpreted}"
+        );
+
+        let bytecode = execute_path_bytecode_result(&main_path, &[])
+            .expect_err("bytecode private method after load should fail");
+        assert!(
+            bytecode
+                .to_string()
+                .contains("method `hidden` has private access for class `Vault`"),
+            "{bytecode}"
+        );
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_executes_packaged_plain_class_dependency() {
+        let temp_dir = unique_temp_script_dir("classdef-bundle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundle class");
+        fs::write(
+            &main_path,
+            "p = Point(5, 6);\n\
+             out = [p.x p.y p.total()];\n",
+        )
+        .expect("write bundle script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+        let result = execute_script_bytecode_bundle(&bundle).expect("execute class bundle");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  out = [5, 6, 11]\n  p = Point with properties {x=5, y=6}\n"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_execution_preserves_handle_aliasing_across_save_and_load_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-bundle-handle-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-bundle-handle-alias");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 d = c;\n\
+                 save('{matlab_path}', 'c', 'd');\n\
+                 clear('c', 'd');\n\
+                 s = load('{matlab_path}');\n\
+                 s.d.increment(2);\n\
+                 out = s.c.value;\n"
+            ),
+        )
+        .expect("write bundle handle alias script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result =
+            execute_script_bytecode_bundle(&bundle).expect("execute bundled handle alias script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  out = 7\n  s = struct{c=Counter with properties {value=7}, d=Counter with properties {value=7}}\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+    }
+
+    #[test]
+    fn classdef_bundle_execution_keeps_loaded_and_new_handles_distinct_across_save_append_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-bundle-handle-append-distinct");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-bundle-handle-append-distinct");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            format!(
+                "c = Counter(5);\n\
+                 save('{matlab_path}', 'c');\n\
+                 clear('c');\n\
+                 load('{matlab_path}');\n\
+                 d = Counter(20);\n\
+                 save('{matlab_path}', '-append', 'd');\n\
+                 clear('c', 'd');\n\
+                 s = load('{matlab_path}');\n\
+                 s.d.increment(2);\n\
+                 out = [s.c.value s.d.value];\n"
+            ),
+        )
+        .expect("write bundle handle append distinct script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled handle append distinct script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  out = [5, 22]\n  s = struct{c=Counter with properties {value=5}, d=Counter with properties {value=22}}\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+    }
+
+    #[test]
+    fn package_classdef_supports_constructor_and_method_calls() {
+        let temp_dir = unique_temp_script_dir("classdef-package");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package class");
+        fs::write(
+            &main_path,
+            "p = pkg.Point(8, 9);\n\
+             kind = class(p);\n\
+             ok = isa(p, 'pkg.Point');\n\
+             out = [p.x p.y p.total()];\n",
+        )
+        .expect("write package script");
+
+        let expected = "workspace\n  kind = 'pkg.Point'\n  ok = true\n  out = [8, 9, 17]\n  p = pkg.Point with properties {x=8, y=9}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn package_classdef_inheritance_supports_qualified_class_and_isa() {
+        let temp_dir = unique_temp_script_dir("classdef-package-inherit");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let base_path = package_dir.join("Base.m");
+        let child_path = package_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             methods\n\
+             function total = total(obj)\n\
+             total = obj.x + 2;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package base class");
+        fs::write(
+            &child_path,
+            "classdef Child < pkg.Base\n\
+             properties\n\
+             y = 4;\n\
+             end\n\
+             methods\n\
+             function obj = Child(y)\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package child class");
+        fs::write(
+            &main_path,
+            "c = pkg.Child(7);\n\
+             kind = class(c);\n\
+             ok_child = isa(c, 'pkg.Child');\n\
+             ok_base = isa(c, 'pkg.Base');\n\
+             out = [c.x c.y c.total()];\n",
+        )
+        .expect("write package inherit script");
+
+        let expected = "workspace\n  c = pkg.Child with properties {x=1, y=7}\n  kind = 'pkg.Child'\n  ok_base = true\n  ok_child = true\n  out = [1, 7, 3]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn package_class_folder_methods_and_private_helpers_support_dot_and_function_form_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-package-folder");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package folder class dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package folder class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write package external method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write package private helper");
+        fs::write(
+            &main_path,
+            "c = pkg.Counter(10);\n\
+             kind = class(c);\n\
+             ok = isa(c, 'pkg.Counter');\n\
+             out = [c.plusWithOffset(5) plusWithOffset(c, 6)];\n",
+        )
+        .expect("write package folder script");
+
+        let expected =
+            "workspace\n  c = pkg.Counter with properties {value=10}\n  kind = 'pkg.Counter'\n  ok = true\n  out = [17, 18]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn class_folder_private_helpers_are_visible_from_external_methods() {
+        let temp_dir = unique_temp_script_dir("classdef-private-helper");
+        let class_dir = temp_dir.join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write private-helper class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write external method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write private helper");
+        fs::write(
+            &main_path,
+            "c = Counter(10);\n\
+             out = c.plusWithOffset(5);\n",
+        )
+        .expect("write private-helper script");
+
+        let expected =
+            "workspace\n  c = Counter with properties {value=10}\n  out = 17\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_executes_packaged_package_folder_method_dependency_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-folder-bundle");
+        let class_dir = temp_dir.join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled folder class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write bundled external method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 3;\n\
+             end\n",
+        )
+        .expect("write bundled private helper");
+        fs::write(
+            &main_path,
+            "c = Counter(20);\n\
+             out = c.plusWithOffset(4);\n",
+        )
+        .expect("write bundled script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result =
+            execute_script_bytecode_bundle(&bundle).expect("execute folder-method class bundle");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = Counter with properties {value=20}\n  out = 27\n"
+        );
+    }
+
+    #[test]
+    fn classdef_bundle_executes_packaged_folder_method_dependency_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-package-folder-bundle");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create packaged private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package folder class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write bundled package external method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 3;\n\
+             end\n",
+        )
+        .expect("write bundled package private helper");
+        fs::write(
+            &main_path,
+            "c = pkg.Counter(20);\n\
+             out = [c.plusWithOffset(4) plusWithOffset(c, 5)];\n",
+        )
+        .expect("write bundled package folder script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result =
+            execute_script_bytecode_bundle(&bundle).expect("execute packaged folder-method class bundle");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = pkg.Counter with properties {value=20}\n  out = [27, 28]\n"
+        );
+    }
+
+    #[test]
+    fn classdef_static_methods_support_class_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-static");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [0 0];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write static class");
+        fs::write(
+            &main_path,
+            "out = Point.origin();\n",
+        )
+        .expect("write static script");
+
+        let expected = "workspace\n  out = [0, 0]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn package_classdef_static_methods_support_qualified_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-package-static");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = unit()\n\
+             out = [1 1];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package static class");
+        fs::write(
+            &main_path,
+            "out = pkg.Point.unit();\n",
+        )
+        .expect("write package static script");
+
+        let expected = "workspace\n  out = [1, 1]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_executes_packaged_static_method_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-static-bundle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [4 5];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled static class");
+        fs::write(
+            &main_path,
+            "out = Point.origin();\n",
+        )
+        .expect("write bundled static script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result =
+            execute_script_bytecode_bundle(&bundle).expect("execute static bundle");
+        assert_eq!(render_execution_result(&result), "workspace\n  out = [4, 5]\n");
+    }
+
+    #[test]
+    fn classdef_static_method_handles_support_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-static-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [2 3];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write static handle class");
+        fs::write(
+            &main_path,
+            "f = @Point.origin;\n\
+             out = f();\n",
+        )
+        .expect("write static handle script");
+
+        let expected = "workspace\n  f = @Point.origin\n  out = [2, 3]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn package_classdef_static_method_handles_support_qualified_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-package-static-handle");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = unit()\n\
+             out = [6 7];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package static handle class");
+        fs::write(
+            &main_path,
+            "f = @pkg.Point.unit;\n\
+             out = f();\n",
+        )
+        .expect("write package static handle script");
+
+        let expected = "workspace\n  f = @pkg.Point.unit\n  out = [6, 7]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_instance_method_handles_support_unbound_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-instance-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write instance handle class");
+        fs::write(
+            &main_path,
+            "f = @Point.total;\n\
+             p = Point(5, 6);\n\
+             out = f(p);\n",
+        )
+        .expect("write instance handle script");
+
+        let expected =
+            "workspace\n  f = @Point.total\n  out = 11\n  p = Point with properties {x=5, y=6}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn unqualified_instance_method_handles_support_dispatch_and_roundtrip() {
+        let temp_dir = unique_temp_script_dir("classdef-unqualified-instance-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let path = unique_temp_mat_path("classdef-unqualified-instance-handle");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write unqualified instance handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "f = @total;\n\
+                 p = Point(5, 6);\n\
+                 first = f(p);\n\
+                 save('{matlab_path}', 'f', 'p');\n\
+                 clear('f', 'p');\n\
+                 s = load('{matlab_path}');\n\
+                 second = s.f(s.p);\n"
+            ),
+        )
+        .expect("write unqualified instance handle script");
+
+        let expected =
+            "workspace\n  first = 11\n  s = struct{f=@total, p=Point with properties {x=5, y=6}}\n  second = 11\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn package_class_folder_method_handles_support_unbound_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-package-folder-handle");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package folder class dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package folder handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write package folder handle method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write package folder handle helper");
+        fs::write(
+            &main_path,
+            "f = @pkg.Counter.plusWithOffset;\n\
+             c = pkg.Counter(10);\n\
+             out = f(c, 5);\n",
+        )
+        .expect("write package folder handle script");
+
+        let expected =
+            "workspace\n  c = pkg.Counter with properties {value=10}\n  f = @pkg.Counter.plusWithOffset\n  out = 17\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn unqualified_folder_method_handles_support_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-unqualified-folder-handle");
+        let class_dir = temp_dir.join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create class dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write unqualified folder handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write unqualified folder handle method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write unqualified folder handle helper");
+        fs::write(
+            &main_path,
+            "f = @plusWithOffset;\n\
+             c = Counter(10);\n\
+             out = f(c, 5);\n",
+        )
+        .expect("write unqualified folder handle script");
+
+        let expected =
+            "workspace\n  c = Counter with properties {value=10}\n  f = @plusWithOffset\n  out = 17\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn object_bound_handle_syntax_supports_dispatch_and_roundtrip() {
+        let temp_dir = unique_temp_script_dir("classdef-object-bound-handle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let path = unique_temp_mat_path("classdef-object-bound-handle");
+        let matlab_path = path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object-bound handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "p = Point(5, 6);\n\
+                 f = @p.total;\n\
+                 first = f();\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f');\n\
+                 s = load('{matlab_path}');\n\
+                 second = s.f();\n"
+            ),
+        )
+        .expect("write object-bound handle script");
+
+        let expected =
+            "workspace\n  first = 11\n  p = Point with properties {x=5, y=6}\n  s = struct{f=@Point.total}\n  second = 11\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn package_object_bound_folder_handle_syntax_supports_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-package-object-bound-folder-handle");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create class dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package object-bound folder class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write package object-bound folder method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write package object-bound folder helper");
+        fs::write(
+            &main_path,
+            "c = pkg.Counter(10);\n\
+             f = @c.plusWithOffset;\n\
+             out = f(5);\n",
+        )
+        .expect("write package object-bound folder handle script");
+
+        let expected =
+            "workspace\n  c = pkg.Counter with properties {value=10}\n  f = @pkg.Counter.plusWithOffset\n  out = 17\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_packaged_static_method_handles_support_dispatch_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-package-static-handle-bundle");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = unit()\n\
+             out = [8 9];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package static handle class");
+        fs::write(
+            &main_path,
+            "f = @pkg.Point.unit;\n\
+             out = f();\n",
+        )
+        .expect("write bundled package static handle script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled package static handle script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  f = @pkg.Point.unit\n  out = [8, 9]\n"
+        );
+    }
+
+    #[test]
+    fn classdef_bundle_packaged_bound_method_handles_survive_save_and_load_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-package-bound-handle-bundle");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-package-bound-handle-bundle");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package bound handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "p = pkg.Point(5, 6);\n\
+                 f = @p.total;\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f', 'p');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.f();\n"
+            ),
+        )
+        .expect("write bundled package bound handle script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled package bound handle script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  out = 11\n  s = struct{f=@pkg.Point.total}\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+    }
+
+    #[test]
+    fn classdef_bundle_property_produced_bound_method_handles_survive_save_and_load_without_source_tree(
+    ) {
+        let temp_dir = unique_temp_script_dir("classdef-property-produced-bound-handle-bundle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-property-produced-bound-handle-bundle");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled property-produced bound-handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Point(1, Point(10, [])), Point(2, Point(20, []))];\n\
+                 f = @objs.child.total;\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('objs', 'f');\n\
+                 load('{matlab_path}');\n\
+                 out = f();\n"
+            ),
+        )
+        .expect("write bundled property-produced bound-handle script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled property-produced bound-handle script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  f = @Point.total\n  out = 30\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+    }
+
+    #[test]
+    fn classdef_bundle_property_produced_full_2d_bound_handles_roundtrip_preserve_receiver_layout_without_source_tree(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-property-produced-full-2d-bound-bundle");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-property-produced-full-2d-bound-bundle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = peek(obj)\n\
+             out = obj(1,2).x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled full 2d point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled full 2d wrap class");
+        fs::write(
+            &main_path,
+            format!(
+                "wraps = [Wrap(Point(1)) Wrap(Point(2)); Wrap(Point(3)) Wrap(Point(4))];\n\
+                 f = @wraps.data.peek;\n\
+                 save('{snapshot_text}', 'f');\n\
+                 clear('f', 'wraps');\n\
+                 load('{snapshot_text}');\n\
+                 out = f();\n"
+            ),
+        )
+        .expect("write bundled full 2d roundtrip script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled full 2d roundtrip script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  f = @Point.peek\n  out = 2\n"
+        );
+
+        let _ = fs::remove_file(snapshot_path);
+    }
+
+    #[test]
+    fn classdef_bundle_packaged_property_produced_handle_bound_method_handles_survive_save_and_load_without_source_tree(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-package-property-produced-handle-bound-bundle");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path =
+            unique_temp_mat_path("classdef-package-property-produced-handle-bound-bundle");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value, child)\n\
+             obj.value = value;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.value]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package property-produced handle class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [pkg.Counter(1, pkg.Counter(10, [])), pkg.Counter(2, pkg.Counter(20, []))];\n\
+                 f = @objs.child.total;\n\
+                 save('{matlab_path}', 'objs', 'f');\n\
+                 clear('objs', 'f');\n\
+                 load('{matlab_path}');\n\
+                 out = f();\n\
+                 vals = [objs.child.value];\n"
+            ),
+        )
+        .expect("write bundled package property-produced handle script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled package property-produced handle script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  f = @pkg.Counter.total\n  objs = [pkg.Counter with properties {value=1, child=pkg.Counter with properties {value=10, child=[]}}, pkg.Counter with properties {value=2, child=pkg.Counter with properties {value=20, child=[]}}]\n  out = 30\n  vals = [10, 20]\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+    }
+
+    #[test]
+    fn load_preserves_property_produced_handle_bound_method_aliasing_in_workspace() {
+        let temp_dir = unique_temp_script_dir("classdef-load-property-produced-handle-alias");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-load-property-produced-handle-alias").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value, child)\n\
+             obj.value = value;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.value]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write load alias class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Counter(1, Counter(10, [])), Counter(2, Counter(20, []))];\n\
+                 f = @objs.child.total;\n\
+                 save('{snapshot_text}', 'objs', 'f');\n\
+                 clear('objs', 'f');\n\
+                 load('{snapshot_text}');\n"
+            ),
+        )
+        .expect("write load alias script");
+
+        let result = execute_path(&main_path, &[]);
+        let Value::Matrix(objs) = result.workspace.get("objs").expect("objs value") else {
+            panic!("expected object array");
+        };
+        let Value::FunctionHandle(FunctionHandleValue {
+            target: FunctionHandleTarget::BoundMethod { receiver, .. },
+            ..
+        }) = result.workspace.get("f").expect("f value")
+        else {
+            panic!("expected bound handle");
+        };
+        let Value::Matrix(receiver_matrix) = receiver.as_ref() else {
+            panic!("expected matrix receiver");
+        };
+        for (parent, receiver_value) in objs.elements().iter().zip(receiver_matrix.elements().iter()) {
+            let Value::Object(parent_object) = parent else {
+                panic!("expected parent object");
+            };
+            let Value::Object(child_object) = parent_object.property_value("child").expect("child property")
+            else {
+                panic!("expected child object");
+            };
+            let Value::Object(receiver_object) = receiver_value else {
+                panic!("expected receiver object");
+            };
+            let (
+                ObjectStorage::Handle {
+                    id: child_id,
+                    shared: child_shared,
+                },
+                ObjectStorage::Handle {
+                    id: receiver_id,
+                    shared: receiver_shared,
+                },
+            ) = (&child_object.storage, &receiver_object.storage)
+            else {
+                panic!("expected handle-backed objects");
+            };
+            assert_eq!(child_id, receiver_id);
+            assert!(Rc::ptr_eq(child_shared, receiver_shared));
+        }
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn load_restores_property_produced_handle_bound_method_aliasing_for_later_assignment() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-load-property-produced-handle-alias-assignment");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-load-property-produced-handle-alias-assignment")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value, child)\n\
+             obj.value = value;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.value]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write load alias assignment class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Counter(1, Counter(10, [])), Counter(2, Counter(20, []))];\n\
+                 f = @objs.child.total;\n\
+                 save('{snapshot_text}', 'objs', 'f');\n\
+                 clear('objs', 'f');\n\
+                 load('{snapshot_text}');\n\
+                 objs.child.value = [100 200];\n\
+                 out = f();\n\
+                 vals = [objs.child.value];\n"
+            ),
+        )
+        .expect("write load alias assignment script");
+
+        let expected =
+            "workspace\n  f = @Counter.total\n  objs = [Counter with properties {value=1, child=Counter with properties {value=100, child=[]}}, Counter with properties {value=2, child=Counter with properties {value=200, child=[]}}]\n  out = 300\n  vals = [100, 200]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn load_restores_property_produced_handle_bound_method_aliasing_from_mat_file_for_later_assignment(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-load-property-produced-handle-alias-mat");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-load-property-produced-handle-alias-mat");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value, child)\n\
+             obj.value = value;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.value]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write load alias mat class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Counter(1, Counter(10, [])), Counter(2, Counter(20, []))];\n\
+                 f = @objs.child.total;\n\
+                 save('{matlab_path}', 'objs', 'f');\n\
+                 clear('objs', 'f');\n\
+                 load('{matlab_path}');\n\
+                 objs.child.value = [100 200];\n\
+                 out = f();\n\
+                 vals = [objs.child.value];\n"
+            ),
+        )
+        .expect("write load alias mat script");
+
+        let expected =
+            "workspace\n  f = @Counter.total\n  objs = [Counter with properties {value=1, child=Counter with properties {value=100, child=[]}}, Counter with properties {value=2, child=Counter with properties {value=200, child=[]}}]\n  out = 300\n  vals = [100, 200]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_load_restores_property_produced_handle_bound_method_aliasing_without_source_tree(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-load-property-produced-handle-alias-bundle");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-load-property-produced-handle-alias-bundle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value, child)\n\
+             obj.value = value;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.value]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled load alias class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Counter(1, Counter(10, [])), Counter(2, Counter(20, []))];\n\
+                 f = @objs.child.total;\n\
+                 save('{snapshot_text}', 'objs', 'f');\n\
+                 clear('objs', 'f');\n\
+                 load('{snapshot_text}');\n\
+                 objs.child.value = [100 200];\n\
+                 out = f();\n\
+                 vals = [objs.child.value];\n"
+            ),
+        )
+        .expect("write bundled load alias script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled load alias script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  f = @Counter.total\n  objs = [Counter with properties {value=1, child=Counter with properties {value=100, child=[]}}, Counter with properties {value=2, child=Counter with properties {value=200, child=[]}}]\n  out = 300\n  vals = [100, 200]\n"
+        );
+
+        let _ = fs::remove_file(snapshot_path);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_plain_function_handles_without_source_tree()
+    {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-plain-handle-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-plain-handle-consumer");
+        let helper_path = source_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-plain-handle").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 5;\n\
+             end\n",
+        )
+        .expect("write snapshot plain-handle helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @helper;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot plain-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot plain-handle source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot plain-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = f(7);\n"
+            ),
+        )
+        .expect("write snapshot plain-handle consumer");
+
+        let expected = "workspace\n  f = @helper\n  out = 12\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_packaged_plain_function_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-packaged-plain-handle-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-packaged-plain-handle-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let helper_path = package_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-packaged-plain-handle").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 8;\n\
+             end\n",
+        )
+        .expect("write snapshot packaged plain-handle helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @pkg.helper;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot packaged plain-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot packaged plain-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot packaged plain-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = f(4);\n"
+            ),
+        )
+        .expect("write snapshot packaged plain-handle consumer");
+
+        let expected = "workspace\n  f = @pkg.helper\n  out = 12\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_plain_function_calls_without_source_tree() {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-plain-call-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-plain-call-consumer");
+        let helper_path = source_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-plain-call").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 5;\n\
+             end\n",
+        )
+        .expect("write snapshot plain-call helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @helper;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot plain-call producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot plain-call source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot plain-call producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = helper(7);\n"
+            ),
+        )
+        .expect("write snapshot plain-call consumer");
+
+        let expected = "workspace\n  f = @helper\n  out = 12\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_packaged_plain_function_calls_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-packaged-plain-call-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-packaged-plain-call-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let helper_path = package_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-packaged-plain-call").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 8;\n\
+             end\n",
+        )
+        .expect("write snapshot packaged plain-call helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @pkg.helper;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot packaged plain-call producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot packaged plain-call source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot packaged plain-call producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = pkg.helper(4);\n"
+            ),
+        )
+        .expect("write snapshot packaged plain-call consumer");
+
+        let expected = "workspace\n  f = @pkg.helper\n  out = 12\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_plain_function_private_helpers_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-private-helper-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-private-helper-consumer");
+        let private_dir = source_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create private dir");
+        let public_path = source_dir.join("publicFun.m");
+        let private_path = private_dir.join("privateHelper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-private-helper").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &public_path,
+            "function out = publicFun(x)\n\
+             out = privateHelper(x) + 1;\n\
+             end\n",
+        )
+        .expect("write snapshot private-helper public function");
+        fs::write(
+            &private_path,
+            "function out = privateHelper(x)\n\
+             out = x * 2;\n\
+             end\n",
+        )
+        .expect("write snapshot private-helper private function");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @publicFun;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot private-helper producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot private-helper source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot private-helper producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out1 = f(5);\n\
+                 out2 = publicFun(5);\n"
+            ),
+        )
+        .expect("write snapshot private-helper consumer");
+
+        let expected = "workspace\n  f = @publicFun\n  out1 = 11\n  out2 = 11\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 2);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 2);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_packaged_plain_function_private_helpers_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("snapshot-bundle-packaged-private-helper-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-packaged-private-helper-consumer");
+        let package_dir = source_dir.join("+pkg");
+        let private_dir = package_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package private dir");
+        let public_path = package_dir.join("publicFun.m");
+        let private_path = private_dir.join("privateHelper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-packaged-private-helper").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &public_path,
+            "function out = publicFun(x)\n\
+             out = privateHelper(x) + 1;\n\
+             end\n",
+        )
+        .expect("write snapshot packaged private-helper public function");
+        fs::write(
+            &private_path,
+            "function out = privateHelper(x)\n\
+             out = x * 3;\n\
+             end\n",
+        )
+        .expect("write snapshot packaged private-helper private function");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @pkg.publicFun;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot packaged private-helper producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot packaged private-helper source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot packaged private-helper producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out1 = f(5);\n\
+                 out2 = pkg.publicFun(5);\n"
+            ),
+        )
+        .expect("write snapshot packaged private-helper consumer");
+
+        let expected = "workspace\n  f = @pkg.publicFun\n  out1 = 16\n  out2 = 16\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 2);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 2);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_does_not_expose_bundle_backed_private_helpers_without_source_tree() {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-private-hidden-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-private-hidden-consumer");
+        let private_dir = source_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create private dir");
+        let public_path = source_dir.join("publicFun.m");
+        let private_path = private_dir.join("privateHelper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-private-hidden").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &public_path,
+            "function out = publicFun(x)\n\
+             out = privateHelper(x) + 1;\n\
+             end\n",
+        )
+        .expect("write snapshot private-hidden public function");
+        fs::write(
+            &private_path,
+            "function out = privateHelper(x)\n\
+             out = x * 2;\n\
+             end\n",
+        )
+        .expect("write snapshot private-hidden private function");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @publicFun;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot private-hidden producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot private-hidden source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot private-hidden producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = privateHelper(5);\n"
+            ),
+        )
+        .expect("write snapshot private-hidden consumer");
+
+        let interpreted = execute_path_result(&consumer_path, &[])
+            .expect_err("interpreted snapshot private helper should stay hidden");
+        assert!(
+            interpreted
+                .to_string()
+                .contains("call target `privateHelper` is not executable in the current interpreter"),
+            "{interpreted}"
+        );
+
+        let bytecode = execute_path_bytecode_result(&consumer_path, &[])
+            .expect_err("bytecode snapshot private helper should stay hidden");
+        assert!(
+            bytecode
+                .to_string()
+                .contains("call target `privateHelper` is not executable in the current bytecode VM"),
+            "{bytecode}"
+        );
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_does_not_expose_bundle_backed_packaged_private_helpers_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("snapshot-bundle-packaged-private-hidden-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-packaged-private-hidden-consumer");
+        let package_dir = source_dir.join("+pkg");
+        let private_dir = package_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package private dir");
+        let public_path = package_dir.join("publicFun.m");
+        let private_path = private_dir.join("privateHelper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-packaged-private-hidden")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &public_path,
+            "function out = publicFun(x)\n\
+             out = privateHelper(x) + 1;\n\
+             end\n",
+        )
+        .expect("write snapshot packaged private-hidden public function");
+        fs::write(
+            &private_path,
+            "function out = privateHelper(x)\n\
+             out = x * 3;\n\
+             end\n",
+        )
+        .expect("write snapshot packaged private-hidden private function");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @pkg.publicFun;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot packaged private-hidden producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot packaged private-hidden source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot packaged private-hidden producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = pkg.privateHelper(5);\n"
+            ),
+        )
+        .expect("write snapshot packaged private-hidden consumer");
+
+        let interpreted = execute_path_result(&consumer_path, &[])
+            .expect_err("interpreted snapshot packaged private helper should stay hidden");
+        assert!(
+            interpreted
+                .to_string()
+                .contains("call target `pkg.privateHelper` is not executable in the current interpreter"),
+            "{interpreted}"
+        );
+
+        let bytecode = execute_path_bytecode_result(&consumer_path, &[])
+            .expect_err("bytecode snapshot packaged private helper should stay hidden");
+        assert!(
+            bytecode
+                .to_string()
+                .contains("call target `pkg.privateHelper` is not executable in the current bytecode VM"),
+            "{bytecode}"
+        );
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_keeps_bundle_backed_plain_handles_while_later_script_local_functions_win(
+    )
+    {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-local-precedence-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-local-precedence-consumer");
+        let helper_path = source_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_helper_path = consumer_dir.join("helper.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-local-precedence").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 5;\n\
+             end\n",
+        )
+        .expect("write snapshot local-precedence bundled helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @helper;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot local-precedence producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot local-precedence source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot local-precedence producer");
+
+        fs::write(
+            &consumer_helper_path,
+            "function out = helper(x)\n\
+             out = x + 100;\n\
+             end\n",
+        )
+        .expect("write snapshot local-precedence consumer helper");
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out_handle = f(7);\n\
+                 out_local = helper(7);\n"
+            ),
+        )
+        .expect("write snapshot local-precedence consumer");
+
+        let expected = "workspace\n  f = @helper\n  out_handle = 12\n  out_local = 107\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_keeps_bundle_backed_packaged_plain_handles_while_later_local_package_functions_win(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("snapshot-bundle-package-precedence-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-package-precedence-consumer");
+        let source_package_dir = source_dir.join("+pkg");
+        let consumer_package_dir = consumer_dir.join("+pkg");
+        fs::create_dir_all(&source_package_dir).expect("create source package dir");
+        fs::create_dir_all(&consumer_package_dir).expect("create consumer package dir");
+        let helper_path = source_package_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_helper_path = consumer_package_dir.join("helper.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-package-precedence").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 8;\n\
+             end\n",
+        )
+        .expect("write snapshot package-precedence bundled helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @pkg.helper;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot package-precedence producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot package-precedence source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot package-precedence producer");
+
+        fs::write(
+            &consumer_helper_path,
+            "function out = helper(x)\n\
+             out = x + 100;\n\
+             end\n",
+        )
+        .expect("write snapshot package-precedence consumer helper");
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out_handle = f(4);\n\
+                 out_local = pkg.helper(4);\n"
+            ),
+        )
+        .expect("write snapshot package-precedence consumer");
+
+        let expected = "workspace\n  f = @pkg.helper\n  out_handle = 12\n  out_local = 104\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_keeps_bundle_backed_plain_handles_while_later_local_functions_win()
+    {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-localfn-precedence-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-localfn-precedence-consumer");
+        let helper_path = source_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-localfn-precedence").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 5;\n\
+             end\n",
+        )
+        .expect("write snapshot localfn-precedence bundled helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @helper;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot localfn-precedence producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot localfn-precedence source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot localfn-precedence producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out_handle = f(7);\n\
+                 out_local = helper(7);\n\
+                 function out = helper(x)\n\
+                 out = x + 100;\n\
+                 end\n"
+            ),
+        )
+        .expect("write snapshot localfn-precedence consumer");
+
+        let expected = "workspace\n  f = @helper\n  out_handle = 12\n  out_local = 107\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_keeps_bundle_backed_plain_handles_while_later_workspace_function_handle_variables_win(
+    ) {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-handlevar-precedence-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-handlevar-precedence-consumer");
+        let helper_path = source_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-handlevar-precedence").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 5;\n\
+             end\n",
+        )
+        .expect("write snapshot handlevar-precedence bundled helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @helper;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot handlevar-precedence producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot handlevar-precedence source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot handlevar-precedence producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 helper = @(x) x + 100;\n\
+                 out_handle = f(7);\n\
+                 out_local = helper(7);\n"
+            ),
+        )
+        .expect("write snapshot handlevar-precedence consumer");
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(interpreted.workspace.get("out_handle"), Some(&Value::Scalar(12.0)));
+        assert_eq!(interpreted.workspace.get("out_local"), Some(&Value::Scalar(107.0)));
+        assert!(
+            matches!(interpreted.workspace.get("f"), Some(Value::FunctionHandle(_))),
+            "expected bundled helper handle"
+        );
+        assert!(
+            matches!(interpreted.workspace.get("helper"), Some(Value::FunctionHandle(_))),
+            "expected later workspace helper binding to be a function handle"
+        );
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(bytecode.workspace.get("out_handle"), Some(&Value::Scalar(12.0)));
+        assert_eq!(bytecode.workspace.get("out_local"), Some(&Value::Scalar(107.0)));
+        assert!(
+            matches!(bytecode.workspace.get("f"), Some(Value::FunctionHandle(_))),
+            "expected bundled helper handle"
+        );
+        assert!(
+            matches!(bytecode.workspace.get("helper"), Some(Value::FunctionHandle(_))),
+            "expected later workspace helper binding to be a function handle"
+        );
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_plain_function_handles_without_source_tree()
+    {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-new-plain-handle-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-new-plain-handle-consumer");
+        let helper_path = source_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-new-plain-handle").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 5;\n\
+             end\n",
+        )
+        .expect("write snapshot new plain-handle helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = @helper;\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new plain-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot new plain-handle source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot new plain-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 g = @helper;\n\
+                 out = g(7);\n"
+            ),
+        )
+        .expect("write snapshot new plain-handle consumer");
+
+        let expected = "workspace\n  g = @helper\n  out = 12\n  seed = @helper\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_packaged_plain_function_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-new-packaged-plain-handle-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-new-packaged-plain-handle-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let helper_path = package_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-new-packaged-plain-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 8;\n\
+             end\n",
+        )
+        .expect("write snapshot new packaged plain-handle helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = @pkg.helper;\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new packaged plain-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new packaged plain-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new packaged plain-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 g = @pkg.helper;\n\
+                 out = g(4);\n"
+            ),
+        )
+        .expect("write snapshot new packaged plain-handle consumer");
+
+        let expected = "workspace\n  g = @pkg.helper\n  out = 12\n  seed = @pkg.helper\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_bound_method_handles_without_source_tree() {
+        let source_dir = unique_temp_script_dir("classdef-snapshot-bundle-bound-source");
+        let consumer_dir = unique_temp_script_dir("classdef-snapshot-bundle-bound-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-bound").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot bundle point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "objs = [Point(1, Point(10, [])), Point(2, Point(20, [])), Point(3, Point(30, []))];\n\
+                 f = @objs.child.total;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot bundle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot bundle source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot bundle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = f();\n"
+            ),
+        )
+        .expect("write snapshot bundle consumer");
+
+        let expected = "workspace\n  f = @Point.total\n  out = 60\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_constructor_and_static_handle_calls_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-constructor-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-constructor-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path = unique_temp_mat_path("classdef-snapshot-bundle-new-constructor")
+            .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             methods (Static)\n\
+             function [a, b] = pair()\n\
+             a = 11;\n\
+             b = 22;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new-constructor point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Point(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new-constructor producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot new-constructor source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot new-constructor producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 q = Point(10);\n\
+                 f = @Point.pair;\n\
+                 [a, b] = f();\n\
+                 out = [q.x, a, b];\n"
+            ),
+        )
+        .expect("write snapshot new-constructor consumer");
+
+        let expected =
+            "workspace\n  a = 11\n  b = 22\n  f = @Point.pair\n  out = [10, 11, 22]\n  q = Point with properties {x=10}\n  seed = Point with properties {x=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_object_array_growth_without_source_tree() {
+        let source_dir = unique_temp_script_dir("classdef-snapshot-bundle-growth-source");
+        let consumer_dir = unique_temp_script_dir("classdef-snapshot-bundle-growth-consumer");
+        let class_path = source_dir.join("Marker.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-growth").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Marker\n\
+             properties\n\
+             tag = -1;\n\
+             end\n\
+             methods\n\
+             function obj = Marker()\n\
+             obj.tag = 7;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot growth marker class");
+        fs::write(
+            &producer_path,
+            format!(
+                "objs = Marker();\n\
+                 save('{snapshot_text}', 'objs');\n"
+            ),
+        )
+        .expect("write snapshot growth producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot growth source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot growth producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 objs(3) = objs(1);\n\
+                 objs(3).tag = 9;\n\
+                 out = objs.tag;\n"
+            ),
+        )
+        .expect("write snapshot growth consumer");
+
+        let expected =
+            "workspace\n  objs = [Marker with properties {tag=7}, Marker with properties {tag=7}, Marker with properties {tag=9}]\n  out = [7, 7, 9]\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_object_property_growth_without_source_tree()
+    {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-object-property-growth-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-object-property-growth-consumer");
+        let point_path = source_dir.join("Point.m");
+        let wrap_path = source_dir.join("Wrap.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-object-property-growth")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot object-property growth point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot object-property growth wrap class");
+        fs::write(
+            &producer_path,
+            format!(
+                "wraps = [Wrap([Point() Point()]), Wrap([Point() Point()])];\n\
+                 save('{snapshot_text}', 'wraps');\n"
+            ),
+        )
+        .expect("write snapshot object-property growth producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot object-property growth source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot object-property growth producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 p = wraps.data(1);\n\
+                 p.x = 99;\n\
+                 wraps.data(6) = p;\n\
+                 cls = class(wraps);\n\
+                 out = wraps.data.x;\n"
+            ),
+        )
+        .expect("write snapshot object-property growth consumer");
+
+        let expected =
+            "workspace\n  cls = 'Wrap'\n  out = [0, 0, 0, 0, 0, 99]\n  p = Point with properties {x=99}\n  wraps = [Wrap with properties {data=[Point with properties {x=0}, Point with properties {x=0}, Point with properties {x=0}]}, Wrap with properties {data=[Point with properties {x=0}, Point with properties {x=0}, Point with properties {x=99}]}]\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 2);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 2);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_packaged_bundle_backed_constructor_and_static_handle_calls_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-constructor-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-constructor-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-packaged-constructor")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             methods (Static)\n\
+             function [a, b] = pair()\n\
+             a = 7;\n\
+             b = 8;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new-packaged-constructor point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = pkg.Point(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new-packaged-constructor producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new-packaged-constructor source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new-packaged-constructor producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 q = pkg.Point(10);\n\
+                 f = @pkg.Point.pair;\n\
+                 [a, b] = f();\n\
+                 out = [q.x, a, b];\n"
+            ),
+        )
+        .expect("write snapshot new-packaged-constructor consumer");
+
+        let expected =
+            "workspace\n  a = 7\n  b = 8\n  f = @pkg.Point.pair\n  out = [10, 7, 8]\n  q = pkg.Point with properties {x=10}\n  seed = pkg.Point with properties {x=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_constructor_handles_without_source_tree() {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-constructor-handle-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-constructor-handle-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-constructor-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new-constructor-handle point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Point(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new-constructor-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new-constructor-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new-constructor-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 f = @Point;\n\
+                 p = f(10);\n\
+                 out = p.x;\n"
+            ),
+        )
+        .expect("write snapshot new-constructor-handle consumer");
+
+        let expected =
+            "workspace\n  f = @Point\n  out = 10\n  p = Point with properties {x=10}\n  seed = Point with properties {x=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_packaged_bundle_backed_constructor_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-constructor-handle-source");
+        let consumer_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-packaged-constructor-handle-consumer",
+        );
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-packaged-constructor-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new-packaged-constructor-handle point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = pkg.Point(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new-packaged-constructor-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new-packaged-constructor-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new-packaged-constructor-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 f = @pkg.Point;\n\
+                 p = f(10);\n\
+                 out = p.x;\n"
+            ),
+        )
+        .expect("write snapshot new-packaged-constructor-handle consumer");
+
+        let expected =
+            "workspace\n  f = @pkg.Point\n  out = 10\n  p = pkg.Point with properties {x=10}\n  seed = pkg.Point with properties {x=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_class_qualified_instance_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-instance-handle-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-instance-handle-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-instance-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = obj.x + 1;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new-instance-handle point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Point(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new-instance-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot new-instance-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new-instance-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 p = Point(10);\n\
+                 f = @Point.total;\n\
+                 out = f(p);\n"
+            ),
+        )
+        .expect("write snapshot new-instance-handle consumer");
+
+        let expected =
+            "workspace\n  f = @Point.total\n  out = 11\n  p = Point with properties {x=10}\n  seed = Point with properties {x=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_packaged_bundle_backed_class_qualified_instance_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-instance-handle-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-instance-handle-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-packaged-instance-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = obj.x + 1;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new-packaged-instance-handle point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = pkg.Point(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new-packaged-instance-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new-packaged-instance-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new-packaged-instance-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 p = pkg.Point(10);\n\
+                 f = @pkg.Point.total;\n\
+                 out = f(p);\n"
+            ),
+        )
+        .expect("write snapshot new-packaged-instance-handle consumer");
+
+        let expected =
+            "workspace\n  f = @pkg.Point.total\n  out = 11\n  p = pkg.Point with properties {x=10}\n  seed = pkg.Point with properties {x=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_class_qualified_instance_calls_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-instance-call-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-instance-call-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-instance-call")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = obj.x + 1;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new-instance-call point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Point(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new-instance-call producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot new-instance-call source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new-instance-call producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 p = Point(10);\n\
+                 out = Point.total(p);\n"
+            ),
+        )
+        .expect("write snapshot new-instance-call consumer");
+
+        let expected =
+            "workspace\n  out = 11\n  p = Point with properties {x=10}\n  seed = Point with properties {x=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_packaged_bundle_backed_class_qualified_instance_calls_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-instance-call-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-instance-call-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-packaged-instance-call")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = obj.x + 1;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new-packaged-instance-call point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = pkg.Point(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new-packaged-instance-call producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new-packaged-instance-call source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new-packaged-instance-call producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 p = pkg.Point(10);\n\
+                 out = pkg.Point.total(p);\n"
+            ),
+        )
+        .expect("write snapshot new-packaged-instance-call consumer");
+
+        let expected =
+            "workspace\n  out = 11\n  p = pkg.Point with properties {x=10}\n  seed = pkg.Point with properties {x=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_folder_method_handles_and_calls_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-folder-method-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-folder-method-consumer");
+        let class_dir = source_dir.join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create class private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-folder-method")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new folder-method class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write snapshot new folder-method function");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write snapshot new folder-method helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Counter(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new folder-method producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new folder-method source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new folder-method producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 c = Counter(20);\n\
+                 fq = @Counter.plusWithOffset;\n\
+                 outq = fq(c, 4);\n\
+                 fd = @c.plusWithOffset;\n\
+                 outd = fd(4);\n\
+                 outc = Counter.plusWithOffset(c, 5);\n\
+                 outu = plusWithOffset(c, 6);\n"
+            ),
+        )
+        .expect("write snapshot new folder-method consumer");
+
+        let expected =
+            "workspace\n  c = Counter with properties {value=20}\n  fd = @Counter.plusWithOffset\n  fq = @Counter.plusWithOffset\n  outc = 27\n  outd = 26\n  outq = 26\n  outu = 28\n  seed = Counter with properties {value=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 3);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 3);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_packaged_bundle_backed_folder_method_handles_and_calls_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-packaged-folder-method-source",
+        );
+        let consumer_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-packaged-folder-method-consumer",
+        );
+        let class_dir = source_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package class private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path = unique_temp_mat_path(
+            "classdef-snapshot-bundle-new-packaged-folder-method",
+        )
+        .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new packaged folder-method class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write snapshot new packaged folder-method function");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 3;\n\
+             end\n",
+        )
+        .expect("write snapshot new packaged folder-method helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = pkg.Counter(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new packaged folder-method producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new packaged folder-method source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new packaged folder-method producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 c = pkg.Counter(20);\n\
+                 fq = @pkg.Counter.plusWithOffset;\n\
+                 outq = fq(c, 4);\n\
+                 fd = @c.plusWithOffset;\n\
+                 outd = fd(4);\n\
+                 outc = pkg.Counter.plusWithOffset(c, 5);\n\
+                 outu = plusWithOffset(c, 6);\n"
+            ),
+        )
+        .expect("write snapshot new packaged folder-method consumer");
+
+        let expected =
+            "workspace\n  c = pkg.Counter with properties {value=20}\n  fd = @pkg.Counter.plusWithOffset\n  fq = @pkg.Counter.plusWithOffset\n  outc = 28\n  outd = 27\n  outq = 27\n  outu = 29\n  seed = pkg.Counter with properties {value=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 3);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 3);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_unqualified_folder_method_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-unqualified-folder-handle-source",
+        );
+        let consumer_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-unqualified-folder-handle-consumer",
+        );
+        let class_dir = source_dir.join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create class private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path = unique_temp_mat_path(
+            "classdef-snapshot-bundle-new-unqualified-folder-handle",
+        )
+        .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified folder-handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified folder-handle function");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified folder-handle helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Counter(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new unqualified folder-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new unqualified folder-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new unqualified folder-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 c = Counter(20);\n\
+                 f = @plusWithOffset;\n\
+                 out = f(c, 5);\n"
+            ),
+        )
+        .expect("write snapshot new unqualified folder-handle consumer");
+
+        let expected =
+            "workspace\n  c = Counter with properties {value=20}\n  f = @plusWithOffset\n  out = 27\n  seed = Counter with properties {value=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 3);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 3);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_packaged_bundle_backed_unqualified_folder_method_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-packaged-unqualified-folder-handle-source",
+        );
+        let consumer_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-packaged-unqualified-folder-handle-consumer",
+        );
+        let class_dir = source_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package class private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path = unique_temp_mat_path(
+            "classdef-snapshot-bundle-new-packaged-unqualified-folder-handle",
+        )
+        .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new packaged unqualified folder-handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write snapshot new packaged unqualified folder-handle function");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 3;\n\
+             end\n",
+        )
+        .expect("write snapshot new packaged unqualified folder-handle helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = pkg.Counter(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new packaged unqualified folder-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new packaged unqualified folder-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new packaged unqualified folder-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 c = pkg.Counter(20);\n\
+                 f = @plusWithOffset;\n\
+                 out = f(c, 5);\n"
+            ),
+        )
+        .expect("write snapshot new packaged unqualified folder-handle consumer");
+
+        let expected =
+            "workspace\n  c = pkg.Counter with properties {value=20}\n  f = @plusWithOffset\n  out = 28\n  seed = pkg.Counter with properties {value=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 3);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 3);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_packaged_bundle_backed_indexed_folder_method_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-indexed-folder-handle-source");
+        let consumer_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-indexed-folder-handle-consumer",
+        );
+        let class_dir = source_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package class private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-indexed-folder-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new indexed folder-handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write snapshot new indexed folder-handle function");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 3;\n\
+             end\n",
+        )
+        .expect("write snapshot new indexed folder-handle helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = pkg.Counter(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new indexed folder-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new indexed folder-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new indexed folder-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 objs = [pkg.Counter(10) pkg.Counter(20) pkg.Counter(30)];\n\
+                 f = @objs(2).plusWithOffset;\n\
+                 out = f(5);\n"
+            ),
+        )
+        .expect("write snapshot new indexed folder-handle consumer");
+
+        let expected =
+            "workspace\n  f = @pkg.Counter.plusWithOffset\n  objs = [pkg.Counter with properties {value=10}, pkg.Counter with properties {value=20}, pkg.Counter with properties {value=30}]\n  out = 28\n  seed = pkg.Counter with properties {value=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 3);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 3);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_packaged_bundle_backed_property_produced_folder_method_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-property-folder-handle-source",
+        );
+        let consumer_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-property-folder-handle-consumer",
+        );
+        let class_dir = source_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        let wrap_path = source_dir.join("Wrap.m");
+        fs::create_dir_all(&private_dir).expect("create package class private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-property-folder-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new property folder-handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write snapshot new property folder-handle function");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 3;\n\
+             end\n",
+        )
+        .expect("write snapshot new property folder-handle helper");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(child)\n\
+             obj.child = child;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new property folder-handle wrap");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Wrap(pkg.Counter(1));\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new property folder-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new property folder-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new property folder-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 w = Wrap(pkg.Counter(20));\n\
+                 f = @w.child.plusWithOffset;\n\
+                 out = f(5);\n"
+            ),
+        )
+        .expect("write snapshot new property folder-handle consumer");
+
+        let expected =
+            "workspace\n  f = @pkg.Counter.plusWithOffset\n  out = 28\n  seed = Wrap with properties {child=pkg.Counter with properties {value=1}}\n  w = Wrap with properties {child=pkg.Counter with properties {value=20}}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 4);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 4);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_indexed_folder_method_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-unqualified-indexed-folder-handle-source");
+        let consumer_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-unqualified-indexed-folder-handle-consumer",
+        );
+        let class_dir = source_dir.join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create class private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path = unique_temp_mat_path(
+            "classdef-snapshot-bundle-new-unqualified-indexed-folder-handle",
+        )
+        .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified indexed folder-handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified indexed folder-handle function");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified indexed folder-handle helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Counter(1);\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new unqualified indexed folder-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new unqualified indexed folder-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new unqualified indexed folder-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 objs = [Counter(10) Counter(20) Counter(30)];\n\
+                 f = @objs(2).plusWithOffset;\n\
+                 out = f(5);\n"
+            ),
+        )
+        .expect("write snapshot new unqualified indexed folder-handle consumer");
+
+        let expected =
+            "workspace\n  f = @Counter.plusWithOffset\n  objs = [Counter with properties {value=10}, Counter with properties {value=20}, Counter with properties {value=30}]\n  out = 27\n  seed = Counter with properties {value=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 3);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 3);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_allows_new_bundle_backed_property_produced_folder_method_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-unqualified-property-folder-handle-source",
+        );
+        let consumer_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-unqualified-property-folder-handle-consumer",
+        );
+        let class_dir = source_dir.join("@Counter");
+        let private_dir = class_dir.join("private");
+        let wrap_path = source_dir.join("Wrap.m");
+        fs::create_dir_all(&private_dir).expect("create class private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path = unique_temp_mat_path(
+            "classdef-snapshot-bundle-new-unqualified-property-folder-handle",
+        )
+        .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified property folder-handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified property folder-handle function");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified property folder-handle helper");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(child)\n\
+             obj.child = child;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot new unqualified property folder-handle wrap");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Wrap(Counter(1));\n\
+                 save('{snapshot_text}', 'seed');\n"
+            ),
+        )
+        .expect("write snapshot new unqualified property folder-handle producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot new unqualified property folder-handle source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new unqualified property folder-handle producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 w = Wrap(Counter(20));\n\
+                 f = @w.child.plusWithOffset;\n\
+                 out = f(5);\n"
+            ),
+        )
+        .expect("write snapshot new unqualified property folder-handle consumer");
+
+        let expected =
+            "workspace\n  f = @Counter.plusWithOffset\n  out = 27\n  seed = Wrap with properties {child=Counter with properties {value=1}}\n  w = Wrap with properties {child=Counter with properties {value=20}}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 4);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 4);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_multi_output_static_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("classdef-snapshot-bundle-multiout-source");
+        let consumer_dir = unique_temp_script_dir("classdef-snapshot-bundle-multiout-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-multiout").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function [a, b] = pair()\n\
+             a = 11;\n\
+             b = 22;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot multi-output point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @Point.pair;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot multi-output producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot multi-output source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot multi-output producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 [a, b] = f();\n\
+                 out = [a, b];\n"
+            ),
+        )
+        .expect("write snapshot multi-output consumer");
+
+        let expected = "workspace\n  a = 11\n  b = 22\n  f = @Point.pair\n  out = [11, 22]\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_packaged_bundle_backed_multi_output_static_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("classdef-snapshot-bundle-pkg-multiout-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-pkg-multiout-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path = unique_temp_mat_path("classdef-snapshot-bundle-pkg-multiout")
+            .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function [a, b] = pair()\n\
+             a = 7;\n\
+             b = 8;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot packaged multi-output point class");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @pkg.Point.pair;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot packaged multi-output producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot packaged multi-output source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot packaged multi-output producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 [a, b] = f();\n\
+                 out = [a, b];\n"
+            ),
+        )
+        .expect("write snapshot packaged multi-output consumer");
+
+        let expected =
+            "workspace\n  a = 7\n  b = 8\n  f = @pkg.Point.pair\n  out = [7, 8]\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_inherited_static_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("classdef-snapshot-bundle-inherit-static-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-inherit-static-consumer");
+        let base_path = source_dir.join("Base.m");
+        let child_path = source_dir.join("Child.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-inherit-static").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             methods (Static)\n\
+             function [a, b] = origin()\n\
+             a = 9;\n\
+             b = 10;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot inherited static base class");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             end\n",
+        )
+        .expect("write snapshot inherited static child class");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = @Child.origin;\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot inherited static producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot inherited static source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot inherited static producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 [a, b] = f();\n\
+                 out = [a, b];\n"
+            ),
+        )
+        .expect("write snapshot inherited static consumer");
+
+        let expected = "workspace\n  a = 9\n  b = 10\n  f = @Child.origin\n  out = [9, 10]\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 2);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 2);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_inherited_objects_without_source_tree() {
+        let source_dir = unique_temp_script_dir("classdef-snapshot-bundle-inherit-object-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-inherit-object-consumer");
+        let base_path = source_dir.join("Base.m");
+        let child_path = source_dir.join("Child.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-inherit-object").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             methods\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot inherited object base class");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             properties\n\
+             y = 7;\n\
+             end\n\
+             methods\n\
+             function obj = Child()\n\
+             obj.y = 4;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot inherited object child class");
+        fs::write(
+            &producer_path,
+            format!(
+                "c = Child();\n\
+                 save('{snapshot_text}', 'c');\n"
+            ),
+        )
+        .expect("write snapshot inherited object producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot inherited object source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot inherited object producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 kind = class(c);\n\
+                 ok = isa(c, 'Base');\n\
+                 c(3) = c(1);\n\
+                 c(3).y = 9;\n\
+                 out = c.total();\n"
+            ),
+        )
+        .expect("write snapshot inherited object consumer");
+
+        let expected =
+            "workspace\n  c = [Child with properties {x=1, y=4}, Child with properties {x=1, y=4}, Child with properties {x=1, y=9}]\n  kind = 'Child'\n  ok = true\n  out = [5, 5, 10]\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 2);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 2);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_load_restores_property_produced_handle_bound_method_aliasing_from_mat_file_without_source_tree(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-load-property-produced-handle-alias-bundle-mat");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path =
+            unique_temp_mat_path("classdef-load-property-produced-handle-alias-bundle-mat");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value, child)\n\
+             obj.value = value;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.value]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled load alias mat class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [Counter(1, Counter(10, [])), Counter(2, Counter(20, []))];\n\
+                 f = @objs.child.total;\n\
+                 save('{matlab_path}', 'objs', 'f');\n\
+                 clear('objs', 'f');\n\
+                 load('{matlab_path}');\n\
+                 objs.child.value = [100 200];\n\
+                 out = f();\n\
+                 vals = [objs.child.value];\n"
+            ),
+        )
+        .expect("write bundled load alias mat script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled load alias mat script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  f = @Counter.total\n  objs = [Counter with properties {value=1, child=Counter with properties {value=100, child=[]}}, Counter with properties {value=2, child=Counter with properties {value=200, child=[]}}]\n  out = 300\n  vals = [100, 200]\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+    }
+
+    #[test]
+    fn classdef_bundle_load_restores_packaged_property_produced_handle_bound_method_aliasing_without_source_tree(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-load-packaged-property-produced-handle-alias-bundle");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-load-packaged-property-produced-handle-alias-bundle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value, child)\n\
+             obj.value = value;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.value]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled packaged load alias class");
+        fs::write(
+            &main_path,
+            format!(
+                "objs = [pkg.Counter(1, pkg.Counter(10, [])), pkg.Counter(2, pkg.Counter(20, []))];\n\
+                 f = @objs.child.total;\n\
+                 save('{snapshot_text}', 'objs', 'f');\n\
+                 clear('objs', 'f');\n\
+                 load('{snapshot_text}');\n\
+                 objs.child.value = [100 200];\n\
+                 out = f();\n\
+                 vals = [objs.child.value];\n"
+            ),
+        )
+        .expect("write bundled packaged load alias script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled packaged load alias script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  f = @pkg.Counter.total\n  objs = [pkg.Counter with properties {value=1, child=pkg.Counter with properties {value=100, child=[]}}, pkg.Counter with properties {value=2, child=pkg.Counter with properties {value=200, child=[]}}]\n  out = 300\n  vals = [100, 200]\n"
+        );
+
+        let _ = fs::remove_file(snapshot_path);
+    }
+
+    #[test]
+    fn classdef_bundle_method_produced_indexed_bound_method_handles_support_dispatch_without_source_tree(
+    ) {
+        let temp_dir = unique_temp_script_dir("classdef-method-produced-indexed-bound-bundle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function dup = duplicate(obj)\n\
+             dup = [obj obj];\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled method-produced indexed bound-handle class");
+        fs::write(
+            &main_path,
+            "objs = [Point(2), Point(5)];\n\
+             f = @objs.duplicate()(3).total;\n\
+             out = f();\n",
+        )
+        .expect("write bundled method-produced indexed bound-handle script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled method-produced indexed bound-handle script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  f = @Point.total\n  objs = [Point with properties {x=2}, Point with properties {x=5}]\n  out = 2\n"
+        );
+    }
+
+    #[test]
+    fn classdef_bundle_package_folder_inherited_bound_method_handles_survive_save_and_load_without_source_tree(
+    ) {
+        let temp_dir = unique_temp_script_dir("classdef-package-folder-inherited-bound-handle-bundle");
+        let base_dir = temp_dir.join("+pkg").join("@Base");
+        let private_dir = base_dir.join("private");
+        let child_dir = temp_dir.join("+pkg").join("@Child");
+        fs::create_dir_all(&private_dir).expect("create base private dir");
+        fs::create_dir_all(&child_dir).expect("create child dir");
+        let base_path = base_dir.join("Base.m");
+        let total_path = base_dir.join("total.m");
+        let bonus_path = private_dir.join("bonus.m");
+        let child_path = child_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        let mat_path = unique_temp_mat_path("classdef-package-folder-inherited-bound-handle-bundle");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package folder base class");
+        fs::write(
+            &total_path,
+            "function out = total(obj)\n\
+             out = obj.x + bonus();\n\
+             end\n",
+        )
+        .expect("write bundled package folder parent method");
+        fs::write(
+            &bonus_path,
+            "function out = bonus()\n\
+             out = 3;\n\
+             end\n",
+        )
+        .expect("write bundled package folder private helper");
+        fs::write(
+            &child_path,
+            "classdef Child < pkg.Base\n\
+             properties\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Child(y)\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package folder child class");
+        fs::write(
+            &main_path,
+            format!(
+                "c = pkg.Child(4);\n\
+                 f = @c.total;\n\
+                 save('{matlab_path}', 'f');\n\
+                 clear('f', 'c');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.f();\n"
+            ),
+        )
+        .expect("write bundled package folder inherited bound handle script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled package folder inherited bound handle script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  out = 4\n  s = struct{f=@pkg.Child.total}\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+    }
+
+    #[test]
+    fn classdef_bundle_packaged_instance_method_handles_support_dispatch_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-package-instance-handle-bundle");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package folder class dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package instance handle class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write bundled package instance handle method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 3;\n\
+             end\n",
+        )
+        .expect("write bundled package instance handle helper");
+        fs::write(
+            &main_path,
+            "f = @pkg.Counter.plusWithOffset;\n\
+             c = pkg.Counter(20);\n\
+             out = f(c, 4);\n",
+        )
+        .expect("write bundled package instance handle script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled package instance handle script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = pkg.Counter with properties {value=20}\n  f = @pkg.Counter.plusWithOffset\n  out = 27\n"
+        );
+    }
+
+    #[test]
+    fn classdef_private_members_are_accessible_from_public_wrappers() {
+        let temp_dir = unique_temp_script_dir("classdef-private-success");
+        let class_path = temp_dir.join("Vault.m");
+        let main_path = temp_dir.join("main.m");
+        write_private_access_class(&class_path);
+        fs::write(
+            &main_path,
+            "v = Vault();\n\
+             a = v.reveal();\n\
+             b = v.callHidden();\n\
+             c = Vault.callCode();\n",
+        )
+        .expect("write private wrapper script");
+
+        let expected =
+            "workspace\n  a = 42\n  b = 42\n  c = 7\n  v = Vault with properties {secret=41}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_private_property_access_is_enforced() {
+        let temp_dir = unique_temp_script_dir("classdef-private-property");
+        let class_path = temp_dir.join("Vault.m");
+        let main_path = temp_dir.join("main.m");
+        write_private_access_class(&class_path);
+        fs::write(
+            &main_path,
+            "v = Vault();\n\
+             out = v.secret;\n",
+        )
+        .expect("write private property script");
+
+        let interpreted = execute_path_result(&main_path, &[])
+            .expect_err("interpreted private property access should fail");
+        assert!(
+            interpreted
+                .to_string()
+                .contains("property `secret` has private access for class `Vault`"),
+            "{interpreted}"
+        );
+
+        let bytecode = execute_path_bytecode_result(&main_path, &[])
+            .expect_err("bytecode private property access should fail");
+        assert!(
+            bytecode
+                .to_string()
+                .contains("property `secret` has private access for class `Vault`"),
+            "{bytecode}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_private_instance_method_access_is_enforced_for_dot_and_function_form() {
+        let temp_dir = unique_temp_script_dir("classdef-private-method");
+        let class_path = temp_dir.join("Vault.m");
+        let dot_main_path = temp_dir.join("dot_main.m");
+        let function_main_path = temp_dir.join("function_main.m");
+        write_private_access_class(&class_path);
+        fs::write(
+            &dot_main_path,
+            "v = Vault();\n\
+             out = v.hidden();\n",
+        )
+        .expect("write private dot-method script");
+        fs::write(
+            &function_main_path,
+            "v = Vault();\n\
+             out = hidden(v);\n",
+        )
+        .expect("write private function-form script");
+
+        let interpreted_dot = execute_path_result(&dot_main_path, &[])
+            .expect_err("interpreted private dot-call should fail");
+        assert!(
+            interpreted_dot
+                .to_string()
+                .contains("method `hidden` has private access for class `Vault`"),
+            "{interpreted_dot}"
+        );
+
+        let bytecode_dot = execute_path_bytecode_result(&dot_main_path, &[])
+            .expect_err("bytecode private dot-call should fail");
+        assert!(
+            bytecode_dot
+                .to_string()
+                .contains("method `hidden` has private access for class `Vault`"),
+            "{bytecode_dot}"
+        );
+
+        let interpreted_function = execute_path_result(&function_main_path, &[])
+            .expect_err("interpreted private function-form call should fail");
+        assert!(
+            interpreted_function
+                .to_string()
+                .contains("method `hidden` has private access for class `Vault`"),
+            "{interpreted_function}"
+        );
+
+        let bytecode_function = execute_path_bytecode_result(&function_main_path, &[])
+            .expect_err("bytecode private function-form call should fail");
+        assert!(
+            bytecode_function
+                .to_string()
+                .contains("method `hidden` has private access for class `Vault`"),
+            "{bytecode_function}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_private_static_method_access_is_enforced() {
+        let temp_dir = unique_temp_script_dir("classdef-private-static");
+        let class_path = temp_dir.join("Vault.m");
+        let main_path = temp_dir.join("main.m");
+        write_private_access_class(&class_path);
+        fs::write(
+            &main_path,
+            "out = Vault.code();\n",
+        )
+        .expect("write private static script");
+
+        let interpreted = execute_path_result(&main_path, &[])
+            .expect_err("interpreted private static call should fail");
+        assert!(
+            interpreted
+                .to_string()
+                .contains("static method `code` has private access for class `Vault`"),
+            "{interpreted}"
+        );
+
+        let bytecode = execute_path_bytecode_result(&main_path, &[])
+            .expect_err("bytecode private static call should fail");
+        assert!(
+            bytecode
+                .to_string()
+                .contains("static method `code` has private access for class `Vault`"),
+            "{bytecode}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_inherited_private_members_remain_accessible_from_base_methods() {
+        let temp_dir = unique_temp_script_dir("classdef-inherited-private-success");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        write_inherited_private_access_classes(&base_path, &child_path);
+        fs::write(
+            &main_path,
+            "c = Child();\n\
+             a = c.reveal();\n\
+             b = c.callHidden();\n",
+        )
+        .expect("write inherited private success script");
+
+        let expected = "workspace\n  a = 41\n  b = 42\n  c = Child with properties {secret=41}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_inherited_private_property_access_is_enforced_for_callers_and_subclasses() {
+        let temp_dir = unique_temp_script_dir("classdef-inherited-private-property");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let direct_main_path = temp_dir.join("direct_main.m");
+        let child_main_path = temp_dir.join("child_main.m");
+        write_inherited_private_access_classes(&base_path, &child_path);
+        fs::write(
+            &direct_main_path,
+            "c = Child();\n\
+             out = c.secret;\n",
+        )
+        .expect("write inherited direct private property script");
+        fs::write(
+            &child_main_path,
+            "c = Child();\n\
+             out = c.childPeek();\n",
+        )
+        .expect("write inherited child private property script");
+
+        let interpreted_direct = execute_path_result(&direct_main_path, &[])
+            .expect_err("interpreted inherited direct private property should fail");
+        assert!(
+            interpreted_direct
+                .to_string()
+                .contains("property `secret` has private access for class `Base`"),
+            "{interpreted_direct}"
+        );
+
+        let bytecode_direct = execute_path_bytecode_result(&direct_main_path, &[])
+            .expect_err("bytecode inherited direct private property should fail");
+        assert!(
+            bytecode_direct
+                .to_string()
+                .contains("property `secret` has private access for class `Base`"),
+            "{bytecode_direct}"
+        );
+
+        let interpreted_child = execute_path_result(&child_main_path, &[])
+            .expect_err("interpreted inherited child private property should fail");
+        assert!(
+            interpreted_child
+                .to_string()
+                .contains("property `secret` has private access for class `Base`"),
+            "{interpreted_child}"
+        );
+
+        let bytecode_child = execute_path_bytecode_result(&child_main_path, &[])
+            .expect_err("bytecode inherited child private property should fail");
+        assert!(
+            bytecode_child
+                .to_string()
+                .contains("property `secret` has private access for class `Base`"),
+            "{bytecode_child}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_inherited_private_method_and_assignment_access_are_enforced() {
+        let temp_dir = unique_temp_script_dir("classdef-inherited-private-method");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let dot_main_path = temp_dir.join("dot_main.m");
+        let child_main_path = temp_dir.join("child_main.m");
+        let assign_main_path = temp_dir.join("assign_main.m");
+        write_inherited_private_access_classes(&base_path, &child_path);
+        fs::write(
+            &dot_main_path,
+            "c = Child();\n\
+             out = c.hidden();\n",
+        )
+        .expect("write inherited direct private method script");
+        fs::write(
+            &child_main_path,
+            "c = Child();\n\
+             out = c.childCallHidden();\n",
+        )
+        .expect("write inherited child private method script");
+        fs::write(
+            &assign_main_path,
+            "c = Child();\n\
+             c.secret = 5;\n",
+        )
+        .expect("write inherited private assignment script");
+
+        let interpreted_dot = execute_path_result(&dot_main_path, &[])
+            .expect_err("interpreted inherited direct private method should fail");
+        assert!(
+            interpreted_dot
+                .to_string()
+                .contains("method `hidden` has private access for class `Base`"),
+            "{interpreted_dot}"
+        );
+
+        let bytecode_dot = execute_path_bytecode_result(&dot_main_path, &[])
+            .expect_err("bytecode inherited direct private method should fail");
+        assert!(
+            bytecode_dot
+                .to_string()
+                .contains("method `hidden` has private access for class `Base`"),
+            "{bytecode_dot}"
+        );
+
+        let interpreted_child = execute_path_result(&child_main_path, &[])
+            .expect_err("interpreted inherited child private method should fail");
+        assert!(
+            interpreted_child
+                .to_string()
+                .contains("method `hidden` has private access for class `Base`"),
+            "{interpreted_child}"
+        );
+
+        let bytecode_child = execute_path_bytecode_result(&child_main_path, &[])
+            .expect_err("bytecode inherited child private method should fail");
+        assert!(
+            bytecode_child
+                .to_string()
+                .contains("method `hidden` has private access for class `Base`"),
+            "{bytecode_child}"
+        );
+
+        let interpreted_assign = execute_path_result(&assign_main_path, &[])
+            .expect_err("interpreted inherited private assignment should fail");
+        assert!(
+            interpreted_assign
+                .to_string()
+                .contains("property `secret` has private access for class `Base`"),
+            "{interpreted_assign}"
+        );
+
+        let bytecode_assign = execute_path_bytecode_result(&assign_main_path, &[])
+            .expect_err("bytecode inherited private assignment should fail");
+        assert!(
+            bytecode_assign
+                .to_string()
+                .contains("property `secret` has private access for class `Base`"),
+            "{bytecode_assign}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_inherited_private_members_remain_enforced_after_save_and_load() {
+        let temp_dir = unique_temp_script_dir("classdef-save-load-inherited-private");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let success_main_path = temp_dir.join("success_main.m");
+        let property_main_path = temp_dir.join("property_main.m");
+        let method_main_path = temp_dir.join("method_main.m");
+        let mat_path = unique_temp_mat_path("classdef-inherited-private");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+        write_inherited_private_access_classes(&base_path, &child_path);
+        fs::write(
+            &success_main_path,
+            format!(
+                "c = Child();\n\
+                 save('{matlab_path}', 'c');\n\
+                 clear('c');\n\
+                 s = load('{matlab_path}');\n\
+                 a = s.c.reveal();\n\
+                 b = s.c.callHidden();\n"
+            ),
+        )
+        .expect("write inherited private save/load success script");
+        fs::write(
+            &property_main_path,
+            format!(
+                "c = Child();\n\
+                 save('{matlab_path}', 'c');\n\
+                 clear('c');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.c.secret;\n"
+            ),
+        )
+        .expect("write inherited private save/load property script");
+        fs::write(
+            &method_main_path,
+            format!(
+                "c = Child();\n\
+                 save('{matlab_path}', 'c');\n\
+                 clear('c');\n\
+                 s = load('{matlab_path}');\n\
+                 out = s.c.hidden();\n"
+            ),
+        )
+        .expect("write inherited private save/load method script");
+
+        let expected =
+            "workspace\n  a = 41\n  b = 42\n  s = struct{c=Child with properties {secret=41}}\n";
+        let interpreted = execute_path(&success_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&success_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let interpreted_property = execute_path_result(&property_main_path, &[])
+            .expect_err("interpreted inherited private property after load should fail");
+        assert!(
+            interpreted_property
+                .to_string()
+                .contains("property `secret` has private access for class `Base`"),
+            "{interpreted_property}"
+        );
+
+        let bytecode_property = execute_path_bytecode_result(&property_main_path, &[])
+            .expect_err("bytecode inherited private property after load should fail");
+        assert!(
+            bytecode_property
+                .to_string()
+                .contains("property `secret` has private access for class `Base`"),
+            "{bytecode_property}"
+        );
+
+        let interpreted_method = execute_path_result(&method_main_path, &[])
+            .expect_err("interpreted inherited private method after load should fail");
+        assert!(
+            interpreted_method
+                .to_string()
+                .contains("method `hidden` has private access for class `Base`"),
+            "{interpreted_method}"
+        );
+
+        let bytecode_method = execute_path_bytecode_result(&method_main_path, &[])
+            .expect_err("bytecode inherited private method after load should fail");
+        assert!(
+            bytecode_method
+                .to_string()
+                .contains("method `hidden` has private access for class `Base`"),
+            "{bytecode_method}"
+        );
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_executes_packaged_inline_instance_method_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-inline-bundle");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled inline class");
+        fs::write(
+            &main_path,
+            "p = Point(11, 12);\n\
+             out = p.total();\n",
+        )
+        .expect("write bundled inline script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let compiled_dependencies = collect_bytecode_dependency_paths(&root_bytecode)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+                let unit = parsed.unit.expect("dependency unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+            })
+            .collect::<Vec<_>>();
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled inline-instance-method class");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  out = 23\n  p = Point with properties {x=11, y=12}\n"
+        );
+    }
+
+    #[test]
+    fn classdef_scalar_value_objects_support_paren_indexing_and_end_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-scalar-object-paren");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write scalar paren-index class");
+        fs::write(
+            &main_path,
+            "p = Point(5, 6);\n\
+             first = p(1).x;\n\
+             same = p(end).total();\n\
+             p(1).y = 10;\n\
+             dup = p([1 1]);\n\
+             out = [first same dup(2).y];\n\
+             spread = dup.x;\n",
+        )
+        .expect("write scalar paren-index script");
+
+        let expected = "workspace\n  dup = [Point with properties {x=5, y=10}, Point with properties {x=5, y=10}]\n  first = 5\n  out = [5, 11, 10]\n  p = Point with properties {x=5, y=10}\n  same = 11\n  spread = [5, 5]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_handle_objects_support_paren_indexing_aliases() {
+        let temp_dir = unique_temp_script_dir("classdef-scalar-handle-paren");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            "c = Counter(5);\n\
+             alias = c(1);\n\
+             pair = c([1 1]);\n\
+             alias.increment(2);\n\
+             pair(2).increment(3);\n\
+             out = [c.current() alias.current() pair(1).current() pair(end).current()];\n",
+        )
+        .expect("write scalar handle paren-index script");
+
+        let expected = "workspace\n  alias = Counter with properties {value=10}\n  c = Counter with properties {value=10}\n  out = [10, 10, 10, 10]\n  pair = [Counter with properties {value=10}, Counter with properties {value=10}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_value_objects_support_gapped_growth_with_default_constructor_fill() {
+        let temp_dir = unique_temp_script_dir("classdef-scalar-object-gapped-growth");
+        let class_path = temp_dir.join("Marker.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Marker\n\
+             properties\n\
+             tag = -1;\n\
+             end\n\
+             methods\n\
+             function obj = Marker()\n\
+             obj.tag = 7;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write gapped-growth value class");
+        fs::write(
+            &main_path,
+            "m = Marker();\n\
+             m(3) = Marker();\n\
+             m(3).tag = 9;\n\
+             out = m.tag;\n",
+        )
+        .expect("write gapped-growth value script");
+
+        let expected =
+            "workspace\n  m = [Marker with properties {tag=7}, Marker with properties {tag=7}, Marker with properties {tag=9}]\n  out = [7, 7, 9]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_row_column_and_linear_deletion() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-delete");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object array delete class");
+        fs::write(
+            &main_path,
+            "row = [Point(1), Point(2), Point(3)];\n\
+             row(2) = [];\n\
+             out1 = row.x;\n\
+             mat = [Point(1) Point(2); Point(3) Point(4)];\n\
+             mat(:,2) = [];\n\
+             out2 = mat.x;\n",
+        )
+        .expect("write object array delete script");
+
+        let expected =
+            "workspace\n  mat = [Point with properties {x=1} ; Point with properties {x=3}]\n  out1 = [1, 3]\n  out2 = [1 ; 3]\n  row = [Point with properties {x=1}, Point with properties {x=3}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_handle_objects_support_gapped_growth_with_distinct_default_handles() {
+        let temp_dir = unique_temp_script_dir("classdef-scalar-handle-gapped-growth");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function increment(obj, delta)\n\
+             obj.value = obj.value + delta;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write gapped-growth handle class");
+        fs::write(
+            &main_path,
+            "c = Counter();\n\
+             c.value = 5;\n\
+             c(4) = Counter();\n\
+             c(4).value = 9;\n\
+             refs = c;\n\
+             c(2).increment(1);\n\
+             c(3).increment(2);\n\
+             out = refs.value;\n",
+        )
+        .expect("write gapped-growth handle script");
+
+        let expected =
+            "workspace\n  c = [Counter with properties {value=5}, Counter with properties {value=1}, Counter with properties {value=2}, Counter with properties {value=9}]\n  out = [5, 1, 2, 9]\n  refs = [Counter with properties {value=5}, Counter with properties {value=1}, Counter with properties {value=2}, Counter with properties {value=9}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_empty_value_object_arrays_support_gapped_growth_from_empty_root() {
+        let temp_dir = unique_temp_script_dir("classdef-empty-object-gapped-growth");
+        let class_path = temp_dir.join("Marker.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Marker\n\
+             properties\n\
+             tag = -1;\n\
+             end\n\
+             methods\n\
+             function obj = Marker()\n\
+             obj.tag = 7;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write empty-root value class");
+        fs::write(
+            &main_path,
+            "objs = [];\n\
+             objs(3) = Marker();\n\
+             objs(3).tag = 9;\n\
+             out = objs.tag;\n",
+        )
+        .expect("write empty-root value script");
+
+        let expected =
+            "workspace\n  objs = [Marker with properties {tag=7}, Marker with properties {tag=7}, Marker with properties {tag=9}]\n  out = [7, 7, 9]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_empty_handle_object_arrays_support_gapped_growth_from_empty_root() {
+        let temp_dir = unique_temp_script_dir("classdef-empty-handle-gapped-growth");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function increment(obj, delta)\n\
+             obj.value = obj.value + delta;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write empty-root handle class");
+        fs::write(
+            &main_path,
+            "objs = [];\n\
+             objs(4) = Counter();\n\
+             objs(4).value = 9;\n\
+             refs = objs;\n\
+             objs(2).increment(1);\n\
+             objs(3).increment(2);\n\
+             out = refs.value;\n",
+        )
+        .expect("write empty-root handle script");
+
+        let expected =
+            "workspace\n  objs = [Counter with properties {value=0}, Counter with properties {value=1}, Counter with properties {value=2}, Counter with properties {value=9}]\n  out = [0, 1, 2, 9]\n  refs = [Counter with properties {value=0}, Counter with properties {value=1}, Counter with properties {value=2}, Counter with properties {value=9}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_scalar_handle_objects_support_gapped_growth_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-bundle-handle-gapped-growth");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function increment(obj, delta)\n\
+             obj.value = obj.value + delta;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled gapped-growth handle class");
+        fs::write(
+            &main_path,
+            "c = Counter();\n\
+             c.value = 5;\n\
+             c(4) = Counter();\n\
+             c(4).value = 9;\n\
+             refs = c;\n\
+             c(2).increment(1);\n\
+             c(3).increment(2);\n\
+             out = refs.value;\n",
+        )
+        .expect("write bundled gapped-growth handle script");
+
+        let bundle = compile_bytecode_bundle(&main_path);
+        fs::remove_dir_all(&temp_dir).expect("remove bundled gapped-growth source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled gapped-growth handle script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = [Counter with properties {value=5}, Counter with properties {value=1}, Counter with properties {value=2}, Counter with properties {value=9}]\n  out = [5, 1, 2, 9]\n  refs = [Counter with properties {value=5}, Counter with properties {value=1}, Counter with properties {value=2}, Counter with properties {value=9}]\n"
+        );
+    }
+
+    #[test]
+    fn classdef_gapped_growth_reports_zero_arg_constructor_requirement() {
+        let temp_dir = unique_temp_script_dir("classdef-object-gapped-growth-error");
+        let class_path = temp_dir.join("NeedsArg.m");
+        let scalar_main_path = temp_dir.join("scalar_main.m");
+        let empty_main_path = temp_dir.join("empty_main.m");
+        fs::write(
+            &class_path,
+            "classdef NeedsArg\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = NeedsArg(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write arg-requiring class");
+        fs::write(
+            &scalar_main_path,
+            "a = NeedsArg(5);\n\
+             a(3) = NeedsArg(9);\n",
+        )
+        .expect("write scalar growth error script");
+        fs::write(
+            &empty_main_path,
+            "a = [];\n\
+             a(3) = NeedsArg(9);\n",
+        )
+        .expect("write empty growth error script");
+
+        let source_scalar = execute_path_result(&scalar_main_path, &[])
+            .expect_err("scalar gapped growth should require zero-arg constructor");
+        let bytecode_scalar = execute_path_bytecode_result(&scalar_main_path, &[])
+            .expect_err("bytecode scalar gapped growth should require zero-arg constructor");
+        let source_empty = execute_path_result(&empty_main_path, &[])
+            .expect_err("empty-root gapped growth should require zero-arg constructor");
+        let bytecode_empty = execute_path_bytecode_result(&empty_main_path, &[])
+            .expect_err("bytecode empty-root gapped growth should require zero-arg constructor");
+
+        for error in [source_scalar, bytecode_scalar, source_empty, bytecode_empty] {
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(
+                    "growing object arrays for class `NeedsArg` requires a zero-argument constructor for intermediate elements"
+                ),
+                "{rendered}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_mixed_class_object_literals_are_rejected() {
+        let temp_dir = unique_temp_script_dir("classdef-mixed-object-literal");
+        let point_path = temp_dir.join("Point.m");
+        let other_path = temp_dir.join("Other.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write point class");
+        fs::write(
+            &other_path,
+            "classdef Other\n\
+             properties\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Other(y)\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write other class");
+        fs::write(
+            &main_path,
+            "a = [Point(1), Other(2)];\n",
+        )
+        .expect("write mixed object literal script");
+
+        let source = execute_path_result(&main_path, &[])
+            .expect_err("mixed-class object literal should fail in interpreter");
+        let bytecode = execute_path_bytecode_result(&main_path, &[])
+            .expect_err("mixed-class object literal should fail in bytecode");
+        for error in [source, bytecode] {
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(
+                    "matrix values currently require object elements to have the same class"
+                ),
+                "{rendered}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_mixed_class_object_concatenation_is_rejected() {
+        let temp_dir = unique_temp_script_dir("classdef-mixed-object-concat");
+        let point_path = temp_dir.join("Point.m");
+        let other_path = temp_dir.join("Other.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write concat point class");
+        fs::write(
+            &other_path,
+            "classdef Other\n\
+             properties\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Other(y)\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write concat other class");
+        fs::write(
+            &main_path,
+            "a = [Point(1)];\n\
+             b = [Other(2)];\n\
+             c = horzcat(a, b);\n",
+        )
+        .expect("write mixed object concat script");
+
+        let source = execute_path_result(&main_path, &[])
+            .expect_err("mixed-class object concat should fail in interpreter");
+        let bytecode = execute_path_bytecode_result(&main_path, &[])
+            .expect_err("mixed-class object concat should fail in bytecode");
+        for error in [source, bytecode] {
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(
+                    "matrix values currently require object elements to have the same class"
+                ),
+                "{rendered}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_objects_support_concat_builtins() {
+        let temp_dir = unique_temp_script_dir("classdef-object-concat");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write concat point class");
+        fs::write(
+            &main_path,
+            "row = horzcat(Point(1), Point(2));\n\
+             col = vertcat(Point(3), Point(4));\n\
+             row_size = size(row);\n\
+             col_size = size(col);\n\
+             out = [row_size(1) row_size(2) col_size(1) col_size(2) row(1).x row(2).x col(1).x col(2).x];\n",
+        )
+        .expect("write concat script");
+
+        let expected =
+            "workspace\n  col = [Point with properties {x=3} ; Point with properties {x=4}]\n  col_size = [2, 1]\n  out = [1, 2, 2, 1, 1, 2, 3, 4]\n  row = [Point with properties {x=1}, Point with properties {x=2}]\n  row_size = [1, 2]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_objects_support_cat_nd_builtin() {
+        let temp_dir = unique_temp_script_dir("classdef-object-cat-nd");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write cat nd point class");
+        fs::write(
+            &main_path,
+            "cube = cat(3, Point(5), Point(9));\n\
+             dims = size(cube);\n\
+             out = [dims(1) dims(2) dims(3) cube(1, 1, 1).x cube(1, 1, 2).x];\n\
+             clear('cube');\n",
+        )
+        .expect("write cat nd script");
+
+        let expected = "workspace\n  dims = [1, 1, 2]\n  out = [1, 1, 2, 5, 9]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn matrix_literals_concatenate_matrix_valued_expressions() {
+        let source = "x = [1 2; 3 4];\n\
+                      h = [x x];\n\
+                      v = [x; x];\n";
+
+        let interpreted = execute_script_source(source);
+        let Value::Matrix(h) = interpreted.workspace.get("h").expect("horizontal result") else {
+            panic!("expected matrix literal result");
+        };
+        assert_eq!(h.rows, 2);
+        assert_eq!(h.cols, 4);
+        assert_eq!(
+            h.elements,
+            vec![
+                Value::Scalar(1.0),
+                Value::Scalar(2.0),
+                Value::Scalar(1.0),
+                Value::Scalar(2.0),
+                Value::Scalar(3.0),
+                Value::Scalar(4.0),
+                Value::Scalar(3.0),
+                Value::Scalar(4.0),
+            ]
+        );
+        let Value::Matrix(v) = interpreted.workspace.get("v").expect("vertical result") else {
+            panic!("expected matrix literal result");
+        };
+        assert_eq!(v.rows, 4);
+        assert_eq!(v.cols, 2);
+        assert_eq!(
+            v.elements,
+            vec![
+                Value::Scalar(1.0),
+                Value::Scalar(2.0),
+                Value::Scalar(3.0),
+                Value::Scalar(4.0),
+                Value::Scalar(1.0),
+                Value::Scalar(2.0),
+                Value::Scalar(3.0),
+                Value::Scalar(4.0),
+            ]
+        );
+
+        let bytecode = execute_script_source_bytecode(source);
+        let Value::Matrix(h) = bytecode.workspace.get("h").expect("bytecode horizontal result") else {
+            panic!("expected matrix literal result");
+        };
+        assert_eq!(h.rows, 2);
+        assert_eq!(h.cols, 4);
+        let Value::Matrix(v) = bytecode.workspace.get("v").expect("bytecode vertical result") else {
+            panic!("expected matrix literal result");
+        };
+        assert_eq!(v.rows, 4);
+        assert_eq!(v.cols, 2);
+    }
+
+    #[test]
+    fn classdef_object_array_methods_support_matrix_literal_concat_results() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-literal-concat");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function dup = duplicate(obj)\n\
+             dup = [obj obj];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write duplicate class");
+        fs::write(
+            &main_path,
+            "objs = [Point(2), Point(5)];\n\
+             dup = objs.duplicate();\n\
+             out = dup.x;\n\
+             pick = objs.duplicate()(3).x;\n",
+        )
+        .expect("write duplicate script");
+
+        let expected =
+            "workspace\n  dup = [Point with properties {x=2}, Point with properties {x=5}, Point with properties {x=2}, Point with properties {x=5}]\n  objs = [Point with properties {x=2}, Point with properties {x=5}]\n  out = [2, 5, 2, 5]\n  pick = 2\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_value_object_arrays_support_class_isa_and_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write array class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, 2), Point(3, 4)];\n\
+             cls = class(objs);\n\
+             ok = isa(objs, 'Point');\n\
+             out = [objs.x];\n",
+        )
+        .expect("write array script");
+
+        let expected =
+            "workspace\n  cls = 'Point'\n  objs = [Point with properties {x=1, y=2}, Point with properties {x=3, y=4}]\n  ok = true\n  out = [1, 3]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_value_2d_object_arrays_preserve_property_read_layout() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-2d-property-read");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write 2d property-read class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1) Point(2); Point(3) Point(4)];\n\
+             out = objs.x;\n",
+        )
+        .expect("write 2d property-read script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=1}, Point with properties {x=2} ; Point with properties {x=3}, Point with properties {x=4}]\n  out = [1, 2 ; 3, 4]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_array_property_subindex_assignment_updates_selected_receiver() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-property-subindex");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write nested object class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])), Point(2, Point(20, []))];\n\
+             objs.child(2).x = 40;\n\
+             out = objs.child.x;\n",
+        )
+        .expect("write property subindex assignment script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=40, child=[]}}]\n  out = [10, 40]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_method_result_assignment_is_rejected_consistently() {
+        let temp_dir = unique_temp_script_dir("classdef-method-result-assignment");
+        let class_path = temp_dir.join("Point.m");
+        let indexed_main_path = temp_dir.join("indexed_main.m");
+        let bulk_main_path = temp_dir.join("bulk_main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function dup = duplicate(obj)\n\
+             dup = [obj obj];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write duplicate-return class");
+        fs::write(
+            &indexed_main_path,
+            "objs = [Point(2, []), Point(5, [])];\n\
+             objs.duplicate()(3).x = 9;\n",
+        )
+        .expect("write indexed method-result assignment script");
+        fs::write(
+            &bulk_main_path,
+            "objs = [Point(2, []), Point(5, [])];\n\
+             objs.duplicate().x = [1 2 3 4];\n",
+        )
+        .expect("write bulk method-result assignment script");
+
+        for path in [&indexed_main_path, &bulk_main_path] {
+            let source = execute_path_result(path, &[])
+                .expect_err("method-result assignment should fail in interpreter");
+            let bytecode = execute_path_bytecode_result(path, &[])
+                .expect_err("method-result assignment should fail in bytecode");
+            for error in [source, bytecode] {
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains(
+                        "assignment through method result `duplicate(...)` is not supported; assign the result to a variable first"
+                    ),
+                    "{rendered}"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_objects_support_repmat() {
+        let temp_dir = unique_temp_script_dir("classdef-object-repmat");
+        let point_path = temp_dir.join("Point.m");
+        let counter_path = temp_dir.join("Counter.m");
+        let value_main_path = temp_dir.join("value_main.m");
+        let handle_main_path = temp_dir.join("handle_main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write repmat value class");
+        write_handle_counter_class(&counter_path);
+        fs::write(
+            &value_main_path,
+            "obj = Point(7);\n\
+             arr = repmat(obj, 1, 3);\n\
+             out = arr.x;\n",
+        )
+        .expect("write value repmat script");
+        fs::write(
+            &handle_main_path,
+            "obj = Counter(7);\n\
+             arr = repmat(obj, 1, 3);\n\
+             arr(3).increment(2);\n\
+             out = [obj.value arr.value];\n",
+        )
+        .expect("write handle repmat script");
+
+        let expected_value =
+            "workspace\n  arr = [Point with properties {x=7}, Point with properties {x=7}, Point with properties {x=7}]\n  obj = Point with properties {x=7}\n  out = [7, 7, 7]\n";
+        let interpreted_value = execute_path(&value_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted_value), expected_value);
+        let bytecode_value = execute_path_bytecode(&value_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode_value), expected_value);
+
+        let expected_handle =
+            "workspace\n  arr = [Counter with properties {value=9}, Counter with properties {value=9}, Counter with properties {value=9}]\n  obj = Counter with properties {value=9}\n  out = [9, 9, 9, 9]\n";
+        let interpreted_handle = execute_path(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_objects_support_repelem() {
+        let temp_dir = unique_temp_script_dir("classdef-object-repelem");
+        let point_path = temp_dir.join("Point.m");
+        let counter_path = temp_dir.join("Counter.m");
+        let value_main_path = temp_dir.join("value_main.m");
+        let handle_main_path = temp_dir.join("handle_main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write repelem value class");
+        write_handle_counter_class(&counter_path);
+        fs::write(
+            &value_main_path,
+            "obj = Point(7);\n\
+             arr = repelem(obj, 3);\n\
+             out = arr.x;\n",
+        )
+        .expect("write value repelem script");
+        fs::write(
+            &handle_main_path,
+            "obj = Counter(7);\n\
+             arr = repelem(obj, 3);\n\
+             arr(3).increment(2);\n\
+             out = [obj.value arr.value];\n",
+        )
+        .expect("write handle repelem script");
+
+        let expected_value =
+            "workspace\n  arr = [Point with properties {x=7}, Point with properties {x=7}, Point with properties {x=7}]\n  obj = Point with properties {x=7}\n  out = [7, 7, 7]\n";
+        let interpreted_value = execute_path(&value_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted_value), expected_value);
+        let bytecode_value = execute_path_bytecode(&value_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode_value), expected_value);
+
+        let expected_handle =
+            "workspace\n  arr = [Counter with properties {value=9}, Counter with properties {value=9}, Counter with properties {value=9}]\n  obj = Counter with properties {value=9}\n  out = [9, 9, 9, 9]\n";
+        let interpreted_handle = execute_path(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_objects_support_shape_helpers() {
+        let temp_dir = unique_temp_script_dir("classdef-object-shape-helpers");
+        let point_path = temp_dir.join("Point.m");
+        let counter_path = temp_dir.join("Counter.m");
+        let value_main_path = temp_dir.join("value_main.m");
+        let handle_main_path = temp_dir.join("handle_main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write shape-helper value class");
+        write_handle_counter_class(&counter_path);
+        fs::write(
+            &value_main_path,
+            "obj = Point(7);\n\
+             r = reshape(obj, 1, 1);\n\
+             p = permute(obj, [1 2]);\n\
+             i = ipermute(obj, [1 2]);\n\
+             f = flip(obj);\n\
+             c = circshift(obj, 0);\n\
+             out = [r.x p.x i.x f.x c.x];\n",
+        )
+        .expect("write value shape-helper script");
+        fs::write(
+            &handle_main_path,
+            "obj = Counter(7);\n\
+             r = reshape(obj, 1, 1);\n\
+             p = permute(obj, [1 2]);\n\
+             i = ipermute(obj, [1 2]);\n\
+             f = flip(obj);\n\
+             c = circshift(obj, 0);\n\
+             r.increment(1);\n\
+             p.increment(2);\n\
+             i.increment(3);\n\
+             f.increment(4);\n\
+             c.increment(5);\n\
+             out = [obj.value r.value p.value i.value f.value c.value];\n",
+        )
+        .expect("write handle shape-helper script");
+
+        let expected_value =
+            "workspace\n  c = Point with properties {x=7}\n  f = Point with properties {x=7}\n  i = Point with properties {x=7}\n  obj = Point with properties {x=7}\n  out = [7, 7, 7, 7, 7]\n  p = Point with properties {x=7}\n  r = [Point with properties {x=7}]\n";
+        let interpreted_value = execute_path(&value_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted_value), expected_value);
+        let bytecode_value = execute_path_bytecode(&value_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode_value), expected_value);
+
+        let expected_handle =
+            "workspace\n  c = Counter with properties {value=22}\n  f = Counter with properties {value=22}\n  i = Counter with properties {value=22}\n  obj = Counter with properties {value=22}\n  out = [22, 22, 22, 22, 22, 22]\n  p = Counter with properties {value=22}\n  r = [Counter with properties {value=22}]\n";
+        let interpreted_handle = execute_path(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_objects_support_page_transpose_helpers() {
+        let temp_dir = unique_temp_script_dir("classdef-object-page-transpose");
+        let point_path = temp_dir.join("Point.m");
+        let counter_path = temp_dir.join("Counter.m");
+        let value_main_path = temp_dir.join("value_main.m");
+        let handle_main_path = temp_dir.join("handle_main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write page-transpose value class");
+        write_handle_counter_class(&counter_path);
+        fs::write(
+            &value_main_path,
+            "obj = Point(7);\n\
+             p = pagetranspose(obj);\n\
+             c = pagectranspose(obj);\n\
+             out = [p.x c.x];\n",
+        )
+        .expect("write value page-transpose script");
+        fs::write(
+            &handle_main_path,
+            "obj = Counter(7);\n\
+             p = pagetranspose(obj);\n\
+             c = pagectranspose(obj);\n\
+             p.increment(2);\n\
+             c.increment(3);\n\
+             out = [obj.value p.value c.value];\n",
+        )
+        .expect("write handle page-transpose script");
+
+        let expected_value =
+            "workspace\n  c = Point with properties {x=7}\n  obj = Point with properties {x=7}\n  out = [7, 7]\n  p = Point with properties {x=7}\n";
+        let interpreted_value = execute_path(&value_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted_value), expected_value);
+        let bytecode_value = execute_path_bytecode(&value_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode_value), expected_value);
+
+        let expected_handle =
+            "workspace\n  c = Counter with properties {value=12}\n  obj = Counter with properties {value=12}\n  out = [12, 12, 12]\n  p = Counter with properties {value=12}\n";
+        let interpreted_handle = execute_path(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_scalar_objects_support_transpose_helpers() {
+        let temp_dir = unique_temp_script_dir("classdef-object-transpose");
+        let point_path = temp_dir.join("Point.m");
+        let counter_path = temp_dir.join("Counter.m");
+        let value_main_path = temp_dir.join("value_main.m");
+        let handle_main_path = temp_dir.join("handle_main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write transpose value class");
+        write_handle_counter_class(&counter_path);
+        fs::write(
+            &value_main_path,
+            "obj = Point(7);\n\
+             t = obj';\n\
+             out = t.x;\n",
+        )
+        .expect("write value transpose script");
+        fs::write(
+            &handle_main_path,
+            "obj = Counter(7);\n\
+             t = obj';\n\
+             t.increment(2);\n\
+             out = [obj.value t.value];\n",
+        )
+        .expect("write handle transpose script");
+
+        let interpreted_value = execute_path(&value_main_path, &[]);
+        assert_eq!(
+            render_execution_result(&interpreted_value),
+            "workspace\n  obj = Point with properties {x=7}\n  out = 7\n  t = Point with properties {x=7}\n"
+        );
+        let bytecode_value = execute_path_bytecode(&value_main_path, &[]);
+        assert_eq!(
+            render_execution_result(&bytecode_value),
+            "workspace\n  obj = Point with properties {x=7}\n  out = 7\n  t = Point with properties {x=7}\n"
+        );
+
+        let expected_handle =
+            "workspace\n  obj = Counter with properties {value=9}\n  out = [9, 9]\n  t = Counter with properties {value=9}\n";
+        let interpreted_handle = execute_path(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_value_object_arrays_support_direct_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-direct");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write direct property-read class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, 2), Point(3, 4)];\n\
+             out = objs.x;\n",
+        )
+        .expect("write direct property-read script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=1, y=2}, Point with properties {x=3, y=4}]\n  out = [1, 3]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_direct_cell_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-cell-property");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             items = {0};\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(a, b)\n\
+             obj.items = {a, b};\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write cell property-read class");
+        fs::write(
+            &main_path,
+            "objs = [Wrap(1, 2), Wrap(3, 4)];\n\
+             out = objs.items;\n",
+        )
+        .expect("write cell property-read script");
+
+        let expected =
+            "workspace\n  objs = [Wrap with properties {items={1, 2}}, Wrap with properties {items={3, 4}}]\n  out = {{1, 2}, {3, 4}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_preserve_2d_cell_property_read_layout() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-2d-cell-property");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             items = {0};\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(a, b)\n\
+             obj.items = {a, b};\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write 2d cell property class");
+        fs::write(
+            &main_path,
+            "objs = [Wrap(1, 2) Wrap(3, 4); Wrap(5, 6) Wrap(7, 8)];\n\
+             out = objs.items;\n",
+        )
+        .expect("write 2d cell property script");
+
+        let expected =
+            "workspace\n  objs = [Wrap with properties {items={1, 2}}, Wrap with properties {items={3, 4}} ; Wrap with properties {items={5, 6}}, Wrap with properties {items={7, 8}}]\n  out = {{1, 2}, {3, 4} ; {5, 6}, {7, 8}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_preserve_2d_matrix_property_read_layout() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-2d-matrix-property");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write 2d matrix property class");
+        fs::write(
+            &main_path,
+            "objs = [Wrap([1 2]) Wrap([3 4]); Wrap([5 6]) Wrap([7 8])];\n\
+             out = objs.data;\n",
+        )
+        .expect("write 2d matrix property script");
+
+        let expected =
+            "workspace\n  objs = [Wrap with properties {data=[1, 2]}, Wrap with properties {data=[3, 4]} ; Wrap with properties {data=[5, 6]}, Wrap with properties {data=[7, 8]}]\n  out = [1, 2, 3, 4 ; 5, 6, 7, 8]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_block_concatenate_matrix_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-matrix-property");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write matrix property-read class");
+        fs::write(
+            &main_path,
+            "row_objs = [Wrap([1 2]), Wrap([3 4])];\n\
+             row = row_objs.data;\n\
+             pick = row_objs.data(2);\n\
+             col_objs = [Wrap([1; 2]), Wrap([3; 4])];\n\
+             col = col_objs.data;\n\
+             block_objs = [Wrap([1 2; 3 4]), Wrap([5 6; 7 8])];\n\
+             block = block_objs.data;\n",
+        )
+        .expect("write matrix property-read script");
+
+        let expected =
+            "workspace\n  block = [1, 2, 5, 6 ; 3, 4, 7, 8]\n  block_objs = [Wrap with properties {data=[1, 2 ; 3, 4]}, Wrap with properties {data=[5, 6 ; 7, 8]}]\n  col = [1, 3 ; 2, 4]\n  col_objs = [Wrap with properties {data=[1 ; 2]}, Wrap with properties {data=[3 ; 4]}]\n  pick = 2\n  row = [1, 2, 3, 4]\n  row_objs = [Wrap with properties {data=[1, 2]}, Wrap with properties {data=[3, 4]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_concatenate_object_array_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-object-property");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object property point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object property wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([Point(1) Point(2)]), Wrap([Point(3) Point(4)])];\n\
+             out = wraps.data.x;\n\
+             via = wraps.data.total();\n",
+        )
+        .expect("write object property read script");
+
+        let expected =
+            "workspace\n  out = [1, 2, 3, 4]\n  via = 10\n  wraps = [Wrap with properties {data=[Point with properties {x=1}, Point with properties {x=2}]}, Wrap with properties {data=[Point with properties {x=3}, Point with properties {x=4}]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_assignment_on_object_array_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-object-property-assign");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object property assign point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object property assign wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([Point(1) Point(2)]), Wrap([Point(3) Point(4)])];\n\
+             wraps.data(2).x = 99;\n\
+             out = wraps.data.x;\n",
+        )
+        .expect("write object property assign script");
+
+        let expected =
+            "workspace\n  out = [1, 99, 3, 4]\n  wraps = [Wrap with properties {data=[Point with properties {x=1}, Point with properties {x=99}]}, Wrap with properties {data=[Point with properties {x=3}, Point with properties {x=4}]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_bulk_assignment_on_object_array_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-object-property-bulk-assign");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bulk object property point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bulk object property wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([Point(1) Point(2)]), Wrap([Point(3) Point(4)])];\n\
+             wraps.data = [Point(10) Point(20) Point(30) Point(40)];\n\
+             out = wraps.data.x;\n",
+        )
+        .expect("write bulk object property assign script");
+
+        let expected =
+            "workspace\n  out = [10, 20, 30, 40]\n  wraps = [Wrap with properties {data=[Point with properties {x=10}, Point with properties {x=20}]}, Wrap with properties {data=[Point with properties {x=30}, Point with properties {x=40}]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_bulk_assignment_on_2d_object_array_valued_property_reads() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-object-array-object-property-bulk-assign-2d");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bulk 2d object property point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bulk 2d object property wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([Point(1) Point(2)]) Wrap([Point(3) Point(4)]); Wrap([Point(5) Point(6)]) Wrap([Point(7) Point(8)])];\n\
+             wraps.data = [Point(10) Point(20) Point(30) Point(40); Point(50) Point(60) Point(70) Point(80)];\n\
+             out = wraps.data.x;\n",
+        )
+        .expect("write bulk 2d object property assign script");
+
+        let expected =
+            "workspace\n  out = [10, 20, 30, 40 ; 50, 60, 70, 80]\n  wraps = [Wrap with properties {data=[Point with properties {x=10}, Point with properties {x=20}]}, Wrap with properties {data=[Point with properties {x=30}, Point with properties {x=40}]} ; Wrap with properties {data=[Point with properties {x=50}, Point with properties {x=60}]}, Wrap with properties {data=[Point with properties {x=70}, Point with properties {x=80}]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_object_arrays_support_bulk_assignment_on_handle_valued_property_reads() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-handle-array-handle-property-bulk-assign");
+        let counter_path = temp_dir.join("Counter.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &counter_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(v)\n\
+             obj.value = v;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write handle bulk property counter class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write handle bulk property wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap(Counter(1)), Wrap(Counter(2)), Wrap(Counter(3))];\n\
+             refs = wraps.data;\n\
+             wraps.data = [Counter(10), Counter(20), Counter(30)];\n\
+             out = refs.value;\n\
+             now = wraps.data.value;\n",
+        )
+        .expect("write handle bulk property assign script");
+
+        let expected =
+            "workspace\n  now = [10, 20, 30]\n  out = [1, 2, 3]\n  refs = [Counter with properties {value=1}, Counter with properties {value=2}, Counter with properties {value=3}]\n  wraps = [Wrap with properties {data=Counter with properties {value=10}}, Wrap with properties {data=Counter with properties {value=20}}, Wrap with properties {data=Counter with properties {value=30}}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_subindex_assignment_on_matrix_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-matrix-property-assign");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write matrix property-assign class");
+        fs::write(
+            &main_path,
+            "row_objs = [Wrap([1 2]), Wrap([3 4])];\n\
+             row_objs.data(2) = 99;\n\
+             row = row_objs.data;\n\
+             block_objs = [Wrap([1 2; 3 4]), Wrap([5 6; 7 8])];\n\
+             block_objs.data(:,2) = [20; 40];\n\
+             block = block_objs.data;\n",
+        )
+        .expect("write matrix property-assign script");
+
+        let expected =
+            "workspace\n  block = [1, 20, 5, 6 ; 3, 40, 7, 8]\n  block_objs = [Wrap with properties {data=[1, 20 ; 3, 40]}, Wrap with properties {data=[5, 6 ; 7, 8]}]\n  row = [1, 99, 3, 4]\n  row_objs = [Wrap with properties {data=[1, 99]}, Wrap with properties {data=[3, 4]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_bulk_assignment_on_matrix_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-matrix-property-bulk-assign");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bulk matrix property class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([1 2]), Wrap([3 4])];\n\
+             wraps.data = [10 20 30 40];\n\
+             out = wraps.data;\n",
+        )
+        .expect("write bulk matrix property assign script");
+
+        let expected =
+            "workspace\n  out = [10, 20, 30, 40]\n  wraps = [Wrap with properties {data=[10, 20]}, Wrap with properties {data=[30, 40]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_bulk_assignment_on_2d_matrix_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-matrix-property-bulk-assign-2d");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bulk 2d matrix property class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([1 2]) Wrap([3 4]); Wrap([5 6]) Wrap([7 8])];\n\
+             wraps.data = [10 20 30 40; 50 60 70 80];\n\
+             out = wraps.data;\n",
+        )
+        .expect("write bulk 2d matrix property assign script");
+
+        let expected =
+            "workspace\n  out = [10, 20, 30, 40 ; 50, 60, 70, 80]\n  wraps = [Wrap with properties {data=[10, 20]}, Wrap with properties {data=[30, 40]} ; Wrap with properties {data=[50, 60]}, Wrap with properties {data=[70, 80]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_uniform_growth_on_matrix_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-matrix-property-growth");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write matrix property growth class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([1 2]) Wrap([3 4]); Wrap([5 6]) Wrap([7 8])];\n\
+             wraps.data(:, 6) = [30; 90];\n\
+             out = wraps.data;\n",
+        )
+        .expect("write matrix property growth script");
+
+        let expected =
+            "workspace\n  out = [1, 2, 3, 4, 0, 30 ; 5, 6, 7, 8, 0, 90]\n  wraps = [Wrap with properties {data=[1, 2, 3]}, Wrap with properties {data=[4, 0, 30]} ; Wrap with properties {data=[5, 6, 7]}, Wrap with properties {data=[8, 0, 90]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_uniform_growth_on_object_array_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-object-property-growth");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object property growth point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object property growth wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([Point() Point()]), Wrap([Point() Point()])];\n\
+             p = Point();\n\
+             p.x = 99;\n\
+             wraps.data(6) = p;\n\
+             out = wraps.data.x;\n",
+        )
+        .expect("write object property growth script");
+
+        let expected =
+            "workspace\n  out = [0, 0, 0, 0, 0, 99]\n  p = Point with properties {x=99}\n  wraps = [Wrap with properties {data=[Point with properties {x=0}, Point with properties {x=0}, Point with properties {x=0}]}, Wrap with properties {data=[Point with properties {x=0}, Point with properties {x=0}, Point with properties {x=99}]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_uniform_deletion_on_matrix_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-matrix-property-delete");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write matrix property delete class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([1 2]), Wrap([3 4])];\n\
+             wraps.data(2:2:end) = [];\n\
+             out = wraps.data;\n",
+        )
+        .expect("write matrix property delete script");
+
+        let expected =
+            "workspace\n  out = [1, 3]\n  wraps = [Wrap with properties {data=[1]}, Wrap with properties {data=[3]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_uniform_deletion_on_object_array_valued_property_reads() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-object-property-delete");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object property delete point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write object property delete wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([Point(1) Point(2)]), Wrap([Point(3) Point(4)])];\n\
+             wraps.data(2:2:end) = [];\n\
+             out = wraps.data.x;\n",
+        )
+        .expect("write object property delete script");
+
+        let expected =
+            "workspace\n  out = [1, 3]\n  wraps = [Wrap with properties {data=[Point with properties {x=1}]}, Wrap with properties {data=[Point with properties {x=3}]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_value_object_arrays_support_indexed_property_assignment() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-assign");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write assign class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, 2), Point(3, 4)];\n\
+             objs(2).x = 10;\n\
+             out = [objs.x];\n",
+        )
+        .expect("write assign script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=1, y=2}, Point with properties {x=10, y=4}]\n  out = [1, 10]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_value_object_array_slices_support_property_assignment() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-slice-assign");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write slice assign class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, 2), Point(3, 4), Point(5, 6)];\n\
+             objs(1:2).x = [10 20];\n\
+             out = objs.x;\n",
+        )
+        .expect("write slice assign script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=10, y=2}, Point with properties {x=20, y=4}, Point with properties {x=5, y=6}]\n  out = [10, 20, 5]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_value_object_array_logical_slices_support_property_assignment() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-logical-slice-assign");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write logical slice assign class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, 2), Point(3, 4), Point(5, 6)];\n\
+             objs([true false true]).x = [10 50];\n\
+             out = objs.x;\n",
+        )
+        .expect("write logical slice assign script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=10, y=2}, Point with properties {x=3, y=4}, Point with properties {x=50, y=6}]\n  out = [10, 3, 50]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_value_object_arrays_support_bulk_property_assignment() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-bulk-assign");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bulk assign class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, 2), Point(3, 4)];\n\
+             objs.x = [10 20];\n\
+             out = objs.x;\n",
+        )
+        .expect("write bulk assign script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=10, y=2}, Point with properties {x=20, y=4}]\n  out = [10, 20]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_object_arrays_support_bulk_property_assignment() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-array-bulk-assign");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            "objs = [Counter(5), Counter(7)];\n\
+             refs = objs;\n\
+             objs.value = [10 20];\n\
+             out = refs.value;\n",
+        )
+        .expect("write handle bulk assign script");
+
+        let expected =
+            "workspace\n  objs = [Counter with properties {value=10}, Counter with properties {value=20}]\n  out = [10, 20]\n  refs = [Counter with properties {value=10}, Counter with properties {value=20}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_object_arrays_support_bulk_assignment_on_2d_handle_valued_property_reads() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-handle-array-handle-property-bulk-assign-2d");
+        let counter_path = temp_dir.join("Counter.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &counter_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(v)\n\
+             obj.value = v;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write 2d handle property counter class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write 2d handle property wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap(Counter(1)) Wrap(Counter(2)); Wrap(Counter(3)) Wrap(Counter(4))];\n\
+             refs = wraps.data;\n\
+             wraps.data = [Counter(10) Counter(20); Counter(30) Counter(40)];\n\
+             out = refs.value;\n\
+             now = wraps.data.value;\n",
+        )
+        .expect("write 2d handle property assign script");
+
+        let expected =
+            "workspace\n  now = [10, 20 ; 30, 40]\n  out = [1, 2 ; 3, 4]\n  refs = [Counter with properties {value=1}, Counter with properties {value=2} ; Counter with properties {value=3}, Counter with properties {value=4}]\n  wraps = [Wrap with properties {data=Counter with properties {value=10}}, Wrap with properties {data=Counter with properties {value=20}} ; Wrap with properties {data=Counter with properties {value=30}}, Wrap with properties {data=Counter with properties {value=40}}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_object_array_slices_support_property_assignment() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-array-slice-assign");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            "objs = [Counter(5), Counter(7), Counter(9)];\n\
+             refs = objs;\n\
+             objs(1:2).value = [10 20];\n\
+             out = refs.value;\n",
+        )
+        .expect("write handle slice assign script");
+
+        let expected =
+            "workspace\n  objs = [Counter with properties {value=10}, Counter with properties {value=20}, Counter with properties {value=9}]\n  out = [10, 20, 9]\n  refs = [Counter with properties {value=10}, Counter with properties {value=20}, Counter with properties {value=9}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_object_array_logical_slices_support_property_assignment() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-array-logical-slice-assign");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        write_handle_counter_class(&class_path);
+        fs::write(
+            &main_path,
+            "objs = [Counter(1), Counter(2), Counter(3)];\n\
+             refs = objs;\n\
+             objs([true false true]).value = [10 30];\n\
+             out = refs.value;\n",
+        )
+        .expect("write handle logical slice assign script");
+
+        let expected =
+            "workspace\n  objs = [Counter with properties {value=10}, Counter with properties {value=2}, Counter with properties {value=30}]\n  out = [10, 2, 30]\n  refs = [Counter with properties {value=10}, Counter with properties {value=2}, Counter with properties {value=30}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_bulk_cell_property_assignment() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-bulk-cell-assign");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             items = {0};\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(a, b)\n\
+             obj.items = {a, b};\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bulk cell assign class");
+        fs::write(
+            &main_path,
+            "objs = [Wrap(1, 2), Wrap(3, 4)];\n\
+             objs.items = {{5, 6}, {7, 8}};\n\
+             out = objs.items;\n",
+        )
+        .expect("write bulk cell assign script");
+
+        let expected =
+            "workspace\n  objs = [Wrap with properties {items={5, 6}}, Wrap with properties {items={7, 8}}]\n  out = {{5, 6}, {7, 8}}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_bulk_cell_property_assignment_on_2d_outer_arrays() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-bulk-cell-assign-2d");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             items = {0};\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(a, b)\n\
+             obj.items = {a, b};\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bulk 2d cell assign class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap(1, 2) Wrap(3, 4); Wrap(5, 6) Wrap(7, 8)];\n\
+             wraps.items = {{10, 20}, {30, 40}; {50, 60}, {70, 80}};\n\
+             out = wraps.items;\n",
+        )
+        .expect("write bulk 2d cell assign script");
+
+        let expected =
+            "workspace\n  out = {{10, 20}, {30, 40} ; {50, 60}, {70, 80}}\n  wraps = [Wrap with properties {items={10, 20}}, Wrap with properties {items={30, 40}} ; Wrap with properties {items={50, 60}}, Wrap with properties {items={70, 80}}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_outer_cell_property_brace_assignment() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-cell-brace-assign");
+        let class_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Wrap\n\
+             properties\n\
+             items = {0};\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(a, b)\n\
+             obj.items = {a, b};\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write cell brace assign class");
+        fs::write(
+            &main_path,
+            "objs = [Wrap(1, 2), Wrap(3, 4)];\n\
+             objs.items{2} = 99;\n\
+             out = objs.items;\n",
+        )
+        .expect("write cell brace assign script");
+
+        let expected =
+            "workspace\n  objs = [Wrap with properties {items={1, 2}}, Wrap with properties {items=99}]\n  out = [{1, 2}, 99]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_property_produced_object_arrays_support_slice_indexing_and_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-property-produced-object-array-slice");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y, child)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write property-produced slice class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, 2, Point(10, 0, [])), Point(3, 4, Point(20, 0, [])), Point(5, 6, Point(30, 0, []))];\n\
+             sel = objs.child(1:2);\n\
+             cls = class(sel);\n\
+             direct = sel.x;\n\
+             via = objs.child(1:2).total();\n",
+        )
+        .expect("write property-produced slice script");
+
+        let expected =
+            "workspace\n  cls = 'Point'\n  direct = [10, 20]\n  objs = [Point with properties {x=1, y=2, child=Point with properties {x=10, y=0, child=[]}}, Point with properties {x=3, y=4, child=Point with properties {x=20, y=0, child=[]}}, Point with properties {x=5, y=6, child=Point with properties {x=30, y=0, child=[]}}]\n  sel = [Point with properties {x=10, y=0, child=[]}, Point with properties {x=20, y=0, child=[]}]\n  via = 30\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_property_produced_2d_object_arrays_preserve_selector_layout_and_bound_handles() {
+        let temp_dir = unique_temp_script_dir("classdef-property-produced-2d-object-array");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write property-produced 2d class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])) Point(2, Point(20, [])); Point(3, Point(30, [])) Point(4, Point(40, []))];\n\
+             direct = objs.child(:,2).x;\n\
+             f = @objs.child(:,2).total;\n\
+             out = f();\n\
+             sel = objs.child(:,2);\n",
+        )
+        .expect("write property-produced 2d script");
+
+        let expected =
+            "workspace\n  direct = [20 ; 40]\n  f = @Point.total\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=20, child=[]}} ; Point with properties {x=3, child=Point with properties {x=30, child=[]}}, Point with properties {x=4, child=Point with properties {x=40, child=[]}}]\n  out = 60\n  sel = [Point with properties {x=20, child=[]} ; Point with properties {x=40, child=[]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_property_produced_full_2d_object_arrays_preserve_receiver_layout_for_method_dispatch(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-property-produced-full-2d-object-array-method");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = peek(obj)\n\
+             out = obj(1,2).x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write full 2d point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write full 2d wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap(Point(1)) Wrap(Point(2)); Wrap(Point(3)) Wrap(Point(4))];\n\
+             sel = wraps.data;\n\
+             direct = sel.peek();\n\
+             f = @wraps.data.peek;\n\
+             via = f();\n",
+        )
+        .expect("write full 2d property-produced method script");
+
+        let expected =
+            "workspace\n  direct = 2\n  f = @Point.peek\n  sel = [Point with properties {x=1}, Point with properties {x=2} ; Point with properties {x=3}, Point with properties {x=4}]\n  via = 2\n  wraps = [Wrap with properties {data=Point with properties {x=1}}, Wrap with properties {data=Point with properties {x=2}} ; Wrap with properties {data=Point with properties {x=3}}, Wrap with properties {data=Point with properties {x=4}}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_property_produced_full_2d_object_arrays_support_slice_and_logical_mask_property_assignment(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-property-produced-full-2d-object-array-assign");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write full 2d property-produced assign point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write full 2d property-produced assign wrap class");
+        fs::write(
+            &main_path,
+            "wraps = [Wrap([Point(1) Point(2)]), Wrap([Point(3) Point(4)]); Wrap([Point(5) Point(6)]), Wrap([Point(7) Point(8)])];\n\
+             wraps.data(:,2).x = [20 80];\n\
+             out1 = wraps.data.x;\n\
+             wraps.data([true false false true false false false false]).x = [100 800];\n\
+             out2 = wraps.data.x;\n",
+        )
+        .expect("write full 2d property-produced assign script");
+
+        let expected =
+            "workspace\n  out1 = [1, 20, 3, 4 ; 5, 80, 7, 8]\n  out2 = [100, 20, 3, 4 ; 5, 800, 7, 8]\n  wraps = [Wrap with properties {data=[Point with properties {x=100}, Point with properties {x=20}]}, Wrap with properties {data=[Point with properties {x=3}, Point with properties {x=4}]} ; Wrap with properties {data=[Point with properties {x=5}, Point with properties {x=800}]}, Wrap with properties {data=[Point with properties {x=7}, Point with properties {x=8}]}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_property_produced_full_2d_bound_handles_roundtrip_preserve_receiver_layout() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-property-produced-full-2d-bound-roundtrip");
+        let point_path = temp_dir.join("Point.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-property-produced-full-2d-bound-roundtrip")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &point_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = peek(obj)\n\
+             out = obj(1,2).x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write full 2d roundtrip point class");
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write full 2d roundtrip wrap class");
+        fs::write(
+            &main_path,
+            format!(
+                "wraps = [Wrap(Point(1)) Wrap(Point(2)); Wrap(Point(3)) Wrap(Point(4))];\n\
+                 f = @wraps.data.peek;\n\
+                 save('{snapshot_text}', 'f');\n\
+                 clear('f', 'wraps');\n\
+                 load('{snapshot_text}');\n\
+                 out = f();\n"
+            ),
+        )
+        .expect("write full 2d roundtrip script");
+
+        let expected = "workspace\n  f = @Point.peek\n  out = 2\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_property_produced_object_arrays_support_function_form_dispatch() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-property-produced-object-array-function-form");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write property-produced function-form class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])), Point(2, Point(20, [])), Point(3, Point(30, []))];\n\
+             out = total(objs.child(1:2));\n",
+        )
+        .expect("write property-produced function-form script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=20, child=[]}}, Point with properties {x=3, child=Point with properties {x=30, child=[]}}]\n  out = 30\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_property_produced_object_arrays_support_function_form_dispatch_without_source_tree(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-bundle-property-produced-object-array-function-form");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled property-produced function-form class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])), Point(2, Point(20, [])), Point(3, Point(30, []))];\n\
+             out = total(objs.child(1:2));\n",
+        )
+        .expect("write bundled property-produced function-form script");
+
+        let bundle = compile_bytecode_bundle(&main_path);
+        fs::remove_dir_all(&temp_dir)
+            .expect("remove bundled property-produced function-form source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled property-produced function-form script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=20, child=[]}}, Point with properties {x=3, child=Point with properties {x=30, child=[]}}]\n  out = 30\n"
+        );
+    }
+
+    #[test]
+    fn classdef_property_produced_handle_object_arrays_preserve_aliasing_on_property_assignment() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-property-produced-handle-object-array-alias");
+        let counter_path = temp_dir.join("Counter.m");
+        let wrap_path = temp_dir.join("Wrap.m");
+        let main_path = temp_dir.join("main.m");
+        write_handle_counter_class(&counter_path);
+        fs::write(
+            &wrap_path,
+            "classdef Wrap\n\
+             properties\n\
+             data = [];\n\
+             end\n\
+             methods\n\
+             function obj = Wrap(data)\n\
+             obj.data = data;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write property-produced handle alias wrap class");
+        fs::write(
+            &main_path,
+            "objs = [Wrap(Counter(1)), Wrap(Counter(2)), Wrap(Counter(3))];\n\
+             refs = objs.data;\n\
+             objs.data.value = [10 20 30];\n\
+             out = refs.value;\n",
+        )
+        .expect("write property-produced handle alias script");
+
+        let expected =
+            "workspace\n  objs = [Wrap with properties {data=Counter with properties {value=10}}, Wrap with properties {data=Counter with properties {value=20}}, Wrap with properties {data=Counter with properties {value=30}}]\n  out = [10, 20, 30]\n  refs = [Counter with properties {value=10}, Counter with properties {value=20}, Counter with properties {value=30}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_property_produced_logical_mask_selectors_support_method_dispatch_and_bound_handles() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-property-produced-logical-mask-method");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write logical mask selector class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])), Point(2, Point(20, [])), Point(3, Point(30, []))];\n\
+             direct = total(objs.child([true false true]));\n\
+             f = @objs.child([true false true]).total;\n\
+             via = f();\n\
+             sel = objs.child([true false true]);\n",
+        )
+        .expect("write logical mask selector script");
+
+        let expected =
+            "workspace\n  direct = 40\n  f = @Point.total\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=20, child=[]}}, Point with properties {x=3, child=Point with properties {x=30, child=[]}}]\n  sel = [Point with properties {x=10, child=[]}, Point with properties {x=30, child=[]}]\n  via = 40\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_property_produced_logical_mask_selectors_support_method_dispatch_and_bound_handles_without_source_tree(
+    ) {
+        let temp_dir =
+            unique_temp_script_dir("classdef-bundle-property-produced-logical-mask-method");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled logical-mask selector class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])), Point(2, Point(20, [])), Point(3, Point(30, []))];\n\
+             direct = total(objs.child([true false true]));\n\
+             f = @objs.child([true false true]).total;\n\
+             via = f();\n\
+             sel = objs.child([true false true]);\n",
+        )
+        .expect("write bundled logical-mask selector script");
+
+        let bundle = compile_bytecode_bundle(&main_path);
+        fs::remove_dir_all(&temp_dir).expect("remove bundled logical-mask source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled logical-mask selector script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  direct = 40\n  f = @Point.total\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=20, child=[]}}, Point with properties {x=3, child=Point with properties {x=30, child=[]}}]\n  sel = [Point with properties {x=10, child=[]}, Point with properties {x=30, child=[]}]\n  via = 40\n"
+        );
+    }
+
+    #[test]
+    fn classdef_property_produced_end_selectors_support_method_dispatch_and_bound_handles() {
+        let temp_dir = unique_temp_script_dir("classdef-property-produced-end-method");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write end selector class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])) Point(2, Point(20, [])); Point(3, Point(30, [])) Point(4, Point(40, []))];\n\
+             direct = total(objs.child(end));\n\
+             f = @objs.child(end).total;\n\
+             via = f();\n\
+             sel = objs.child(end);\n",
+        )
+        .expect("write end selector script");
+
+        let expected =
+            "workspace\n  direct = 40\n  f = @Point.total\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=20, child=[]}} ; Point with properties {x=3, child=Point with properties {x=30, child=[]}}, Point with properties {x=4, child=Point with properties {x=40, child=[]}}]\n  sel = Point with properties {x=40, child=[]}\n  via = 40\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_property_produced_end_selectors_support_method_dispatch_and_bound_handles_without_source_tree(
+    ) {
+        let temp_dir = unique_temp_script_dir("classdef-bundle-property-produced-end-method");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled end selector class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])) Point(2, Point(20, [])); Point(3, Point(30, [])) Point(4, Point(40, []))];\n\
+             direct = total(objs.child(end));\n\
+             f = @objs.child(end).total;\n\
+             via = f();\n\
+             sel = objs.child(end);\n",
+        )
+        .expect("write bundled end selector script");
+
+        let bundle = compile_bytecode_bundle(&main_path);
+        fs::remove_dir_all(&temp_dir).expect("remove bundled end-selector source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled end-selector script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  direct = 40\n  f = @Point.total\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=20, child=[]}} ; Point with properties {x=3, child=Point with properties {x=30, child=[]}}, Point with properties {x=4, child=Point with properties {x=40, child=[]}}]\n  sel = Point with properties {x=40, child=[]}\n  via = 40\n"
+        );
+    }
+
+    #[test]
+    fn classdef_property_produced_scalar_object_aggregates_support_nested_assignment() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-property-produced-scalar-object-assignment");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y, child)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             obj.child = child;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write scalar object aggregate class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, 2, Point(10, 0, [])), Point(3, 4, Point(20, 0, [])), Point(5, 6, Point(30, 0, []))];\n\
+             objs.child(2).x = 99;\n\
+             out = objs.child.x;\n",
+        )
+        .expect("write scalar object aggregate assignment script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=1, y=2, child=Point with properties {x=10, y=0, child=[]}}, Point with properties {x=3, y=4, child=Point with properties {x=99, y=0, child=[]}}, Point with properties {x=5, y=6, child=Point with properties {x=30, y=0, child=[]}}]\n  out = [10, 99, 30]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_property_produced_scalar_object_aggregate_shape_changes_are_rejected() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-property-produced-scalar-object-shape-error");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write scalar object aggregate shape-error class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1, Point(10, [])), Point(2, Point(20, [])), Point(3, Point(30, []))];\n\
+             objs.child(2) = [];\n",
+        )
+        .expect("write scalar object aggregate shape-error script");
+
+        for error in [
+            execute_path_result(&main_path, &[])
+                .expect_err("scalar object aggregate deletion should fail in interpreter"),
+            execute_path_bytecode_result(&main_path, &[])
+                .expect_err("scalar object aggregate deletion should fail in bytecode"),
+        ] {
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(
+                    "object-valued property assignment expects shape [1, 3], found [1, 2]"
+                ),
+                "{rendered}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_subindex_assignment_on_string_scalar_property_reads() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-object-array-string-property-subindex-assign");
+        let class_path = temp_dir.join("Person.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Person\n\
+             properties\n\
+             name = \"\";\n\
+             end\n\
+             methods\n\
+             function obj = Person(name)\n\
+             obj.name = name;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write string property class");
+        fs::write(
+            &main_path,
+            "objs = [Person(\"a\"), Person(\"b\"), Person(\"c\")];\n\
+             objs.name(2) = \"bee\";\n\
+             out = objs.name;\n",
+        )
+        .expect("write string property script");
+
+        let expected =
+            "workspace\n  objs = [Person with properties {name=\"a\"}, Person with properties {name=\"bee\"}, Person with properties {name=\"c\"}]\n  out = [\"a\", \"bee\", \"c\"]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_subindex_assignment_on_char_property_reads() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-object-array-char-property-subindex-assign");
+        let class_path = temp_dir.join("Label.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Label\n\
+             properties\n\
+             name = 'x';\n\
+             end\n\
+             methods\n\
+             function obj = Label(name)\n\
+             obj.name = name;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write char property class");
+        fs::write(
+            &main_path,
+            "objs = [Label('aa'), Label('bb'), Label('cc')];\n\
+             objs.name(2) = 'zz';\n\
+             out = objs.name;\n",
+        )
+        .expect("write char property script");
+
+        let expected =
+            "workspace\n  objs = [Label with properties {name='aa'}, Label with properties {name='zz'}, Label with properties {name='cc'}]\n  out = ['aa', 'zz', 'cc']\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_subindex_assignment_on_scalar_property_reads() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-object-array-scalar-property-subindex-assign");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write scalar property subindex class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1), Point(2), Point(3)];\n\
+             objs.x(2) = 99;\n\
+             out = objs.x;\n",
+        )
+        .expect("write scalar property subindex script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=1}, Point with properties {x=99}, Point with properties {x=3}]\n  out = [1, 99, 3]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_array_scalar_property_aggregate_shape_changes_are_rejected() {
+        let temp_dir =
+            unique_temp_script_dir("classdef-object-array-scalar-property-shape-error");
+        let class_path = temp_dir.join("Point.m");
+        let handle_path = temp_dir.join("Counter.m");
+        let value_main_path = temp_dir.join("value_main.m");
+        let handle_main_path = temp_dir.join("handle_main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write scalar property shape-error value class");
+        write_handle_counter_class(&handle_path);
+        fs::write(
+            &value_main_path,
+            "objs = [Point(1), Point(2), Point(3)];\n\
+             objs.x(2) = [];\n",
+        )
+        .expect("write scalar property shape-error value script");
+        fs::write(
+            &handle_main_path,
+            "objs = [Counter(1), Counter(2), Counter(3)];\n\
+             objs.value(2) = [];\n",
+        )
+        .expect("write scalar property shape-error handle script");
+
+        for path in [&value_main_path, &handle_main_path] {
+            for error in [
+                execute_path_result(path, &[])
+                    .expect_err("scalar property aggregate deletion should fail in interpreter"),
+                execute_path_bytecode_result(path, &[])
+                    .expect_err("scalar property aggregate deletion should fail in bytecode"),
+            ] {
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains(
+                        "object-array property aggregate assignment expects shape [1, 3], found [1, 2]"
+                    ),
+                    "{rendered}"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_object_arrays_support_handle_isa_and_aliasing() {
+        let temp_dir = unique_temp_script_dir("classdef-handle-array");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write handle array class");
+        fs::write(
+            &main_path,
+            "objs = [Counter(5), Counter(7)];\n\
+             refs = objs;\n\
+             objs(2).value = 20;\n\
+             cls = class(objs);\n\
+             ok_class = isa(objs, 'Counter');\n\
+             ok_handle = isa(objs, 'handle');\n\
+             out = [refs.value];\n",
+        )
+        .expect("write handle array script");
+
+        let expected =
+            "workspace\n  cls = 'Counter'\n  objs = [Counter with properties {value=5}, Counter with properties {value=20}]\n  ok_class = true\n  ok_handle = true\n  out = [5, 20]\n  refs = [Counter with properties {value=5}, Counter with properties {value=20}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_dot_method_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-method");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write array method class");
+        fs::write(
+            &main_path,
+            "objs = [Point(2), Point(5), Point(7)];\n\
+             out = objs.total();\n",
+        )
+        .expect("write array method script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=2}, Point with properties {x=5}, Point with properties {x=7}]\n  out = 14\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_object_arrays_support_function_form_method_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-function-form");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write function-form array method class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1), Point(4), Point(9)];\n\
+             out = total(objs);\n",
+        )
+        .expect("write function-form array script");
+
+        let expected =
+            "workspace\n  objs = [Point with properties {x=1}, Point with properties {x=4}, Point with properties {x=9}]\n  out = 14\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_full_2d_object_arrays_preserve_receiver_layout_for_method_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-object-array-full-2d-method");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = peek(obj)\n\
+             out = obj(1,2).x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write full 2d method class");
+        fs::write(
+            &main_path,
+            "objs = [Point(1) Point(2); Point(3) Point(4)];\n\
+             direct = objs.peek();\n\
+             f = @objs.peek;\n\
+             via = f();\n",
+        )
+        .expect("write full 2d method script");
+
+        let expected =
+            "workspace\n  direct = 2\n  f = @Point.peek\n  objs = [Point with properties {x=1}, Point with properties {x=2} ; Point with properties {x=3}, Point with properties {x=4}]\n  via = 2\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_value_inheritance_supports_inherited_methods_and_isa() {
+        let temp_dir = unique_temp_script_dir("classdef-inherit-value");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             methods\n\
+             function total = total(obj)\n\
+             total = obj.x + 5;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write base class");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             properties\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Child(y)\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write child class");
+        fs::write(
+            &main_path,
+            "c = Child(7);\n\
+             out = [c.x c.y c.total()];\n\
+             kind = class(c);\n\
+             ok_child = isa(c, 'Child');\n\
+             ok_base = isa(c, 'Base');\n",
+        )
+        .expect("write inherit script");
+
+        let expected =
+            "workspace\n  c = Child with properties {x=1, y=7}\n  kind = 'Child'\n  ok_base = true\n  ok_child = true\n  out = [1, 7, 6]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_handle_inheritance_supports_inherited_methods_and_handle_identity() {
+        let temp_dir = unique_temp_script_dir("classdef-inherit-handle");
+        let base_path = temp_dir.join("BaseHandle.m");
+        let child_path = temp_dir.join("ChildHandle.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef BaseHandle < handle\n\
+             properties\n\
+             value = 5;\n\
+             end\n\
+             methods\n\
+             function obj = setValue(obj, value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write base handle class");
+        fs::write(
+            &child_path,
+            "classdef ChildHandle < BaseHandle\n\
+             properties\n\
+             tag = 1;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write child handle class");
+        fs::write(
+            &main_path,
+            "c = ChildHandle();\n\
+             d = c;\n\
+             c = c.setValue(20);\n\
+             out = [d.value c.tag];\n\
+             kind = class(c);\n\
+             ok_base = isa(c, 'BaseHandle');\n\
+             ok_handle = isa(c, 'handle');\n",
+        )
+        .expect("write inherit handle script");
+
+        let expected =
+            "workspace\n  c = ChildHandle with properties {value=20, tag=1}\n  d = ChildHandle with properties {value=20, tag=1}\n  kind = 'ChildHandle'\n  ok_base = true\n  ok_handle = true\n  out = [20, 1]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_package_folder_inheritance_supports_superclass_constructor_chaining() {
+        let temp_dir = unique_temp_script_dir("classdef-package-folder-super-ctor");
+        let package_dir = temp_dir.join("+pkg");
+        let base_dir = package_dir.join("@Base");
+        let child_dir = package_dir.join("@Child");
+        fs::create_dir_all(&base_dir).expect("create base class dir");
+        fs::create_dir_all(&child_dir).expect("create child class dir");
+        let base_path = base_dir.join("Base.m");
+        let base_method_path = base_dir.join("total.m");
+        let child_path = child_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Base(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write superclass classdef");
+        fs::write(
+            &base_method_path,
+            "function out = total(obj)\n\
+             out = obj.x + 1;\n\
+             end\n",
+        )
+        .expect("write inherited external method");
+        fs::write(
+            &child_path,
+            "classdef Child < pkg.Base\n\
+             methods\n\
+             function obj = Child(x)\n\
+             obj@pkg.Base(x);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write child classdef");
+        fs::write(
+            &main_path,
+            "c = pkg.Child(7);\n\
+             f = c.total;\n\
+             out = [c.x f()];\n",
+        )
+        .expect("write superclass constructor chaining script");
+
+        let expected =
+            "workspace\n  c = pkg.Child with properties {x=7}\n  f = @pkg.Child.total\n  out = [7, 8]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_multilevel_inheritance_supports_nested_superclass_constructor_chaining() {
+        let temp_dir = unique_temp_script_dir("classdef-multilevel-super-ctor");
+        let grand_path = temp_dir.join("GrandBase.m");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &grand_path,
+            "classdef GrandBase\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = GrandBase(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = obj.x + 1;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write grand base class");
+        fs::write(
+            &base_path,
+            "classdef Base < GrandBase\n\
+             methods\n\
+             function obj = Base(x)\n\
+             obj@GrandBase(x);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write base class");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             methods\n\
+             function obj = Child(x)\n\
+             obj@Base(x);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write child class");
+        fs::write(
+            &main_path,
+            "c = Child(7);\n\
+             f = c.total;\n\
+             kind = class(c);\n\
+             ok = isa(c, 'GrandBase');\n\
+             out = [c.x f()];\n",
+        )
+        .expect("write multilevel super ctor script");
+
+        let expected =
+            "workspace\n  c = Child with properties {x=7}\n  f = @Child.total\n  kind = 'Child'\n  ok = true\n  out = [7, 8]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_folder_inheritance_supports_inherited_external_methods_and_handles() {
+        let temp_dir = unique_temp_script_dir("classdef-folder-inherit");
+        let base_dir = temp_dir.join("@Base");
+        let base_private_dir = base_dir.join("private");
+        let child_dir = temp_dir.join("@Child");
+        fs::create_dir_all(&base_private_dir).expect("create base private dir");
+        fs::create_dir_all(&child_dir).expect("create child dir");
+        let base_path = base_dir.join("Base.m");
+        let total_path = base_dir.join("total.m");
+        let bonus_path = base_private_dir.join("bonus.m");
+        let child_path = child_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write folder base class");
+        fs::write(
+            &total_path,
+            "function out = total(obj)\n\
+             out = obj.x + bonus();\n\
+             end\n",
+        )
+        .expect("write folder base method");
+        fs::write(
+            &bonus_path,
+            "function out = bonus()\n\
+             out = 2;\n\
+             end\n",
+        )
+        .expect("write folder base helper");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             properties\n\
+             y = 7;\n\
+             end\n\
+             methods\n\
+             function obj = Child(y)\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write folder child class");
+        fs::write(
+            &main_path,
+            "f = @Child.total;\n\
+             c = Child(4);\n\
+             direct = c.total();\n\
+             via = f(c);\n\
+             ok = isa(c, 'Base');\n\
+             out = [c.x c.y direct via];\n",
+        )
+        .expect("write folder inherit script");
+
+        let expected = "workspace\n  c = Child with properties {x=1, y=4}\n  direct = 3\n  f = @Child.total\n  ok = true\n  out = [1, 4, 3, 3]\n  via = 3\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_static_inheritance_supports_parent_static_dispatch() {
+        let temp_dir = unique_temp_script_dir("classdef-inherit-static");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [1 2];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write base static class");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             end\n",
+        )
+        .expect("write child static class");
+        fs::write(
+            &main_path,
+            "out = Child.origin();\n",
+        )
+        .expect("write inherit static script");
+
+        let expected = "workspace\n  out = [1, 2]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_package_folder_static_inheritance_supports_parent_static_dispatch_and_handles() {
+        let temp_dir = unique_temp_script_dir("classdef-package-folder-static-inherit");
+        let base_dir = temp_dir.join("+pkg").join("@Base");
+        let child_dir = temp_dir.join("+pkg").join("@Child");
+        fs::create_dir_all(&base_dir).expect("create base dir");
+        fs::create_dir_all(&child_dir).expect("create child dir");
+        let base_path = base_dir.join("Base.m");
+        let child_path = child_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [9 9];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package folder base class");
+        fs::write(
+            &child_path,
+            "classdef Child < pkg.Base\n\
+             end\n",
+        )
+        .expect("write package folder child class");
+        fs::write(
+            &main_path,
+            "f = @pkg.Child.origin;\n\
+             direct = pkg.Child.origin();\n\
+             via = f();\n\
+             c = pkg.Child();\n\
+             kind = class(c);\n\
+             ok = isa(c, 'pkg.Base');\n",
+        )
+        .expect("write package folder static inherit script");
+
+        let expected =
+            "workspace\n  c = pkg.Child with properties {}\n  direct = [9, 9]\n  f = @pkg.Child.origin\n  kind = 'pkg.Child'\n  ok = true\n  via = [9, 9]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_bundle_inheritance_supports_parent_methods_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-inherit-bundle");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             methods\n\
+             function total = total(obj)\n\
+             total = obj.x + 2;\n\
+             end\n\
+             end\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [9 9];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled base class");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             properties\n\
+             y = 7;\n\
+             end\n\
+             methods\n\
+             function obj = Child(y)\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled child class");
+        fs::write(
+            &main_path,
+            "c = Child(4);\n\
+             total = c.total();\n\
+             origin = Child.origin();\n\
+             ok = isa(c, 'Base');\n",
+        )
+        .expect("write bundled inherit script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled inheritance script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = Child with properties {x=1, y=4}\n  ok = true\n  origin = [9, 9]\n  total = 3\n"
+        );
+    }
+
+    #[test]
+    fn classdef_bundle_packaged_inheritance_supports_parent_methods_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-package-inherit-bundle");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let base_path = package_dir.join("Base.m");
+        let child_path = package_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             methods\n\
+             function total = total(obj)\n\
+             total = obj.x + 2;\n\
+             end\n\
+             end\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [9 9];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package base class");
+        fs::write(
+            &child_path,
+            "classdef Child < pkg.Base\n\
+             properties\n\
+             y = 7;\n\
+             end\n\
+             methods\n\
+             function obj = Child(y)\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package child class");
+        fs::write(
+            &main_path,
+            "c = pkg.Child(4);\n\
+             kind = class(c);\n\
+             total = c.total();\n\
+             origin = pkg.Child.origin();\n\
+             ok = isa(c, 'pkg.Base');\n",
+        )
+        .expect("write bundled package inherit script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled package inheritance script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = pkg.Child with properties {x=1, y=4}\n  kind = 'pkg.Child'\n  ok = true\n  origin = [9, 9]\n  total = 3\n"
+        );
+    }
+
+    #[test]
+    fn classdef_bundle_package_folder_inheritance_supports_external_parent_methods_without_source_tree() {
+        let temp_dir = unique_temp_script_dir("classdef-package-folder-inherit-bundle");
+        let base_dir = temp_dir.join("+pkg").join("@Base");
+        let base_private_dir = base_dir.join("private");
+        let child_dir = temp_dir.join("+pkg").join("@Child");
+        fs::create_dir_all(&base_private_dir).expect("create base private dir");
+        fs::create_dir_all(&child_dir).expect("create child dir");
+        let base_path = base_dir.join("Base.m");
+        let total_path = base_dir.join("total.m");
+        let bonus_path = base_private_dir.join("bonus.m");
+        let child_path = child_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 1;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled folder base class");
+        fs::write(
+            &total_path,
+            "function out = total(obj)\n\
+             out = obj.x + bonus();\n\
+             end\n",
+        )
+        .expect("write bundled folder base method");
+        fs::write(
+            &bonus_path,
+            "function out = bonus()\n\
+             out = 3;\n\
+             end\n",
+        )
+        .expect("write bundled folder base helper");
+        fs::write(
+            &child_path,
+            "classdef Child < pkg.Base\n\
+             properties\n\
+             y = 7;\n\
+             end\n\
+             methods\n\
+             function obj = Child(y)\n\
+             obj.y = y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled folder child class");
+        fs::write(
+            &main_path,
+            "f = @pkg.Child.total;\n\
+             c = pkg.Child(4);\n\
+             direct = c.total();\n\
+             via = f(c);\n\
+             ok = isa(c, 'pkg.Base');\n\
+             out = [c.x c.y direct via];\n",
+        )
+        .expect("write bundled folder inherit script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled package folder inheritance script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = pkg.Child with properties {x=1, y=4}\n  direct = 4\n  f = @pkg.Child.total\n  ok = true\n  out = [1, 4, 4, 4]\n  via = 4\n"
+        );
+    }
+
+    #[test]
+    fn classdef_bundle_package_folder_inheritance_supports_superclass_constructor_chaining_without_source_tree(
+    ) {
+        let temp_dir = unique_temp_script_dir("classdef-package-folder-super-ctor-bundle");
+        let base_dir = temp_dir.join("+pkg").join("@Base");
+        let child_dir = temp_dir.join("+pkg").join("@Child");
+        fs::create_dir_all(&base_dir).expect("create base dir");
+        fs::create_dir_all(&child_dir).expect("create child dir");
+        let base_path = base_dir.join("Base.m");
+        let base_method_path = base_dir.join("total.m");
+        let child_path = child_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Base(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled super class");
+        fs::write(
+            &base_method_path,
+            "function out = total(obj)\n\
+             out = obj.x + 1;\n\
+             end\n",
+        )
+        .expect("write bundled inherited method");
+        fs::write(
+            &child_path,
+            "classdef Child < pkg.Base\n\
+             methods\n\
+             function obj = Child(x)\n\
+             obj@pkg.Base(x);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled child class");
+        fs::write(
+            &main_path,
+            "c = pkg.Child(7);\n\
+             f = c.total;\n\
+             out = [c.x f()];\n",
+        )
+        .expect("write bundled super ctor script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled super ctor script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = pkg.Child with properties {x=7}\n  f = @pkg.Child.total\n  out = [7, 8]\n"
+        );
+    }
+
+    #[test]
+    fn classdef_bundle_package_folder_static_inheritance_supports_parent_static_dispatch_and_handles_without_source_tree(
+    ) {
+        let temp_dir = unique_temp_script_dir("classdef-package-folder-static-inherit-bundle");
+        let base_dir = temp_dir.join("+pkg").join("@Base");
+        let child_dir = temp_dir.join("+pkg").join("@Child");
+        fs::create_dir_all(&base_dir).expect("create base dir");
+        fs::create_dir_all(&child_dir).expect("create child dir");
+        let base_path = base_dir.join("Base.m");
+        let child_path = child_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [9 9];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled package folder base class");
+        fs::write(
+            &child_path,
+            "classdef Child < pkg.Base\n\
+             end\n",
+        )
+        .expect("write bundled package folder child class");
+        fs::write(
+            &main_path,
+            "f = @pkg.Child.origin;\n\
+             direct = pkg.Child.origin();\n\
+             via = f();\n\
+             c = pkg.Child();\n\
+             kind = class(c);\n\
+             ok = isa(c, 'pkg.Base');\n",
+        )
+        .expect("write bundled package folder static inherit script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled package folder static inheritance script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = pkg.Child with properties {}\n  direct = [9, 9]\n  f = @pkg.Child.origin\n  kind = 'pkg.Child'\n  ok = true\n  via = [9, 9]\n"
+        );
+    }
+
+    #[test]
+    fn classdef_bundle_multilevel_inheritance_supports_nested_superclass_constructor_chaining_without_source_tree(
+    ) {
+        let temp_dir = unique_temp_script_dir("classdef-multilevel-super-ctor-bundle");
+        let grand_path = temp_dir.join("GrandBase.m");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &grand_path,
+            "classdef GrandBase\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = GrandBase(x)\n\
+             obj.x = x;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = obj.x + 1;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled grand base class");
+        fs::write(
+            &base_path,
+            "classdef Base < GrandBase\n\
+             methods\n\
+             function obj = Base(x)\n\
+             obj@GrandBase(x);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled base class");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             methods\n\
+             function obj = Child(x)\n\
+             obj@Base(x);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write bundled child class");
+        fs::write(
+            &main_path,
+            "c = Child(7);\n\
+             f = c.total;\n\
+             kind = class(c);\n\
+             ok = isa(c, 'GrandBase');\n\
+             out = [c.x f()];\n",
+        )
+        .expect("write bundled multilevel super ctor script");
+
+        let source = fs::read_to_string(&main_path).expect("read root source");
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("root unit");
+        let analysis = analyze_compilation_unit_with_context(
+            &unit,
+            &ResolverContext::from_source_file(main_path.clone()),
+        );
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let hir = lower_to_hir(&unit, &analysis);
+        let optimized = optimize_module(&hir);
+        let root_bytecode = emit_bytecode(&optimized.module);
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut compiled_dependencies = Vec::new();
+        while let Some(next_path) = pending.pop() {
+            let key = next_path.display().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = fs::read_to_string(&next_path).expect("dependency source");
+            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+            assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+            let unit = parsed.unit.expect("dependency unit");
+            let analysis = analyze_compilation_unit_with_context(
+                &unit,
+                &ResolverContext::from_source_file(next_path.clone()),
+            );
+            assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+            let hir = lower_to_hir(&unit, &analysis);
+            let optimized = optimize_module(&hir);
+            let bytecode = emit_bytecode(&optimized.module);
+            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+                let dep_key = dependency.display().to_string();
+                if !seen.contains(&dep_key) {
+                    pending.push(dependency);
+                }
+            }
+            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+        }
+        let path_to_module_id = compiled_dependencies
+            .iter()
+            .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let dependency_modules = compiled_dependencies
+            .into_iter()
+            .map(|(path, module_id, module)| PackagedBytecodeModule {
+                module_id,
+                source_path: path.display().to_string(),
+                module: rewrite_bytecode_bundle_targets(&module, &path_to_module_id),
+            })
+            .collect::<Vec<_>>();
+        let bundle = BytecodeBundle {
+            root_source_path: main_path.display().to_string(),
+            root_module: rewrite_bytecode_bundle_targets(&root_bytecode, &path_to_module_id),
+            dependency_modules,
+        };
+
+        fs::remove_dir_all(&temp_dir).expect("remove source tree");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute bundled multilevel inheritance script");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  c = Child with properties {x=7}\n  f = @Child.total\n  kind = 'Child'\n  ok = true\n  out = [7, 8]\n"
+        );
     }
 
     fn unique_temp_mat_path(label: &str) -> PathBuf {

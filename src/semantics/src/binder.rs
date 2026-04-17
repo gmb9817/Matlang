@@ -7,9 +7,10 @@ use std::{
 };
 
 use matlab_frontend::ast::{
-    AssignmentTarget, ClassDef, ClassMethodBlock, ClassPropertyBlock, CompilationUnit,
-    CompilationUnitKind, Expression, ExpressionKind, FunctionDef, Identifier, IndexArgument,
-    Item, QualifiedName, Statement, StatementKind,
+    AssignmentTarget, ClassDef, ClassMemberAccess, ClassMethodBlock, ClassPropertyBlock,
+    CompilationUnit, CompilationUnitKind, Expression, ExpressionKind, FunctionDef,
+    FunctionHandleTarget, Identifier, IndexArgument, Item, QualifiedName, Statement,
+    StatementKind,
 };
 use matlab_frontend::source::{SourceFileId, SourcePosition, SourceSpan};
 use matlab_interop::{read_mat_file, read_workspace_snapshot};
@@ -91,6 +92,7 @@ struct Binder {
     global_bindings: HashMap<String, BindingId>,
     persistent_bindings: HashMap<(WorkspaceId, String), BindingId>,
     source_file: Option<PathBuf>,
+    property_default_depth: u32,
 }
 
 const BUILTIN_FUNCTIONS: &[&str] = &[
@@ -566,6 +568,7 @@ impl Binder {
             global_bindings: HashMap::new(),
             persistent_bindings: HashMap::new(),
             source_file,
+            property_default_depth: 0,
         }
     }
 
@@ -736,6 +739,14 @@ impl Binder {
         let inline_methods = class_def
             .method_blocks
             .iter()
+            .filter(|block| !block.is_static)
+            .flat_map(|block| block.methods.iter())
+            .map(|method| method.name.name.clone())
+            .collect::<Vec<_>>();
+        let static_inline_methods = class_def
+            .method_blocks
+            .iter()
+            .filter(|block| block.is_static)
             .flat_map(|block| block.methods.iter())
             .map(|method| method.name.name.clone())
             .collect::<Vec<_>>();
@@ -748,35 +759,61 @@ impl Binder {
         let properties = class_def
             .property_blocks
             .iter()
-            .flat_map(|block| block.properties.iter())
-            .map(|property| ClassPropertyInfo {
-                name: property.name.name.clone(),
-                default: property.default.clone(),
+            .flat_map(|block| {
+                block.properties.iter().map(|property| ClassPropertyInfo {
+                    name: property.name.name.clone(),
+                    access: block.access,
+                    default: property.default.clone(),
+                })
             })
             .collect::<Vec<_>>();
-        let inherits_handle = class_def
+        let private_properties = class_def
+            .property_blocks
+            .iter()
+            .filter(|block| block.access == ClassMemberAccess::Private)
+            .flat_map(|block| block.properties.iter())
+            .map(|property| property.name.name.clone())
+            .collect::<Vec<_>>();
+        let private_inline_methods = class_def
+            .method_blocks
+            .iter()
+            .filter(|block| !block.is_static && block.access == ClassMemberAccess::Private)
+            .flat_map(|block| block.methods.iter())
+            .map(|method| method.name.name.clone())
+            .collect::<Vec<_>>();
+        let private_static_inline_methods = class_def
+            .method_blocks
+            .iter()
+            .filter(|block| block.is_static && block.access == ClassMemberAccess::Private)
+            .flat_map(|block| block.methods.iter())
+            .map(|method| method.name.name.clone())
+            .collect::<Vec<_>>();
+        let superclass_name = class_def
             .superclass
             .as_ref()
-            .is_some_and(|superclass| qualified_name_identifier(superclass).name.eq_ignore_ascii_case("handle"));
-        if let Some(superclass) = &class_def.superclass {
-            let superclass_name = qualified_name_identifier(superclass).name;
-            if !superclass_name.eq_ignore_ascii_case("handle") {
-                self.diagnostics.push(SemanticDiagnostic::error(
-                    "SEM007",
-                    format!(
-                        "only `handle` inheritance is supported for class `{}`",
-                        class_def.name.name
-                    ),
-                    superclass.span,
-                ));
-            }
-        }
+            .map(|superclass| {
+                superclass
+                    .segments
+                    .iter()
+                    .map(|segment| segment.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            });
+        let inherits_handle = superclass_name
+            .as_deref()
+            .is_some_and(|superclass| superclass.eq_ignore_ascii_case("handle"));
         self.classes.push(ClassInfo {
             name: class_def.name.name.clone(),
             package,
+            superclass_name,
+            superclass_path: None,
             inherits_handle,
             properties,
             inline_methods,
+            static_inline_methods,
+            private_properties,
+            private_inline_methods,
+            private_static_inline_methods,
             external_methods,
             constructor,
             source_path: self.source_file.clone(),
@@ -820,7 +857,9 @@ impl Binder {
     fn bind_class_property_block(&mut self, block: &ClassPropertyBlock, scope_id: ScopeId) {
         for property in &block.properties {
             if let Some(default) = &property.default {
+                self.property_default_depth += 1;
                 self.bind_expression(default, scope_id);
+                self.property_default_depth -= 1;
             }
         }
     }
@@ -1453,9 +1492,14 @@ impl Binder {
                     }
                 }
             }
-            ExpressionKind::FunctionHandle(name) => {
-                self.resolve_qualified_name(scope_id, name, ReferenceRole::FunctionHandleTarget)
-            }
+            ExpressionKind::FunctionHandle(target) => match target {
+                FunctionHandleTarget::Name(name) => {
+                    self.resolve_qualified_name(scope_id, name, ReferenceRole::FunctionHandleTarget)
+                }
+                FunctionHandleTarget::Expression(expression) => {
+                    self.bind_expression(expression, scope_id);
+                }
+            },
             ExpressionKind::Unary { rhs, .. } => self.bind_expression(rhs, scope_id),
             ExpressionKind::Binary { lhs, rhs, .. } => {
                 self.bind_expression(lhs, scope_id);
@@ -1560,6 +1604,26 @@ impl Binder {
         name: &QualifiedName,
         role: ReferenceRole,
     ) {
+        if role == ReferenceRole::FunctionHandleTarget && name.segments.len() >= 2 {
+            let root = &name.segments[0];
+            if let Some(resolved) = self.lookup_resolvable_value_symbol(scope_id, &root.name) {
+                let capture_access = if resolved.scope_id != scope_id {
+                    self.record_capture(scope_id, &root.name, resolved, CaptureAccess::Read);
+                    Some(CaptureAccess::Read)
+                } else {
+                    None
+                };
+                let identifier = qualified_name_identifier(name);
+                self.push_reference(
+                    &identifier,
+                    ReferenceRole::FunctionHandleTarget,
+                    ReferenceResolution::WorkspaceValue,
+                    Some(resolved),
+                    capture_access,
+                );
+                return;
+            }
+        }
         let identifier = qualified_name_identifier(name);
         self.resolve_identifier(scope_id, &identifier, role);
     }
@@ -1601,11 +1665,13 @@ impl Binder {
             None,
             None,
         );
-        self.diagnostics.push(SemanticDiagnostic::error(
-            "SEM002",
-            format!("unbound identifier `{}`", identifier.name),
-            identifier.span,
-        ));
+        if self.property_default_depth == 0 {
+            self.diagnostics.push(SemanticDiagnostic::error(
+                "SEM002",
+                format!("unbound identifier `{}`", identifier.name),
+                identifier.span,
+            ));
+        }
     }
 
     fn resolve_call_target(&mut self, scope_id: ScopeId, identifier: &Identifier) {
@@ -1989,7 +2055,7 @@ impl Binder {
                 | SymbolKind::Output
                 | SymbolKind::Global
                 | SymbolKind::Persistent
-        )
+        ) || (self.property_default_depth > 0 && matches!(kind, SymbolKind::Property))
     }
 
     fn scope_workspace(&self, scope_id: ScopeId) -> WorkspaceId {
@@ -2482,6 +2548,24 @@ mod tests {
             reference.name == "sum"
                 && reference.role == ReferenceRole::FunctionHandleTarget
                 && reference.resolution == ReferenceResolution::BuiltinFunction
+        }));
+    }
+
+    #[test]
+    fn dotted_function_handles_with_workspace_roots_stay_in_workspace_value_space() {
+        let parsed = parse_source(
+            "function y = outer(objs)\nf = @objs.child.total;\ny = f;\nend\n",
+            SourceFileId(1),
+            ParseMode::AutoDetect,
+        );
+        let unit = parsed.unit.expect("parsed unit");
+        let analysis = analyze_compilation_unit(&unit);
+
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        assert!(analysis.references.iter().any(|reference| {
+            reference.name == "objs.child.total"
+                && reference.role == ReferenceRole::FunctionHandleTarget
+                && reference.resolution == ReferenceResolution::WorkspaceValue
         }));
     }
 

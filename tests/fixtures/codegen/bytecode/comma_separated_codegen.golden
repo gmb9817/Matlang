@@ -13,7 +13,7 @@ verification
   issues = 0
 
 bytecode module backend=bytecode unit_kind=Script entry=<script>
-function <script> role=script_entry params=[] outputs=[] captures=[] temps=43 labels=0
+function <script> role=script_entry owner_class=None params=[] outputs=[] captures=[] temps=43 labels=0
   t0 = const number(1)
   t1 = const number(2)
   t2 = const number(3)

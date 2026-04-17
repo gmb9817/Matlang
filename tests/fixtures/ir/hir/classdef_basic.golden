@@ -1,5 +1,5 @@
 module ClassFile scope=0 workspace=0
-  class Point package=None handle=true constructor=Some("Point") source_path=Some("classdef_basic.m")
+  class Point package=None superclass=Some("handle") superclass_path=None handle=true constructor=Some("Point") source_path=Some("classdef_basic.m")
     properties [x=number(1), y=number(2)]
     inline_methods [Point, total]
   function Point scope=2 workspace=2 captures=[]

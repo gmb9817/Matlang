@@ -4,11 +4,18 @@ use std::collections::BTreeSet;
 
 use matlab_ir::{
     HirAnonymousFunction, HirAssignmentTarget, HirBinding, HirCallTarget, HirCallableRef,
-    HirConditionalBranch, HirExpression, HirFunction, HirIndexArgument, HirItem, HirModule,
-    HirStatement, HirSwitchCase, HirValueRef,
+    HirConditionalBranch, HirExpression, HirFunction, HirFunctionHandleTarget, HirIndexArgument,
+    HirItem, HirModule, HirStatement, HirSwitchCase, HirValueRef,
 };
 
 pub const CRATE_NAME: &str = "matlab-codegen";
+
+fn qualified_class_name(name: &str, package: Option<&str>) -> String {
+    match package {
+        Some(package) if !package.is_empty() => format!("{package}.{name}"),
+        _ => name.to_string(),
+    }
+}
 
 pub type TempId = u32;
 pub type LabelId = u32;
@@ -35,13 +42,42 @@ pub struct BytecodeModule {
     pub backend: BackendKind,
     pub unit_kind: String,
     pub entry: String,
+    pub classes: Vec<BytecodeClass>,
     pub functions: Vec<BytecodeFunction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BytecodeClass {
+    pub name: String,
+    pub package: Option<String>,
+    pub superclass_name: Option<String>,
+    pub superclass_path: Option<String>,
+    pub superclass_bundle_module_id: Option<String>,
+    pub inherits_handle: bool,
+    pub source_path: Option<String>,
+    pub property_names: Vec<String>,
+    pub private_property_names: Vec<String>,
+    pub default_initializer: Option<String>,
+    pub constructor: Option<String>,
+    pub inline_methods: Vec<String>,
+    pub static_inline_methods: Vec<String>,
+    pub private_inline_methods: Vec<String>,
+    pub private_static_inline_methods: Vec<String>,
+    pub external_methods: Vec<BytecodeExternalMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BytecodeExternalMethod {
+    pub name: String,
+    pub path: Option<String>,
+    pub bundle_module_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BytecodeFunction {
     pub name: String,
     pub role: String,
+    pub owner_class_name: Option<String>,
     pub params: Vec<String>,
     pub outputs: Vec<String>,
     pub captures: Vec<String>,
@@ -234,6 +270,7 @@ impl VerificationSummary {
 #[derive(Default)]
 struct ModuleEmitter {
     functions: Vec<BytecodeFunction>,
+    classes: Vec<BytecodeClass>,
     next_anonymous_id: u32,
 }
 
@@ -261,6 +298,7 @@ pub fn emit_bytecode(module: &HirModule) -> BytecodeModule {
         backend: BackendKind::Bytecode,
         unit_kind: format!("{:?}", module.kind),
         entry,
+        classes: emitter.classes,
         functions: emitter.functions,
     }
 }
@@ -368,11 +406,31 @@ pub fn render_bytecode(module: &BytecodeModule) -> String {
         module.unit_kind,
         module.entry
     ));
+    for class in &module.classes {
+        out.push_str(&format!(
+            "class {} package={:?} superclass={:?} superclass_path={:?} handle={} initializer={:?} constructor={:?} properties=[{}] private_properties=[{}] inline_methods=[{}] static_inline_methods=[{}] private_inline_methods=[{}] private_static_inline_methods=[{}] source_path={:?}\n",
+            class.name,
+            class.package,
+            class.superclass_name,
+            class.superclass_path,
+            class.inherits_handle,
+            class.default_initializer,
+            class.constructor,
+            class.property_names.join(", "),
+            class.private_property_names.join(", "),
+            class.inline_methods.join(", "),
+            class.static_inline_methods.join(", "),
+            class.private_inline_methods.join(", "),
+            class.private_static_inline_methods.join(", "),
+            class.source_path
+        ));
+    }
     for function in &module.functions {
         out.push_str(&format!(
-            "function {} role={} params=[{}] outputs=[{}] captures=[{}] temps={} labels={}\n",
+            "function {} role={} owner_class={:?} params=[{}] outputs=[{}] captures=[{}] temps={} labels={}\n",
             function.name,
             function.role,
+            function.owner_class_name,
             function.params.join(", "),
             function.outputs.join(", "),
             function.captures.join(", "),
@@ -390,6 +448,50 @@ pub fn render_bytecode(module: &BytecodeModule) -> String {
 
 impl ModuleEmitter {
     fn emit_module(&mut self, module: &HirModule) -> String {
+        for class in &module.classes {
+            let initializer = if class.properties.iter().any(|property| property.default.is_some()) {
+                Some(self.emit_class_initializer(class))
+            } else {
+                None
+            };
+            self.classes.push(BytecodeClass {
+                name: class.name.clone(),
+                package: class.package.clone(),
+                superclass_name: class.superclass_name.clone(),
+                superclass_path: class
+                    .superclass_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                superclass_bundle_module_id: None,
+                inherits_handle: class.inherits_handle,
+                source_path: class
+                    .source_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                property_names: class
+                    .properties
+                    .iter()
+                    .map(|property| property.name.clone())
+                    .collect(),
+                private_property_names: class.private_properties.clone(),
+                default_initializer: initializer,
+                constructor: class.constructor.clone(),
+                inline_methods: class.inline_methods.clone(),
+                static_inline_methods: class.static_inline_methods.clone(),
+                private_inline_methods: class.private_inline_methods.clone(),
+                private_static_inline_methods: class.private_static_inline_methods.clone(),
+                external_methods: class
+                    .external_methods
+                    .iter()
+                    .map(|method| BytecodeExternalMethod {
+                        name: method.name.clone(),
+                        path: Some(method.path.display().to_string()),
+                        bundle_module_id: None,
+                    })
+                    .collect(),
+            });
+        }
+
         let statements = module
             .items
             .iter()
@@ -430,6 +532,49 @@ impl ModuleEmitter {
         entry
     }
 
+    fn emit_class_initializer(&mut self, class: &matlab_ir::HirClass) -> String {
+        let name = format!("__classinit_{}_{}", class.name, self.functions.len());
+        let output_names = class
+            .properties
+            .iter()
+            .map(|property| format!("__default_{}", property.name))
+            .collect::<Vec<_>>();
+        let mut emitter = FunctionEmitter::new(self, output_names.clone(), None);
+        let mut values = Vec::new();
+        for property in &class.properties {
+            let temp = match &property.default {
+                Some(default) => emitter.lower_expression(default),
+                None => {
+                    let temp = emitter.new_temp();
+                    emitter.instructions.push(BytecodeInstruction::BuildMatrix {
+                        dst: temp,
+                        rows: 0,
+                        cols: 0,
+                        elements: Vec::new(),
+                    });
+                    temp
+                }
+            };
+            values.push(temp);
+        }
+        emitter
+            .instructions
+            .push(BytecodeInstruction::Return { values });
+        let body = emitter.finish();
+        self.functions.push(BytecodeFunction {
+            name: name.clone(),
+            role: "class_initializer".to_string(),
+            owner_class_name: Some(qualified_class_name(&class.name, class.package.as_deref())),
+            params: Vec::new(),
+            outputs: output_names,
+            captures: Vec::new(),
+            temp_count: body.temp_count,
+            label_count: body.label_count,
+            instructions: body.instructions,
+        });
+        name
+    }
+
     fn emit_script_entry(
         &mut self,
         statements: &[&HirStatement],
@@ -446,6 +591,7 @@ impl ModuleEmitter {
         BytecodeFunction {
             name: "<script>".to_string(),
             role: "script_entry".to_string(),
+            owner_class_name: None,
             params: Vec::new(),
             outputs: Vec::new(),
             captures: Vec::new(),
@@ -478,6 +624,7 @@ impl ModuleEmitter {
         self.functions.push(BytecodeFunction {
             name: name.clone(),
             role: role.to_string(),
+            owner_class_name: function.owner_class_name.clone(),
             params: function.inputs.iter().map(binding_name).collect(),
             outputs,
             captures: function
@@ -515,6 +662,7 @@ impl ModuleEmitter {
         self.functions.push(BytecodeFunction {
             name: name.clone(),
             role: "anonymous_function".to_string(),
+            owner_class_name: None,
             params: anonymous.params.iter().map(binding_name).collect(),
             outputs: vec!["<anon_result>".to_string()],
             captures: anonymous
@@ -934,34 +1082,15 @@ impl<'a> FunctionEmitter<'a> {
             HirExpression::CharLiteral(text) => self.load_const(format!("char({text})")),
             HirExpression::StringLiteral(text) => self.load_const(format!("string({text})")),
             HirExpression::MatrixLiteral(rows) => {
-                if literal_rows_need_list_expansion(rows) {
-                    let (row_item_counts, elements) = self.lower_literal_row_sources(rows);
-                    let temp = self.new_temp();
-                    self.instructions
-                        .push(BytecodeInstruction::BuildMatrixList {
-                            dst: temp,
-                            row_item_counts,
-                            elements,
-                        });
-                    temp
-                } else {
-                    let mut elements = Vec::new();
-                    let row_count = rows.len();
-                    let col_count = rows.first().map(|row| row.len()).unwrap_or(0);
-                    for row in rows {
-                        for element in row {
-                            elements.push(self.lower_expression(element));
-                        }
-                    }
-                    let temp = self.new_temp();
-                    self.instructions.push(BytecodeInstruction::BuildMatrix {
+                let (row_item_counts, elements) = self.lower_literal_row_sources(rows);
+                let temp = self.new_temp();
+                self.instructions
+                    .push(BytecodeInstruction::BuildMatrixList {
                         dst: temp,
-                        rows: row_count,
-                        cols: col_count,
+                        row_item_counts,
                         elements,
                     });
-                    temp
-                }
+                temp
             }
             HirExpression::CellLiteral(rows) => {
                 if literal_rows_need_list_expansion(rows) {
@@ -992,14 +1121,19 @@ impl<'a> FunctionEmitter<'a> {
                     temp
                 }
             }
-            HirExpression::FunctionHandle(reference) => {
-                let temp = self.new_temp();
-                self.instructions.push(BytecodeInstruction::MakeHandle {
-                    dst: temp,
-                    target: callable_target_name(reference),
-                });
-                temp
-            }
+            HirExpression::FunctionHandle(target) => match target {
+                HirFunctionHandleTarget::Callable(reference) => {
+                    let temp = self.new_temp();
+                    self.instructions.push(BytecodeInstruction::MakeHandle {
+                        dst: temp,
+                        target: callable_target_name(reference),
+                    });
+                    temp
+                }
+                HirFunctionHandleTarget::Expression(expression) => {
+                    self.lower_expression(expression)
+                }
+            },
             HirExpression::EndKeyword => self.load_const("keyword(end)".to_string()),
             HirExpression::Unary { op, rhs } => {
                 let src = self.lower_expression(rhs);
@@ -1451,13 +1585,22 @@ fn callable_binding_name(reference: &HirCallableRef) -> String {
 }
 
 fn callable_target_name(reference: &HirCallableRef) -> String {
+    let binding = reference
+        .binding_id
+        .map(|binding_id| format!(" binding={}", binding_id.0))
+        .unwrap_or_default();
+    let super_constructor = if reference.super_constructor {
+        " super_ctor=true"
+    } else {
+        ""
+    };
     match &reference.final_resolution {
         Some(final_resolution) => format!(
-            "{} [semantic={:?} final={:?}]",
+            "{} [semantic={:?}{binding}{super_constructor} final={:?}]",
             reference.name, reference.semantic_resolution, final_resolution
         ),
         None => format!(
-            "{} [semantic={:?}]",
+            "{} [semantic={:?}{binding}{super_constructor}]",
             reference.name, reference.semantic_resolution
         ),
     }

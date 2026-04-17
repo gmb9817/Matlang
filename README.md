@@ -1,6 +1,9 @@
-# MATLAB Reimplementation
+# Matlang
 
-This repository contains a modular, compiler-first reimplementation of a MATLAB-compatible language system.
+Matlang is a modular, compiler-first reimplementation of a MATLAB-compatible language system.
+
+Matlang is an independent project and is not affiliated with or endorsed by MathWorks.
+MATLAB is a trademark of The MathWorks, Inc.
 
 Current project intent:
 - Build a CLI-first compiler and runtime before any desktop UX work.
@@ -18,7 +21,7 @@ Current default technical direction:
 - Implementation language: Rust
 - Execution bring-up path: parser -> semantics -> interpreter -> bytecode VM -> native backend
 - Compatibility strategy: explicit feature matrix with documented divergences
-- Helper build scripts: `tools/build/check-workspace.ps1` and `tools/build/run-matc.ps1`
+- Helper build scripts: `scripts/cargo-msvc.cmd` and `scripts/cargo-msvc.ps1`
 
 Immediate focus:
 1. Expand semantic binding from first-pass symbols/scopes into real workspace and resolution rules.
@@ -29,6 +32,13 @@ Immediate focus:
 Current usable CLI surface:
 - `matc parse <file.m>`
 - `matc check <file.m>`
+
+Current public-facing project name:
+- `Matlang`
+- CLI binary currently remains `matc`
+
+License:
+- Apache License 2.0
 
 Contributors must read:
 1. `docs/handoff/CURRENT_STATE.md`

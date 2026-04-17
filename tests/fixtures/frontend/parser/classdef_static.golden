@@ -1,0 +1,6 @@
+unit ClassFile
+class Point
+  methods (Static)
+    function origin() -> [out]
+      assign [out] = matrix[number(0), number(0)]
+  end_methods

@@ -31,11 +31,13 @@ use matlab_frontend::{
     source::SourceFileId,
     testing::render_compilation_unit,
 };
-use matlab_interop::{read_workspace_snapshot, write_workspace_snapshot};
+use matlab_interop::{
+    read_workspace_snapshot, write_workspace_snapshot_with_modules, WorkspaceSnapshotBundleModule,
+};
 use matlab_ir::{lower_to_hir, testing::render_hir};
 use matlab_optimizer::{optimize_module, render_optimization_summary, OptimizationSummary};
 use matlab_platform::{
-    collect_bytecode_dependency_paths, read_bytecode_artifact, read_bytecode_bundle,
+    collect_bytecode_dependency_paths, encode_bytecode_module, read_bytecode_artifact, read_bytecode_bundle,
     render_bundle_summary, rewrite_bytecode_bundle_targets, write_bytecode_artifact,
     write_bytecode_bundle, BytecodeBundle, PackagedBytecodeModule,
 };
@@ -300,8 +302,21 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                 .get(2)
                 .ok_or_else(|| "missing snapshot path for `matc export-workspace`".to_string())?;
             let runtime_args = parse_runtime_args(&args[3..])?;
-            let workspace = execute_input_workspace(input_path, &runtime_args)?;
-            write_workspace_snapshot(Path::new(snapshot_path), &workspace)
+            let exported = execute_input_workspace(input_path, &runtime_args)?;
+            let snapshot_bundle_modules = exported
+                .bundle_modules
+                .iter()
+                .map(|module| WorkspaceSnapshotBundleModule {
+                    module_id: module.module_id.clone(),
+                    source_path: module.source_path.clone(),
+                    encoded_module: encode_bytecode_module(&module.module),
+                })
+                .collect::<Vec<_>>();
+            write_workspace_snapshot_with_modules(
+                Path::new(snapshot_path),
+                &exported.workspace,
+                &snapshot_bundle_modules,
+            )
                 .map_err(|error| error.to_string())?;
             let byte_count = fs::metadata(snapshot_path)
                 .map(|metadata| metadata.len())
@@ -309,7 +324,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             println!("workspace_snapshot");
             println!("  input = {input_path}");
             println!("  path = {snapshot_path}");
-            println!("  variables = {}", workspace.len());
+            println!("  variables = {}", exported.workspace.len());
             println!("  bytes = {byte_count}");
             Ok(0)
         }
@@ -557,6 +572,9 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                     &runtime_args,
                     artifact_path.to_string(),
                 ),
+                "ClassFile" => {
+                    return Err(serialized_class_execution_error("run-artifact", "artifacts"))
+                }
                 other => {
                     return Err(format!(
                         "artifact `{artifact_path}` has unsupported unit kind `{other}`"
@@ -587,6 +605,9 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                     execute_script_bytecode_bundle(&bundle)
                 }
                 "FunctionFile" => execute_function_file_bytecode_bundle(&bundle, &runtime_args),
+                "ClassFile" => {
+                    return Err(serialized_class_execution_error("run-bundle", "bundles"))
+                }
                 other => {
                     return Err(format!(
                         "bundle `{bundle_path}` has unsupported unit kind `{other}`"
@@ -602,6 +623,10 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             "unknown command `{command}`\n\nUse `matc help` for usage."
         )),
     }
+}
+
+fn serialized_class_execution_error(command: &str, container: &str) -> String {
+    format!("`matc {command}` does not execute class definition {container} directly")
 }
 
 struct CompiledBytecodeUnit {
@@ -730,7 +755,15 @@ fn render_bundle_modules(bundle: &BytecodeBundle) -> String {
     out
 }
 
-fn execute_input_workspace(input_path: &str, runtime_args: &[Value]) -> Result<Workspace, String> {
+struct ExportedWorkspace {
+    workspace: Workspace,
+    bundle_modules: Vec<PackagedBytecodeModule>,
+}
+
+fn execute_input_workspace(
+    input_path: &str,
+    runtime_args: &[Value],
+) -> Result<ExportedWorkspace, String> {
     let path = Path::new(input_path);
     match path.extension().and_then(|value| value.to_str()) {
         Some("matpkg") => {
@@ -746,6 +779,12 @@ fn execute_input_workspace(input_path: &str, runtime_args: &[Value]) -> Result<W
                     execute_script_bytecode_bundle(&bundle)
                 }
                 "FunctionFile" => execute_function_file_bytecode_bundle(&bundle, runtime_args),
+                "ClassFile" => {
+                    return Err(serialized_class_execution_error(
+                        "export-workspace",
+                        "bundles",
+                    ))
+                }
                 other => {
                     return Err(format!(
                         "bundle `{input_path}` has unsupported unit kind `{other}`"
@@ -753,7 +792,11 @@ fn execute_input_workspace(input_path: &str, runtime_args: &[Value]) -> Result<W
                 }
             }
             .map_err(|error| format!("bundle execution failed for `{input_path}`: {error}"))?;
-            Ok(result.workspace)
+            let bundle_modules = result.bundle_modules().to_vec();
+            Ok(ExportedWorkspace {
+                workspace: result.workspace,
+                bundle_modules,
+            })
         }
         Some("matbc") => {
             let bytecode = read_bytecode_artifact(path).map_err(|error| error.to_string())?;
@@ -772,6 +815,12 @@ fn execute_input_workspace(input_path: &str, runtime_args: &[Value]) -> Result<W
                     runtime_args,
                     input_path.to_string(),
                 ),
+                "ClassFile" => {
+                    return Err(serialized_class_execution_error(
+                        "export-workspace",
+                        "artifacts",
+                    ))
+                }
                 other => {
                     return Err(format!(
                         "artifact `{input_path}` has unsupported unit kind `{other}`"
@@ -779,7 +828,11 @@ fn execute_input_workspace(input_path: &str, runtime_args: &[Value]) -> Result<W
                 }
             }
             .map_err(|error| format!("artifact execution failed for `{input_path}`: {error}"))?;
-            Ok(result.workspace)
+            let bundle_modules = result.bundle_modules().to_vec();
+            Ok(ExportedWorkspace {
+                workspace: result.workspace,
+                bundle_modules,
+            })
         }
         _ => {
             let source = read_source(input_path)?;
@@ -824,7 +877,11 @@ fn execute_input_workspace(input_path: &str, runtime_args: &[Value]) -> Result<W
                 }
             }
             .map_err(|error| format!("execution failed for `{input_path}`: {error}"))?;
-            Ok(result.workspace)
+            let bundle_modules = result.bundle_modules().to_vec();
+            Ok(ExportedWorkspace {
+                workspace: result.workspace,
+                bundle_modules,
+            })
         }
     }
 }
@@ -1254,6 +1311,124 @@ fn print_help() {
     println!("  run-bytecode  Parse, analyze, lower, optimize, execute through the bytecode VM path, and print the final workspace.");
     println!("  run-artifact  Load and execute a serialized bytecode artifact, then print the final workspace.");
     println!("  run-bundle  Load and execute a serialized bytecode bundle, resolving packaged external modules before the filesystem.");
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{build_bytecode_bundle, execute_input_workspace, serialized_class_execution_error};
+    use matlab_interop::{write_workspace_snapshot_with_modules, WorkspaceSnapshotBundleModule};
+    use matlab_platform::{encode_bytecode_module, write_bytecode_bundle};
+    use matlab_runtime::Value;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{stamp}"))
+    }
+
+    #[test]
+    fn serialized_class_execution_errors_are_explicit() {
+        assert_eq!(
+            serialized_class_execution_error("run-artifact", "artifacts"),
+            "`matc run-artifact` does not execute class definition artifacts directly"
+        );
+        assert_eq!(
+            serialized_class_execution_error("run-bundle", "bundles"),
+            "`matc run-bundle` does not execute class definition bundles directly"
+        );
+        assert_eq!(
+            serialized_class_execution_error("export-workspace", "artifacts"),
+            "`matc export-workspace` does not execute class definition artifacts directly"
+        );
+    }
+
+    #[test]
+    fn export_workspace_preserves_embedded_bundle_modules_after_source_snapshot_reload() {
+        let temp_dir = unique_temp_dir("matc-export-workspace-bundle-registry");
+        let source_dir = temp_dir.join("src");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = temp_dir.join("consumer.m");
+        let bundle_path = temp_dir.join("producer.matpkg");
+        let snapshot_path = temp_dir.join("state.matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             child = [];\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, child)\n\
+             obj.x = x;\n\
+             obj.child = child;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = sum([obj.x]);\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write export-workspace class");
+        fs::write(
+            &producer_path,
+            "objs = [Point(1, Point(10, [])), Point(2, Point(20, [])), Point(3, Point(30, []))];\n\
+             f = @objs.child.total;\n",
+        )
+        .expect("write export-workspace producer");
+
+        let (_, bundle) = build_bytecode_bundle(&producer_path).expect("build bytecode bundle");
+        write_bytecode_bundle(&bundle_path, &bundle).expect("write bytecode bundle");
+        let exported_bundle =
+            execute_input_workspace(bundle_path.to_str().expect("bundle path"), &[])
+                .expect("execute bundle input");
+        let snapshot_modules = exported_bundle
+            .bundle_modules
+            .iter()
+            .map(|module| WorkspaceSnapshotBundleModule {
+                module_id: module.module_id.clone(),
+                source_path: module.source_path.clone(),
+                encoded_module: encode_bytecode_module(&module.module),
+            })
+            .collect::<Vec<_>>();
+        write_workspace_snapshot_with_modules(
+            &snapshot_path,
+            &exported_bundle.workspace,
+            &snapshot_modules,
+        )
+        .expect("write workspace snapshot");
+
+        fs::remove_dir_all(&source_dir).expect("remove source tree");
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = f();\n"
+            ),
+        )
+        .expect("write export-workspace consumer");
+
+        let exported_source =
+            execute_input_workspace(consumer_path.to_str().expect("consumer path"), &[])
+                .expect("execute source input");
+        assert_eq!(exported_source.bundle_modules.len(), 1);
+        assert_eq!(exported_source.bundle_modules[0].module_id, "dep0");
+        assert_eq!(
+            exported_source.workspace.get("out"),
+            Some(&Value::Scalar(60.0))
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]

@@ -13,7 +13,7 @@ verification
   issues = 0
 
 bytecode module backend=bytecode unit_kind=Script entry=<script>
-function <script> role=script_entry params=[] outputs=[] captures=[] temps=20 labels=0
+function <script> role=script_entry owner_class=None params=[] outputs=[] captures=[] temps=20 labels=0
   t0 = const number(1)
   t1 = const number(2)
   t2 = const number(3)
@@ -22,7 +22,7 @@ function <script> role=script_entry params=[] outputs=[] captures=[] temps=20 la
   store data#1 <- t4
   t5 = const number(9)
   t6 = const number(8)
-  t7 = matrix 1x2 [t5, t6]
+  t7 = matrix_list rows=[2] [t5, t6]
   store row#2 <- t7
   t8 = load row#2
   t9 = const number(5)

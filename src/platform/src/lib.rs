@@ -7,7 +7,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use matlab_codegen::{BackendKind, BytecodeFunction, BytecodeInstruction, BytecodeModule};
+use matlab_codegen::{
+    BackendKind, BytecodeClass, BytecodeExternalMethod, BytecodeFunction, BytecodeInstruction,
+    BytecodeModule,
+};
 
 pub const CRATE_NAME: &str = "matlab-platform";
 pub const BYTECODE_ARTIFACT_MAGIC: &str = "MATC-BYTECODE";
@@ -96,6 +99,20 @@ pub fn rewrite_bytecode_bundle_targets(
     path_to_module_id: &HashMap<PathBuf, String>,
 ) -> BytecodeModule {
     let mut rewritten = module.clone();
+    for class in &mut rewritten.classes {
+        if let Some(path) = class.superclass_path.as_ref().map(PathBuf::from) {
+            if let Some(module_id) = path_to_module_id.get(&path) {
+                class.superclass_bundle_module_id = Some(module_id.clone());
+            }
+        }
+        for method in &mut class.external_methods {
+            if let Some(path) = method.path.as_ref().map(PathBuf::from) {
+                if let Some(module_id) = path_to_module_id.get(&path) {
+                    method.bundle_module_id = Some(module_id.clone());
+                }
+            }
+        }
+    }
     for function in &mut rewritten.functions {
         for instruction in &mut function.instructions {
             match instruction {
@@ -140,6 +157,38 @@ pub fn encode_bytecode_module(module: &BytecodeModule) -> String {
             module.entry.clone(),
         ],
     );
+    for class in &module.classes {
+        let mut fields = vec![
+            class.name.clone(),
+            class.package.clone().unwrap_or_default(),
+            class.superclass_name.clone().unwrap_or_default(),
+            class.superclass_path.clone().unwrap_or_default(),
+            class.superclass_bundle_module_id.clone().unwrap_or_default(),
+            class.inherits_handle.to_string(),
+            class.source_path.clone().unwrap_or_default(),
+            class.default_initializer.clone().unwrap_or_default(),
+            class.constructor.clone().unwrap_or_default(),
+            class.property_names.len().to_string(),
+        ];
+        fields.extend(class.property_names.iter().cloned());
+        fields.push(class.private_property_names.len().to_string());
+        fields.extend(class.private_property_names.iter().cloned());
+        fields.push(class.inline_methods.len().to_string());
+        fields.extend(class.inline_methods.iter().cloned());
+        fields.push(class.static_inline_methods.len().to_string());
+        fields.extend(class.static_inline_methods.iter().cloned());
+        fields.push(class.private_inline_methods.len().to_string());
+        fields.extend(class.private_inline_methods.iter().cloned());
+        fields.push(class.private_static_inline_methods.len().to_string());
+        fields.extend(class.private_static_inline_methods.iter().cloned());
+        fields.push(class.external_methods.len().to_string());
+        for method in &class.external_methods {
+            fields.push(method.name.clone());
+            fields.push(method.path.clone().unwrap_or_default());
+            fields.push(method.bundle_module_id.clone().unwrap_or_default());
+        }
+        push_record(&mut out, "CLASS", &fields);
+    }
     for function in &module.functions {
         push_record(
             &mut out,
@@ -147,6 +196,7 @@ pub fn encode_bytecode_module(module: &BytecodeModule) -> String {
             &[
                 function.name.clone(),
                 function.role.clone(),
+                function.owner_class_name.clone().unwrap_or_default(),
                 function.temp_count.to_string(),
                 function.label_count.to_string(),
             ],
@@ -215,11 +265,16 @@ pub fn decode_bytecode_module(source: &str) -> Result<BytecodeModule, PlatformEr
     let entry = module_fields[3].clone();
     cursor += 1;
 
+    let mut classes = Vec::new();
     let mut functions = Vec::new();
 
     while let Some((line_index, record)) = lines.get(cursor) {
         let fields = parse_fields(record, *line_index)?;
         match fields.first().map(String::as_str) {
+            Some("CLASS") => {
+                classes.push(parse_class(fields, *line_index)?);
+                cursor += 1;
+            }
             Some("FUNCTION") => {
                 let function = parse_function(&lines, &mut cursor, fields, *line_index)?;
                 functions.push(function);
@@ -238,6 +293,7 @@ pub fn decode_bytecode_module(source: &str) -> Result<BytecodeModule, PlatformEr
         backend,
         unit_kind,
         entry,
+        classes,
         functions,
     })
 }
@@ -403,6 +459,16 @@ pub fn read_bytecode_bundle(path: &Path) -> Result<BytecodeBundle, PlatformError
 
 pub fn collect_bytecode_dependency_paths(module: &BytecodeModule) -> Vec<PathBuf> {
     let mut paths = BTreeSet::new();
+    for class in &module.classes {
+        if let Some(path) = &class.superclass_path {
+            paths.insert(PathBuf::from(path));
+        }
+        for method in &class.external_methods {
+            if let Some(path) = &method.path {
+                paths.insert(PathBuf::from(path));
+            }
+        }
+    }
     for function in &module.functions {
         for instruction in &function.instructions {
             match instruction {
@@ -698,19 +764,21 @@ fn parse_function(
     fields: Vec<String>,
     line_number: usize,
 ) -> Result<BytecodeFunction, PlatformError> {
-    if fields.len() != 5 {
+    if fields.len() != 6 {
         return Err(PlatformError::Parse(format!(
-            "line {line_number}: FUNCTION record must have 4 fields"
+            "line {line_number}: FUNCTION record must have 5 fields"
         )));
     }
 
     let name = fields[1].clone();
     let role = fields[2].clone();
-    let temp_count = parse_u32(&fields[3], "temp count", line_number)?;
-    let label_count = parse_u32(&fields[4], "label count", line_number)?;
+    let owner_class_name = (!fields[3].is_empty()).then(|| fields[3].clone());
+    let temp_count = parse_u32(&fields[4], "temp count", line_number)?;
+    let label_count = parse_u32(&fields[5], "label count", line_number)?;
     let mut function = BytecodeFunction {
         name,
         role,
+        owner_class_name,
         params: Vec::new(),
         outputs: Vec::new(),
         captures: Vec::new(),
@@ -764,6 +832,140 @@ fn parse_function(
         "line {line_number}: function `{}` is missing END_FUNCTION",
         function.name
     )))
+}
+
+fn parse_class(fields: Vec<String>, line_number: usize) -> Result<BytecodeClass, PlatformError> {
+    if fields.len() < 11 {
+        return Err(PlatformError::Parse(format!(
+            "line {line_number}: CLASS record is too short"
+        )));
+    }
+    let name = fields[1].clone();
+    let package = (!fields[2].is_empty()).then(|| fields[2].clone());
+    let superclass_name = (!fields[3].is_empty()).then(|| fields[3].clone());
+    let superclass_path = (!fields[4].is_empty()).then(|| fields[4].clone());
+    let superclass_bundle_module_id = (!fields[5].is_empty()).then(|| fields[5].clone());
+    let inherits_handle = parse_bool(&fields[6], line_number)?;
+    let source_path = (!fields[7].is_empty()).then(|| fields[7].clone());
+    let default_initializer = (!fields[8].is_empty()).then(|| fields[8].clone());
+    let constructor = (!fields[9].is_empty()).then(|| fields[9].clone());
+    let property_count = parse_usize(&fields[10], "class property count", line_number)?;
+    let property_start = 11;
+    let property_end = property_start + property_count;
+    if fields.len() < property_end + 1 {
+        return Err(PlatformError::Parse(format!(
+            "line {line_number}: CLASS record is missing private property count"
+        )));
+    }
+    let property_names = fields[property_start..property_end].to_vec();
+    let private_property_count =
+        parse_usize(&fields[property_end], "class private property count", line_number)?;
+    let private_property_start = property_end + 1;
+    let private_property_end = private_property_start + private_property_count;
+    if fields.len() < private_property_end + 1 {
+        return Err(PlatformError::Parse(format!(
+            "line {line_number}: CLASS record is missing inline method count"
+        )));
+    }
+    let private_property_names = fields[private_property_start..private_property_end].to_vec();
+    let method_count = parse_usize(
+        &fields[private_property_end],
+        "class inline method count",
+        line_number,
+    )?;
+    let methods_start = private_property_end + 1;
+    let methods_end = methods_start + method_count;
+    if fields.len() < methods_end + 1 {
+        return Err(PlatformError::Parse(format!(
+            "line {line_number}: CLASS record is missing static inline method count"
+        )));
+    }
+    let inline_methods = fields[methods_start..methods_end].to_vec();
+    let static_count = parse_usize(
+        &fields[methods_end],
+        "class static inline method count",
+        line_number,
+    )?;
+    let static_start = methods_end + 1;
+    let static_end = static_start + static_count;
+    if fields.len() < static_end + 1 {
+        return Err(PlatformError::Parse(format!(
+            "line {line_number}: CLASS record is missing external method count"
+        )));
+    }
+    let static_inline_methods = fields[static_start..static_end].to_vec();
+    if fields.len() < static_end + 1 {
+        return Err(PlatformError::Parse(format!(
+            "line {line_number}: CLASS record is missing private inline method count"
+        )));
+    }
+    let private_inline_count = parse_usize(
+        &fields[static_end],
+        "class private inline method count",
+        line_number,
+    )?;
+    let private_inline_start = static_end + 1;
+    let private_inline_end = private_inline_start + private_inline_count;
+    if fields.len() < private_inline_end + 1 {
+        return Err(PlatformError::Parse(format!(
+            "line {line_number}: CLASS record is missing private static inline method count"
+        )));
+    }
+    let private_inline_methods = fields[private_inline_start..private_inline_end].to_vec();
+    let private_static_count = parse_usize(
+        &fields[private_inline_end],
+        "class private static inline method count",
+        line_number,
+    )?;
+    let private_static_start = private_inline_end + 1;
+    let private_static_end = private_static_start + private_static_count;
+    if fields.len() < private_static_end + 1 {
+        return Err(PlatformError::Parse(format!(
+            "line {line_number}: CLASS record is missing external method count"
+        )));
+    }
+    let private_static_inline_methods =
+        fields[private_static_start..private_static_end].to_vec();
+    let external_count = parse_usize(
+        &fields[private_static_end],
+        "class external method count",
+        line_number,
+    )?;
+    let external_start = private_static_end + 1;
+    let external_end = external_start + external_count * 3;
+    if fields.len() != external_end {
+        return Err(PlatformError::Parse(format!(
+            "line {line_number}: CLASS record external method payload does not match count"
+        )));
+    }
+    let mut external_methods = Vec::new();
+    let mut cursor = external_start;
+    while cursor < external_end {
+        external_methods.push(BytecodeExternalMethod {
+            name: fields[cursor].clone(),
+            path: (!fields[cursor + 1].is_empty()).then(|| fields[cursor + 1].clone()),
+            bundle_module_id: (!fields[cursor + 2].is_empty()).then(|| fields[cursor + 2].clone()),
+        });
+        cursor += 3;
+    }
+    Ok(BytecodeClass {
+        name,
+        package,
+        superclass_name,
+        superclass_path,
+        superclass_bundle_module_id,
+        inherits_handle,
+        source_path,
+        property_names,
+        private_property_names,
+        default_initializer,
+        constructor,
+        inline_methods,
+        static_inline_methods,
+        private_inline_methods,
+        private_static_inline_methods,
+        external_methods,
+    })
 }
 
 fn parse_instruction(
@@ -1437,9 +1639,11 @@ mod tests {
                 backend: BackendKind::Bytecode,
                 unit_kind: "Script".to_string(),
                 entry: "<script>".to_string(),
+                classes: Vec::new(),
                 functions: vec![BytecodeFunction {
                     name: "<script>".to_string(),
                     role: "script_entry".to_string(),
+                    owner_class_name: None,
                     params: Vec::new(),
                     outputs: Vec::new(),
                     captures: Vec::new(),
@@ -1455,9 +1659,11 @@ mod tests {
                     backend: BackendKind::Bytecode,
                     unit_kind: "FunctionFile".to_string(),
                     entry: "dep#s0w0".to_string(),
+                    classes: Vec::new(),
                     functions: vec![BytecodeFunction {
                         name: "dep#s0w0".to_string(),
                         role: "function".to_string(),
+                        owner_class_name: None,
                         params: Vec::new(),
                         outputs: Vec::new(),
                         captures: Vec::new(),

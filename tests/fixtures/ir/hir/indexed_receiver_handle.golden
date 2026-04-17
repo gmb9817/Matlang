@@ -1,0 +1,7 @@
+module FunctionFile scope=0 workspace=0
+  function indexed_handle scope=1 workspace=1 captures=[]
+    inputs [binding(name=objs kind=parameter binding=2 storage=local)]
+    outputs [binding(name=y kind=output binding=3 storage=local)]
+    assign [binding(name=f kind=variable binding=4 storage=local)] = handle_expr(field(call(callable(name=objs semantic=workspace_value final=workspace_value symbol=3 kind=parameter binding=2), [:, number(2)]), total))
+    assign [binding(name=g kind=variable binding=5 storage=local)] = handle_expr(field(call_expr(field(value(name=objs resolution=workspace_value binding=2 kind=parameter), child), [range(number(1), number(2))]), total))
+    assign [binding(name=y kind=output binding=3 storage=local)] = value(name=f resolution=workspace_value binding=4 kind=variable)

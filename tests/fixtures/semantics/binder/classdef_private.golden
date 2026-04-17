@@ -1,0 +1,48 @@
+workspaces
+  Class id=0 parent=None name=None
+  Class id=1 parent=Some(0) name=Some("Vault")
+  Function id=2 parent=Some(1) name=Some("reveal")
+  Function id=3 parent=Some(1) name=Some("hidden")
+  Function id=4 parent=Some(1) name=Some("code")
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+  ClassBody id=1 parent=Some(0) workspace=1
+  FunctionBody id=2 parent=Some(1) workspace=2
+  FunctionBody id=3 parent=Some(1) workspace=3
+  FunctionBody id=4 parent=Some(1) workspace=4
+symbols
+  Vault kind=class scope=0 workspace=0 binding=None
+  secret kind=property scope=1 workspace=1 binding=None
+  reveal kind=method scope=1 workspace=1 binding=None
+  hidden kind=method scope=1 workspace=1 binding=None
+  code kind=method scope=1 workspace=1 binding=None
+  ans kind=variable scope=2 workspace=2 binding=Some(0)
+  obj kind=parameter scope=2 workspace=2 binding=Some(1)
+  out kind=output scope=2 workspace=2 binding=Some(2)
+  ans kind=variable scope=3 workspace=3 binding=Some(3)
+  obj kind=parameter scope=3 workspace=3 binding=Some(4)
+  out kind=output scope=3 workspace=3 binding=Some(5)
+  ans kind=variable scope=4 workspace=4 binding=Some(6)
+  out kind=output scope=4 workspace=4 binding=Some(7)
+bindings
+  ans id=0 storage=local owner_symbol=5 owner_scope=2 owner_workspace=2 shared=false
+  obj id=1 storage=local owner_symbol=6 owner_scope=2 owner_workspace=2 shared=false
+  out id=2 storage=local owner_symbol=7 owner_scope=2 owner_workspace=2 shared=false
+  ans id=3 storage=local owner_symbol=8 owner_scope=3 owner_workspace=3 shared=false
+  obj id=4 storage=local owner_symbol=9 owner_scope=3 owner_workspace=3 shared=false
+  out id=5 storage=local owner_symbol=10 owner_scope=3 owner_workspace=3 shared=false
+  ans id=6 storage=local owner_symbol=11 owner_scope=4 owner_workspace=4 shared=false
+  out id=7 storage=local owner_symbol=12 owner_scope=4 owner_workspace=4 shared=false
+classes
+  Vault package=None superclass=None handle=false constructor=None source_path=None
+    properties [secret=default]
+    inline_methods [reveal, hidden]
+    static_inline_methods [code]
+    private_properties [secret]
+    private_inline_methods [hidden]
+    private_static_inline_methods [code]
+references
+  obj role=value resolution=workspace_value symbol=Some(6) kind=parameter scope=Some(2) workspace=Some(2) binding=Some(1) capture=none
+  obj role=value resolution=workspace_value symbol=Some(9) kind=parameter scope=Some(3) workspace=Some(3) binding=Some(4) capture=none
+captures
+diagnostics

@@ -42,8 +42,15 @@ pub struct ClassDef {
     pub span: SourceSpan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassMemberAccess {
+    Public,
+    Private,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassPropertyBlock {
+    pub access: ClassMemberAccess,
     pub properties: Vec<ClassPropertyDef>,
     pub span: SourceSpan,
 }
@@ -57,6 +64,8 @@ pub struct ClassPropertyDef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassMethodBlock {
+    pub access: ClassMemberAccess,
+    pub is_static: bool,
     pub methods: Vec<FunctionDef>,
     pub span: SourceSpan,
 }
@@ -157,7 +166,7 @@ pub enum ExpressionKind {
     StringLiteral(String),
     MatrixLiteral(Vec<Vec<Expression>>),
     CellLiteral(Vec<Vec<Expression>>),
-    FunctionHandle(QualifiedName),
+    FunctionHandle(FunctionHandleTarget),
     EndKeyword,
     Unary {
         op: UnaryOp,
@@ -189,6 +198,12 @@ pub enum ExpressionKind {
         params: Vec<Identifier>,
         body: Box<Expression>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionHandleTarget {
+    Name(QualifiedName),
+    Expression(Box<Expression>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

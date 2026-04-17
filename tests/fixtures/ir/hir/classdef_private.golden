@@ -1,0 +1,20 @@
+module ClassFile scope=0 workspace=0
+  class Vault package=None superclass=None superclass_path=None handle=false constructor=None source_path=Some("classdef_private.m")
+    properties [secret=number(41)]
+    inline_methods [reveal, hidden]
+    static_inline_methods [code]
+    private_properties [secret]
+    private_inline_methods [hidden]
+    private_static_inline_methods [code]
+  function reveal scope=2 workspace=2 captures=[]
+    inputs [binding(name=obj kind=parameter binding=1 storage=local)]
+    outputs [binding(name=out kind=output binding=2 storage=local)]
+    assign [binding(name=out kind=output binding=2 storage=local)] = field(value(name=obj resolution=workspace_value binding=1 kind=parameter), secret)
+  function hidden scope=3 workspace=3 captures=[]
+    inputs [binding(name=obj kind=parameter binding=4 storage=local)]
+    outputs [binding(name=out kind=output binding=5 storage=local)]
+    assign [binding(name=out kind=output binding=5 storage=local)] = binary(Add, field(value(name=obj resolution=workspace_value binding=4 kind=parameter), secret), number(1))
+  function code scope=4 workspace=4 captures=[]
+    inputs []
+    outputs [binding(name=out kind=output binding=7 storage=local)]
+    assign [binding(name=out kind=output binding=7 storage=local)] = number(7)

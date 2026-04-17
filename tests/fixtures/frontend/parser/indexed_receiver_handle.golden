@@ -1,0 +1,5 @@
+unit FunctionFile
+function indexed_handle(objs) -> [y]
+  assign [f] = handle(@field(apply(objs, [:, number(2)]), total))
+  assign [g] = handle(@field(apply(field(objs, child), [range(number(1), number(2))]), total))
+  assign [y] = f

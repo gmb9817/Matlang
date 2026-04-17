@@ -2,7 +2,8 @@ use std::collections::{HashMap, VecDeque};
 
 use matlab_frontend::ast::{
     AssignmentTarget, ClassDef, CompilationUnit, CompilationUnitKind, Expression, ExpressionKind,
-    FunctionDef, Identifier, IndexArgument, Item, QualifiedName, Statement, StatementKind,
+    FunctionDef, FunctionHandleTarget, Identifier, IndexArgument, Item, QualifiedName, Statement,
+    StatementKind,
 };
 use matlab_frontend::source::SourceSpan;
 use matlab_semantics::{
@@ -17,11 +18,19 @@ use matlab_semantics::{
 use crate::hir::{
     HirAnonymousFunction, HirAssignmentTarget, HirBinding, HirCallTarget, HirCallableRef,
     HirCapture, HirClass, HirClassProperty, HirConditionalBranch, HirExpression, HirFunction,
-    HirIndexArgument, HirItem, HirModule, HirStatement, HirSwitchCase, HirValueRef,
+    HirFunctionHandleTarget, HirIndexArgument, HirItem, HirModule, HirStatement, HirSwitchCase,
+    HirValueRef,
 };
 
 pub fn lower_to_hir(unit: &CompilationUnit, analysis: &AnalysisResult) -> HirModule {
     LoweringContext::new(analysis).lower_module(unit)
+}
+
+fn qualified_class_name(name: &str, package: Option<&str>) -> String {
+    match package {
+        Some(package) if !package.is_empty() => format!("{package}.{name}"),
+        _ => name.to_string(),
+    }
 }
 
 struct LoweringContext<'a> {
@@ -188,12 +197,25 @@ impl<'a> LoweringContext<'a> {
                 Item::Statement(statement) => {
                     vec![HirItem::Statement(self.lower_statement(statement, scope_id))]
                 }
-                Item::Function(function) => vec![HirItem::Function(self.lower_function(function))],
+                Item::Function(function) => {
+                    vec![HirItem::Function(self.lower_function(function, None))]
+                }
                 Item::Class(class_def) => class_def
                     .method_blocks
                     .iter()
                     .flat_map(|block| block.methods.iter())
-                    .map(|method| HirItem::Function(self.lower_function(method)))
+                    .map(|method| {
+                        let owner_class_name = self
+                            .analysis_class(&class_def.name.name)
+                            .map(|class| {
+                                qualified_class_name(
+                                    &class.name,
+                                    class.package.as_deref(),
+                                )
+                            })
+                            .unwrap_or_else(|| class_def.name.name.clone());
+                        HirItem::Function(self.lower_function(method, Some(owner_class_name.as_str())))
+                    })
                     .collect::<Vec<_>>(),
             })
             .collect()
@@ -204,6 +226,12 @@ impl<'a> LoweringContext<'a> {
         HirClass {
             name: class_def.name.name.clone(),
             package: metadata.as_ref().and_then(|class| class.package.clone()),
+            superclass_name: metadata
+                .as_ref()
+                .and_then(|class| class.superclass_name.clone()),
+            superclass_path: metadata
+                .as_ref()
+                .and_then(|class| class.superclass_path.clone()),
             inherits_handle: metadata
                 .as_ref()
                 .is_some_and(|class| class.inherits_handle),
@@ -213,6 +241,12 @@ impl<'a> LoweringContext<'a> {
                 .flat_map(|block| block.properties.iter())
                 .map(|property| HirClassProperty {
                     name: property.name.name.clone(),
+                    access: class_def
+                        .property_blocks
+                        .iter()
+                        .find(|block| block.properties.iter().any(|candidate| candidate.name.name == property.name.name))
+                        .map(|block| block.access)
+                        .unwrap_or(matlab_frontend::ast::ClassMemberAccess::Public),
                     default: property
                         .default
                         .as_ref()
@@ -222,9 +256,29 @@ impl<'a> LoweringContext<'a> {
             inline_methods: class_def
                 .method_blocks
                 .iter()
+                .filter(|block| !block.is_static)
                 .flat_map(|block| block.methods.iter())
                 .map(|method| method.name.name.clone())
                 .collect(),
+            static_inline_methods: class_def
+                .method_blocks
+                .iter()
+                .filter(|block| block.is_static)
+                .flat_map(|block| block.methods.iter())
+                .map(|method| method.name.name.clone())
+                .collect(),
+            private_properties: metadata
+                .as_ref()
+                .map(|class| class.private_properties.clone())
+                .unwrap_or_default(),
+            private_inline_methods: metadata
+                .as_ref()
+                .map(|class| class.private_inline_methods.clone())
+                .unwrap_or_default(),
+            private_static_inline_methods: metadata
+                .as_ref()
+                .map(|class| class.private_static_inline_methods.clone())
+                .unwrap_or_default(),
             external_methods: metadata
                 .as_ref()
                 .map(|class| class.external_methods.clone())
@@ -234,7 +288,7 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
-    fn lower_function(&mut self, function: &FunctionDef) -> HirFunction {
+    fn lower_function(&mut self, function: &FunctionDef, owner_class_name: Option<&str>) -> HirFunction {
         let frame = self
             .function_frames
             .pop_front()
@@ -243,6 +297,7 @@ impl<'a> LoweringContext<'a> {
 
         HirFunction {
             name: function.name.name.clone(),
+            owner_class_name: owner_class_name.map(ToOwned::to_owned),
             scope_id: frame.scope_id,
             workspace_id: frame.workspace_id,
             implicit_ans: Some(self.lookup_current_binding(
@@ -265,17 +320,51 @@ impl<'a> LoweringContext<'a> {
                 })
                 .collect(),
             captures: frame.captures,
-            body: function
-                .body
-                .iter()
-                .map(|statement| self.lower_statement(statement, frame.scope_id))
-                .collect(),
+            body: self.lower_function_body(function, frame.scope_id, owner_class_name),
             local_functions: function
                 .local_functions
                 .iter()
-                .map(|local| self.lower_function(local))
+                .map(|local| self.lower_function(local, owner_class_name))
                 .collect(),
         }
+    }
+
+    fn lower_function_body(
+        &mut self,
+        function: &FunctionDef,
+        scope_id: ScopeId,
+        owner_class_name: Option<&str>,
+    ) -> Vec<HirStatement> {
+        let mut body = Vec::with_capacity(function.body.len());
+        let class_info = owner_class_name.and_then(|owner| {
+            self.analysis.classes.iter().find(|class| {
+                class.name.eq_ignore_ascii_case(owner)
+                    || qualified_class_name(&class.name, class.package.as_deref())
+                        .eq_ignore_ascii_case(owner)
+            })
+        });
+        let superclass_name = class_info.and_then(|class| class.superclass_name.clone());
+        let is_constructor = owner_class_name
+            .and_then(|owner| owner.rsplit('.').next())
+            .is_some_and(|owner| owner == function.name.name);
+        let mut index = 0usize;
+        while index < function.body.len() {
+            if is_constructor && index + 1 < function.body.len() {
+                if let Some(statement) = self.lower_super_constructor_statement_pair(
+                    &function.body[index],
+                    &function.body[index + 1],
+                    scope_id,
+                    superclass_name.as_deref(),
+                ) {
+                    body.push(statement);
+                    index += 2;
+                    continue;
+                }
+            }
+            body.push(self.lower_statement(&function.body[index], scope_id));
+            index += 1;
+        }
+        body
     }
 
     fn lower_statement(&mut self, statement: &Statement, scope_id: ScopeId) -> HirStatement {
@@ -401,6 +490,64 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
+    fn lower_super_constructor_statement_pair(
+        &mut self,
+        first: &Statement,
+        second: &Statement,
+        scope_id: ScopeId,
+        superclass_name: Option<&str>,
+    ) -> Option<HirStatement> {
+        let superclass_name = superclass_name?;
+        let StatementKind::Expression(receiver_expr) = &first.kind else {
+            return None;
+        };
+        let ExpressionKind::Identifier(receiver) = &receiver_expr.kind else {
+            return None;
+        };
+        if receiver.name != "obj" {
+            return None;
+        }
+
+        let StatementKind::Expression(call_expr) = &second.kind else {
+            return None;
+        };
+        let ExpressionKind::ParenApply { target, indices: args } = &call_expr.kind else {
+            return None;
+        };
+        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Name(qualified_name)) = &target.kind else {
+            return None;
+        };
+        let qualified = qualified_name
+            .segments
+            .iter()
+            .map(|segment| segment.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        if !qualified.eq_ignore_ascii_case(superclass_name) {
+            return None;
+        }
+
+        Some(HirStatement::Assignment {
+            targets: vec![HirAssignmentTarget::Binding(
+                self.lookup_current_binding(scope_id, "obj", SymbolKind::Output),
+            )],
+            value: HirExpression::Call {
+                target: HirCallTarget::Callable({
+                    let mut reference = self.lower_callable_reference(
+                        &qualified,
+                        qualified_name.span,
+                        ReferenceRole::FunctionHandleTarget,
+                    );
+                    reference.super_constructor = true;
+                    reference
+                }),
+                args: self.lower_index_arguments(args, scope_id),
+            },
+            list_assignment: false,
+            display_suppressed: second.display_suppressed,
+        })
+    }
+
     fn lower_assignment_target(
         &mut self,
         target: &AssignmentTarget,
@@ -451,13 +598,30 @@ impl<'a> LoweringContext<'a> {
                     })
                     .collect(),
             ),
-            ExpressionKind::FunctionHandle(name) => {
-                HirExpression::FunctionHandle(self.lower_callable_reference(
-                    &qualified_name_string(name),
-                    name.span,
-                    ReferenceRole::FunctionHandleTarget,
-                ))
-            }
+            ExpressionKind::FunctionHandle(target) => match target {
+                FunctionHandleTarget::Name(name) => {
+                    if let Some(expression) =
+                        self.lower_workspace_function_handle_expression(name, scope_id)
+                    {
+                        HirExpression::FunctionHandle(HirFunctionHandleTarget::Expression(
+                            Box::new(expression),
+                        ))
+                    } else {
+                        HirExpression::FunctionHandle(HirFunctionHandleTarget::Callable(
+                            self.lower_callable_reference(
+                                &qualified_name_string(name),
+                                name.span,
+                                ReferenceRole::FunctionHandleTarget,
+                            ),
+                        ))
+                    }
+                }
+                FunctionHandleTarget::Expression(expression) => {
+                    HirExpression::FunctionHandle(HirFunctionHandleTarget::Expression(Box::new(
+                        self.lower_expression(expression, scope_id),
+                    )))
+                }
+            },
             ExpressionKind::EndKeyword => HirExpression::EndKeyword,
             ExpressionKind::Unary { op, rhs } => HirExpression::Unary {
                 op: *op,
@@ -587,6 +751,38 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
+    fn lower_workspace_function_handle_expression(
+        &self,
+        name: &QualifiedName,
+        _scope_id: ScopeId,
+    ) -> Option<HirExpression> {
+        if name.segments.len() < 2 {
+            return None;
+        }
+        let qualified = qualified_name_string(name);
+        let reference =
+            self.lookup_reference(&qualified, name.span, ReferenceRole::FunctionHandleTarget)?;
+        if reference.resolution != ReferenceResolution::WorkspaceValue {
+            return None;
+        }
+
+        let root = name.segments.first()?.clone();
+        let mut expression = HirExpression::ValueRef(HirValueRef {
+            name: root.name,
+            resolution: ReferenceResolution::WorkspaceValue,
+            binding_id: reference.binding_id,
+            symbol_kind: reference.resolved_kind,
+            capture_access: reference.capture_access,
+        });
+        for segment in &name.segments[1..] {
+            expression = HirExpression::FieldAccess {
+                target: Box::new(expression),
+                field: segment.name.clone(),
+            };
+        }
+        Some(expression)
+    }
+
     fn lower_callable_reference(
         &self,
         name: &str,
@@ -596,6 +792,7 @@ impl<'a> LoweringContext<'a> {
         if let Some(reference) = self.lookup_reference(name, span, role) {
             HirCallableRef {
                 name: reference.name.clone(),
+                super_constructor: false,
                 semantic_resolution: reference.resolution.clone(),
                 final_resolution: self
                     .lookup_resolved_reference(name, span, role)
@@ -608,6 +805,7 @@ impl<'a> LoweringContext<'a> {
         } else {
             HirCallableRef {
                 name: name.to_string(),
+                super_constructor: false,
                 semantic_resolution: ReferenceResolution::ExternalFunctionCandidate,
                 final_resolution: None,
                 resolved_symbol: None,

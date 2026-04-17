@@ -54,6 +54,9 @@ impl ResolverContext {
 
         if let Some(source_dir) = self.source_dir() {
             push_unique_path(&mut roots, &mut seen, source_dir.to_path_buf());
+            if let Some(enclosing_root) = enclosing_lookup_root(source_dir) {
+                push_unique_path(&mut roots, &mut seen, enclosing_root);
+            }
         }
 
         for root in &self.search_roots {
@@ -62,6 +65,23 @@ impl ResolverContext {
 
         roots
     }
+}
+
+fn enclosing_lookup_root(source_dir: &Path) -> Option<PathBuf> {
+    let mut current = source_dir.to_path_buf();
+    let mut saw_special = false;
+
+    while let Some(name) = current.file_name().and_then(|name| name.to_str()) {
+        if name == "private" || name.starts_with('+') || name.starts_with('@') {
+            let parent = current.parent()?.to_path_buf();
+            current = parent;
+            saw_special = true;
+        } else {
+            break;
+        }
+    }
+
+    saw_special.then_some(current)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +191,10 @@ pub fn resolve_callable(name: &str, context: &ResolverContext) -> Option<Resolve
             return Some(ResolvedCallable::Function(package));
         }
 
+        if let Some(class_def) = resolve_static_class_reference(name, &root, context) {
+            return Some(ResolvedCallable::Class(class_def));
+        }
+
         let candidate = root.join(format!("{name}.m"));
         if candidate.is_file() && !m_file_looks_like_classdef(&candidate) {
             let kind = if context
@@ -196,6 +220,16 @@ pub fn resolve_callable(name: &str, context: &ResolverContext) -> Option<Resolve
     }
 
     None
+}
+
+fn resolve_static_class_reference(
+    name: &str,
+    root: &Path,
+    context: &ResolverContext,
+) -> Option<ResolvedClass> {
+    let (class_name, _method_name) = name.rsplit_once('.')?;
+    resolve_folder_class_definition(class_name, root, context)
+        .or_else(|| resolve_plain_class_definition(class_name, root, context))
 }
 
 pub fn resolve_class_definition(name: &str, context: &ResolverContext) -> Option<ResolvedClass> {
@@ -636,6 +670,55 @@ mod tests {
         assert_eq!(resolved.kind, ResolvedClassKind::PackageDirectory);
         assert_eq!(resolved.package.as_deref(), Some("pkg"));
         assert_eq!(resolved.path, root.join("+pkg").join("Point.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn resolves_package_class_definition_from_inside_package_directory() {
+        let workspace = temp_test_dir();
+        let package_dir = workspace.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let child_path = package_dir.join("Child.m");
+        write_file(&child_path, "classdef Child < pkg.Base\nend\n");
+        write_file(&package_dir.join("Base.m"), "classdef Base\nend\n");
+
+        let resolved = resolve_class_definition(
+            "pkg.Base",
+            &ResolverContext::from_source_file(child_path),
+        )
+        .expect("package class should resolve from inside package");
+
+        assert_eq!(resolved.kind, ResolvedClassKind::PackageDirectory);
+        assert_eq!(resolved.package.as_deref(), Some("pkg"));
+        assert_eq!(resolved.path, package_dir.join("Base.m"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn resolves_package_folder_class_definition_from_search_root() {
+        let workspace = temp_test_dir();
+        let source = workspace.join("src");
+        let root = workspace.join("packages");
+        fs::create_dir_all(&source).expect("create source dir");
+        fs::create_dir_all(root.join("+pkg").join("@Counter")).expect("create package folder class dir");
+        write_file(&source.join("main.m"), "obj = pkg.Counter();\n");
+        write_file(
+            &root.join("+pkg").join("@Counter").join("Counter.m"),
+            "classdef Counter\nend\n",
+        );
+
+        let resolved = resolve_class_definition(
+            "pkg.Counter",
+            &ResolverContext::new(Some(source.join("main.m")), vec![root.clone()]),
+        )
+        .expect("package folder class should resolve");
+
+        assert_eq!(resolved.kind, ResolvedClassKind::FolderPackageDirectory);
+        assert_eq!(resolved.package.as_deref(), Some("pkg"));
+        assert_eq!(
+            resolved.path,
+            root.join("+pkg").join("@Counter").join("Counter.m")
+        );
         cleanup(&workspace);
     }
 

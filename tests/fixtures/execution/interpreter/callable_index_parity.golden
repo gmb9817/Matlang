@@ -1,5 +1,5 @@
 workspace
-  err_id = "MATC:Unsupported"
+  err_id = ''
   fh = @sum
   handle_idx = 2
   index_last = [6 ; 8]

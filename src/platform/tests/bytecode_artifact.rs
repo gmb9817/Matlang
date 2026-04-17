@@ -28,6 +28,10 @@ fn fixture_path(name: &str) -> PathBuf {
 
 fn compile_fixture(name: &str) -> matlab_codegen::BytecodeModule {
     let source_path = fixture_path(name);
+    compile_source_path(&source_path)
+}
+
+fn compile_source_path(source_path: &PathBuf) -> matlab_codegen::BytecodeModule {
     let source = fs::read_to_string(&source_path).expect("fixture source");
     let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
     assert!(
@@ -52,6 +56,16 @@ fn compile_fixture(name: &str) -> matlab_codegen::BytecodeModule {
     emit_bytecode(&optimized.module)
 }
 
+fn temp_test_dir(label: &str) -> PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("matc-platform-{label}-{suffix}"));
+    fs::create_dir_all(&path).expect("create temp dir");
+    path
+}
+
 #[test]
 fn encode_decode_roundtrip_matches_bytecode_module() {
     let module = compile_fixture("control_flow_codegen");
@@ -74,6 +88,53 @@ fn write_and_read_artifact_roundtrip_matches_bytecode_module() {
     assert_eq!(decoded, module);
 
     let _ = fs::remove_file(artifact_path);
+}
+
+#[test]
+fn class_module_artifact_roundtrip_preserves_class_metadata() {
+    let workspace = temp_test_dir("class-artifact");
+    let package_dir = workspace.join("+pkg");
+    fs::create_dir_all(&package_dir).expect("create package dir");
+    let class_path = package_dir.join("Point.m");
+    fs::write(
+        &class_path,
+        "classdef Point < handle\n\
+         properties (Access=private)\n\
+         secret = 41;\n\
+         end\n\
+         methods\n\
+         function obj = Point(secret)\n\
+         obj.secret = secret;\n\
+         end\n\
+         function out = reveal(obj)\n\
+         out = obj.secret;\n\
+         end\n\
+         end\n\
+         methods (Static, Access=private)\n\
+         function out = code()\n\
+         out = 7;\n\
+         end\n\
+         end\n\
+         end\n",
+    )
+    .expect("write class module");
+
+    let module = compile_source_path(&class_path);
+    let encoded = encode_bytecode_module(&module);
+    let decoded = decode_bytecode_module(&encoded).expect("decode");
+    assert_eq!(decoded, module);
+    assert_eq!(decoded.unit_kind, "ClassFile");
+    let class = decoded.classes.first().expect("class metadata");
+    assert_eq!(class.package.as_deref(), Some("pkg"));
+    assert!(class.inherits_handle);
+    assert_eq!(class.private_property_names, vec!["secret".to_string()]);
+    assert_eq!(class.private_inline_methods, Vec::<String>::new());
+    assert_eq!(class.private_static_inline_methods, vec!["code".to_string()]);
+    assert!(decoded.functions.iter().any(|function| {
+        function.role == "class_initializer" && function.owner_class_name.as_deref() == Some("pkg.Point")
+    }));
+
+    let _ = fs::remove_dir_all(workspace);
 }
 
 #[test]
@@ -191,6 +252,42 @@ fn rewrite_bundle_targets_adds_bundle_ids_for_packaged_paths() {
     let rewritten = rewrite_bytecode_bundle_targets(&bytecode, &path_map);
     let rendered = matlab_codegen::render_bytecode(&rewritten);
     assert!(rendered.contains("bundle_id=dep0") || rendered.contains("bundle_id=dep1"));
+}
+
+#[test]
+fn rewrite_bundle_targets_adds_superclass_bundle_id_for_class_modules() {
+    let workspace = temp_test_dir("class-super-bundle");
+    let base_path = workspace.join("Base.m");
+    let child_path = workspace.join("Child.m");
+    fs::write(
+        &base_path,
+        "classdef Base\n\
+         properties\n\
+         x = 1;\n\
+         end\n\
+         end\n",
+    )
+    .expect("write base class");
+    fs::write(
+        &child_path,
+        "classdef Child < Base\n\
+         properties\n\
+         y = 2;\n\
+         end\n\
+         end\n",
+    )
+    .expect("write child class");
+
+    let child_module = compile_source_path(&child_path);
+    let paths = collect_bytecode_dependency_paths(&child_module);
+    assert_eq!(paths, vec![base_path.clone()]);
+    let path_map = std::collections::HashMap::from([(base_path.clone(), "dep0".to_string())]);
+    let rewritten = rewrite_bytecode_bundle_targets(&child_module, &path_map);
+    let class = rewritten.classes.first().expect("child class metadata");
+    assert_eq!(class.superclass_path.as_deref(), Some(base_path.to_string_lossy().as_ref()));
+    assert_eq!(class.superclass_bundle_module_id.as_deref(), Some("dep0"));
+
+    let _ = fs::remove_dir_all(workspace);
 }
 
 #[test]

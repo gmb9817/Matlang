@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use matlab_frontend::ast::{BinaryOp, CompilationUnitKind, UnaryOp};
+use matlab_frontend::ast::{BinaryOp, ClassMemberAccess, CompilationUnitKind, UnaryOp};
 use matlab_semantics::{
     symbols::{
         BindingId, BindingStorage, CaptureAccess, ExternalMethodInfo, FinalReferenceResolution,
@@ -23,9 +23,15 @@ pub struct HirModule {
 pub struct HirClass {
     pub name: String,
     pub package: Option<String>,
+    pub superclass_name: Option<String>,
+    pub superclass_path: Option<PathBuf>,
     pub inherits_handle: bool,
     pub properties: Vec<HirClassProperty>,
     pub inline_methods: Vec<String>,
+    pub static_inline_methods: Vec<String>,
+    pub private_properties: Vec<String>,
+    pub private_inline_methods: Vec<String>,
+    pub private_static_inline_methods: Vec<String>,
     pub external_methods: Vec<ExternalMethodInfo>,
     pub constructor: Option<String>,
     pub source_path: Option<PathBuf>,
@@ -34,6 +40,7 @@ pub struct HirClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HirClassProperty {
     pub name: String,
+    pub access: ClassMemberAccess,
     pub default: Option<HirExpression>,
 }
 
@@ -46,6 +53,7 @@ pub enum HirItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HirFunction {
     pub name: String,
+    pub owner_class_name: Option<String>,
     pub scope_id: ScopeId,
     pub workspace_id: WorkspaceId,
     pub implicit_ans: Option<HirBinding>,
@@ -161,7 +169,7 @@ pub enum HirExpression {
     StringLiteral(String),
     MatrixLiteral(Vec<Vec<HirExpression>>),
     CellLiteral(Vec<Vec<HirExpression>>),
-    FunctionHandle(HirCallableRef),
+    FunctionHandle(HirFunctionHandleTarget),
     EndKeyword,
     Unary {
         op: UnaryOp,
@@ -193,6 +201,12 @@ pub enum HirExpression {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HirFunctionHandleTarget {
+    Callable(HirCallableRef),
+    Expression(Box<HirExpression>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HirCallTarget {
     Callable(HirCallableRef),
     Expression(Box<HirExpression>),
@@ -217,6 +231,7 @@ pub struct HirValueRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HirCallableRef {
     pub name: String,
+    pub super_constructor: bool,
     pub semantic_resolution: ReferenceResolution,
     pub final_resolution: Option<FinalReferenceResolution>,
     pub resolved_symbol: Option<SymbolId>,

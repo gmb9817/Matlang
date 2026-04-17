@@ -2,8 +2,8 @@
 
 use crate::ast::{
     AssignmentTarget, ClassDef, ClassMethodBlock, ClassPropertyBlock, ClassPropertyDef,
-    CompilationUnit, Expression, ExpressionKind, FunctionDef, Identifier, IndexArgument, Item,
-    QualifiedName, Statement, StatementKind,
+    CompilationUnit, Expression, ExpressionKind, FunctionDef, FunctionHandleTarget, Identifier,
+    IndexArgument, Item, QualifiedName, Statement, StatementKind,
 };
 
 pub fn render_compilation_unit(unit: &CompilationUnit) -> String {
@@ -62,7 +62,11 @@ fn render_class(class_def: &ClassDef, depth: usize, out: &mut String) {
 }
 
 fn render_property_block(block: &ClassPropertyBlock, depth: usize, out: &mut String) {
-    push_line(out, depth, "properties".to_string());
+    let header = match block.access {
+        crate::ast::ClassMemberAccess::Public => "properties".to_string(),
+        crate::ast::ClassMemberAccess::Private => "properties (Access=private)".to_string(),
+    };
+    push_line(out, depth, header);
     for property in &block.properties {
         render_property(property, depth + 1, out);
     }
@@ -78,7 +82,17 @@ fn render_property(property: &ClassPropertyDef, depth: usize, out: &mut String) 
 }
 
 fn render_method_block(block: &ClassMethodBlock, depth: usize, out: &mut String) {
-    push_line(out, depth, "methods".to_string());
+    let header = match (block.is_static, block.access) {
+        (true, crate::ast::ClassMemberAccess::Private) => {
+            "methods (Static, Access=private)".to_string()
+        }
+        (true, crate::ast::ClassMemberAccess::Public) => "methods (Static)".to_string(),
+        (false, crate::ast::ClassMemberAccess::Private) => {
+            "methods (Access=private)".to_string()
+        }
+        (false, crate::ast::ClassMemberAccess::Public) => "methods".to_string(),
+    };
+    push_line(out, depth, header);
     for method in &block.methods {
         render_function(method, depth + 1, out);
     }
@@ -248,7 +262,9 @@ fn render_expression(expression: &Expression) -> String {
                 .join(" ; ");
             format!("cell{{{rows}}}")
         }
-        ExpressionKind::FunctionHandle(name) => format!("handle(@{})", join_qualified_name(name)),
+        ExpressionKind::FunctionHandle(target) => {
+            format!("handle(@{})", render_function_handle_target(target))
+        }
         ExpressionKind::EndKeyword => "end".to_string(),
         ExpressionKind::Unary { op, rhs } => format!("unary({op:?}, {})", render_expression(rhs)),
         ExpressionKind::Binary { op, lhs, rhs } => {
@@ -289,6 +305,13 @@ fn render_expression(expression: &Expression) -> String {
             join_identifiers(params),
             render_expression(body)
         ),
+    }
+}
+
+fn render_function_handle_target(target: &FunctionHandleTarget) -> String {
+    match target {
+        FunctionHandleTarget::Name(name) => join_qualified_name(name),
+        FunctionHandleTarget::Expression(expression) => render_expression(expression),
     }
 }
 

@@ -1,6 +1,7 @@
 //! Runtime crate for executable MATLAB semantics.
 
 use std::{
+    sync::atomic::{AtomicU64, Ordering},
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -10,6 +11,8 @@ use std::{
 };
 
 pub const CRATE_NAME: &str = "matlab-runtime";
+
+static NEXT_HANDLE_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub type Workspace = BTreeMap<String, Value>;
 
@@ -80,12 +83,26 @@ pub enum ObjectStorageKind {
 pub struct ObjectClassMetadata {
     pub class_name: String,
     pub package: Option<String>,
+    pub superclass_name: Option<String>,
+    pub ancestor_class_names: BTreeSet<String>,
     pub storage_kind: ObjectStorageKind,
     pub source_path: Option<PathBuf>,
+    pub module_target: Option<ObjectMethodTarget>,
     pub property_order: Vec<String>,
+    pub private_properties: BTreeSet<String>,
+    pub private_property_owners: BTreeMap<String, String>,
     pub inline_methods: BTreeSet<String>,
-    pub external_methods: BTreeMap<String, PathBuf>,
+    pub private_inline_methods: BTreeSet<String>,
+    pub private_instance_method_owners: BTreeMap<String, String>,
+    pub private_static_inline_methods: BTreeSet<String>,
+    pub external_methods: BTreeMap<String, ObjectMethodTarget>,
     pub constructor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectMethodTarget {
+    Path(PathBuf),
+    BundleModule(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,13 +113,90 @@ pub struct ObjectInstance {
 #[derive(Debug, Clone)]
 pub enum ObjectStorage {
     Value(ObjectInstance),
-    Handle(Rc<RefCell<ObjectInstance>>),
+    Handle {
+        id: u64,
+        shared: Rc<RefCell<ObjectInstance>>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct ObjectValue {
     pub class: ObjectClassMetadata,
     pub storage: ObjectStorage,
+}
+
+pub fn qualified_object_class_name(class_name: &str, package: Option<&str>) -> String {
+    match package {
+        Some(package) if !package.is_empty() => format!("{package}.{class_name}"),
+        _ => class_name.to_string(),
+    }
+}
+
+pub fn observe_handle_object_id(id: u64) {
+    NEXT_HANDLE_OBJECT_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
+}
+
+fn validate_matrix_object_elements(elements: &[Value]) -> Result<(), RuntimeError> {
+    let mut first_object_class = None::<String>;
+    let mut saw_non_object = false;
+    for element in elements {
+        match element {
+            Value::Object(object) => {
+                let class_name = object.class.qualified_name();
+                if saw_non_object {
+                    return Err(RuntimeError::TypeError(format!(
+                        "matrix values currently do not support mixing object elements of class `{class_name}` with non-object elements; use cell arrays for heterogeneous containers"
+                    )));
+                }
+                if let Some(first) = &first_object_class {
+                    if !class_name.eq_ignore_ascii_case(first) {
+                        return Err(RuntimeError::TypeError(format!(
+                            "matrix values currently require object elements to have the same class; found `{first}` and `{class_name}`; use cell arrays for heterogeneous objects"
+                        )));
+                    }
+                } else {
+                    first_object_class = Some(class_name);
+                }
+            }
+            _ => {
+                if let Some(first) = &first_object_class {
+                    return Err(RuntimeError::TypeError(format!(
+                        "matrix values currently do not support mixing object elements of class `{first}` with non-object elements; use cell arrays for heterogeneous containers"
+                    )));
+                }
+                saw_non_object = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl ObjectClassMetadata {
+    pub fn qualified_name(&self) -> String {
+        qualified_object_class_name(&self.class_name, self.package.as_deref())
+    }
+
+    pub fn private_property_owner(&self, name: &str) -> Option<String> {
+        self.private_property_owners
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                self.private_properties
+                    .contains(name)
+                    .then(|| self.qualified_name())
+            })
+    }
+
+    pub fn private_instance_method_owner(&self, name: &str) -> Option<String> {
+        self.private_instance_method_owners
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                self.private_inline_methods
+                    .contains(name)
+                    .then(|| self.qualified_name())
+            })
+    }
 }
 
 impl PartialEq for ObjectValue {
@@ -351,6 +445,7 @@ impl MatrixValue {
             )));
         }
 
+        validate_matrix_object_elements(&elements)?;
         let dims = normalize_dimensions(rows, cols, dims)?;
 
         Ok(Self {
@@ -597,10 +692,15 @@ impl ObjectValue {
     pub fn new(class: ObjectClassMetadata, properties: StructValue) -> Self {
         let storage = match class.storage_kind {
             ObjectStorageKind::Value => ObjectStorage::Value(ObjectInstance { properties }),
-            ObjectStorageKind::Handle => {
-                ObjectStorage::Handle(Rc::new(RefCell::new(ObjectInstance { properties })))
-            }
+            ObjectStorageKind::Handle => ObjectStorage::Handle {
+                id: NEXT_HANDLE_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+                shared: Rc::new(RefCell::new(ObjectInstance { properties })),
+            },
         };
+        Self { class, storage }
+    }
+
+    pub fn from_storage(class: ObjectClassMetadata, storage: ObjectStorage) -> Self {
         Self { class, storage }
     }
 
@@ -608,17 +708,24 @@ impl ObjectValue {
         self.class.storage_kind
     }
 
+    pub fn handle_id(&self) -> Option<u64> {
+        match &self.storage {
+            ObjectStorage::Handle { id, .. } => Some(*id),
+            ObjectStorage::Value(_) => None,
+        }
+    }
+
     pub fn properties(&self) -> StructValue {
         match &self.storage {
             ObjectStorage::Value(instance) => instance.properties.clone(),
-            ObjectStorage::Handle(shared) => shared.borrow().properties.clone(),
+            ObjectStorage::Handle { shared, .. } => shared.borrow().properties.clone(),
         }
     }
 
     pub fn property_value(&self, name: &str) -> Option<Value> {
         match &self.storage {
             ObjectStorage::Value(instance) => instance.properties.fields.get(name).cloned(),
-            ObjectStorage::Handle(shared) => shared.borrow().properties.fields.get(name).cloned(),
+            ObjectStorage::Handle { shared, .. } => shared.borrow().properties.fields.get(name).cloned(),
         }
     }
 
@@ -627,7 +734,7 @@ impl ObjectValue {
             ObjectStorage::Value(instance) => {
                 instance.properties.insert_field(name.to_string(), value);
             }
-            ObjectStorage::Handle(shared) => {
+            ObjectStorage::Handle { shared, .. } => {
                 shared
                     .borrow_mut()
                     .properties
@@ -640,8 +747,35 @@ impl ObjectValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArrayStorageClass, CellValue, ComplexValue, MatrixValue, StructValue, Value};
-    use std::collections::BTreeMap;
+    use super::{
+        ArrayStorageClass, CellValue, ComplexValue, MatrixValue, ObjectClassMetadata,
+        ObjectStorageKind, ObjectValue, StructValue, Value,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn test_object(class_name: &str) -> Value {
+        Value::Object(ObjectValue::new(
+            ObjectClassMetadata {
+                class_name: class_name.to_string(),
+                package: None,
+                superclass_name: None,
+                ancestor_class_names: BTreeSet::new(),
+                storage_kind: ObjectStorageKind::Value,
+                source_path: None,
+                module_target: None,
+                property_order: Vec::new(),
+                private_properties: BTreeSet::new(),
+                private_property_owners: BTreeMap::new(),
+                inline_methods: BTreeSet::new(),
+                private_inline_methods: BTreeSet::new(),
+                private_instance_method_owners: BTreeMap::new(),
+                private_static_inline_methods: BTreeSet::new(),
+                external_methods: BTreeMap::new(),
+                constructor: None,
+            },
+            StructValue::default(),
+        ))
+    }
 
     #[test]
     fn matrix_with_dimensions_preserves_explicit_metadata() {
@@ -711,6 +845,30 @@ mod tests {
         )
         .expect("generic matrix");
         assert_eq!(generic.storage_class(), ArrayStorageClass::Generic);
+    }
+
+    #[test]
+    fn matrix_rejects_mixed_object_classes() {
+        let error = MatrixValue::new(1, 2, vec![test_object("Point"), test_object("Other")])
+            .expect_err("mixed object classes should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("matrix values currently require object elements to have the same class"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn matrix_rejects_mixed_object_and_non_object_elements() {
+        let error = MatrixValue::new(1, 2, vec![test_object("Point"), Value::Scalar(1.0)])
+            .expect_err("mixed object and scalar elements should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("matrix values currently do not support mixing object elements"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -816,7 +974,7 @@ pub fn render_value(value: &Value) -> String {
         }
         Value::Object(object) => format!(
             "{} with properties {{{}}}",
-            object.class.class_name,
+            object.class.qualified_name(),
             object
                 .properties()
                 .ordered_entries()

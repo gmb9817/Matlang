@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use matlab_frontend::ast::Expression;
+use matlab_frontend::ast::{ClassMemberAccess, Expression};
 use matlab_frontend::source::SourceSpan;
 
 use crate::workspace::{ScopeId, WorkspaceId};
@@ -51,6 +51,7 @@ impl SymbolKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassPropertyInfo {
     pub name: String,
+    pub access: ClassMemberAccess,
     pub default: Option<Expression>,
 }
 
@@ -64,9 +65,15 @@ pub struct ExternalMethodInfo {
 pub struct ClassInfo {
     pub name: String,
     pub package: Option<String>,
+    pub superclass_name: Option<String>,
+    pub superclass_path: Option<PathBuf>,
     pub inherits_handle: bool,
     pub properties: Vec<ClassPropertyInfo>,
     pub inline_methods: Vec<String>,
+    pub static_inline_methods: Vec<String>,
+    pub private_properties: Vec<String>,
+    pub private_inline_methods: Vec<String>,
+    pub private_static_inline_methods: Vec<String>,
     pub external_methods: Vec<ExternalMethodInfo>,
     pub constructor: Option<String>,
     pub source_path: Option<PathBuf>,
@@ -145,7 +152,7 @@ impl CaptureAccess {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReferenceRole {
     Value,
     CallTarget,

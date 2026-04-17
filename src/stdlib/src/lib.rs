@@ -6287,14 +6287,14 @@ fn builtin_repmat(args: &[Value]) -> Result<Value, RuntimeError> {
     };
 
     match value {
-        Value::Scalar(_) | Value::Matrix(_) => {
+        Value::Scalar(_) | Value::Matrix(_) | Value::Object(_) => {
             let matrix = coerce_matrix(value)?;
             Ok(Value::Matrix(tile_matrix_nd(&matrix, &repetitions)?))
         }
         Value::Cell(cell) => Ok(Value::Cell(tile_cell_nd(cell, &repetitions)?)),
         Value::CharArray(text) => tile_char_array(text, &repetitions),
         _ => Err(RuntimeError::TypeError(
-            "repmat currently expects scalar, matrix, cell, or row-char input".to_string(),
+            "repmat currently expects scalar, object, matrix, cell, or row-char input".to_string(),
         )),
     }
 }
@@ -6322,6 +6322,20 @@ fn builtin_reshape(args: &[Value]) -> Result<Value, RuntimeError> {
                 1,
                 dims.clone(),
                 vec![Value::Scalar(*number)],
+            )?))
+        }
+        Value::Object(object) => {
+            if target_len != 1 {
+                return Err(RuntimeError::ShapeError(format!(
+                    "cannot reshape scalar object into {}x{} result",
+                    rows, cols
+                )));
+            }
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                1,
+                1,
+                dims.clone(),
+                vec![Value::Object(object.clone())],
             )?))
         }
         Value::Matrix(matrix) => {
@@ -6356,7 +6370,7 @@ fn builtin_reshape(args: &[Value]) -> Result<Value, RuntimeError> {
             )?))
         }
         _ => Err(RuntimeError::TypeError(
-            "reshape currently expects scalar, matrix, or cell input".to_string(),
+            "reshape currently expects scalar, object, matrix, or cell input".to_string(),
         )),
     }
 }
@@ -14016,11 +14030,12 @@ fn finalize_reshape_dimensions(
 
     let element_count = match value {
         Value::Scalar(_) => 1,
+        Value::Object(_) => 1,
         Value::Matrix(matrix) => matrix.elements.len(),
         Value::Cell(cell) => cell.elements.len(),
         _ => {
             return Err(RuntimeError::TypeError(
-                "reshape currently expects scalar, matrix, or cell input".to_string(),
+                "reshape currently expects scalar, object, matrix, or cell input".to_string(),
             ))
         }
     };
@@ -14077,7 +14092,11 @@ fn permute_value(
     builtin_name: &str,
 ) -> Result<Value, RuntimeError> {
     match value {
-        Value::Scalar(_) | Value::Complex(_) | Value::Logical(_) | Value::FunctionHandle(_) => {
+        Value::Scalar(_)
+        | Value::Complex(_)
+        | Value::Logical(_)
+        | Value::FunctionHandle(_)
+        | Value::Object(_) => {
             Ok(value.clone())
         }
         Value::Matrix(matrix) => {
@@ -14103,7 +14122,7 @@ fn permute_value(
             )?))
         }
         _ => Err(RuntimeError::TypeError(format!(
-            "{builtin_name} currently expects scalar, matrix, cell, or function-handle input"
+            "{builtin_name} currently expects scalar, object, matrix, cell, or function-handle input"
         ))),
     }
 }
@@ -15283,6 +15302,7 @@ fn builtin_repelem(args: &[Value]) -> Result<Value, RuntimeError> {
         | Value::Complex(_)
         | Value::String(_)
         | Value::Struct(_)
+        | Value::Object(_)
             if reps.len() == 1 =>
         {
             let counts = repelem_vector_counts(&reps[0], 1, "repelem")?;
@@ -15332,7 +15352,7 @@ fn builtin_repelem(args: &[Value]) -> Result<Value, RuntimeError> {
         Value::Matrix(matrix) => repelem_array_result(matrix.dims(), matrix.elements(), reps, false),
         Value::Cell(cell) => repelem_array_result(cell.dims(), cell.elements(), reps, true),
         other => Err(RuntimeError::TypeError(format!(
-            "repelem currently expects scalar, vector, matrix, or cell array input, found {}",
+            "repelem currently expects scalar, object, vector, matrix, or cell array input, found {}",
             other.kind_name()
         ))),
     }
@@ -16709,7 +16729,7 @@ fn concatenate_values(args: &[Value], axis: ConcatAxis) -> Result<Value, Runtime
 
     if args
         .iter()
-        .all(|value| matches!(value, Value::Scalar(_) | Value::Matrix(_)))
+        .all(|value| matches!(value, Value::Scalar(_) | Value::Matrix(_) | Value::Object(_)))
     {
         let matrices = args
             .iter()
@@ -16737,9 +16757,10 @@ fn concatenate_values(args: &[Value], axis: ConcatAxis) -> Result<Value, Runtime
 fn coerce_matrix(value: &Value) -> Result<MatrixValue, RuntimeError> {
     match value {
         Value::Scalar(number) => MatrixValue::new(1, 1, vec![Value::Scalar(*number)]),
+        Value::Object(object) => MatrixValue::new(1, 1, vec![Value::Object(object.clone())]),
         Value::Matrix(matrix) => Ok(matrix.clone()),
         _ => Err(RuntimeError::TypeError(
-            "expected numeric scalar or matrix input".to_string(),
+            "expected numeric scalar, object scalar, or matrix input".to_string(),
         )),
     }
 }
@@ -16828,6 +16849,7 @@ fn transpose_value(value: &Value, conjugate: bool) -> Result<Value, RuntimeError
             }
             .conjugate_if(conjugate),
         )),
+        Value::Object(object) => Ok(Value::Object(object.clone())),
         Value::Matrix(matrix) => Ok(Value::Matrix(if conjugate {
             transpose_matrix_with_mode(matrix, true)?
         } else {
@@ -16835,10 +16857,10 @@ fn transpose_value(value: &Value, conjugate: bool) -> Result<Value, RuntimeError
         })),
         Value::Cell(cell) => Ok(Value::Cell(transpose_cell(cell)?)),
         _ => Err(RuntimeError::TypeError(if conjugate {
-            "ctranspose currently expects scalar, logical, complex, matrix, or cell input"
+            "ctranspose currently expects scalar, logical, complex, object, matrix, or cell input"
                 .to_string()
         } else {
-            "transpose currently expects scalar, logical, complex, matrix, or cell input"
+            "transpose currently expects scalar, logical, complex, object, matrix, or cell input"
                 .to_string()
         })),
     }
@@ -16863,7 +16885,11 @@ fn page_transpose_value(
     builtin_name: &str,
 ) -> Result<Value, RuntimeError> {
     match value {
-        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) | Value::FunctionHandle(_) => {
+        Value::Scalar(_)
+        | Value::Logical(_)
+        | Value::Complex(_)
+        | Value::FunctionHandle(_)
+        | Value::Object(_) => {
             Ok(value.clone())
         }
         Value::CharArray(_) | Value::String(_) => transpose_value(value, conjugate),
@@ -16872,7 +16898,7 @@ fn page_transpose_value(
         )?)),
         Value::Cell(cell) => Ok(Value::Cell(page_transpose_cell(cell)?)),
         _ => Err(RuntimeError::TypeError(format!(
-            "{builtin_name} currently expects scalar, logical, complex, matrix, cell, or text input"
+            "{builtin_name} currently expects scalar, logical, complex, object, matrix, cell, or text input"
         ))),
     }
 }
@@ -17161,6 +17187,7 @@ fn flip_along_dimension(
         Value::Scalar(number) => Ok(Value::Scalar(*number)),
         Value::Logical(flag) => Ok(Value::Logical(*flag)),
         Value::Complex(number) => Ok(Value::Complex(number.clone())),
+        Value::Object(object) => Ok(Value::Object(object.clone())),
         Value::CharArray(text) | Value::String(text) => {
             if dimension == 2 {
                 let reversed = text.chars().rev().collect::<String>();
@@ -17194,7 +17221,7 @@ fn flip_along_dimension(
             )?,
         })),
         _ => Err(RuntimeError::TypeError(format!(
-            "{builtin_name} currently expects scalar, matrix, cell, or row-text input"
+            "{builtin_name} currently expects scalar, object, matrix, cell, or row-text input"
         ))),
     }
 }
@@ -17205,7 +17232,9 @@ fn rotate_90(
     builtin_name: &str,
 ) -> Result<Value, RuntimeError> {
     match value {
-        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) => Ok(value.clone()),
+        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) | Value::Object(_) => {
+            Ok(value.clone())
+        }
         Value::Matrix(matrix) => Ok(Value::Matrix(rotate_matrix_first_two_dims(
             matrix,
             if counterclockwise { 1 } else { 3 },
@@ -17222,7 +17251,9 @@ fn rotate_90(
 
 fn rotate_180(value: &Value, builtin_name: &str) -> Result<Value, RuntimeError> {
     match value {
-        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) => Ok(value.clone()),
+        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) | Value::Object(_) => {
+            Ok(value.clone())
+        }
         Value::Matrix(matrix) => Ok(Value::Matrix(rotate_matrix_first_two_dims(matrix, 2)?)),
         Value::Cell(cell) => Ok(Value::Cell(rotate_cell_first_two_dims(cell, 2)?)),
         _ => Err(RuntimeError::TypeError(format!(
@@ -17352,7 +17383,9 @@ fn circshift_value(
     builtin_name: &str,
 ) -> Result<Value, RuntimeError> {
     match value {
-        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) => Ok(value.clone()),
+        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) | Value::Object(_) => {
+            Ok(value.clone())
+        }
         Value::CharArray(text) | Value::String(text) => {
             let chars = text.chars().collect::<Vec<_>>();
             if chars.is_empty() {
@@ -17369,7 +17402,7 @@ fn circshift_value(
         Value::Matrix(matrix) => Ok(Value::Matrix(circshift_matrix(matrix, shifts)?)),
         Value::Cell(cell) => Ok(Value::Cell(circshift_cell(cell, shifts)?)),
         _ => Err(RuntimeError::TypeError(format!(
-            "{builtin_name} currently expects scalar, matrix, cell, or row-text input"
+            "{builtin_name} currently expects scalar, object, matrix, cell, or row-text input"
         ))),
     }
 }
@@ -26484,6 +26517,21 @@ fn matrix_is_struct(matrix: &MatrixValue) -> bool {
         .all(|element| matches!(element, Value::Struct(_)))
 }
 
+fn matrix_object_class_name(matrix: &MatrixValue) -> Option<String> {
+    let mut objects = matrix.iter().filter_map(|element| match element {
+        Value::Object(object) => Some(object),
+        _ => None,
+    });
+    let first = objects.next()?;
+    if objects.all(|object| {
+        object.class.class_name == first.class.class_name && object.class.package == first.class.package
+    }) {
+        Some(first.class.qualified_name())
+    } else {
+        None
+    }
+}
+
 fn runtime_class_name(value: &Value) -> String {
     match value {
         Value::Scalar(_) => "double".to_string(),
@@ -26495,23 +26543,65 @@ fn runtime_class_name(value: &Value) -> String {
         Value::Matrix(matrix) if matrix_is_logical(matrix) => "logical".to_string(),
         Value::Matrix(matrix) if matrix_is_string(matrix) => "string".to_string(),
         Value::Matrix(matrix) if matrix_is_struct(matrix) => "struct".to_string(),
+        Value::Matrix(matrix) if matrix_object_class_name(matrix).is_some() => {
+            matrix_object_class_name(matrix).expect("guard checked object class")
+        }
         Value::Matrix(_) => "matrix".to_string(),
         Value::Cell(_) => "cell".to_string(),
         Value::Struct(struct_value) if is_error_struct_value(struct_value) => {
             "MException".to_string()
         }
         Value::Struct(_) => "struct".to_string(),
-        Value::Object(object) => object.class.class_name.clone(),
+        Value::Object(object) => object.class.qualified_name(),
         Value::FunctionHandle(_) => "function_handle".to_string(),
     }
 }
 
 fn runtime_class_matches(value: &Value, requested_class: &str) -> bool {
-    requested_class.eq_ignore_ascii_case(&runtime_class_name(value))
-        || (matches!(value, Value::Struct(struct_value) if is_error_struct_value(struct_value))
-            && requested_class.eq_ignore_ascii_case("struct"))
-        || (matches!(value, Value::Object(object) if object.class.storage_kind == matlab_runtime::ObjectStorageKind::Handle)
-            && requested_class.eq_ignore_ascii_case("handle"))
+    let direct = requested_class.eq_ignore_ascii_case(&runtime_class_name(value));
+    let error_struct_alias =
+        matches!(value, Value::Struct(struct_value) if is_error_struct_value(struct_value))
+            && requested_class.eq_ignore_ascii_case("struct");
+    let object_ancestor = matches!(
+        value,
+        Value::Object(object)
+            if object
+                .class
+                .ancestor_class_names
+                .iter()
+                .any(|ancestor| requested_class.eq_ignore_ascii_case(ancestor))
+    );
+    let object_handle =
+        matches!(value, Value::Object(object) if object.class.storage_kind == matlab_runtime::ObjectStorageKind::Handle)
+            && requested_class.eq_ignore_ascii_case("handle");
+    let object_matrix_ancestor = matches!(
+        value,
+        Value::Matrix(matrix)
+            if matrix.iter().all(|element| {
+                matches!(
+                    element,
+                    Value::Object(object)
+                        if object
+                            .class
+                            .ancestor_class_names
+                            .iter()
+                            .any(|ancestor| requested_class.eq_ignore_ascii_case(ancestor))
+                )
+            })
+    );
+    let object_matrix_handle = matches!(
+        value,
+        Value::Matrix(matrix)
+            if matrix.iter().all(|element| {
+                matches!(
+                    element,
+                    Value::Object(object)
+                        if object.class.storage_kind == matlab_runtime::ObjectStorageKind::Handle
+                )
+            })
+    ) && requested_class.eq_ignore_ascii_case("handle");
+
+    direct || error_struct_alias || object_ancestor || object_handle || object_matrix_ancestor || object_matrix_handle
 }
 
 fn runtime_error_from_value(

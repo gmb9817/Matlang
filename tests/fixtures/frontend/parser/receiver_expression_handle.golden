@@ -1,0 +1,6 @@
+unit FunctionFile
+function receiver_expression_handle(objs, s) -> [y]
+  assign [f0] = handle(@s.item.total)
+  assign [f1] = handle(@field(cell_index(objs, [number(2)]), total))
+  assign [f2] = handle(@field(apply(apply(field(objs, duplicate), []), [number(3)]), total))
+  assign [y] = f0

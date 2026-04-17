@@ -1,0 +1,22 @@
+workspaces
+  Class id=0 parent=None name=None
+  Class id=1 parent=Some(0) name=Some("Point")
+  Function id=2 parent=Some(1) name=Some("origin")
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+  ClassBody id=1 parent=Some(0) workspace=1
+  FunctionBody id=2 parent=Some(1) workspace=2
+symbols
+  Point kind=class scope=0 workspace=0 binding=None
+  origin kind=method scope=1 workspace=1 binding=None
+  ans kind=variable scope=2 workspace=2 binding=Some(0)
+  out kind=output scope=2 workspace=2 binding=Some(1)
+bindings
+  ans id=0 storage=local owner_symbol=2 owner_scope=2 owner_workspace=2 shared=false
+  out id=1 storage=local owner_symbol=3 owner_scope=2 owner_workspace=2 shared=false
+classes
+  Point package=None superclass=None handle=false constructor=None source_path=None
+    static_inline_methods [origin]
+references
+captures
+diagnostics

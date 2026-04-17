@@ -63,9 +63,10 @@ pub fn render_analysis(result: &AnalysisResult) -> String {
         out.push_str("classes\n");
         for class in &result.classes {
             out.push_str(&format!(
-                "  {} package={:?} handle={} constructor={:?} source_path={:?}\n",
+                "  {} package={:?} superclass={:?} handle={} constructor={:?} source_path={:?}\n",
                 class.name,
                 class.package,
+                class.superclass_name,
                 class.inherits_handle,
                 class.constructor,
                 class.source_path
@@ -90,6 +91,30 @@ pub fn render_analysis(result: &AnalysisResult) -> String {
                 out.push_str(&format!(
                     "    inline_methods [{}]\n",
                     class.inline_methods.join(", ")
+                ));
+            }
+            if !class.static_inline_methods.is_empty() {
+                out.push_str(&format!(
+                    "    static_inline_methods [{}]\n",
+                    class.static_inline_methods.join(", ")
+                ));
+            }
+            if !class.private_properties.is_empty() {
+                out.push_str(&format!(
+                    "    private_properties [{}]\n",
+                    class.private_properties.join(", ")
+                ));
+            }
+            if !class.private_inline_methods.is_empty() {
+                out.push_str(&format!(
+                    "    private_inline_methods [{}]\n",
+                    class.private_inline_methods.join(", ")
+                ));
+            }
+            if !class.private_static_inline_methods.is_empty() {
+                out.push_str(&format!(
+                    "    private_static_inline_methods [{}]\n",
+                    class.private_static_inline_methods.join(", ")
                 ));
             }
             if !class.external_methods.is_empty() {

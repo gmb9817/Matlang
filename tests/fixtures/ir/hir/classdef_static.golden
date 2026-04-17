@@ -1,0 +1,7 @@
+module ClassFile scope=0 workspace=0
+  class Point package=None superclass=None superclass_path=None handle=false constructor=None source_path=Some("classdef_static.m")
+    static_inline_methods [origin]
+  function origin scope=2 workspace=2 captures=[]
+    inputs []
+    outputs [binding(name=out kind=output binding=1 storage=local)]
+    assign [binding(name=out kind=output binding=1 storage=local)] = matrix[number(0), number(0)]

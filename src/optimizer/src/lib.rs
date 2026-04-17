@@ -3,7 +3,8 @@
 use matlab_frontend::ast::{BinaryOp, UnaryOp};
 use matlab_ir::{
     HirAnonymousFunction, HirAssignmentTarget, HirCallTarget, HirConditionalBranch, HirExpression,
-    HirFunction, HirIndexArgument, HirItem, HirModule, HirStatement, HirSwitchCase,
+    HirFunction, HirFunctionHandleTarget, HirIndexArgument, HirItem, HirModule, HirStatement,
+    HirSwitchCase,
 };
 
 pub const CRATE_NAME: &str = "matlab-optimizer";
@@ -90,6 +91,7 @@ impl Optimizer {
     fn optimize_function(&mut self, function: &HirFunction) -> HirFunction {
         HirFunction {
             name: function.name.clone(),
+            owner_class_name: function.owner_class_name.clone(),
             scope_id: function.scope_id,
             workspace_id: function.workspace_id,
             implicit_ans: function.implicit_ans.clone(),
@@ -344,9 +346,14 @@ impl Optimizer {
                     })
                     .collect(),
             ),
-            HirExpression::FunctionHandle(reference) => {
-                HirExpression::FunctionHandle(reference.clone())
-            }
+            HirExpression::FunctionHandle(target) => HirExpression::FunctionHandle(match target {
+                HirFunctionHandleTarget::Callable(reference) => {
+                    HirFunctionHandleTarget::Callable(reference.clone())
+                }
+                HirFunctionHandleTarget::Expression(expression) => {
+                    HirFunctionHandleTarget::Expression(Box::new(self.optimize_expression(expression)))
+                }
+            }),
             HirExpression::EndKeyword => HirExpression::EndKeyword,
             HirExpression::Unary { op, rhs } => {
                 let rhs = self.optimize_expression(rhs);

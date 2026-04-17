@@ -30,7 +30,7 @@ bindings
   obj id=5 storage=local owner_symbol=10 owner_scope=3 owner_workspace=3 shared=false
   total id=6 storage=local owner_symbol=11 owner_scope=3 owner_workspace=3 shared=false
 classes
-  Point package=None handle=true constructor=Some("Point") source_path=None
+  Point package=None superclass=Some("handle") handle=true constructor=Some("Point") source_path=None
     properties [x=default, y=default]
     inline_methods [Point, total]
 references

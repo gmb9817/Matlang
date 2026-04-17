@@ -1,0 +1,32 @@
+workspaces
+  Function id=0 parent=None name=None
+  Function id=1 parent=Some(0) name=Some("receiver_expression_handle")
+scopes
+  CompilationUnit id=0 parent=None workspace=0
+  FunctionBody id=1 parent=Some(0) workspace=1
+symbols
+  ans kind=variable scope=0 workspace=0 binding=Some(0)
+  receiver_expression_handle kind=function scope=0 workspace=0 binding=None
+  ans kind=variable scope=1 workspace=1 binding=Some(1)
+  objs kind=parameter scope=1 workspace=1 binding=Some(2)
+  s kind=parameter scope=1 workspace=1 binding=Some(3)
+  y kind=output scope=1 workspace=1 binding=Some(4)
+  f0 kind=variable scope=1 workspace=1 binding=Some(5)
+  f1 kind=variable scope=1 workspace=1 binding=Some(6)
+  f2 kind=variable scope=1 workspace=1 binding=Some(7)
+bindings
+  ans id=0 storage=local owner_symbol=0 owner_scope=0 owner_workspace=0 shared=false
+  ans id=1 storage=local owner_symbol=2 owner_scope=1 owner_workspace=1 shared=false
+  objs id=2 storage=local owner_symbol=3 owner_scope=1 owner_workspace=1 shared=false
+  s id=3 storage=local owner_symbol=4 owner_scope=1 owner_workspace=1 shared=false
+  y id=4 storage=local owner_symbol=5 owner_scope=1 owner_workspace=1 shared=false
+  f0 id=5 storage=local owner_symbol=6 owner_scope=1 owner_workspace=1 shared=false
+  f1 id=6 storage=local owner_symbol=7 owner_scope=1 owner_workspace=1 shared=false
+  f2 id=7 storage=local owner_symbol=8 owner_scope=1 owner_workspace=1 shared=false
+references
+  s.item.total role=function_handle_target resolution=workspace_value symbol=Some(4) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(3) capture=none
+  objs role=value resolution=workspace_value symbol=Some(3) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(2) capture=none
+  objs role=value resolution=workspace_value symbol=Some(3) kind=parameter scope=Some(1) workspace=Some(1) binding=Some(2) capture=none
+  f0 role=value resolution=workspace_value symbol=Some(6) kind=variable scope=Some(1) workspace=Some(1) binding=Some(5) capture=none
+captures
+diagnostics

@@ -13,12 +13,12 @@ verification
   issues = 0
 
 bytecode module backend=bytecode unit_kind=FunctionFile entry=handles_and_nested_codegen#s1w1
-function <anon:0>#s2w2 role=anonymous_function params=[z#5] outputs=[<anon_result>] captures=[x binding=2 access=Read] temps=3 labels=0
+function <anon:0>#s2w2 role=anonymous_function owner_class=None params=[z#5] outputs=[<anon_result>] captures=[x binding=2 access=Read] temps=3 labels=0
   t0 = load z#5
   t1 = load x#2
   t2 = binary Add t0, t1
   return [t2]
-function handles_and_nested_codegen#s1w1 role=function params=[x#2] outputs=[y#3] captures=[] temps=8 labels=0
+function handles_and_nested_codegen#s1w1 role=function owner_class=None params=[x#2] outputs=[y#3] captures=[] temps=8 labels=0
   t0 = handle inner [semantic=NestedFunction final=NestedFunction]
   store f#4 <- t0
   t1 = handle <anon:0>#s2w2
@@ -32,7 +32,7 @@ function handles_and_nested_codegen#s1w1 role=function params=[x#2] outputs=[y#3
   store y#3 <- t5
   t7 = load y#3
   return [t7]
-function inner#s3w3 role=nested_function params=[step#9] outputs=[out#10] captures=[x binding=2 access=Read] temps=4 labels=0
+function inner#s3w3 role=nested_function owner_class=None params=[step#9] outputs=[out#10] captures=[x binding=2 access=Read] temps=4 labels=0
   t0 = load x#2
   t1 = load step#9
   t2 = binary Add t0, t1
