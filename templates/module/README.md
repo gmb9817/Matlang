@@ -4,9 +4,7 @@ Copy this template into a concrete module when that module begins active impleme
 
 Required companion files:
 - `SPEC.md`
-- `TASKS.md`
 - `DECISIONS.md`
-- `TEST_PLAN.md`
 
 Every module must state:
 - ownership boundary

@@ -6,8 +6,7 @@ If you are the next AI working on this repo, start here.
 
 1. Read this file.
 2. Use `docs/handoff/KNOWN_BREAKAGE.md` only for confirmed limitations or edge-case caveats.
-3. Use `docs/handoff/NEXT_STEPS.md` only for the broader post-plan backlog.
-4. Do not reread `docs/handoff/CURRENT_STATE.md`, the master plan, or the architecture/spec docs unless you truly need deep historical context for a specific bug or design question.
+3. Do not reread `docs/handoff/CURRENT_STATE.md` or the architecture/spec docs unless you truly need deep historical context for a specific bug or design question.
 
 ## Status
 

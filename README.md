@@ -11,10 +11,8 @@ Current project intent:
 - Keep the repository decomposed for long-running multi-AI and human collaboration.
 
 Primary documents:
-- `MASTER_MATLAB_REIMPLEMENTATION_PLAN.txt`
 - `docs/architecture/OVERVIEW.md`
 - `docs/architecture/RUST_WORKSPACE.md`
-- `docs/roadmap/PHASES.md`
 - `docs/handoff/CURRENT_STATE.md`
 
 Current default technical direction:
@@ -42,5 +40,5 @@ License:
 
 Contributors must read:
 1. `docs/handoff/CURRENT_STATE.md`
-2. `docs/handoff/NEXT_STEPS.md`
-3. relevant `SPEC.md` and `TASKS.md` before editing a module
+2. `docs/handoff/FUTURE_ONLY.md`
+3. relevant `SPEC.md` and `DECISIONS.md` before editing a module
