@@ -573,6 +573,18 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn lower_expression(&mut self, expression: &Expression, scope_id: ScopeId) -> HirExpression {
+        if let Some((name, span)) = call_target_name_span(expression) {
+            if let Some(reference) = self.lookup_reference(&name, span, ReferenceRole::CallTarget)
+            {
+                if reference.resolution != ReferenceResolution::WorkspaceValue {
+                    return HirExpression::Call {
+                        target: self.lower_call_target(expression, scope_id),
+                        args: Vec::new(),
+                    };
+                }
+            }
+        }
+
         match &expression.kind {
             ExpressionKind::Identifier(identifier) => {
                 HirExpression::ValueRef(self.lower_value_reference(identifier))

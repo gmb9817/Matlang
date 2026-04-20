@@ -15,8 +15,9 @@ use std::{
 
 pub use bytecode::{
     execute_function_file_bytecode, execute_function_file_bytecode_bundle,
-    execute_function_file_bytecode_module, execute_script_bytecode, execute_script_bytecode_bundle,
-    execute_script_bytecode_module,
+    execute_function_file_bytecode_module, execute_function_file_bytecode_with_identity,
+    execute_script_bytecode, execute_script_bytecode_bundle, execute_script_bytecode_module,
+    execute_script_bytecode_with_identity,
 };
 use graphics::{
     apply_backend_figure_position, close_figures_now, close_request_handles,
@@ -39,7 +40,10 @@ use matlab_ir::{
     HirModule, HirStatement, HirSwitchCase,
 };
 use matlab_platform::{decode_bytecode_module, encode_bytecode_module, PackagedBytecodeModule};
-use matlab_resolver::{resolve_class_definition, ResolverContext};
+use matlab_resolver::{
+    resolve_all_callables, resolve_callable, resolve_class_definition, resolve_class_folder_method,
+    ResolvedCallable, ResolverContext,
+};
 use matlab_runtime::{
     qualified_object_class_name, render_named_value, render_value, render_workspace,
     ArrayStorageClass, CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue,
@@ -48,6 +52,7 @@ use matlab_runtime::{
 };
 use matlab_semantics::{
     analyze_compilation_unit_with_context,
+    builtin_function_names, is_builtin_function_name,
     symbols::{BindingId, BindingStorage, FinalReferenceResolution, ReferenceResolution},
 };
 use matlab_stdlib::{
@@ -242,6 +247,8 @@ struct SharedRuntimeState {
     bundled_modules: HashMap<PathBuf, BytecodeModule>,
     bundled_modules_by_id: HashMap<String, BytecodeModule>,
     bundled_module_source_paths: HashMap<String, String>,
+    loaded_functions: BTreeMap<String, LoadedFunctionInfo>,
+    loaded_classes: BTreeSet<String>,
     last_warning: Option<WarningState>,
     last_tic_seconds: Option<f64>,
     next_dynamic_binding_id: u32,
@@ -266,6 +273,8 @@ impl Default for SharedRuntimeState {
             bundled_modules: HashMap::new(),
             bundled_modules_by_id: HashMap::new(),
             bundled_module_source_paths: HashMap::new(),
+            loaded_functions: BTreeMap::new(),
+            loaded_classes: BTreeSet::new(),
             last_warning: None,
             last_tic_seconds: None,
             next_dynamic_binding_id: 1_000_000,
@@ -296,13 +305,14 @@ fn install_bundled_modules(
         let path = PathBuf::from(&module.source_path);
         state
             .bundled_modules
-            .insert(path, module.module.clone());
+            .insert(path.clone(), module.module.clone());
         state
             .bundled_modules_by_id
             .insert(module.module_id.clone(), module.module.clone());
         state
             .bundled_module_source_paths
             .insert(module.module_id.clone(), module.source_path.clone());
+        record_loaded_bytecode_module(&mut state, &module.module, Some(&path));
     }
 }
 
@@ -345,6 +355,71 @@ fn snapshot_bundle_modules(
             })
         })
         .collect()
+}
+
+fn collect_root_scoped_bundle_paths_from_value(
+    value: &Value,
+    state: &SharedRuntimeState,
+    paths: &mut BTreeSet<PathBuf>,
+) {
+    match value {
+        Value::FunctionHandle(handle) => {
+            if let FunctionHandleTarget::Named(name) = &handle.target {
+                if let Some((path, _)) = parse_scoped_function_handle_name(name) {
+                    let already_packaged = state
+                        .bundled_module_source_paths
+                        .values()
+                        .any(|source| PathBuf::from(source) == path);
+                    if state.bundled_modules.contains_key(&path) && !already_packaged {
+                        paths.insert(path);
+                    }
+                }
+            }
+        }
+        Value::Matrix(matrix) => {
+            for element in matrix.elements() {
+                collect_root_scoped_bundle_paths_from_value(element, state, paths);
+            }
+        }
+        Value::Cell(cell) => {
+            for element in cell.elements() {
+                collect_root_scoped_bundle_paths_from_value(element, state, paths);
+            }
+        }
+        Value::Struct(struct_value) => {
+            for value in struct_value.fields.values() {
+                collect_root_scoped_bundle_paths_from_value(value, state, paths);
+            }
+        }
+        Value::Object(object) => {
+            for value in object.properties().fields.values() {
+                collect_root_scoped_bundle_paths_from_value(value, state, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn snapshot_bundle_modules_for_workspace(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    workspace: &Workspace,
+) -> Vec<PackagedBytecodeModule> {
+    let mut modules = snapshot_bundle_modules(shared_state);
+    let state = shared_state.borrow();
+    let mut root_paths = BTreeSet::new();
+    for value in workspace.values() {
+        collect_root_scoped_bundle_paths_from_value(value, &state, &mut root_paths);
+    }
+    for path in root_paths {
+        if let Some(module) = state.bundled_modules.get(&path) {
+            modules.push(PackagedBytecodeModule {
+                module_id: format!("root::{}", path.display()),
+                source_path: path.display().to_string(),
+                module: module.clone(),
+            });
+        }
+    }
+    modules
 }
 
 fn encode_snapshot_bundle_modules(
@@ -402,8 +477,119 @@ fn function_handle_target_is_bundle_backed(
         FunctionHandleTarget::BoundMethod { receiver, .. } => {
             value_contains_bundle_backed_modules(receiver, state)
         }
-        FunctionHandleTarget::Named(_) => false,
+        FunctionHandleTarget::Named(name) => parse_scoped_function_handle_name(name)
+            .is_some_and(|(path, _)| state.bundled_modules.contains_key(&path)),
     }
+}
+
+fn install_root_bundled_module(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    source_path: &str,
+    module: &BytecodeModule,
+) {
+    let mut state = shared_state.borrow_mut();
+    state
+        .bundled_modules
+        .insert(PathBuf::from(source_path), module.clone());
+    record_loaded_bytecode_module(&mut state, module, Some(Path::new(source_path)));
+}
+
+fn record_loaded_hir_module(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    module: &HirModule,
+    source_path: Option<&Path>,
+) {
+    let mut state = shared_state.borrow_mut();
+    record_loaded_hir_module_state(&mut state, module, source_path);
+}
+
+fn record_loaded_hir_module_state(
+    state: &mut SharedRuntimeState,
+    module: &HirModule,
+    source_path: Option<&Path>,
+) {
+    if module.kind == CompilationUnitKind::FunctionFile {
+        if let Some(path) = source_path {
+            record_loaded_function_path(state, path);
+        }
+    }
+    for class in &module.classes {
+        state
+            .loaded_classes
+            .insert(qualified_object_class_name(&class.name, class.package.as_deref()));
+    }
+}
+
+fn record_loaded_bytecode_module(
+    state: &mut SharedRuntimeState,
+    module: &BytecodeModule,
+    source_path: Option<&Path>,
+) {
+    if module.unit_kind == "FunctionFile" {
+        if let Some(path) = source_path {
+            record_loaded_function_path(state, path);
+        }
+    }
+    for class in &module.classes {
+        state
+            .loaded_classes
+            .insert(qualified_object_class_name(&class.name, class.package.as_deref()));
+    }
+}
+
+fn record_loaded_function_path(state: &mut SharedRuntimeState, path: &Path) {
+    let short_name = loaded_function_name_from_path(path);
+    let complete_name = path.display().to_string();
+    state.loaded_functions.insert(
+        complete_name.to_ascii_lowercase(),
+        LoadedFunctionInfo {
+            short_name,
+            complete_name,
+        },
+    );
+}
+
+fn loaded_function_name_from_path(path: &Path) -> String {
+    let package_prefix = package_segments_from_path(path);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let parent_class = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix('@'))
+        .map(ToOwned::to_owned);
+    let base = match parent_class {
+        Some(class_name) if !stem.eq_ignore_ascii_case(&class_name) => {
+            format!("{class_name}.{stem}")
+        }
+        Some(class_name) => class_name,
+        None => stem,
+    };
+    if package_prefix.is_empty() {
+        base
+    } else {
+        format!("{package_prefix}.{base}")
+    }
+}
+
+fn package_segments_from_path(path: &Path) -> String {
+    let mut segments = path
+        .ancestors()
+        .skip(1)
+        .filter_map(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('+'))
+                .map(ToOwned::to_owned)
+        })
+        .collect::<Vec<_>>();
+    segments.reverse();
+    segments.join(".")
 }
 
 fn value_contains_bundle_backed_modules(value: &Value, state: &SharedRuntimeState) -> bool {
@@ -480,6 +666,12 @@ struct AnonymousClosure<'a> {
     function: HirAnonymousFunction,
     captured_cells: HashMap<BindingId, Cell>,
     visible_functions: BTreeMap<String, &'a HirFunction>,
+}
+
+#[derive(Clone)]
+struct NamedFunctionClosure<'a> {
+    function: &'a HirFunction,
+    captured_cells: HashMap<BindingId, Cell>,
 }
 
 #[derive(Debug, Clone)]
@@ -667,6 +859,19 @@ fn resolved_path_static_method_name<'a>(path: &Path, display_name: &'a str) -> O
     (class_name != method_name).then_some(method_name)
 }
 
+fn source_path_from_module_identity(module_identity: &str) -> Option<PathBuf> {
+    (!module_identity.starts_with('<')).then(|| PathBuf::from(module_identity))
+}
+
+fn resolve_named_callable_path_from_source_path(source_path: &Path, name: &str) -> Option<PathBuf> {
+    let context =
+        ResolverContext::from_source_file(source_path.to_path_buf()).with_env_search_roots("MATC_PATH");
+    match resolve_callable(name, &context)? {
+        ResolvedCallable::Function(resolved) => Some(resolved.path),
+        ResolvedCallable::Class(resolved) => Some(resolved.path),
+    }
+}
+
 fn is_missing_static_method_error(error: &RuntimeError, method_name: &str) -> bool {
     matches!(
         error,
@@ -766,6 +971,28 @@ pub fn execute_script(module: &HirModule) -> Result<ExecutionResult, RuntimeErro
     interpreter.execute_script()
 }
 
+pub fn execute_script_with_identity(
+    module: &HirModule,
+    module_identity: String,
+    source_path: Option<PathBuf>,
+) -> Result<ExecutionResult, RuntimeError> {
+    if module.kind != CompilationUnitKind::Script {
+        return Err(RuntimeError::Unsupported(
+            "execute_script expects a script compilation unit".to_string(),
+        ));
+    }
+
+    let mut interpreter = Interpreter::with_shared_state(
+        module,
+        module_identity.clone(),
+        Rc::new(RefCell::new(SharedRuntimeState::default())),
+        Vec::new(),
+    );
+    interpreter.resolution_source_path =
+        source_path.or_else(|| source_path_from_module_identity(&module_identity));
+    interpreter.execute_script()
+}
+
 pub fn execute_function_file(
     module: &HirModule,
     args: &[Value],
@@ -777,6 +1004,29 @@ pub fn execute_function_file(
     }
 
     let mut interpreter = Interpreter::new(module);
+    interpreter.execute_function_file(args)
+}
+
+pub fn execute_function_file_with_identity(
+    module: &HirModule,
+    args: &[Value],
+    module_identity: String,
+    source_path: Option<PathBuf>,
+) -> Result<ExecutionResult, RuntimeError> {
+    if module.kind != CompilationUnitKind::FunctionFile {
+        return Err(RuntimeError::Unsupported(
+            "execute_function_file expects a function-file compilation unit".to_string(),
+        ));
+    }
+
+    let mut interpreter = Interpreter::with_shared_state(
+        module,
+        module_identity.clone(),
+        Rc::new(RefCell::new(SharedRuntimeState::default())),
+        Vec::new(),
+    );
+    interpreter.resolution_source_path =
+        source_path.or_else(|| source_path_from_module_identity(&module_identity));
     interpreter.execute_function_file(args)
 }
 
@@ -859,6 +1109,9 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
             | "load"
             | "who"
             | "whos"
+            | "what"
+            | "help"
+            | "lookfor"
             | "tic"
             | "toc"
             | "clear"
@@ -1004,6 +1257,21 @@ fn invoke_runtime_builtin_outputs(
         "disp" | "display" => {
             invoke_display_builtin_outputs(shared_state, name, args, output_arity)
         }
+        "inmem" => invoke_inmem_builtin_outputs(shared_state, args, output_arity),
+        "lookfor" => invoke_lookfor_builtin_outputs(shared_state, None, args, output_arity),
+        "filemarker" => {
+            if !args.is_empty() {
+                Err(RuntimeError::Unsupported(
+                    "filemarker currently supports no input arguments".to_string(),
+                ))
+            } else if output_arity > 1 {
+                Err(RuntimeError::Unsupported(
+                    "filemarker currently supports at most one output".to_string(),
+                ))
+            } else {
+                Ok(vec![Value::CharArray(">".to_string())])
+            }
+        }
         "fprintf" => invoke_fprintf_builtin_outputs(shared_state, args, output_arity),
         "drawnow" => invoke_drawnow_builtin_outputs(shared_state, args, output_arity),
         "clc" => invoke_clc_builtin_outputs(shared_state, args, output_arity),
@@ -1015,8 +1283,1575 @@ fn invoke_runtime_builtin_outputs(
         "pause" => invoke_pause_builtin_outputs(shared_state, args, output_arity),
         "warning" => invoke_warning_builtin_outputs(shared_state, args, output_arity),
         "lastwarn" => invoke_lastwarn_builtin_outputs(shared_state, args, output_arity),
+        "str2num" => invoke_str2num_builtin_outputs(args, output_arity),
         _ => invoke_stdlib_builtin_outputs(name, args, output_arity),
     }
+}
+
+fn normalize_str2func_name_arg(args: &[Value]) -> Result<String, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "str2func currently supports exactly one argument".to_string(),
+        ));
+    };
+    let text = match value {
+        Value::CharArray(text) | Value::String(text) => text.as_str(),
+        other => {
+            return Err(RuntimeError::TypeError(format!(
+                "str2func currently expects a char or string function name, found {}",
+                other.kind_name()
+            )))
+        }
+    };
+    let trimmed = text.trim();
+    let normalized = trimmed.strip_prefix('@').unwrap_or(trimmed).trim();
+    if normalized.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "str2func currently expects a nonempty function name".to_string(),
+        ));
+    }
+    Ok(normalized.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WhichMode {
+    First,
+    All,
+    In(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WhichWithinFileMatch {
+    base_name: String,
+    marker: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistSearchType {
+    Default,
+    Var,
+    File,
+    Dir,
+    Builtin,
+    Class,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WhatFolderInfo {
+    path: PathBuf,
+    m: Vec<String>,
+    mlapp: Vec<String>,
+    mlx: Vec<String>,
+    mat: Vec<String>,
+    mex: Vec<String>,
+    mdl: Vec<String>,
+    slx: Vec<String>,
+    sfx: Vec<String>,
+    p: Vec<String>,
+    classes: Vec<String>,
+    packages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedFunctionInfo {
+    short_name: String,
+    complete_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LookforMatch {
+    name: String,
+    summary: String,
+    lines: Vec<String>,
+}
+
+fn resolution_context_with_env(resolution_source_path: Option<&Path>) -> ResolverContext {
+    resolution_source_path
+        .map(|path| ResolverContext::from_source_file(path.to_path_buf()).with_env_search_roots("MATC_PATH"))
+        .unwrap_or_else(|| ResolverContext::new(None, matlab_resolver::search_roots_from_env("MATC_PATH")))
+}
+
+fn parse_which_args(args: &[Value]) -> Result<(String, WhichMode), RuntimeError> {
+    match args {
+        [item] => Ok((text_value(item)?.to_string(), WhichMode::First)),
+        [item, flag] if text_value(flag)?.eq_ignore_ascii_case("-all") => {
+            Ok((text_value(item)?.to_string(), WhichMode::All))
+        }
+        [item, keyword, context] if text_value(keyword)?.eq_ignore_ascii_case("in") => Ok((
+            text_value(item)?.to_string(),
+            WhichMode::In(text_value(context)?.to_string()),
+        )),
+        _ => Err(RuntimeError::Unsupported(
+            "which currently supports `which(name)`, `which(name, '-all')`, or `which(name, 'in', context)`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_exist_args(args: &[Value]) -> Result<(String, ExistSearchType), RuntimeError> {
+    match args {
+        [item] => Ok((text_value(item)?.to_string(), ExistSearchType::Default)),
+        [item, search_type] => {
+            let search_type = match text_value(search_type)?.to_ascii_lowercase().as_str() {
+                "var" => ExistSearchType::Var,
+                "file" => ExistSearchType::File,
+                "dir" => ExistSearchType::Dir,
+                "builtin" => ExistSearchType::Builtin,
+                "class" => ExistSearchType::Class,
+                _ => {
+                    return Err(RuntimeError::Unsupported(
+                        "exist currently supports search types `var`, `file`, `dir`, `builtin`, and `class`"
+                            .to_string(),
+                    ))
+                }
+            };
+            Ok((text_value(item)?.to_string(), search_type))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "exist currently supports `exist(name)` or `exist(name, searchType)`".to_string(),
+        )),
+    }
+}
+
+fn parse_what_args(args: &[Value]) -> Result<Option<String>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [folder] => Ok(Some(text_value(folder)?.to_string())),
+        _ => Err(RuntimeError::Unsupported(
+            "what currently supports `what` or `what(folderName)`".to_string(),
+        )),
+    }
+}
+
+fn parse_inmem_args(args: &[Value]) -> Result<bool, RuntimeError> {
+    match args {
+        [] => Ok(false),
+        [value] => Ok(text_value(value)?.eq_ignore_ascii_case("-completenames")),
+        _ => Err(RuntimeError::Unsupported(
+            "inmem currently supports `inmem` or `inmem('-completenames')`".to_string(),
+        )),
+    }
+}
+
+fn parse_help_args(args: &[Value]) -> Result<Option<&Value>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [value] => Ok(Some(value)),
+        _ => Err(RuntimeError::Unsupported(
+            "help currently supports `help` or `help(name)`".to_string(),
+        )),
+    }
+}
+
+fn parse_lookfor_args(args: &[Value]) -> Result<(String, bool), RuntimeError> {
+    match args {
+        [keyword] => Ok((text_value(keyword)?.to_string(), false)),
+        [keyword, flag] if text_value(flag)?.eq_ignore_ascii_case("-all") => {
+            Ok((text_value(keyword)?.to_string(), true))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "lookfor currently supports `lookfor keyword` or `lookfor keyword -all`".to_string(),
+        )),
+    }
+}
+
+fn which_value_result(
+    frame: Option<&Frame<'_>>,
+    visible_function_names: Option<&[String]>,
+    resolution_source_path: Option<&Path>,
+    name: &str,
+    mode: WhichMode,
+) -> Result<Value, RuntimeError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "which currently expects a nonempty function or variable name".to_string(),
+        ));
+    }
+
+    if !matches!(&mode, WhichMode::In(_)) {
+        if let Some(frame) = frame {
+            if frame.visible_workspace_names().iter().any(|candidate| candidate == trimmed) {
+                return which_output_value(vec!["variable".to_string()], &mode);
+            }
+        }
+    }
+
+    let mut matches = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    match &mode {
+        WhichMode::In(context_name) => {
+            let Some(context_path) = resolve_which_context_path(resolution_source_path, context_name)
+            else {
+                return which_output_value(Vec::new(), &mode);
+            };
+            for marker in collect_within_file_matches_for_name(&context_path, trimmed) {
+                push_unique_which_match(&mut matches, &mut seen, marker);
+            }
+            let context = resolution_context_with_env(Some(&context_path));
+            for matched in resolve_all_callables(trimmed, &context) {
+                push_unique_which_match(
+                    &mut matches,
+                    &mut seen,
+                    rendered_resolved_callable_path(&matched),
+                );
+            }
+        }
+        WhichMode::First | WhichMode::All => {
+            if let Some(marker) = current_visible_within_file_match(
+                frame,
+                visible_function_names,
+                resolution_source_path,
+                trimmed,
+            ) {
+                if matches!(&mode, WhichMode::First) {
+                    return which_output_value(vec![marker], &mode);
+                }
+                push_unique_which_match(&mut matches, &mut seen, marker);
+            }
+            let context = resolution_context_with_env(resolution_source_path);
+
+            if matches!(&mode, WhichMode::First) {
+                let first = resolve_callable(trimmed, &context)
+                    .map(|resolved| rendered_resolved_callable_path(&resolved))
+                    .into_iter()
+                    .collect();
+                return which_output_value(first, &mode);
+            }
+
+            for matched in resolve_all_callables(trimmed, &context) {
+                push_unique_which_match(
+                    &mut matches,
+                    &mut seen,
+                    rendered_resolved_callable_path(&matched),
+                );
+            }
+        }
+    }
+
+    which_output_value(matches, &mode)
+}
+
+fn exist_value_result(
+    frame: Option<&Frame<'_>>,
+    visible_function_names: Option<&[String]>,
+    resolution_source_path: Option<&Path>,
+    name: &str,
+    search_type: ExistSearchType,
+) -> Result<Value, RuntimeError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "exist currently expects a nonempty function, variable, or folder name".to_string(),
+        ));
+    }
+
+    if matches!(search_type, ExistSearchType::Default | ExistSearchType::Var)
+        && frame
+            .is_some_and(|frame| frame.visible_workspace_names().iter().any(|candidate| candidate == trimmed))
+    {
+        return Ok(Value::Scalar(1.0));
+    }
+    if matches!(search_type, ExistSearchType::Var) {
+        return Ok(Value::Scalar(0.0));
+    }
+
+    let context = resolution_context_with_env(resolution_source_path);
+    let local_exists = current_visible_function_exists(frame, visible_function_names, trimmed);
+    let direct_file_exists = existing_lookup_path(trimmed, &context, false).is_some();
+    let folder_exists = existing_lookup_path(trimmed, &context, true).is_some();
+    let resolved_callable = resolve_callable(trimmed, &context);
+    let builtin_exists = is_builtin_function_name(trimmed);
+    let class_exists = resolve_class_definition(trimmed, &context).is_some();
+
+    let result = match search_type {
+        ExistSearchType::Default => {
+            if local_exists {
+                2.0
+            } else {
+                let resolved_code = match resolved_callable {
+                    Some(ResolvedCallable::Function(_)) => Some(2.0),
+                    Some(ResolvedCallable::Class(_)) => Some(8.0),
+                    None => None,
+                };
+                if folder_exists && !builtin_exists && (direct_file_exists || resolved_code.is_some()) {
+                    7.0
+                } else if let Some(code) = resolved_code {
+                    code
+                } else if direct_file_exists {
+                    2.0
+                } else if builtin_exists {
+                    5.0
+                } else if folder_exists {
+                    7.0
+                } else {
+                    0.0
+                }
+            }
+        }
+        ExistSearchType::File => {
+            if local_exists || direct_file_exists || resolved_callable.is_some() {
+                2.0
+            } else if folder_exists {
+                7.0
+            } else {
+                0.0
+            }
+        }
+        ExistSearchType::Dir => {
+            if folder_exists {
+                7.0
+            } else {
+                0.0
+            }
+        }
+        ExistSearchType::Builtin => {
+            if builtin_exists {
+                5.0
+            } else {
+                0.0
+            }
+        }
+        ExistSearchType::Class => {
+            if class_exists {
+                8.0
+            } else {
+                0.0
+            }
+        }
+        ExistSearchType::Var => unreachable!("var search type returned early"),
+    };
+
+    Ok(Value::Scalar(result))
+}
+
+fn invoke_what_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "what currently supports at most one output".to_string(),
+        ));
+    }
+
+    let folder_name = parse_what_args(args)?;
+    let infos = collect_what_folder_infos(resolution_source_path, folder_name.as_deref())?;
+    if output_arity == 0 {
+        push_text_displayed_output(shared_state, render_what_infos(&infos), false);
+        Ok(Vec::new())
+    } else {
+        Ok(vec![what_infos_value(&infos)?])
+    }
+}
+
+fn invoke_inmem_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "inmem currently supports at most three outputs".to_string(),
+        ));
+    }
+    let complete_names = parse_inmem_args(args)?;
+    let output_arity = output_arity.max(1);
+    let state = shared_state.borrow();
+    let functions = inmem_function_cell_value(&state, complete_names);
+    let mex = Value::Cell(CellValue::new(0, 0, Vec::new()).expect("empty mex cell"));
+    let classes = inmem_class_cell_value(&state);
+    let mut outputs = vec![functions, mex, classes];
+    outputs.truncate(output_arity);
+    Ok(outputs)
+}
+
+fn invoke_help_builtin_outputs(
+    frame: Option<&Frame<'_>>,
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "help currently supports at most one output".to_string(),
+        ));
+    }
+
+    let text = match parse_help_args(args)? {
+        None => "Type `help name` for help on a specific function, class, or folder.".to_string(),
+        Some(value) => help_text_for_value(frame, resolution_source_path, value)?,
+    };
+
+    if output_arity == 0 {
+        push_text_displayed_output(shared_state, text, true);
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::CharArray(text)])
+    }
+}
+
+fn invoke_lookfor_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 0 {
+        return Err(RuntimeError::Unsupported(
+            "lookfor currently does not return outputs".to_string(),
+        ));
+    }
+    let (keyword, search_all) = parse_lookfor_args(args)?;
+    let rendered = render_lookfor_matches(&collect_lookfor_matches(
+        resolution_source_path,
+        &keyword,
+        search_all,
+    )?);
+    push_text_displayed_output(shared_state, rendered, true);
+    Ok(Vec::new())
+}
+
+fn current_visible_within_file_match(
+    frame: Option<&Frame<'_>>,
+    visible_function_names: Option<&[String]>,
+    resolution_source_path: Option<&Path>,
+    name: &str,
+) -> Option<String> {
+    let path = resolution_source_path?;
+    let visible_names = visible_function_names.map(|names| names.to_vec()).unwrap_or_else(|| {
+        frame
+            .map(|frame| frame.visible_functions.keys().cloned().collect())
+            .unwrap_or_default()
+    });
+    if visible_names.is_empty() {
+        return None;
+    }
+    let visible_base_names = visible_names
+        .into_iter()
+        .map(|candidate| base_scoped_function_name(&candidate).to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    collect_within_file_matches(path)
+        .into_iter()
+        .find(|candidate| {
+            candidate.base_name.eq_ignore_ascii_case(name)
+                && visible_base_names.contains(&candidate.base_name.to_ascii_lowercase())
+        })
+        .map(|candidate| candidate.marker)
+}
+
+fn current_visible_function_exists(
+    frame: Option<&Frame<'_>>,
+    visible_function_names: Option<&[String]>,
+    name: &str,
+) -> bool {
+    visible_function_names
+        .map(|names| {
+            names.iter().any(|candidate| {
+                base_scoped_function_name(candidate).eq_ignore_ascii_case(name)
+            })
+        })
+        .or_else(|| {
+            frame.map(|frame| {
+                frame.visible_functions.keys().any(|candidate| {
+                    base_scoped_function_name(candidate).eq_ignore_ascii_case(name)
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn help_text_for_value(
+    frame: Option<&Frame<'_>>,
+    resolution_source_path: Option<&Path>,
+    value: &Value,
+) -> Result<String, RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "help currently expects a nonempty function, class, or folder name".to_string(),
+                ));
+            }
+            if let Some(text) = help_text_for_name(frame, resolution_source_path, trimmed)? {
+                Ok(text)
+            } else if let Some(frame) = frame {
+                if let Ok(variable) = frame.read_reference(None, trimmed) {
+                    help_text_for_class_name(resolution_source_path, &matlab_class_name(&variable))
+                } else {
+                    Ok(format!("No help found for '{}'.", trimmed))
+                }
+            } else {
+                Ok(format!("No help found for '{}'.", trimmed))
+            }
+        }
+        other => help_text_for_class_name(resolution_source_path, &matlab_class_name(other)),
+    }
+}
+
+fn help_text_for_name(
+    _frame: Option<&Frame<'_>>,
+    resolution_source_path: Option<&Path>,
+    name: &str,
+) -> Result<Option<String>, RuntimeError> {
+    if let Some(path) = resolution_source_path {
+        if let Some(text) = read_named_help_text_from_path(path, name)? {
+            return Ok(Some(text));
+        }
+    }
+
+    let context = resolution_context_with_env(resolution_source_path);
+    if let Some(resolved) = resolve_callable(name, &context) {
+        return help_text_for_resolved_callable(&resolved, name).map(Some);
+    }
+    if is_builtin_function_name(name) {
+        return Ok(Some(format!("{name} is a built-in function.")));
+    }
+    if let Some(folder_path) = collect_what_folder_paths(resolution_source_path, Some(name))?
+        .into_iter()
+        .next()
+    {
+        return Ok(Some(help_text_for_folder_path(&folder_path)?));
+    }
+    Ok(None)
+}
+
+fn help_text_for_class_name(
+    resolution_source_path: Option<&Path>,
+    class_name: &str,
+) -> Result<String, RuntimeError> {
+    let context = resolution_context_with_env(resolution_source_path);
+    if let Some(class_def) = resolve_class_definition(class_name, &context) {
+        return help_text_for_path(&class_def.path)
+            .map(|text| {
+                text.unwrap_or_else(|| format!("{class_name} is a class defined in {}.", class_def.path.display()))
+            });
+    }
+    Ok(format!("{class_name} is a built-in class."))
+}
+
+fn help_text_for_resolved_callable(
+    resolved: &ResolvedCallable,
+    display_name: &str,
+) -> Result<String, RuntimeError> {
+    match resolved {
+        ResolvedCallable::Function(function) => {
+            help_text_for_path(&function.path).map(|text| {
+                text.unwrap_or_else(|| format!("{display_name} is a function defined in {}.", function.path.display()))
+            })
+        }
+        ResolvedCallable::Class(class_def) => {
+            if let Some((_, method_name)) = display_name.rsplit_once('.') {
+                if let Some(method_path) = resolve_class_folder_method(&class_def.path, method_name) {
+                    return help_text_for_path(&method_path).map(|text| {
+                        text.unwrap_or_else(|| {
+                            format!("{display_name} is a class method defined in {}.", method_path.display())
+                        })
+                    });
+                }
+                if let Some(text) = read_named_help_text_from_path(&class_def.path, method_name)? {
+                    return Ok(text);
+                }
+                return Ok(format!("{display_name} is a class method."));
+            }
+            help_text_for_path(&class_def.path).map(|text| {
+                text.unwrap_or_else(|| format!("{display_name} is a class defined in {}.", class_def.path.display()))
+            })
+        }
+    }
+}
+
+fn help_text_for_folder_path(path: &Path) -> Result<String, RuntimeError> {
+    let contents_path = path.join("Contents.m");
+    if contents_path.is_file() {
+        if let Some(text) = help_text_for_path(&contents_path)? {
+            return Ok(text);
+        }
+        return Ok(format!("{} is a folder.", path.display()));
+    }
+
+    let info = scan_what_folder(path)?;
+    let mut lines = Vec::new();
+    for file_name in info.m {
+        if file_name.eq_ignore_ascii_case("Contents.m") {
+            continue;
+        }
+        let file_path = path.join(&file_name);
+        let stem = Path::new(&file_name)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&file_name);
+        let summary = help_summary_line_for_path(&file_path)?;
+        if let Some(summary) = summary {
+            lines.push(format!("{stem} - {summary}"));
+        } else {
+            lines.push(stem.to_string());
+        }
+    }
+    if lines.is_empty() {
+        Ok(format!("{} is a folder.", path.display()))
+    } else {
+        Ok(format!(
+            "Contents of folder {}\n\n{}",
+            path.display(),
+            lines.join("\n")
+        ))
+    }
+}
+
+fn help_summary_line_for_path(path: &Path) -> Result<Option<String>, RuntimeError> {
+    Ok(help_text_for_path(path)?
+        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()).map(|line| line.trim().to_string())))
+}
+
+fn help_text_for_path(path: &Path) -> Result<Option<String>, RuntimeError> {
+    let source = fs::read_to_string(path).map_err(|error| {
+        RuntimeError::Unsupported(format!(
+            "help could not read `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(read_primary_help_text_from_source(&source))
+}
+
+fn read_named_help_text_from_path(path: &Path, name: &str) -> Result<Option<String>, RuntimeError> {
+    let source = fs::read_to_string(path).map_err(|error| {
+        RuntimeError::Unsupported(format!(
+            "help could not read `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(read_named_help_text_from_source(&source, name))
+}
+
+fn read_primary_help_text_from_source(source: &str) -> Option<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let first_nonblank = lines
+        .iter()
+        .position(|line| !line.trim().is_empty())?;
+    let first = lines[first_nonblank].trim_start();
+    let start = if first.starts_with("function") || first.starts_with("classdef") {
+        first_nonblank + 1
+    } else {
+        first_nonblank
+    };
+    collect_help_block_from_lines(&lines, start)
+}
+
+fn read_named_help_text_from_source(source: &str, name: &str) -> Option<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some(function_name) = declared_function_name_from_line(trimmed) {
+            if function_name.eq_ignore_ascii_case(name) {
+                return collect_help_block_from_lines(&lines, index + 1);
+            }
+        }
+    }
+    None
+}
+
+fn collect_lookfor_matches(
+    resolution_source_path: Option<&Path>,
+    keyword: &str,
+    search_all: bool,
+) -> Result<Vec<LookforMatch>, RuntimeError> {
+    let needle = keyword.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "lookfor currently expects a nonempty keyword".to_string(),
+        ));
+    }
+
+    let context = resolution_context_with_env(resolution_source_path);
+    let mut matches = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for builtin in builtin_function_names() {
+        let summary = format!("{builtin} is a built-in function.");
+        let builtin_lower = builtin.to_ascii_lowercase();
+        let summary_lower = summary.to_ascii_lowercase();
+        let matched = if search_all {
+            builtin_lower.contains(&needle) || summary_lower.contains(&needle)
+        } else {
+            builtin_lower.contains(&needle) || summary_lower.contains(&needle)
+        };
+        if matched {
+            matches.push(LookforMatch {
+                name: (*builtin).to_string(),
+                summary,
+                lines: if search_all {
+                    vec![format!("{builtin} is a built-in function.")]
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+    }
+
+    for root in context.effective_search_roots() {
+        collect_lookfor_matches_from_dir(&root, &needle, search_all, &mut seen, &mut matches)?;
+    }
+
+    matches.sort_by_cached_key(|entry| entry.name.to_ascii_lowercase());
+    Ok(matches)
+}
+
+fn collect_lookfor_matches_from_dir(
+    dir: &Path,
+    needle: &str,
+    search_all: bool,
+    seen: &mut BTreeSet<String>,
+    matches: &mut Vec<LookforMatch>,
+) -> Result<(), RuntimeError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            collect_lookfor_matches_from_dir(&path, needle, search_all, seen, matches)?;
+            continue;
+        }
+        if !file_type.is_file()
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_none_or(|extension| !extension.eq_ignore_ascii_case("m"))
+        {
+            continue;
+        }
+
+        let key = path.display().to_string().to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(_) => continue,
+        };
+        let Some(help_text) = read_primary_help_text_from_source(&source) else {
+            continue;
+        };
+        let name = loaded_function_name_from_path(&path);
+        let lines = help_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let summary = lines.first().cloned().unwrap_or_default();
+        let name_lower = name.to_ascii_lowercase();
+
+        if search_all {
+            let matched_lines = lines
+                .iter()
+                .filter(|line| line.to_ascii_lowercase().contains(needle))
+                .cloned()
+                .collect::<Vec<_>>();
+            if name_lower.contains(needle) || !matched_lines.is_empty() {
+                matches.push(LookforMatch {
+                    name,
+                    summary,
+                    lines: matched_lines,
+                });
+            }
+        } else if name_lower.contains(needle) || summary.to_ascii_lowercase().contains(needle) {
+            matches.push(LookforMatch {
+                name,
+                summary,
+                lines: Vec::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn render_lookfor_matches(matches: &[LookforMatch]) -> String {
+    if matches.is_empty() {
+        return "No matches found.".to_string();
+    }
+    let search_all = matches.iter().any(|entry| !entry.lines.is_empty());
+    if !search_all {
+        return matches
+            .iter()
+            .map(|entry| format!("{} - {}", entry.name, entry.summary))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let mut out = String::new();
+    for (index, entry) in matches.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("{}:\n", entry.name));
+        out.push_str(&format!(" {} - {}\n", entry.name, entry.summary));
+        for line in &entry.lines {
+            if line != &entry.summary {
+                out.push_str(&format!("    {line}\n"));
+            }
+        }
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn collect_help_block_from_lines(lines: &[&str], start: usize) -> Option<String> {
+    let mut out = Vec::new();
+    let mut collecting = false;
+    for line in lines.iter().skip(start) {
+        let trimmed = line.trim_start();
+        if let Some(body) = trimmed.strip_prefix('%') {
+            collecting = true;
+            out.push(body.trim_start().to_string());
+            continue;
+        }
+        if trimmed.is_empty() && collecting {
+            out.push(String::new());
+            continue;
+        }
+        if collecting {
+            break;
+        }
+        if !trimmed.is_empty() {
+            break;
+        }
+    }
+    while out.last().is_some_and(|line| line.is_empty()) {
+        out.pop();
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
+fn declared_function_name_from_line(line: &str) -> Option<String> {
+    let body = line.strip_prefix("function")?.trim_start();
+    let body = body.rsplit_once('=').map(|(_, rhs)| rhs.trim_start()).unwrap_or(body);
+    let name = body
+        .split(['(', ' ', '\t', ','])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn collect_what_folder_infos(
+    resolution_source_path: Option<&Path>,
+    folder_name: Option<&str>,
+) -> Result<Vec<WhatFolderInfo>, RuntimeError> {
+    collect_what_folder_paths(resolution_source_path, folder_name)?
+        .into_iter()
+        .map(|path| scan_what_folder(&path))
+        .collect()
+}
+
+fn collect_what_folder_paths(
+    resolution_source_path: Option<&Path>,
+    folder_name: Option<&str>,
+) -> Result<Vec<PathBuf>, RuntimeError> {
+    let context = resolution_context_with_env(resolution_source_path);
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    let push_if_dir = |paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<String>, candidate: PathBuf| {
+        if candidate.is_dir() {
+            let key = candidate.display().to_string();
+            if seen.insert(key) {
+                paths.push(candidate);
+            }
+        }
+    };
+
+    match folder_name.map(str::trim).filter(|name| !name.is_empty()) {
+        None => {
+            if let Some(source_dir) = context.source_dir() {
+                push_if_dir(&mut paths, &mut seen, source_dir.to_path_buf());
+            } else if let Ok(current_dir) = env::current_dir() {
+                push_if_dir(&mut paths, &mut seen, current_dir);
+            }
+        }
+        Some(folder_name) => {
+            for variant in what_folder_name_variants(folder_name) {
+                push_if_dir(&mut paths, &mut seen, variant.clone());
+                if let Some(source_dir) = context.source_dir() {
+                    push_if_dir(&mut paths, &mut seen, source_dir.join(&variant));
+                }
+                for root in context.effective_search_roots() {
+                    push_if_dir(&mut paths, &mut seen, root.join(&variant));
+                }
+            }
+        }
+    }
+
+    Ok(paths)
+}
+
+fn what_folder_name_variants(folder_name: &str) -> Vec<PathBuf> {
+    let trimmed = folder_name.trim();
+    let mut variants = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    let push_variant = |variants: &mut Vec<PathBuf>, seen: &mut BTreeSet<String>, value: PathBuf| {
+        let key = value.display().to_string();
+        if seen.insert(key) {
+            variants.push(value);
+        }
+    };
+
+    push_variant(&mut variants, &mut seen, PathBuf::from(trimmed));
+
+    let has_path_separator = trimmed.contains('\\') || trimmed.contains('/');
+    if !has_path_separator && !trimmed.starts_with('@') && !trimmed.starts_with('+') {
+        push_variant(
+            &mut variants,
+            &mut seen,
+            PathBuf::from(format!("@{trimmed}")),
+        );
+        push_variant(
+            &mut variants,
+            &mut seen,
+            PathBuf::from(format!("+{trimmed}")),
+        );
+
+        if trimmed.contains('.') {
+            let mut package_path = PathBuf::new();
+            let mut class_path = PathBuf::new();
+            let segments = trimmed.split('.').collect::<Vec<_>>();
+            for segment in &segments {
+                package_path.push(format!("+{segment}"));
+            }
+            for segment in &segments[..segments.len().saturating_sub(1)] {
+                class_path.push(format!("+{segment}"));
+            }
+            if let Some(last) = segments.last() {
+                class_path.push(format!("@{last}"));
+            }
+            push_variant(&mut variants, &mut seen, package_path);
+            push_variant(&mut variants, &mut seen, class_path);
+        }
+    }
+
+    variants
+}
+
+fn scan_what_folder(path: &Path) -> Result<WhatFolderInfo, RuntimeError> {
+    let mut info = WhatFolderInfo {
+        path: path.to_path_buf(),
+        m: Vec::new(),
+        mlapp: Vec::new(),
+        mlx: Vec::new(),
+        mat: Vec::new(),
+        mex: Vec::new(),
+        mdl: Vec::new(),
+        slx: Vec::new(),
+        sfx: Vec::new(),
+        p: Vec::new(),
+        classes: Vec::new(),
+        packages: Vec::new(),
+    };
+
+    let entries = fs::read_dir(path).map_err(|error| {
+        RuntimeError::Unsupported(format!(
+            "what could not read folder `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "what could not enumerate folder `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "what could not inspect entry in `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if file_type.is_dir() {
+            if let Some(name) = file_name.strip_prefix('@') {
+                info.classes.push(name.to_string());
+            } else if let Some(name) = file_name.strip_prefix('+') {
+                info.packages.push(name.to_string());
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match extension.as_str() {
+            "m" => info.m.push(file_name),
+            "mlapp" => info.mlapp.push(file_name),
+            "mlx" => info.mlx.push(file_name),
+            "mat" => info.mat.push(file_name),
+            "mdl" => info.mdl.push(file_name),
+            "slx" => info.slx.push(file_name),
+            "sfx" => info.sfx.push(file_name),
+            "p" => info.p.push(file_name),
+            extension if extension.starts_with("mex") => info.mex.push(file_name),
+            _ => {}
+        }
+    }
+
+    sort_what_names(&mut info.m);
+    sort_what_names(&mut info.mlapp);
+    sort_what_names(&mut info.mlx);
+    sort_what_names(&mut info.mat);
+    sort_what_names(&mut info.mex);
+    sort_what_names(&mut info.mdl);
+    sort_what_names(&mut info.slx);
+    sort_what_names(&mut info.sfx);
+    sort_what_names(&mut info.p);
+    sort_what_names(&mut info.classes);
+    sort_what_names(&mut info.packages);
+
+    Ok(info)
+}
+
+fn sort_what_names(values: &mut [String]) {
+    values.sort_by_cached_key(|value| value.to_ascii_lowercase());
+}
+
+fn what_infos_value(infos: &[WhatFolderInfo]) -> Result<Value, RuntimeError> {
+    match infos.len() {
+        0 => Ok(Value::Matrix(MatrixValue::new(0, 0, Vec::new())?)),
+        1 => Ok(what_struct_value(&infos[0])),
+        _ => Ok(Value::Matrix(MatrixValue::new(
+            1,
+            infos.len(),
+            infos.iter().map(what_struct_value).collect(),
+        )?)),
+    }
+}
+
+fn inmem_function_cell_value(state: &SharedRuntimeState, complete_names: bool) -> Value {
+    let mut entries = state
+        .loaded_functions
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.sort_by_cached_key(|entry| {
+        if complete_names {
+            entry.complete_name.to_ascii_lowercase()
+        } else {
+            entry.short_name.to_ascii_lowercase()
+        }
+    });
+    let values = entries
+        .into_iter()
+        .map(|entry| {
+            Value::CharArray(if complete_names {
+                entry.complete_name
+            } else {
+                entry.short_name
+            })
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        Value::Cell(CellValue::new(0, 0, values).expect("empty inmem functions cell"))
+    } else {
+        Value::Cell(CellValue::new(values.len(), 1, values).expect("inmem functions cell"))
+    }
+}
+
+fn inmem_class_cell_value(state: &SharedRuntimeState) -> Value {
+    let values = state
+        .loaded_classes
+        .iter()
+        .cloned()
+        .map(Value::CharArray)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        Value::Cell(CellValue::new(0, 0, values).expect("empty inmem classes cell"))
+    } else {
+        Value::Cell(CellValue::new(values.len(), 1, values).expect("inmem classes cell"))
+    }
+}
+
+fn what_struct_value(info: &WhatFolderInfo) -> Value {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "path".to_string(),
+        Value::CharArray(info.path.display().to_string()),
+    );
+    fields.insert("m".to_string(), what_text_cell_value(&info.m));
+    fields.insert("mlapp".to_string(), what_text_cell_value(&info.mlapp));
+    fields.insert("mlx".to_string(), what_text_cell_value(&info.mlx));
+    fields.insert("mat".to_string(), what_text_cell_value(&info.mat));
+    fields.insert("mex".to_string(), what_text_cell_value(&info.mex));
+    fields.insert("mdl".to_string(), what_text_cell_value(&info.mdl));
+    fields.insert("slx".to_string(), what_text_cell_value(&info.slx));
+    fields.insert("sfx".to_string(), what_text_cell_value(&info.sfx));
+    fields.insert("p".to_string(), what_text_cell_value(&info.p));
+    fields.insert("classes".to_string(), what_text_cell_value(&info.classes));
+    fields.insert("packages".to_string(), what_text_cell_value(&info.packages));
+    Value::Struct(StructValue::with_field_order(
+        fields,
+        vec![
+            "path".to_string(),
+            "m".to_string(),
+            "mlapp".to_string(),
+            "mlx".to_string(),
+            "mat".to_string(),
+            "mex".to_string(),
+            "mdl".to_string(),
+            "slx".to_string(),
+            "sfx".to_string(),
+            "p".to_string(),
+            "classes".to_string(),
+            "packages".to_string(),
+        ],
+    ))
+}
+
+fn what_text_cell_value(values: &[String]) -> Value {
+    if values.is_empty() {
+        Value::Cell(CellValue::new(0, 0, Vec::new()).expect("empty what cell"))
+    } else {
+        Value::Cell(
+            CellValue::new(
+                values.len(),
+                1,
+                values
+                    .iter()
+                    .cloned()
+                    .map(Value::CharArray)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("what text cell"),
+        )
+    }
+}
+
+fn render_what_infos(infos: &[WhatFolderInfo]) -> String {
+    if infos.is_empty() {
+        return "No MATLAB files found.\n".to_string();
+    }
+
+    let mut out = String::new();
+    for (index, info) in infos.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        render_what_section(
+            &mut out,
+            "MATLAB Code files",
+            &info.path,
+            &strip_extensions(&info.m),
+        );
+        render_what_section(&mut out, "MATLAB App files", &info.path, &info.mlapp);
+        render_what_section(&mut out, "MATLAB Live Script files", &info.path, &info.mlx);
+        render_what_section(&mut out, "MAT-files", &info.path, &info.mat);
+        render_what_section(&mut out, "MEX-files", &info.path, &info.mex);
+        render_what_section(&mut out, "MDL files", &info.path, &info.mdl);
+        render_what_section(&mut out, "SLX files", &info.path, &info.slx);
+        render_what_section(&mut out, "SFX files", &info.path, &info.sfx);
+        render_what_section(&mut out, "P-code files", &info.path, &strip_extensions(&info.p));
+        render_what_section(&mut out, "Classes", &info.path, &info.classes);
+        render_what_section(&mut out, "Namespaces", &info.path, &info.packages);
+        if out.is_empty() || out.ends_with("\n\n") {
+            out.push_str(&format!("No MATLAB files found in folder {}\n", info.path.display()));
+        }
+    }
+    out
+}
+
+fn render_what_section(out: &mut String, label: &str, path: &Path, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    out.push_str(&format!("{label} in folder {}\n", path.display()));
+    out.push_str("  ");
+    out.push_str(&values.join("  "));
+    out.push('\n');
+}
+
+fn strip_extensions(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| {
+            Path::new(value)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or(value)
+                .to_string()
+        })
+        .collect()
+}
+
+fn collect_within_file_matches_for_name(path: &Path, name: &str) -> Vec<String> {
+    collect_within_file_matches(path)
+        .into_iter()
+        .filter(|candidate| candidate.base_name.eq_ignore_ascii_case(name))
+        .map(|candidate| candidate.marker)
+        .collect()
+}
+
+fn collect_within_file_matches(path: &Path) -> Vec<WhichWithinFileMatch> {
+    let Ok(source) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+    if parsed.has_errors() {
+        return Vec::new();
+    }
+    let Some(unit) = parsed.unit else {
+        return Vec::new();
+    };
+    if unit.kind == CompilationUnitKind::ClassFile {
+        return Vec::new();
+    }
+    let analysis = analyze_compilation_unit_with_context(
+        &unit,
+        &ResolverContext::from_source_file(path.to_path_buf()),
+    );
+    if analysis.has_errors() {
+        return Vec::new();
+    }
+    let hir = lower_to_hir(&unit, &analysis);
+    let primary_name = if unit.kind == CompilationUnitKind::FunctionFile {
+        hir.items.iter().find_map(|item| match item {
+            HirItem::Function(function) => Some(base_scoped_function_name(&function.name)),
+            HirItem::Statement(_) => None,
+        })
+    } else {
+        None
+    };
+    let mut matches = Vec::new();
+    for function in hir.items.iter().filter_map(|item| match item {
+        HirItem::Function(function) => Some(function),
+        HirItem::Statement(_) => None,
+    }) {
+        let base_name = base_scoped_function_name(&function.name);
+        if primary_name
+            .as_ref()
+            .is_some_and(|primary| primary.eq_ignore_ascii_case(&base_name))
+        {
+            collect_nested_within_file_matches(
+                path,
+                &function.local_functions,
+                vec![base_name],
+                &mut matches,
+            );
+            continue;
+        }
+
+        let chain = vec![base_name.clone()];
+        matches.push(WhichWithinFileMatch {
+            base_name,
+            marker: within_file_marker(path, &chain),
+        });
+        collect_nested_within_file_matches(path, &function.local_functions, chain, &mut matches);
+    }
+    matches
+}
+
+fn collect_nested_within_file_matches(
+    path: &Path,
+    local_functions: &[HirFunction],
+    parent_chain: Vec<String>,
+    matches: &mut Vec<WhichWithinFileMatch>,
+) {
+    for local in local_functions {
+        let base_name = base_scoped_function_name(&local.name);
+        let mut chain = parent_chain.clone();
+        chain.push(base_name.clone());
+        matches.push(WhichWithinFileMatch {
+            base_name,
+            marker: within_file_marker(path, &chain),
+        });
+        collect_nested_within_file_matches(path, &local.local_functions, chain, matches);
+    }
+}
+
+fn within_file_marker(path: &Path, chain: &[String]) -> String {
+    format!("{}>{}", path.display(), chain.join(">"))
+}
+
+fn resolve_which_context_path(
+    resolution_source_path: Option<&Path>,
+    context_name: &str,
+) -> Option<PathBuf> {
+    let trimmed = context_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let direct = PathBuf::from(trimmed);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if direct.extension().is_none() {
+        let direct_m = direct.with_extension("m");
+        if direct_m.is_file() {
+            return Some(direct_m);
+        }
+    }
+
+    if let Some(source_path) = resolution_source_path {
+        if let Some(source_dir) = source_path.parent() {
+            let sibling = source_dir.join(trimmed);
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+            if sibling.extension().is_none() {
+                let sibling_m = sibling.with_extension("m");
+                if sibling_m.is_file() {
+                    return Some(sibling_m);
+                }
+            }
+        }
+    }
+
+    let context = resolution_context_with_env(resolution_source_path);
+    match resolve_callable(trimmed, &context)? {
+        ResolvedCallable::Function(function) => Some(function.path),
+        ResolvedCallable::Class(class_def) => Some(class_def.path),
+    }
+}
+
+fn existing_lookup_path(name: &str, context: &ResolverContext, want_dir: bool) -> Option<PathBuf> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut candidates = BTreeSet::new();
+    candidates.insert(PathBuf::from(trimmed));
+    if let Some(source_dir) = context.source_dir() {
+        candidates.insert(source_dir.join(trimmed));
+    }
+    for root in context.effective_search_roots() {
+        candidates.insert(root.join(trimmed));
+    }
+
+    candidates.into_iter().find(|candidate| {
+        if want_dir {
+            candidate.is_dir()
+        } else {
+            candidate.is_file()
+        }
+    })
+}
+
+fn rendered_resolved_callable_path(resolved: &ResolvedCallable) -> String {
+    match resolved {
+        ResolvedCallable::Function(function) => function.path.display().to_string(),
+        ResolvedCallable::Class(class_def) => class_def.path.display().to_string(),
+    }
+}
+
+fn push_unique_which_match(matches: &mut Vec<String>, seen: &mut BTreeSet<String>, value: String) {
+    if seen.insert(value.clone()) {
+        matches.push(value);
+    }
+}
+
+fn which_output_value(matches: Vec<String>, mode: &WhichMode) -> Result<Value, RuntimeError> {
+    match mode {
+        WhichMode::All => {
+            if matches.is_empty() {
+                Ok(Value::Cell(CellValue::new(0, 0, Vec::new()).expect("empty which cell")))
+            } else {
+                Ok(Value::Cell(
+                    CellValue::new(
+                        matches.len(),
+                        1,
+                        matches.into_iter().map(Value::CharArray).collect(),
+                    )
+                    .expect("which all cell"),
+                ))
+            }
+        }
+        WhichMode::First | WhichMode::In(_) => Ok(Value::CharArray(
+            matches.into_iter().next().unwrap_or_default(),
+        )),
+    }
+}
+
+fn bundled_module_id_for_source_path(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    path: &Path,
+) -> Option<String> {
+    let state = shared_state.borrow();
+    state
+        .bundled_module_source_paths
+        .iter()
+        .find_map(|(module_id, source_path)| {
+            (PathBuf::from(source_path) == path).then(|| module_id.clone())
+        })
+}
+
+fn empty_functions_workspace_value() -> Value {
+    Value::Cell(CellValue::new(0, 0, Vec::new()).expect("empty functions workspace"))
+}
+
+fn functions_workspace_value_from_pairs(pairs: Vec<(String, Value)>) -> Value {
+    if pairs.is_empty() {
+        return empty_functions_workspace_value();
+    }
+    let field_order = pairs.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
+    let fields = pairs.into_iter().collect::<BTreeMap<_, _>>();
+    Value::Cell(
+        CellValue::new(
+            1,
+            1,
+            vec![Value::Struct(StructValue::with_field_order(fields, field_order))],
+        )
+        .expect("functions workspace cell"),
+    )
+}
+
+fn functions_info_struct_value(
+    function_name: String,
+    type_name: &str,
+    file: Option<String>,
+    extras: Vec<(String, Value)>,
+) -> Value {
+    let mut field_order = vec![
+        "function".to_string(),
+        "type".to_string(),
+        "file".to_string(),
+    ];
+    let mut fields = BTreeMap::from([
+        ("function".to_string(), Value::CharArray(function_name)),
+        ("type".to_string(), Value::CharArray(type_name.to_string())),
+        ("file".to_string(), Value::CharArray(file.unwrap_or_default())),
+    ]);
+    for (name, value) in extras {
+        if !field_order.iter().any(|existing| existing == &name) {
+            field_order.push(name.clone());
+        }
+        fields.insert(name, value);
+    }
+    Value::Struct(StructValue::with_field_order(fields, field_order))
+}
+
+fn functions_parentage_value(function_name: &str, file: Option<&str>) -> Value {
+    let parent = file
+        .and_then(|path| Path::new(path).file_stem())
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("__base_function")
+        .to_string();
+    Value::Cell(
+        CellValue::new(
+            1,
+            2,
+            vec![Value::CharArray(function_name.to_string()), Value::CharArray(parent)],
+        )
+        .expect("functions parentage cell"),
+    )
+}
+
+fn functions_main_file_stem(file: Option<&str>) -> String {
+    file.and_then(|path| Path::new(path).file_stem())
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("__base_function")
+        .to_string()
+}
+
+fn nested_functions_display_name(function_name: &str, file: Option<&str>) -> String {
+    format!("{}/{}", functions_main_file_stem(file), function_name)
+}
+
+fn base_scoped_function_name(name: &str) -> String {
+    name.split("#s").next().unwrap_or(name).to_string()
+}
+
+fn scoped_function_handle_name(path: &Path, function_name: &str) -> String {
+    format!("<scoped:{}|{}>", path.display(), function_name)
+}
+
+fn parse_scoped_function_handle_name(name: &str) -> Option<(PathBuf, String)> {
+    let body = name.strip_prefix("<scoped:")?.strip_suffix('>')?;
+    let (path, function_name) = body.rsplit_once('|')?;
+    Some((PathBuf::from(path), function_name.to_string()))
+}
+
+fn resolved_path_functions_file(path: &Path, display_name: &str) -> Option<String> {
+    if resolved_path_static_method_name(path, display_name).is_some()
+        || path.parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('@'))
+        || fs::read_to_string(path)
+            .ok()
+            .is_some_and(|source| source.contains("classdef"))
+    {
+        None
+    } else {
+        Some(path.display().to_string())
+    }
+}
+
+fn resolved_str2func_handle_value(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let name = normalize_str2func_name_arg(args)?;
+    if let Some(source_path) = resolution_source_path {
+        let context =
+            ResolverContext::from_source_file(source_path.to_path_buf()).with_env_search_roots("MATC_PATH");
+        if let Some(resolved) = resolve_callable(&name, &context) {
+            let path = match resolved {
+                ResolvedCallable::Function(resolved) => resolved.path,
+                ResolvedCallable::Class(resolved) => resolved.path,
+            };
+            let target = bundled_module_id_for_source_path(shared_state, &path)
+                .map(FunctionHandleTarget::BundleModule)
+                .unwrap_or(FunctionHandleTarget::ResolvedPath(path));
+            return Ok(Value::FunctionHandle(FunctionHandleValue {
+                display_name: name,
+                target,
+            }));
+        }
+    }
+
+    let (bundled_modules, bundled_modules_by_id) = bundled_module_registries(shared_state);
+    if let Some(target) = bytecode::resolve_bundle_function_handle_target_from_registry(
+        &name,
+        &bundled_modules,
+        &bundled_modules_by_id,
+    ) {
+        return Ok(Value::FunctionHandle(FunctionHandleValue {
+            display_name: name,
+            target,
+        }));
+    }
+
+    Ok(Value::FunctionHandle(FunctionHandleValue {
+        display_name: name.clone(),
+        target: FunctionHandleTarget::Named(name),
+    }))
+}
+
+fn capture_cell_value(cell: &Cell) -> Value {
+    cell.borrow().clone().unwrap_or_else(empty_matrix_value)
 }
 
 #[derive(Debug, Clone)]
@@ -1755,7 +3590,7 @@ fn invoke_save_builtin_outputs(
                 .drain(..)
                 .map(|module| (module.module_id.clone(), module))
                 .collect::<BTreeMap<_, _>>();
-            for module in snapshot_bundle_modules(shared_state) {
+            for module in snapshot_bundle_modules_for_workspace(shared_state, &existing) {
                 merged_bundle_modules.insert(module.module_id.clone(), module);
             }
             (
@@ -1769,7 +3604,7 @@ fn invoke_save_builtin_outputs(
         let bundle_modules = if workspace_snapshot_extension(&spec.path)
             && workspace_contains_bundle_backed_modules(shared_state, &selected)
         {
-            snapshot_bundle_modules(shared_state)
+            snapshot_bundle_modules_for_workspace(shared_state, &selected)
         } else {
             Vec::new()
         };
@@ -1882,6 +3717,133 @@ fn invoke_toc_builtin_outputs(
         _ => Err(RuntimeError::Unsupported(
             "toc currently supports at most one output".to_string(),
         )),
+    }
+}
+
+fn invoke_str2num_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 2 {
+        return Err(RuntimeError::Unsupported(
+            "str2num currently supports one or two outputs".to_string(),
+        ));
+    }
+
+    let [text] = args else {
+        return Err(RuntimeError::Unsupported(
+            "str2num currently supports exactly one argument".to_string(),
+        ));
+    };
+    let text = text_value(text)?;
+
+    match evaluate_str2num_text(text) {
+        Ok(value) => {
+            let mut outputs = vec![value];
+            if output_arity == 2 {
+                outputs.push(Value::Logical(true));
+            }
+            Ok(outputs)
+        }
+        Err(_) => {
+            let mut outputs = vec![empty_matrix_value()];
+            if output_arity == 2 {
+                outputs.push(Value::Logical(false));
+            }
+            Ok(outputs)
+        }
+    }
+}
+
+fn evaluate_str2num_text(text: &str) -> Result<Value, RuntimeError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(RuntimeError::Unsupported(
+            "str2num currently expects nonempty text".to_string(),
+        ));
+    }
+
+    if str2num_prefers_bracket_wrapper(trimmed) {
+        let wrapped_source = format!("__str2num_result__ = [{trimmed}];\n");
+        let value = execute_str2num_source(&wrapped_source)?;
+        return normalize_str2num_value(value);
+    }
+
+    let direct_source = format!("__str2num_result__ = {trimmed};\n");
+    if let Ok(value) = execute_str2num_source(&direct_source) {
+        return normalize_str2num_value(value);
+    }
+
+    let wrapped_source = format!("__str2num_result__ = [{trimmed}];\n");
+    let value = execute_str2num_source(&wrapped_source)?;
+    normalize_str2num_value(value)
+}
+
+fn str2num_prefers_bracket_wrapper(text: &str) -> bool {
+    if text.starts_with('[') {
+        return false;
+    }
+    text.contains(';')
+        || text.contains(',')
+        || text.split_whitespace().nth(1).is_some()
+}
+
+fn execute_str2num_source(source: &str) -> Result<Value, RuntimeError> {
+    let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
+    if parsed.has_errors() {
+        return Err(RuntimeError::Unsupported(format!(
+            "failed to parse str2num input: {}",
+            format_frontend_diagnostics(&parsed.diagnostics)
+        )));
+    }
+    let unit = parsed.unit.ok_or_else(|| {
+        RuntimeError::Unsupported("parser produced no compilation unit for str2num".to_string())
+    })?;
+    let analysis = analyze_compilation_unit_with_context(
+        &unit,
+        &ResolverContext::from_source_file(PathBuf::from("inline_str2num.m")),
+    );
+    if analysis.has_errors() {
+        return Err(RuntimeError::Unsupported(format!(
+            "failed to analyze str2num input: {}",
+            format_semantic_diagnostics(&analysis.diagnostics)
+        )));
+    }
+    let hir = lower_to_hir(&unit, &analysis);
+    let result = execute_script(&hir)?;
+    result
+        .workspace
+        .get("__str2num_result__")
+        .cloned()
+        .ok_or_else(|| RuntimeError::Unsupported("str2num input produced no result".to_string()))
+}
+
+fn normalize_str2num_value(value: Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Scalar(_) | Value::Complex(_) => Ok(value),
+        Value::Logical(_) => Ok(invoke_stdlib_builtin_outputs("double", &[value], 1)?
+            .into_iter()
+            .next()
+            .unwrap_or_else(empty_matrix_value)),
+        Value::Matrix(matrix) => match matrix.storage_class() {
+            ArrayStorageClass::Numeric | ArrayStorageClass::Complex => Ok(Value::Matrix(matrix)),
+            ArrayStorageClass::Logical => Ok(invoke_stdlib_builtin_outputs(
+                "double",
+                &[Value::Matrix(matrix)],
+                1,
+            )?
+            .into_iter()
+            .next()
+            .unwrap_or_else(empty_matrix_value)),
+            _ => Err(RuntimeError::TypeError(
+                "str2num currently expects the parsed expression to evaluate to numeric or logical output"
+                    .to_string(),
+            )),
+        },
+        other => Err(RuntimeError::TypeError(format!(
+            "str2num currently expects the parsed expression to evaluate to numeric output, found {}",
+            other.kind_name()
+        ))),
     }
 }
 
@@ -4444,8 +6406,10 @@ fn runtime_error_stack_value(stack: &[RuntimeStackFrame]) -> Value {
 struct Interpreter<'a> {
     module: &'a HirModule,
     module_identity: String,
+    resolution_source_path: Option<PathBuf>,
     module_functions: BTreeMap<String, &'a HirFunction>,
     anonymous_functions: HashMap<String, AnonymousClosure<'a>>,
+    named_function_handles: HashMap<String, NamedFunctionClosure<'a>>,
     shared_state: Rc<RefCell<SharedRuntimeState>>,
     call_stack: Vec<RuntimeStackFrame>,
     next_anonymous_id: u32,
@@ -4475,12 +6439,16 @@ impl<'a> Interpreter<'a> {
                 HirItem::Statement(_) => None,
             })
             .collect();
+        let resolution_source_path = source_path_from_module_identity(&module_identity);
+        record_loaded_hir_module(&shared_state, module, resolution_source_path.as_deref());
 
         Self {
             module,
+            resolution_source_path,
             module_identity,
             module_functions,
             anonymous_functions: HashMap::new(),
+            named_function_handles: HashMap::new(),
             shared_state,
             call_stack,
             next_anonymous_id: 0,
@@ -4493,6 +6461,468 @@ impl<'a> Interpreter<'a> {
             name: name.into(),
             line: 0,
         }
+    }
+
+    fn functions_info_value(
+        &self,
+        frame: Option<&Frame<'a>>,
+        value: &Value,
+    ) -> Result<Value, RuntimeError> {
+        let Value::FunctionHandle(handle) = value else {
+            return Err(RuntimeError::TypeError(format!(
+                "functions currently expects a function handle input, found {}",
+                value.kind_name()
+            )));
+        };
+
+        let (function_name, type_name, file, extras) = match &handle.target {
+            FunctionHandleTarget::Named(name) => {
+                if let Some(closure) = self.anonymous_functions.get(name) {
+                    (
+                        handle.display_name.clone(),
+                        "anonymous",
+                        self.resolution_source_path
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
+                        vec![
+                            (
+                                "workspace".to_string(),
+                                functions_workspace_value_from_pairs(
+                                    closure
+                                        .function
+                                        .captures
+                                        .iter()
+                                        .filter_map(|capture| {
+                                            closure
+                                                .captured_cells
+                                                .get(&capture.binding_id)
+                                                .map(|cell| {
+                                                    (
+                                                        capture.name.clone(),
+                                                        capture_cell_value(cell),
+                                                    )
+                                                })
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                            (
+                                "within_file_path".to_string(),
+                                Value::CharArray("__base_function".to_string()),
+                            ),
+                        ],
+                    )
+                } else if let Some(closure) = self.named_function_handles.get(name) {
+                    let file = self
+                        .resolution_source_path
+                        .as_ref()
+                        .map(|path| path.display().to_string());
+                    if self.module_functions.contains_key(&closure.function.name) {
+                        (
+                            handle.display_name.clone(),
+                            "scopedfunction",
+                            file.clone(),
+                            vec![(
+                                "parentage".to_string(),
+                                functions_parentage_value(&handle.display_name, file.as_deref()),
+                            )],
+                        )
+                    } else {
+                        (
+                            nested_functions_display_name(&handle.display_name, file.as_deref()),
+                            "nested",
+                            file.clone(),
+                            vec![(
+                                "workspace".to_string(),
+                                functions_workspace_value_from_pairs(
+                                    closure
+                                        .function
+                                        .captures
+                                        .iter()
+                                        .filter_map(|capture| {
+                                            closure
+                                                .captured_cells
+                                                .get(&capture.binding_id)
+                                                .map(|cell| {
+                                                    (
+                                                        capture.name.clone(),
+                                                        capture_cell_value(cell),
+                                                    )
+                                                })
+                                        })
+                                        .collect(),
+                                ),
+                            )],
+                        )
+                    }
+                } else if let Some(function) =
+                    frame.and_then(|frame| frame.visible_functions.get(name).copied())
+                {
+                    let file = self
+                        .resolution_source_path
+                        .as_ref()
+                        .map(|path| path.display().to_string());
+                    if self.module_functions.contains_key(name) {
+                        (
+                            handle.display_name.clone(),
+                            "scopedfunction",
+                            file.clone(),
+                            vec![(
+                                "parentage".to_string(),
+                                functions_parentage_value(&handle.display_name, file.as_deref()),
+                            )],
+                        )
+                    } else {
+                        (
+                            nested_functions_display_name(&handle.display_name, file.as_deref()),
+                            "nested",
+                            file.clone(),
+                            vec![(
+                                "workspace".to_string(),
+                                functions_workspace_value_from_pairs(
+                                    function
+                                        .captures
+                                        .iter()
+                                        .filter_map(|capture| {
+                                            frame
+                                                .and_then(|frame| frame.cell(capture.binding_id))
+                                                .map(|cell| {
+                                                    (
+                                                        capture.name.clone(),
+                                                        capture_cell_value(&cell),
+                                                    )
+                                                })
+                                        })
+                                        .collect(),
+                                ),
+                            )],
+                        )
+                    }
+                } else if self.module_functions.contains_key(name) {
+                    let file = self
+                        .resolution_source_path
+                        .as_ref()
+                        .map(|path| path.display().to_string());
+                    (
+                        handle.display_name.clone(),
+                        "scopedfunction",
+                        file.clone(),
+                        vec![(
+                            "parentage".to_string(),
+                            functions_parentage_value(&handle.display_name, file.as_deref()),
+                        )],
+                    )
+                } else if let Some((path, function_name)) = parse_scoped_function_handle_name(name) {
+                    let file = path.display().to_string();
+                    (
+                        function_name.clone(),
+                        "scopedfunction",
+                        Some(file.clone()),
+                        vec![(
+                            "parentage".to_string(),
+                            functions_parentage_value(&function_name, Some(&file)),
+                        )],
+                    )
+                } else {
+                    (handle.display_name.clone(), "simple", None, Vec::new())
+                }
+            }
+            FunctionHandleTarget::ResolvedPath(path) => (
+                handle.display_name.clone(),
+                "simple",
+                resolved_path_functions_file(path, &handle.display_name),
+                Vec::new(),
+            ),
+            FunctionHandleTarget::BundleModule(_) => (
+                handle.display_name.clone(),
+                "simple",
+                None,
+                Vec::new(),
+            ),
+            FunctionHandleTarget::BoundMethod { receiver: _, .. } => (
+                handle.display_name.clone(),
+                "simple",
+                None,
+                Vec::new(),
+            ),
+        };
+        Ok(functions_info_struct_value(
+            function_name,
+            type_name,
+            file,
+            extras,
+        ))
+    }
+
+    fn invoke_functions_builtin_outputs(
+        &self,
+        frame: Option<&Frame<'a>>,
+        args: &[Value],
+        output_arity: usize,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if output_arity > 1 {
+            return Err(RuntimeError::Unsupported(
+                "functions currently supports at most one output".to_string(),
+            ));
+        }
+        let [value] = args else {
+            return Err(RuntimeError::Unsupported(
+                "functions currently supports exactly one argument".to_string(),
+            ));
+        };
+        Ok(vec![self.functions_info_value(frame, value)?])
+    }
+
+    fn make_named_function_handle(
+        &mut self,
+        frame: &Frame<'a>,
+        display_name: String,
+        function: &'a HirFunction,
+    ) -> Result<Value, RuntimeError> {
+        if self.module_functions.contains_key(&function.name) {
+            if let Some(path) = self.resolution_source_path.as_ref() {
+                let display_name = base_scoped_function_name(&display_name);
+                return Ok(Value::FunctionHandle(FunctionHandleValue {
+                    display_name: display_name.clone(),
+                    target: FunctionHandleTarget::Named(scoped_function_handle_name(
+                        path,
+                        &display_name,
+                    )),
+                }));
+            }
+        }
+        let mut captured_cells = HashMap::new();
+        for capture in &function.captures {
+            let cell = frame.cell(capture.binding_id).ok_or_else(|| {
+                RuntimeError::MissingVariable(format!(
+                    "captured binding `{}` is not available for function handle `{display_name}`",
+                    capture.name
+                ))
+            })?;
+            captured_cells.insert(capture.binding_id, cell);
+        }
+        let handle_name = format!("<handle:{}>", self.next_anonymous_id);
+        self.next_anonymous_id += 1;
+        self.named_function_handles.insert(
+            handle_name.clone(),
+            NamedFunctionClosure {
+                function,
+                captured_cells,
+            },
+        );
+        Ok(Value::FunctionHandle(FunctionHandleValue {
+            display_name,
+            target: FunctionHandleTarget::Named(handle_name),
+        }))
+    }
+
+    fn invoke_scoped_function_handle(
+        &mut self,
+        path: &Path,
+        function_name: &str,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        {
+            let state = self.shared_state.borrow();
+            if state.bundled_modules.contains_key(path) {
+                drop(state);
+                let (bundled_modules, bundled_modules_by_id) =
+                    bundled_module_registries(&self.shared_state);
+                if let Some(values) = bytecode::invoke_bundle_scoped_function_from_registry(
+                    path,
+                    function_name,
+                    args,
+                    bundled_modules,
+                    bundled_modules_by_id,
+                    Rc::clone(&self.shared_state),
+                    self.call_stack.clone(),
+                )? {
+                    return Ok(values);
+                }
+            }
+        }
+
+        let source = fs::read_to_string(path).map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "failed to read external function `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+        if parsed.has_errors() {
+            return Err(RuntimeError::Unsupported(format!(
+                "failed to parse external function `{}`: {}",
+                path.display(),
+                format_frontend_diagnostics(&parsed.diagnostics)
+            )));
+        }
+
+        let unit = parsed.unit.ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "parser produced no compilation unit for external function `{}`",
+                path.display()
+            ))
+        })?;
+        let context =
+            ResolverContext::from_source_file(path.to_path_buf()).with_env_search_roots("MATC_PATH");
+        let analysis = analyze_compilation_unit_with_context(&unit, &context);
+        if analysis.has_errors() {
+            return Err(RuntimeError::Unsupported(format!(
+                "failed to analyze external function `{}`: {}",
+                path.display(),
+                format_semantic_diagnostics(&analysis.diagnostics)
+            )));
+        }
+
+        let hir = lower_to_hir(&unit, &analysis);
+        if unit.kind == CompilationUnitKind::ClassFile {
+            return self.invoke_static_class_method_from_path(path, function_name, args);
+        }
+        let function = hir
+            .items
+            .iter()
+            .find_map(|item| match item {
+                HirItem::Function(function)
+                    if function.name == function_name
+                        || base_scoped_function_name(&function.name) == function_name =>
+                {
+                    Some(function)
+                }
+                HirItem::Statement(_) | HirItem::Function(_) => None,
+            })
+            .ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "function `{function_name}` is not available in `{}`",
+                path.display()
+            ))
+        })?;
+        let mut interpreter = Interpreter::with_shared_state(
+            &hir,
+            "<root>".to_string(),
+            Rc::clone(&self.shared_state),
+            self.call_stack.clone(),
+        );
+        interpreter.resolution_source_path = Some(path.to_path_buf());
+        interpreter.invoke_function(function, args, None)
+    }
+
+    fn invoke_named_function_closure(
+        &mut self,
+        closure: NamedFunctionClosure<'a>,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let stack_frame = self.make_stack_frame(closure.function.name.clone());
+        push_class_access_context(closure.function.owner_class_name.clone());
+        let result = self.with_stack_frame(stack_frame, |this| {
+            if args.len() != closure.function.inputs.len() {
+                return Err(RuntimeError::Unsupported(format!(
+                    "function `{}` expects {} input(s), got {}",
+                    closure.function.name,
+                    closure.function.inputs.len(),
+                    args.len()
+                )));
+            }
+
+            let mut visible_functions = this.module_functions.clone();
+            for local in &closure.function.local_functions {
+                visible_functions.insert(local.name.clone(), local);
+            }
+
+            let mut frame = Frame::new(visible_functions);
+            for capture in &closure.function.captures {
+                let cell = closure.captured_cells.get(&capture.binding_id).cloned().ok_or_else(|| {
+                    RuntimeError::MissingVariable(format!(
+                        "captured binding `{}` is not available when calling `{}`",
+                        capture.name, closure.function.name
+                    ))
+                })?;
+                frame.bind_existing(capture.binding_id, &capture.name, cell);
+            }
+
+            for (binding, value) in closure.function.inputs.iter().zip(args.iter()) {
+                frame.assign_binding(binding, value.clone())?;
+            }
+            if let Some(ans) = &closure.function.implicit_ans {
+                frame.declare_binding(ans)?;
+            }
+            for output in &closure.function.outputs {
+                frame.declare_binding(output)?;
+            }
+
+            let _ = this.execute_block(&mut frame, &closure.function.body)?;
+
+            closure
+                .function
+                .outputs
+                .iter()
+                .map(|binding| frame.read_binding(binding))
+                .collect()
+        });
+        pop_class_access_context();
+        result
+    }
+
+    fn invoke_localfunctions_builtin_outputs(
+        &mut self,
+        frame: &Frame<'a>,
+        args: &[Value],
+        output_arity: usize,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if output_arity > 1 {
+            return Err(RuntimeError::Unsupported(
+                "localfunctions currently supports at most one output".to_string(),
+            ));
+        }
+        if !args.is_empty() {
+            return Err(RuntimeError::Unsupported(
+                "localfunctions currently supports no input arguments".to_string(),
+            ));
+        }
+        if self
+            .call_stack
+            .last()
+            .is_some_and(|frame| frame.name == "@anonymous")
+        {
+            return Ok(vec![Value::Cell(
+                CellValue::new(0, 0, Vec::new()).expect("empty localfunctions cell"),
+            )]);
+        }
+
+        let primary_name = self.module.items.iter().find_map(|item| match item {
+            HirItem::Function(function) => Some(function.name.clone()),
+            HirItem::Statement(_) => None,
+        });
+        let functions = self
+            .module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                HirItem::Function(function) => Some(function),
+                HirItem::Statement(_) => None,
+            })
+            .filter(|function| {
+                self.module.kind != CompilationUnitKind::FunctionFile
+                    || Some(function.name.clone()) != primary_name
+            })
+            .map(|function| {
+                let display_name = base_scoped_function_name(&function.name);
+                if let Some(path) = self.resolution_source_path.as_ref() {
+                    Ok(Value::FunctionHandle(FunctionHandleValue {
+                        display_name: display_name.clone(),
+                        target: FunctionHandleTarget::Named(scoped_function_handle_name(
+                            path,
+                            &display_name,
+                        )),
+                    }))
+                } else {
+                    self.make_named_function_handle(frame, display_name, function)
+                }
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+
+        Ok(vec![Value::Cell(
+            CellValue::new(functions.len(), 1, functions).expect("localfunctions cell"),
+        )])
     }
 
     fn with_stack_frame<T>(
@@ -5360,13 +7790,45 @@ impl<'a> Interpreter<'a> {
         }
         if matches!(
             reference.name.as_str(),
-            "clear" | "clearvars" | "save" | "load"
+            "clear" | "clearvars" | "save" | "load" | "who" | "whos" | "tic" | "toc"
+                | "format"
         ) {
             let shared_state = Rc::clone(&self.shared_state);
             self.invoke_workspace_builtin_outputs(
                 frame,
                 &shared_state,
                 &reference.name,
+                &evaluated_args,
+                0,
+            )
+            .map(|_| ())?;
+            return Ok(());
+        }
+        if reference.name == "what" {
+            invoke_what_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &evaluated_args,
+                0,
+            )
+            .map(|_| ())?;
+            return Ok(());
+        }
+        if reference.name == "help" {
+            invoke_help_builtin_outputs(
+                Some(frame),
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &evaluated_args,
+                0,
+            )
+            .map(|_| ())?;
+            return Ok(());
+        }
+        if reference.name == "lookfor" {
+            invoke_lookfor_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
                 &evaluated_args,
                 0,
             )
@@ -7167,6 +9629,13 @@ impl<'a> Interpreter<'a> {
                             }
                         }
                     }
+                    if let Some(function) = frame.visible_functions.get(&reference.name).copied() {
+                        return self.make_named_function_handle(
+                            frame,
+                            reference.name.clone(),
+                            function,
+                        );
+                    }
                     Ok(Value::FunctionHandle(FunctionHandleValue {
                         display_name: reference.name.clone(),
                         target: match &reference.final_resolution {
@@ -8913,6 +11382,64 @@ impl<'a> Interpreter<'a> {
                         self.call_function_value_outputs(frame, callback, call_args, Some(requested))
                     });
                 }
+                if reference.name == "help" {
+                    return invoke_help_builtin_outputs(
+                        Some(frame),
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        output_arity,
+                    );
+                }
+                if reference.name == "lookfor" {
+                    return invoke_lookfor_builtin_outputs(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        output_arity,
+                    );
+                }
+                if reference.name == "what" {
+                    return invoke_what_builtin_outputs(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        output_arity,
+                    );
+                }
+                if reference.name == "exist" {
+                    let (item, search_type) = parse_exist_args(args)?;
+                    return Ok(vec![exist_value_result(
+                        Some(frame),
+                        None,
+                        self.resolution_source_path.as_deref(),
+                        &item,
+                        search_type,
+                    )?]);
+                }
+                if reference.name == "which" {
+                    let (item, mode) = parse_which_args(args)?;
+                    return Ok(vec![which_value_result(
+                        Some(frame),
+                        None,
+                        self.resolution_source_path.as_deref(),
+                        &item,
+                        mode,
+                    )?]);
+                }
+                if reference.name == "localfunctions" {
+                    return self.invoke_localfunctions_builtin_outputs(frame, args, output_arity);
+                }
+                if reference.name == "functions" {
+                    return self.invoke_functions_builtin_outputs(Some(frame), args, output_arity);
+                }
+                if reference.name == "str2func" {
+                    return Ok(vec![resolved_str2func_handle_value(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                    )?]);
+                }
                 if reference.name == "cellfun" {
                     return execute_cellfun_builtin_outputs(args, output_arity, |callback, call_args, requested| {
                         self.call_function_value_outputs(frame, callback, call_args, Some(requested))
@@ -8925,7 +11452,8 @@ impl<'a> Interpreter<'a> {
                 }
                 if matches!(
                     reference.name.as_str(),
-                    "clear" | "clearvars" | "save" | "load"
+                    "clear" | "clearvars" | "save" | "load" | "who" | "whos" | "tic"
+                        | "toc" | "format"
                 ) {
                     let shared_state = Rc::clone(&self.shared_state);
                     return self.invoke_workspace_builtin_outputs(
@@ -9039,6 +11567,11 @@ impl<'a> Interpreter<'a> {
             "clearvars" => invoke_clearvars_builtin_outputs(frame, args, output_arity),
             "save" => invoke_save_builtin_outputs(frame, shared_state, args, output_arity),
             "load" => invoke_load_builtin_outputs(frame, shared_state, args, output_arity),
+            "who" => invoke_who_builtin_outputs(Some(frame), shared_state, args, output_arity),
+            "whos" => invoke_whos_builtin_outputs(Some(frame), shared_state, args, output_arity),
+            "tic" => invoke_tic_builtin_outputs(shared_state, args, output_arity),
+            "toc" => invoke_toc_builtin_outputs(shared_state, args, output_arity),
+            "format" => invoke_format_builtin_outputs(shared_state, args, output_arity),
             _ => Err(RuntimeError::Unsupported(format!(
                 "workspace builtin `{name}` is not implemented in the current interpreter"
             ))),
@@ -9561,6 +12094,11 @@ impl<'a> Interpreter<'a> {
                 FunctionHandleTarget::Named(name) => {
                     if let Some(closure) = self.anonymous_functions.get(name).cloned() {
                         Ok(vec![self.invoke_anonymous(closure, args)?])
+                    } else if let Some(closure) = self.named_function_handles.get(name).cloned() {
+                        self.invoke_named_function_closure(closure, args)
+                    } else if let Some((path, function_name)) = parse_scoped_function_handle_name(name)
+                    {
+                        self.invoke_scoped_function_handle(&path, &function_name, args)
                     } else if let Some(function) = frame.visible_functions.get(name).copied() {
                         self.invoke_function(function, args, Some(frame))
                     } else {
@@ -9584,6 +12122,72 @@ impl<'a> Interpreter<'a> {
                                     )
                                 },
                             );
+                        }
+                        if name == "help" {
+                            return invoke_help_builtin_outputs(
+                                Some(frame),
+                                &self.shared_state,
+                                self.resolution_source_path.as_deref(),
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "lookfor" {
+                            return invoke_lookfor_builtin_outputs(
+                                &self.shared_state,
+                                self.resolution_source_path.as_deref(),
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "what" {
+                            return invoke_what_builtin_outputs(
+                                &self.shared_state,
+                                self.resolution_source_path.as_deref(),
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "exist" {
+                            let (item, search_type) = parse_exist_args(args)?;
+                            return Ok(vec![exist_value_result(
+                                Some(frame),
+                                None,
+                                self.resolution_source_path.as_deref(),
+                                &item,
+                                search_type,
+                            )?]);
+                        }
+                        if name == "which" {
+                            let (item, mode) = parse_which_args(args)?;
+                            return Ok(vec![which_value_result(
+                                Some(frame),
+                                None,
+                                self.resolution_source_path.as_deref(),
+                                &item,
+                                mode,
+                            )?]);
+                        }
+                        if name == "localfunctions" {
+                            return self.invoke_localfunctions_builtin_outputs(
+                                frame,
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "functions" {
+                            return self.invoke_functions_builtin_outputs(
+                                Some(frame),
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "str2func" {
+                            return Ok(vec![resolved_str2func_handle_value(
+                                &self.shared_state,
+                                self.resolution_source_path.as_deref(),
+                                args,
+                            )?]);
                         }
                         if name == "cellfun" {
                             return execute_cellfun_builtin_outputs(
@@ -9653,6 +12257,13 @@ impl<'a> Interpreter<'a> {
                                         );
                                     }
                                 }
+                                if let Some(source_path) = self.resolution_source_path.as_deref() {
+                                    if let Some(path) =
+                                        resolve_named_callable_path_from_source_path(source_path, name)
+                                    {
+                                        return self.load_and_invoke_external_function(&path, args);
+                                    }
+                                }
                                 Err(RuntimeError::Unsupported(format!(
                                     "function handle `{}` is not executable in the current interpreter",
                                     handle.display_name
@@ -9663,6 +12274,24 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 FunctionHandleTarget::ResolvedPath(path) => {
+                    {
+                        let state = self.shared_state.borrow();
+                        if state.bundled_modules.contains_key(path) {
+                            drop(state);
+                            let (bundled_modules, bundled_modules_by_id) =
+                                bundled_module_registries(&self.shared_state);
+                            if let Some(values) = bytecode::invoke_bundle_named_callable_from_registry(
+                                &handle.display_name,
+                                args,
+                                bundled_modules,
+                                bundled_modules_by_id,
+                                Rc::clone(&self.shared_state),
+                                self.call_stack.clone(),
+                            )? {
+                                return Ok(values);
+                            }
+                        }
+                    }
                     if let Some(method_name) =
                         resolved_path_static_method_name(path, &handle.display_name)
                     {
@@ -14897,33 +17526,35 @@ fn format_semantic_diagnostics(
 mod tests {
     use super::{
         consume_figure_backend_events, distributed_cell_assignment_values,
-        distributed_struct_assignment_values, execute_function_file,
+        distributed_struct_assignment_values, execute_function_file_with_identity,
         execute_function_file_bytecode_module, execute_script, execute_script_bytecode,
+        execute_script_with_identity,
         execute_script_bytecode_bundle, execute_script_bytecode_module,
         invoke_graphics_builtin_outputs, linearized_cell_elements, linearized_matrix_elements,
         logical_value, plan_dimension_selector, plan_linear_selector, render_execution_result,
         render_figure_backend_index, render_matlab_execution_result,
         render_native_figure_host_index, session_manifest_json, EvaluatedIndexArgument,
         FigureBackendState, Frame, HirItem, Interpreter, RenderedFigure, SelectorPlanMode,
-        resize_matrix_to_dims,
+        parse_scoped_function_handle_name, resize_matrix_to_dims,
     };
     use matlab_frontend::{
         ast::CompilationUnitKind,
         parser::{parse_source, ParseMode},
         source::SourceFileId,
     };
-    use matlab_interop::{read_mat_file, write_mat_file};
+    use matlab_interop::{read_mat_file, read_workspace_snapshot_with_modules, write_mat_file};
     use matlab_ir::lower_to_hir;
     use matlab_codegen::emit_bytecode;
     use matlab_optimizer::optimize_module;
     use matlab_platform::{
-        collect_bytecode_dependency_paths, read_bytecode_artifact, rewrite_bytecode_bundle_targets,
-        write_bytecode_artifact, BytecodeBundle, PackagedBytecodeModule,
+        collect_bytecode_dependency_paths, collect_bytecode_dependency_paths_with_context,
+        read_bytecode_artifact, rewrite_bytecode_bundle_targets, write_bytecode_artifact,
+        BytecodeBundle, PackagedBytecodeModule,
     };
     use matlab_resolver::ResolverContext;
     use matlab_runtime::{
         CellValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue, ObjectStorage,
-        RuntimeError, Value, Workspace,
+        RuntimeError, StructValue, Value, Workspace,
     };
     use matlab_semantics::analyze_compilation_unit_with_context;
     use std::{
@@ -14985,8 +17616,17 @@ mod tests {
         assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
         let hir = lower_to_hir(&unit, &analysis);
         match unit.kind {
-            CompilationUnitKind::Script => execute_script(&hir),
-            CompilationUnitKind::FunctionFile => execute_function_file(&hir, args),
+            CompilationUnitKind::Script => {
+                execute_script_with_identity(&hir, "<root>".to_string(), Some(path.to_path_buf()))
+            }
+            CompilationUnitKind::FunctionFile => {
+                execute_function_file_with_identity(
+                    &hir,
+                    args,
+                    "<root>".to_string(),
+                    Some(path.to_path_buf()),
+                )
+            }
             CompilationUnitKind::ClassFile => Err(RuntimeError::Unsupported(
                 "class-file tests must execute a script or function entrypoint".to_string(),
             )),
@@ -15030,6 +17670,97 @@ mod tests {
         execute_path_bytecode_result(path, args).expect("execute bytecode source path")
     }
 
+    fn workspace_struct<'a>(workspace: &'a Workspace, name: &str) -> &'a StructValue {
+        let Value::Struct(struct_value) = workspace.get(name).expect("workspace struct") else {
+            panic!("expected struct value for {name}");
+        };
+        struct_value
+    }
+
+    fn struct_text_field(struct_value: &StructValue, name: &str) -> String {
+        match struct_value.fields.get(name).expect("struct text field") {
+            Value::CharArray(text) | Value::String(text) => text.clone(),
+            other => panic!("expected text field `{name}`, found {}", other.kind_name()),
+        }
+    }
+
+    fn struct_workspace_capture(struct_value: &StructValue) -> Option<&StructValue> {
+        let Some(Value::Cell(cell)) = struct_value.fields.get("workspace") else {
+            return None;
+        };
+        if cell.element_count() == 0 {
+            return None;
+        }
+        let Value::Struct(capture) = cell.elements().first().expect("capture struct") else {
+            panic!("expected capture struct");
+        };
+        Some(capture)
+    }
+
+    fn struct_parentage_texts(struct_value: &StructValue) -> Option<Vec<String>> {
+        let Some(Value::Cell(cell)) = struct_value.fields.get("parentage") else {
+            return None;
+        };
+        Some(
+            cell.elements()
+                .iter()
+                .map(|value| match value {
+                    Value::CharArray(text) | Value::String(text) => text.clone(),
+                    other => panic!("expected text parentage element, found {}", other.kind_name()),
+                })
+                .collect(),
+        )
+    }
+
+    fn struct_within_file_path(struct_value: &StructValue) -> Option<String> {
+        match struct_value.fields.get("within_file_path") {
+            Some(Value::CharArray(text)) | Some(Value::String(text)) => Some(text.clone()),
+            None => None,
+            Some(other) => panic!(
+                "expected text within_file_path field, found {}",
+                other.kind_name()
+            ),
+        }
+    }
+
+    fn struct_has_field(struct_value: &StructValue, name: &str) -> bool {
+        struct_value.fields.contains_key(name)
+    }
+
+    fn workspace_cell<'a>(workspace: &'a Workspace, name: &str) -> &'a CellValue {
+        let Value::Cell(cell_value) = workspace.get(name).expect("workspace cell") else {
+            panic!("expected cell value for {name}");
+        };
+        cell_value
+    }
+
+    fn cell_handle_names(cell: &CellValue) -> Vec<String> {
+        cell.elements()
+            .iter()
+            .map(|value| match value {
+                Value::FunctionHandle(handle) => handle.display_name.clone(),
+                other => panic!("expected function handle cell element, found {}", other.kind_name()),
+            })
+            .collect()
+    }
+
+    fn cell_texts(cell: &CellValue) -> Vec<String> {
+        cell.elements()
+            .iter()
+            .map(|value| match value {
+                Value::CharArray(text) | Value::String(text) => text.clone(),
+                other => panic!("expected text cell element, found {}", other.kind_name()),
+            })
+            .collect()
+    }
+
+    fn struct_cell_texts(struct_value: &StructValue, name: &str) -> Vec<String> {
+        let Value::Cell(cell) = struct_value.fields.get(name).expect("struct cell field") else {
+            panic!("expected cell field `{name}`");
+        };
+        cell_texts(cell)
+    }
+
     fn compile_bytecode_module(path: &std::path::Path) -> matlab_codegen::BytecodeModule {
         let source = fs::read_to_string(path).expect("read source");
         let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
@@ -15048,7 +17779,7 @@ mod tests {
     fn compile_bytecode_bundle(path: &std::path::Path) -> BytecodeBundle {
         let root_bytecode = compile_bytecode_module(path);
         let mut seen = std::collections::BTreeSet::new();
-        let mut pending = collect_bytecode_dependency_paths(&root_bytecode);
+        let mut pending = collect_bytecode_dependency_paths_with_context(&root_bytecode, path);
         let mut compiled_dependencies = Vec::new();
         while let Some(next_path) = pending.pop() {
             let key = next_path.display().to_string();
@@ -15056,7 +17787,7 @@ mod tests {
                 continue;
             }
             let bytecode = compile_bytecode_module(&next_path);
-            for dependency in collect_bytecode_dependency_paths(&bytecode) {
+            for dependency in collect_bytecode_dependency_paths_with_context(&bytecode, &next_path) {
                 let dep_key = dependency.display().to_string();
                 if !seen.contains(&dep_key) {
                     pending.push(dependency);
@@ -15620,6 +18351,1995 @@ mod tests {
             FunctionHandleTarget::Named("sin".to_string())
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn str2func_resolves_external_functions_from_source_path_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("str2func-external-resolution");
+        let main_path = temp_dir.join("main.m");
+        let helper_path = temp_dir.join("helper.m");
+        fs::write(
+            &main_path,
+            "f = str2func('helper');\nname = func2str(f);\nout = f(5);\n",
+        )
+        .expect("write main");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
+            .expect("write helper");
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  f = @helper\n  name = 'helper'\n  out = 6\n"
+        );
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  f = @helper\n  name = 'helper'\n  out = 6\n"
+        );
+    }
+
+    #[test]
+    fn str2func_resolves_package_functions_from_source_path_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("str2func-package-resolution");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let main_path = temp_dir.join("main.m");
+        let helper_path = package_dir.join("helper.m");
+        fs::write(
+            &main_path,
+            "f = str2func('pkg.helper');\nname = func2str(f);\nout = f(5);\n",
+        )
+        .expect("write main");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 3;\nend\n")
+            .expect("write package helper");
+
+        let expected = "workspace\n  f = @pkg.helper\n  name = 'pkg.helper'\n  out = 8\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn str2func_resolves_private_functions_from_source_path_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("str2func-private-resolution");
+        let private_dir = temp_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create private dir");
+        let main_path = temp_dir.join("main.m");
+        let helper_path = private_dir.join("helper.m");
+        fs::write(
+            &main_path,
+            "f = str2func('helper');\nname = func2str(f);\nout = f(5);\n",
+        )
+        .expect("write main");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 4;\nend\n")
+            .expect("write private helper");
+
+        let expected = "workspace\n  f = @helper\n  name = 'helper'\n  out = 9\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn str2func_resolves_folder_class_constructors_from_source_path_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("str2func-folder-class-resolution");
+        let class_dir = temp_dir.join("@Counter");
+        fs::create_dir_all(&class_dir).expect("create class dir");
+        let main_path = temp_dir.join("main.m");
+        let class_path = class_dir.join("Counter.m");
+        fs::write(
+            &main_path,
+            "f = str2func('Counter');\nname = func2str(f);\nc = f(10);\nout = c.value;\n",
+        )
+        .expect("write main");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write folder class");
+
+        let expected =
+            "workspace\n  c = Counter with properties {value=10}\n  f = @Counter\n  name = 'Counter'\n  out = 10\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn str2func_resolves_package_folder_class_constructors_from_source_path_in_interpreter_and_bytecode()
+    {
+        let temp_dir = unique_temp_script_dir("str2func-package-folder-class-resolution");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        fs::create_dir_all(&class_dir).expect("create package class dir");
+        let main_path = temp_dir.join("main.m");
+        let class_path = class_dir.join("Counter.m");
+        fs::write(
+            &main_path,
+            "f = str2func('pkg.Counter');\nname = func2str(f);\nc = f(10);\nout = c.value;\n",
+        )
+        .expect("write main");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package folder class");
+
+        let expected =
+            "workspace\n  c = pkg.Counter with properties {value=10}\n  f = @pkg.Counter\n  name = 'pkg.Counter'\n  out = 10\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+    }
+
+    #[test]
+    fn str2func_resolves_static_method_handles_from_source_path_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("str2func-static-method-resolution");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [2 3];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write static handle class");
+        fs::write(
+            &main_path,
+            "f = str2func('Point.origin');\nname = func2str(f);\nout = f();\n",
+        )
+        .expect("write static handle script");
+
+        let expected = "workspace\n  f = @Point.origin\n  name = 'Point.origin'\n  out = [2, 3]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn str2func_resolves_packaged_static_method_handles_from_source_path_in_interpreter_and_bytecode()
+    {
+        let temp_dir = unique_temp_script_dir("str2func-package-static-method-resolution");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = unit()\n\
+             out = [6 7];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package static handle class");
+        fs::write(
+            &main_path,
+            "f = str2func('pkg.Point.unit');\nname = func2str(f);\nout = f();\n",
+        )
+        .expect("write package static handle script");
+
+        let expected =
+            "workspace\n  f = @pkg.Point.unit\n  name = 'pkg.Point.unit'\n  out = [6, 7]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn str2func_resolves_unbound_instance_method_handles_from_source_path_in_interpreter_and_bytecode(
+    ) {
+        let temp_dir = unique_temp_script_dir("str2func-instance-method-resolution");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write instance handle class");
+        fs::write(
+            &main_path,
+            "f = str2func('Point.total');\nname = func2str(f);\np = Point(5, 6);\nout = f(p);\n",
+        )
+        .expect("write instance handle script");
+
+        let expected =
+            "workspace\n  f = @Point.total\n  name = 'Point.total'\n  out = 11\n  p = Point with properties {x=5, y=6}\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn str2func_resolves_packaged_unbound_instance_method_handles_from_source_path_in_interpreter_and_bytecode(
+    ) {
+        let temp_dir = unique_temp_script_dir("str2func-packaged-instance-method-resolution");
+        let class_dir = temp_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package folder class dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package folder class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write package external method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write package private helper");
+        fs::write(
+            &main_path,
+            "f = str2func('pkg.Counter.plusWithOffset');\nname = func2str(f);\nc = pkg.Counter(10);\nout = f(c, 5);\n",
+        )
+        .expect("write package instance handle script");
+
+        let expected =
+            "workspace\n  c = pkg.Counter with properties {value=10}\n  f = @pkg.Counter.plusWithOffset\n  name = 'pkg.Counter.plusWithOffset'\n  out = 17\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn str2func_saved_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode()
+    {
+        let source_dir = unique_temp_script_dir("str2func-save-load-source");
+        let consumer_dir = unique_temp_script_dir("str2func-save-load-consumer");
+        let helper_path = source_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let mat_path = unique_temp_mat_path("str2func-save-load");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
+            .expect("write helper");
+        fs::write(
+            &producer_path,
+            format!("f = str2func('helper');\nsave('{matlab_path}', 'f');\n"),
+        )
+        .expect("write producer");
+        fs::write(
+            &consumer_path,
+            format!("load('{matlab_path}');\nout = f(5);\n"),
+        )
+        .expect("write consumer");
+
+        let produced = execute_path(&producer_path, &[]);
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle.display_name, "helper");
+        assert_eq!(
+            handle.target,
+            FunctionHandleTarget::ResolvedPath(helper_path.clone())
+        );
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  f = @helper\n  out = 6\n"
+        );
+
+        let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
+        let Value::FunctionHandle(handle_bytecode) =
+            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle_bytecode.display_name, "helper");
+        assert_eq!(
+            handle_bytecode.target,
+            FunctionHandleTarget::ResolvedPath(helper_path.clone())
+        );
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  f = @helper\n  out = 6\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(source_dir);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn str2func_saved_packaged_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode()
+    {
+        let source_dir = unique_temp_script_dir("str2func-save-load-pkg-source");
+        let consumer_dir = unique_temp_script_dir("str2func-save-load-pkg-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let helper_path = package_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let mat_path = unique_temp_mat_path("str2func-save-load-pkg");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 3;\nend\n")
+            .expect("write package helper");
+        fs::write(
+            &producer_path,
+            format!("f = str2func('pkg.helper');\nsave('{matlab_path}', 'f');\n"),
+        )
+        .expect("write producer");
+        fs::write(
+            &consumer_path,
+            format!("load('{matlab_path}');\nout = f(5);\n"),
+        )
+        .expect("write consumer");
+
+        let produced = execute_path(&producer_path, &[]);
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle.display_name, "pkg.helper");
+        assert_eq!(
+            handle.target,
+            FunctionHandleTarget::ResolvedPath(helper_path.clone())
+        );
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  f = @pkg.helper\n  out = 8\n"
+        );
+
+        let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
+        let Value::FunctionHandle(handle_bytecode) =
+            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle_bytecode.display_name, "pkg.helper");
+        assert_eq!(
+            handle_bytecode.target,
+            FunctionHandleTarget::ResolvedPath(helper_path.clone())
+        );
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  f = @pkg.helper\n  out = 8\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(source_dir);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn str2func_saved_static_method_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode(
+    ) {
+        let source_dir = unique_temp_script_dir("str2func-save-load-static-source");
+        let consumer_dir = unique_temp_script_dir("str2func-save-load-static-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let mat_path = unique_temp_mat_path("str2func-save-load-static");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [2 3];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write static class");
+        fs::write(
+            &producer_path,
+            format!("f = str2func('Point.origin');\nsave('{matlab_path}', 'f');\n"),
+        )
+        .expect("write producer");
+        fs::write(
+            &consumer_path,
+            format!("load('{matlab_path}');\nout = f();\n"),
+        )
+        .expect("write consumer");
+
+        let produced = execute_path(&producer_path, &[]);
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle.display_name, "Point.origin");
+        assert_eq!(
+            handle.target,
+            FunctionHandleTarget::ResolvedPath(class_path.clone())
+        );
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  f = @Point.origin\n  out = [2, 3]\n"
+        );
+
+        let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
+        let Value::FunctionHandle(handle_bytecode) =
+            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle_bytecode.display_name, "Point.origin");
+        assert_eq!(
+            handle_bytecode.target,
+            FunctionHandleTarget::ResolvedPath(class_path.clone())
+        );
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  f = @Point.origin\n  out = [2, 3]\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(source_dir);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn str2func_saved_packaged_static_method_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode(
+    ) {
+        let source_dir = unique_temp_script_dir("str2func-save-load-pkg-static-source");
+        let consumer_dir = unique_temp_script_dir("str2func-save-load-pkg-static-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let mat_path = unique_temp_mat_path("str2func-save-load-pkg-static");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = unit()\n\
+             out = [6 7];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package static class");
+        fs::write(
+            &producer_path,
+            format!("f = str2func('pkg.Point.unit');\nsave('{matlab_path}', 'f');\n"),
+        )
+        .expect("write producer");
+        fs::write(
+            &consumer_path,
+            format!("load('{matlab_path}');\nout = f();\n"),
+        )
+        .expect("write consumer");
+
+        let produced = execute_path(&producer_path, &[]);
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle.display_name, "pkg.Point.unit");
+        assert_eq!(
+            handle.target,
+            FunctionHandleTarget::ResolvedPath(class_path.clone())
+        );
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  f = @pkg.Point.unit\n  out = [6, 7]\n"
+        );
+
+        let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
+        let Value::FunctionHandle(handle_bytecode) =
+            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle_bytecode.display_name, "pkg.Point.unit");
+        assert_eq!(
+            handle_bytecode.target,
+            FunctionHandleTarget::ResolvedPath(class_path.clone())
+        );
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  f = @pkg.Point.unit\n  out = [6, 7]\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(source_dir);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn str2func_saved_unbound_instance_method_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode(
+    ) {
+        let source_dir = unique_temp_script_dir("str2func-save-load-instance-source");
+        let consumer_dir = unique_temp_script_dir("str2func-save-load-instance-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let mat_path = unique_temp_mat_path("str2func-save-load-instance");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write instance class");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = str2func('Point.total');\n\
+                 p = Point(10, 20);\n\
+                 save('{matlab_path}', 'f', 'p');\n"
+            ),
+        )
+        .expect("write producer");
+        fs::write(
+            &consumer_path,
+            format!("load('{matlab_path}');\nout = f(p);\n"),
+        )
+        .expect("write consumer");
+
+        let produced = execute_path(&producer_path, &[]);
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle.display_name, "Point.total");
+        assert_eq!(
+            handle.target,
+            FunctionHandleTarget::ResolvedPath(class_path.clone())
+        );
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  f = @Point.total\n  out = 30\n  p = Point with properties {x=10, y=20}\n"
+        );
+
+        let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
+        let Value::FunctionHandle(handle_bytecode) =
+            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle_bytecode.display_name, "Point.total");
+        assert_eq!(
+            handle_bytecode.target,
+            FunctionHandleTarget::ResolvedPath(class_path.clone())
+        );
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  f = @Point.total\n  out = 30\n  p = Point with properties {x=10, y=20}\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(source_dir);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn str2func_saved_packaged_unbound_instance_method_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode(
+    ) {
+        let source_dir = unique_temp_script_dir("str2func-save-load-pkg-instance-source");
+        let consumer_dir = unique_temp_script_dir("str2func-save-load-pkg-instance-consumer");
+        let class_dir = source_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package folder class dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let mat_path = unique_temp_mat_path("str2func-save-load-pkg-instance");
+        let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
+
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write package folder class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write package external method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write package private helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = str2func('pkg.Counter.plusWithOffset');\n\
+                 c = pkg.Counter(10);\n\
+                 save('{matlab_path}', 'f', 'c');\n"
+            ),
+        )
+        .expect("write producer");
+        fs::write(
+            &consumer_path,
+            format!("load('{matlab_path}');\nout = f(c, 5);\n"),
+        )
+        .expect("write consumer");
+
+        let produced = execute_path(&producer_path, &[]);
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle.display_name, "pkg.Counter.plusWithOffset");
+        assert_eq!(
+            handle.target,
+            FunctionHandleTarget::ResolvedPath(class_path.clone())
+        );
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  c = pkg.Counter with properties {value=10}\n  f = @pkg.Counter.plusWithOffset\n  out = 17\n"
+        );
+
+        let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
+        let Value::FunctionHandle(handle_bytecode) =
+            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        else {
+            panic!("expected function handle");
+        };
+        assert_eq!(handle_bytecode.display_name, "pkg.Counter.plusWithOffset");
+        assert_eq!(
+            handle_bytecode.target,
+            FunctionHandleTarget::ResolvedPath(class_path.clone())
+        );
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  c = pkg.Counter with properties {value=10}\n  f = @pkg.Counter.plusWithOffset\n  out = 17\n"
+        );
+
+        let _ = fs::remove_file(mat_path);
+        let _ = fs::remove_dir_all(source_dir);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn functions_builtin_reports_basic_handle_metadata_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("functions-builtin-metadata");
+        let class_path = temp_dir.join("Point.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             y = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function out = total(obj)\n\
+             out = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write point class");
+        fs::write(
+            &main_path,
+            "offset = 4;\n\
+             built = functions(@sin);\n\
+             gf = @functions;\n\
+             via_handle = gf(@sin);\n\
+             anon_h = @(x) x + offset;\n\
+             anon = functions(anon_h);\n\
+             local = functions(@helper);\n\
+             p = Point(5, 6);\n\
+             bound = functions(@p.total);\n\
+             function y = helper(x)\n\
+             y = x + 1;\n\
+             end\n",
+        )
+        .expect("write functions script");
+
+        let interpreted = execute_path(&main_path, &[]);
+        let built = workspace_struct(&interpreted.workspace, "built");
+        assert_eq!(struct_text_field(built, "function"), "sin");
+        assert_eq!(struct_text_field(built, "type"), "simple");
+        assert_eq!(struct_text_field(built, "file"), "");
+        assert!(!struct_has_field(built, "workspace"));
+        assert!(struct_workspace_capture(built).is_none());
+
+        let via_handle = workspace_struct(&interpreted.workspace, "via_handle");
+        assert_eq!(struct_text_field(via_handle, "function"), "sin");
+        assert_eq!(struct_text_field(via_handle, "type"), "simple");
+        assert!(!struct_has_field(via_handle, "workspace"));
+
+        let local = workspace_struct(&interpreted.workspace, "local");
+        assert_eq!(struct_text_field(local, "function"), "helper");
+        assert_eq!(struct_text_field(local, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(local, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(local).expect("local parentage"),
+            vec!["helper".to_string(), "main".to_string()]
+        );
+        assert!(!struct_has_field(local, "workspace"));
+
+        let anon = workspace_struct(&interpreted.workspace, "anon");
+        assert_eq!(struct_text_field(anon, "type"), "anonymous");
+        assert_eq!(struct_text_field(anon, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_within_file_path(anon).as_deref(),
+            Some("__base_function")
+        );
+        assert!(
+            struct_text_field(anon, "function").starts_with("<anon:")
+                || struct_text_field(anon, "function").starts_with("<anonymous:"),
+            "unexpected anonymous display {}",
+            struct_text_field(anon, "function")
+        );
+        let captures = struct_workspace_capture(anon).expect("anonymous capture workspace");
+        assert_eq!(captures.fields.get("offset"), Some(&Value::Scalar(4.0)));
+
+        let bound = workspace_struct(&interpreted.workspace, "bound");
+        assert_eq!(struct_text_field(bound, "function"), "Point.total");
+        assert_eq!(struct_text_field(bound, "type"), "simple");
+        assert_eq!(struct_text_field(bound, "file"), "");
+        assert!(!struct_has_field(bound, "workspace"));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        let built = workspace_struct(&bytecode.workspace, "built");
+        assert_eq!(struct_text_field(built, "function"), "sin");
+        assert_eq!(struct_text_field(built, "type"), "simple");
+        assert_eq!(struct_text_field(built, "file"), "");
+        assert!(!struct_has_field(built, "workspace"));
+        assert!(struct_workspace_capture(built).is_none());
+
+        let via_handle = workspace_struct(&bytecode.workspace, "via_handle");
+        assert_eq!(struct_text_field(via_handle, "function"), "sin");
+        assert_eq!(struct_text_field(via_handle, "type"), "simple");
+        assert!(!struct_has_field(via_handle, "workspace"));
+
+        let local = workspace_struct(&bytecode.workspace, "local");
+        assert_eq!(struct_text_field(local, "function"), "helper");
+        assert_eq!(struct_text_field(local, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(local, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(local).expect("local parentage"),
+            vec!["helper".to_string(), "main".to_string()]
+        );
+        assert!(!struct_has_field(local, "workspace"));
+
+        let anon = workspace_struct(&bytecode.workspace, "anon");
+        assert_eq!(struct_text_field(anon, "type"), "anonymous");
+        assert_eq!(struct_text_field(anon, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_within_file_path(anon).as_deref(),
+            Some("__base_function")
+        );
+        assert!(
+            struct_text_field(anon, "function").starts_with("<anon:")
+                || struct_text_field(anon, "function").starts_with("<anonymous:"),
+            "unexpected anonymous display {}",
+            struct_text_field(anon, "function")
+        );
+        let captures = struct_workspace_capture(anon).expect("anonymous capture workspace");
+        assert_eq!(captures.fields.get("offset"), Some(&Value::Scalar(4.0)));
+
+        let bound = workspace_struct(&bytecode.workspace, "bound");
+        assert_eq!(struct_text_field(bound, "function"), "Point.total");
+        assert_eq!(struct_text_field(bound, "type"), "simple");
+        assert_eq!(struct_text_field(bound, "file"), "");
+        assert!(!struct_has_field(bound, "workspace"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn functions_builtin_reports_nested_and_local_handle_metadata_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("functions-builtin-nested-shape");
+        let function_path = temp_dir.join("nestedShape.m");
+        fs::write(
+            &function_path,
+            "function [sNest, sLocal] = nestedShape(v)\n\
+             hNest = @nestFunction;\n\
+             hLocal = @localFunction;\n\
+             sNest = functions(hNest);\n\
+             sLocal = functions(hLocal);\n\
+                 function y = nestFunction(x)\n\
+                 y = x + v;\n\
+                 end\n\
+             end\n\
+             function y = localFunction(z)\n\
+             y = z + 1;\n\
+             end\n",
+        )
+        .expect("write nested shape function");
+
+        let interpreted = execute_path(&function_path, &[Value::Scalar(13.0)]);
+        let s_nest = workspace_struct(&interpreted.workspace, "sNest");
+        let s_local = workspace_struct(&interpreted.workspace, "sLocal");
+        assert_eq!(struct_text_field(s_nest, "function"), "nestedShape/nestFunction");
+        assert_eq!(struct_text_field(s_nest, "type"), "nested");
+        assert_eq!(struct_text_field(s_nest, "file"), function_path.display().to_string());
+        let nested_workspace = struct_workspace_capture(s_nest).expect("nested workspace");
+        assert_eq!(nested_workspace.fields.get("v"), Some(&Value::Scalar(13.0)));
+        assert!(!struct_has_field(s_nest, "parentage"));
+
+        assert_eq!(struct_text_field(s_local, "function"), "localFunction");
+        assert_eq!(struct_text_field(s_local, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s_local, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s_local).expect("local parentage"),
+            vec!["localFunction".to_string(), "nestedShape".to_string()]
+        );
+        assert!(!struct_has_field(s_local, "workspace"));
+
+        let bytecode = execute_path_bytecode(&function_path, &[Value::Scalar(13.0)]);
+        let s_nest = workspace_struct(&bytecode.workspace, "sNest");
+        let s_local = workspace_struct(&bytecode.workspace, "sLocal");
+        assert_eq!(struct_text_field(s_nest, "function"), "nestedShape/nestFunction");
+        assert_eq!(struct_text_field(s_nest, "type"), "nested");
+        assert_eq!(struct_text_field(s_nest, "file"), function_path.display().to_string());
+        let nested_workspace = struct_workspace_capture(s_nest).expect("nested workspace");
+        assert_eq!(nested_workspace.fields.get("v"), Some(&Value::Scalar(13.0)));
+        assert!(!struct_has_field(s_nest, "parentage"));
+
+        assert_eq!(struct_text_field(s_local, "function"), "localFunction");
+        assert_eq!(struct_text_field(s_local, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s_local, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s_local).expect("local parentage"),
+            vec!["localFunction".to_string(), "nestedShape".to_string()]
+        );
+        assert!(!struct_has_field(s_local, "workspace"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn localfunctions_builtin_returns_script_local_handles_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("localfunctions-script");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "fh = localfunctions;\n\
+             a = fh{1}(10);\n\
+             b = fh{2}(10);\n\
+             s1 = functions(fh{1});\n\
+             s2 = functions(fh{2});\n\
+             function y = alpha(x)\n\
+             y = x + 1;\n\
+             end\n\
+             function y = beta(x)\n\
+             y = x + 2;\n\
+             end\n",
+        )
+        .expect("write localfunctions script");
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(interpreted.workspace.get("a"), Some(&Value::Scalar(11.0)));
+        assert_eq!(interpreted.workspace.get("b"), Some(&Value::Scalar(12.0)));
+        let fh = workspace_cell(&interpreted.workspace, "fh");
+        assert_eq!(fh.rows, 2);
+        assert_eq!(fh.cols, 1);
+        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        let s1 = workspace_struct(&interpreted.workspace, "s1");
+        let s2 = workspace_struct(&interpreted.workspace, "s2");
+        assert_eq!(struct_text_field(s1, "function"), "alpha");
+        assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s1, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s1).expect("script local parentage"),
+            vec!["alpha".to_string(), "main".to_string()]
+        );
+        assert_eq!(struct_text_field(s2, "function"), "beta");
+        assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s2, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s2).expect("script local parentage"),
+            vec!["beta".to_string(), "main".to_string()]
+        );
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(bytecode.workspace.get("a"), Some(&Value::Scalar(11.0)));
+        assert_eq!(bytecode.workspace.get("b"), Some(&Value::Scalar(12.0)));
+        let fh = workspace_cell(&bytecode.workspace, "fh");
+        assert_eq!(fh.rows, 2);
+        assert_eq!(fh.cols, 1);
+        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        let s1 = workspace_struct(&bytecode.workspace, "s1");
+        let s2 = workspace_struct(&bytecode.workspace, "s2");
+        assert_eq!(struct_text_field(s1, "function"), "alpha");
+        assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s1, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s1).expect("script local parentage"),
+            vec!["alpha".to_string(), "main".to_string()]
+        );
+        assert_eq!(struct_text_field(s2, "function"), "beta");
+        assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s2, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s2).expect("script local parentage"),
+            vec!["beta".to_string(), "main".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn localfunctions_builtin_returns_function_file_local_handles_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("localfunctions-function-file");
+        let function_path = temp_dir.join("factory.m");
+        let consumer_path = temp_dir.join("consumer.m");
+        fs::write(
+            &function_path,
+            "function fh = factory()\n\
+             fh = localfunctions;\n\
+             end\n\
+             function y = alpha(x)\n\
+             y = x + 1;\n\
+             end\n\
+             function y = beta(x)\n\
+             y = x + 2;\n\
+             end\n",
+        )
+        .expect("write localfunctions function file");
+        fs::write(
+            &consumer_path,
+            "fh = factory();\n\
+             a = fh{1}(10);\n\
+             b = fh{2}(10);\n\
+             s1 = functions(fh{1});\n\
+             s2 = functions(fh{2});\n",
+        )
+        .expect("write localfunctions consumer");
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(interpreted.workspace.get("a"), Some(&Value::Scalar(11.0)));
+        assert_eq!(interpreted.workspace.get("b"), Some(&Value::Scalar(12.0)));
+        let fh = workspace_cell(&interpreted.workspace, "fh");
+        assert_eq!(fh.rows, 2);
+        assert_eq!(fh.cols, 1);
+        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        let s1 = workspace_struct(&interpreted.workspace, "s1");
+        let s2 = workspace_struct(&interpreted.workspace, "s2");
+        assert_eq!(struct_text_field(s1, "function"), "alpha");
+        assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s1, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s1).expect("function local parentage"),
+            vec!["alpha".to_string(), "factory".to_string()]
+        );
+        assert_eq!(struct_text_field(s2, "function"), "beta");
+        assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s2, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s2).expect("function local parentage"),
+            vec!["beta".to_string(), "factory".to_string()]
+        );
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(bytecode.workspace.get("a"), Some(&Value::Scalar(11.0)));
+        assert_eq!(bytecode.workspace.get("b"), Some(&Value::Scalar(12.0)));
+        let fh = workspace_cell(&bytecode.workspace, "fh");
+        assert_eq!(fh.rows, 2);
+        assert_eq!(fh.cols, 1);
+        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        let s1 = workspace_struct(&bytecode.workspace, "s1");
+        let s2 = workspace_struct(&bytecode.workspace, "s2");
+        assert_eq!(struct_text_field(s1, "function"), "alpha");
+        assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s1, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s1).expect("function local parentage"),
+            vec!["alpha".to_string(), "factory".to_string()]
+        );
+        assert_eq!(struct_text_field(s2, "function"), "beta");
+        assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s2, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_parentage_texts(s2).expect("function local parentage"),
+            vec!["beta".to_string(), "factory".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_localfunctions_function_file_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-localfunctions-fnfile-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-localfunctions-fnfile-consumer");
+        let function_path = source_dir.join("factory.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-localfunctions-fnfile").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &function_path,
+            "function fh = factory()\n\
+             fh = localfunctions;\n\
+             end\n\
+             function y = alpha(x)\n\
+             y = x + 1;\n\
+             end\n\
+             function y = beta(x)\n\
+             y = x + 2;\n\
+             end\n",
+        )
+        .expect("write localfunctions factory");
+        fs::write(
+            &producer_path,
+            format!(
+                "fh = factory();\n\
+                 save('{snapshot_text}', 'fh');\n"
+            ),
+        )
+        .expect("write localfunctions producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove localfunctions source tree");
+        let produced = execute_script_bytecode_bundle(&bundle).expect("execute localfunctions producer");
+        let fh = workspace_cell(&produced.workspace, "fh");
+        let Value::FunctionHandle(first_runtime) = fh.elements().first().expect("runtime handle") else {
+            panic!("expected runtime function handle");
+        };
+        assert!(
+            matches!(
+                &first_runtime.target,
+                FunctionHandleTarget::Named(name) if parse_scoped_function_handle_name(name).is_some()
+            ),
+            "unexpected runtime target {:?}",
+            first_runtime.target
+        );
+
+        let snapshot = read_workspace_snapshot_with_modules(&snapshot_path)
+            .expect("read localfunctions snapshot");
+        let Value::Cell(saved_handles) = snapshot.workspace.get("fh").expect("saved handles") else {
+            panic!("expected saved handles cell");
+        };
+        let Value::FunctionHandle(first_saved) =
+            saved_handles.elements().first().expect("first saved handle")
+        else {
+            panic!("expected saved function handle");
+        };
+        assert!(
+            matches!(
+                &first_saved.target,
+                FunctionHandleTarget::Named(name) if parse_scoped_function_handle_name(name).is_some()
+            ),
+            "unexpected saved target {:?}",
+            first_saved.target
+        );
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 a = fh{{1}}(10);\n\
+                 b = fh{{2}}(10);\n\
+                 s1 = functions(fh{{1}});\n\
+                 s2 = functions(fh{{2}});\n"
+            ),
+        )
+        .expect("write localfunctions consumer");
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(interpreted.workspace.get("a"), Some(&Value::Scalar(11.0)));
+        assert_eq!(interpreted.workspace.get("b"), Some(&Value::Scalar(12.0)));
+        let fh = workspace_cell(&interpreted.workspace, "fh");
+        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        let s1 = workspace_struct(&interpreted.workspace, "s1");
+        let s2 = workspace_struct(&interpreted.workspace, "s2");
+        assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s1, "file"), function_path.display().to_string());
+        assert_eq!(struct_text_field(s2, "file"), function_path.display().to_string());
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(bytecode.workspace.get("a"), Some(&Value::Scalar(11.0)));
+        assert_eq!(bytecode.workspace.get("b"), Some(&Value::Scalar(12.0)));
+        let fh = workspace_cell(&bytecode.workspace, "fh");
+        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        let s1 = workspace_struct(&bytecode.workspace, "s1");
+        let s2 = workspace_struct(&bytecode.workspace, "s2");
+        assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s1, "file"), function_path.display().to_string());
+        assert_eq!(struct_text_field(s2, "file"), function_path.display().to_string());
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_localfunctions_script_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-localfunctions-script-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-localfunctions-script-consumer");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-localfunctions-script").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &producer_path,
+            format!(
+                "fh = localfunctions;\n\
+                 save('{snapshot_text}', 'fh');\n\
+                 function y = alpha(x)\n\
+                 y = x + 1;\n\
+                 end\n\
+                 function y = beta(x)\n\
+                 y = x + 2;\n\
+                 end\n"
+            ),
+        )
+        .expect("write localfunctions script producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove localfunctions script source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute localfunctions script producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 a = fh{{1}}(10);\n\
+                 b = fh{{2}}(10);\n\
+                 s1 = functions(fh{{1}});\n\
+                 s2 = functions(fh{{2}});\n"
+            ),
+        )
+        .expect("write localfunctions script consumer");
+
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(interpreted.workspace.get("a"), Some(&Value::Scalar(11.0)));
+        assert_eq!(interpreted.workspace.get("b"), Some(&Value::Scalar(12.0)));
+        let fh = workspace_cell(&interpreted.workspace, "fh");
+        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        let s1 = workspace_struct(&interpreted.workspace, "s1");
+        let s2 = workspace_struct(&interpreted.workspace, "s2");
+        assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s1, "file"), producer_path.display().to_string());
+        assert_eq!(struct_text_field(s2, "file"), producer_path.display().to_string());
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(bytecode.workspace.get("a"), Some(&Value::Scalar(11.0)));
+        assert_eq!(bytecode.workspace.get("b"), Some(&Value::Scalar(12.0)));
+        let fh = workspace_cell(&bytecode.workspace, "fh");
+        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        let s1 = workspace_struct(&bytecode.workspace, "s1");
+        let s2 = workspace_struct(&bytecode.workspace, "s2");
+        assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
+        assert_eq!(struct_text_field(s1, "file"), producer_path.display().to_string());
+        assert_eq!(struct_text_field(s2, "file"), producer_path.display().to_string());
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn which_and_filemarker_builtins_cover_current_resolution_baseline_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("which-filemarker");
+        let package_dir = temp_dir.join("+pkg");
+        let private_dir = temp_dir.join("private");
+        let class_dir = temp_dir.join("@Counter");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        fs::create_dir_all(&private_dir).expect("create private dir");
+        fs::create_dir_all(&class_dir).expect("create class dir");
+        let helper_path = temp_dir.join("helper.m");
+        let package_helper_path = package_dir.join("helper.m");
+        let private_helper_path = private_dir.join("helper.m");
+        let class_path = class_dir.join("Counter.m");
+        let factory_path = temp_dir.join("factory.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
+            .expect("write helper");
+        fs::write(&package_helper_path, "function y = helper(x)\ny = x + 2;\nend\n")
+            .expect("write package helper");
+        fs::write(&private_helper_path, "function y = helper(x)\ny = x + 3;\nend\n")
+            .expect("write private helper");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write folder class");
+        fs::write(
+            &factory_path,
+            "function y = factory(x)\n\
+             y = nested(x);\n\
+                 function z = nested(v)\n\
+                 z = alpha(v);\n\
+                 end\n\
+             end\n\
+             function y = alpha(x)\n\
+             y = x + 4;\n\
+             end\n",
+        )
+        .expect("write factory");
+        fs::write(
+            &main_path,
+            "helperVar = 5;\n\
+             marker = filemarker();\n\
+             p_helper = which('helper');\n\
+             p_pkg = which('pkg.helper');\n\
+             p_counter = which('Counter');\n\
+             p_var = which('helperVar');\n\
+             p_missing = which('missingName');\n\
+             p_all = which('helper', '-all');\n\
+             p_in_alpha = which('alpha', 'in', 'factory');\n\
+             p_in_nested = which('nested', 'in', 'factory');\n\
+             p_in_private = which('helper', 'in', 'factory');\n\
+             function y = helper(x)\n\
+             y = x + 10;\n\
+             end\n",
+        )
+        .expect("write main script");
+
+        let local_helper_marker = format!("{}>helper", main_path.display());
+        let in_alpha_marker = format!("{}>alpha", factory_path.display());
+        let in_nested_marker = format!("{}>factory>nested", factory_path.display());
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(interpreted.workspace.get("marker"), Some(&Value::CharArray(">".to_string())));
+        assert_eq!(
+            interpreted.workspace.get("p_helper"),
+            Some(&Value::CharArray(local_helper_marker.clone()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("p_pkg"),
+            Some(&Value::CharArray(package_helper_path.display().to_string()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("p_counter"),
+            Some(&Value::CharArray(class_path.display().to_string()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("p_var"),
+            Some(&Value::CharArray("variable".to_string()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("p_missing"),
+            Some(&Value::CharArray(String::new()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("p_in_alpha"),
+            Some(&Value::CharArray(in_alpha_marker.clone()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("p_in_nested"),
+            Some(&Value::CharArray(in_nested_marker.clone()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("p_in_private"),
+            Some(&Value::CharArray(private_helper_path.display().to_string()))
+        );
+        let p_all = workspace_cell(&interpreted.workspace, "p_all");
+        assert_eq!(p_all.rows, 3);
+        assert_eq!(p_all.cols, 1);
+        assert_eq!(
+            cell_texts(p_all),
+            vec![
+                local_helper_marker.clone(),
+                private_helper_path.display().to_string(),
+                helper_path.display().to_string(),
+            ]
+        );
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(bytecode.workspace.get("marker"), Some(&Value::CharArray(">".to_string())));
+        assert_eq!(
+            bytecode.workspace.get("p_helper"),
+            Some(&Value::CharArray(local_helper_marker.clone()))
+        );
+        assert_eq!(
+            bytecode.workspace.get("p_pkg"),
+            Some(&Value::CharArray(package_helper_path.display().to_string()))
+        );
+        assert_eq!(
+            bytecode.workspace.get("p_counter"),
+            Some(&Value::CharArray(class_path.display().to_string()))
+        );
+        assert_eq!(
+            bytecode.workspace.get("p_var"),
+            Some(&Value::CharArray("variable".to_string()))
+        );
+        assert_eq!(
+            bytecode.workspace.get("p_missing"),
+            Some(&Value::CharArray(String::new()))
+        );
+        assert_eq!(
+            bytecode.workspace.get("p_in_alpha"),
+            Some(&Value::CharArray(in_alpha_marker))
+        );
+        assert_eq!(
+            bytecode.workspace.get("p_in_nested"),
+            Some(&Value::CharArray(in_nested_marker))
+        );
+        assert_eq!(
+            bytecode.workspace.get("p_in_private"),
+            Some(&Value::CharArray(private_helper_path.display().to_string()))
+        );
+        let p_all = workspace_cell(&bytecode.workspace, "p_all");
+        assert_eq!(p_all.rows, 3);
+        assert_eq!(p_all.cols, 1);
+        assert_eq!(
+            cell_texts(p_all),
+            vec![
+                local_helper_marker,
+                private_helper_path.display().to_string(),
+                helper_path.display().to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn exist_builtin_reports_current_resolution_and_search_types_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("exist-builtin");
+        let private_dir = temp_dir.join("private");
+        let class_dir = temp_dir.join("@Counter");
+        let data_dir = temp_dir.join("data");
+        fs::create_dir_all(&private_dir).expect("create private dir");
+        fs::create_dir_all(&class_dir).expect("create class dir");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+
+        let helper_path = temp_dir.join("helper.m");
+        let hidden_path = private_dir.join("hidden.m");
+        let plot_path = temp_dir.join("plot.m");
+        let class_path = class_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
+            .expect("write helper");
+        fs::write(&hidden_path, "function y = hidden(x)\ny = x + 2;\nend\n")
+            .expect("write hidden");
+        fs::write(&plot_path, "function y = plot(varargin)\ny = 7;\nend\n")
+            .expect("write plot shadow");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write class");
+        fs::write(
+            &main_path,
+            "helperVar = 5;\n\
+             e_var = exist('helperVar');\n\
+             e_var_only = exist('helperVar', 'var');\n\
+             e_var_file = exist('helperVar', 'file');\n\
+             e_local = exist('helper');\n\
+             e_local_file = exist('helper', 'file');\n\
+             e_hidden = exist('hidden');\n\
+             e_plot = exist('plot');\n\
+             e_plot_builtin = exist('plot', 'builtin');\n\
+             e_disp_builtin = exist disp builtin;\n\
+             e_counter = exist('Counter');\n\
+             e_counter_class = exist('Counter', 'class');\n\
+             e_counter_file = exist('Counter', 'file');\n\
+             e_data = exist('data');\n\
+             e_data_dir = exist data dir;\n\
+             e_data_file = exist('data', 'file');\n\
+             e_missing = exist('missingName');\n\
+             e_missing_builtin = exist('missingName', 'builtin');\n\
+             function y = helper(x)\n\
+             y = x + 10;\n\
+             end\n",
+        )
+        .expect("write main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(interpreted.workspace.get("e_var"), Some(&Value::Scalar(1.0)));
+        assert_eq!(interpreted.workspace.get("e_var_only"), Some(&Value::Scalar(1.0)));
+        assert_eq!(interpreted.workspace.get("e_var_file"), Some(&Value::Scalar(0.0)));
+        assert_eq!(interpreted.workspace.get("e_local"), Some(&Value::Scalar(2.0)));
+        assert_eq!(interpreted.workspace.get("e_local_file"), Some(&Value::Scalar(2.0)));
+        assert_eq!(interpreted.workspace.get("e_hidden"), Some(&Value::Scalar(2.0)));
+        assert_eq!(interpreted.workspace.get("e_plot"), Some(&Value::Scalar(2.0)));
+        assert_eq!(interpreted.workspace.get("e_plot_builtin"), Some(&Value::Scalar(5.0)));
+        assert_eq!(interpreted.workspace.get("e_disp_builtin"), Some(&Value::Scalar(5.0)));
+        assert_eq!(interpreted.workspace.get("e_counter"), Some(&Value::Scalar(8.0)));
+        assert_eq!(interpreted.workspace.get("e_counter_class"), Some(&Value::Scalar(8.0)));
+        assert_eq!(interpreted.workspace.get("e_counter_file"), Some(&Value::Scalar(2.0)));
+        assert_eq!(interpreted.workspace.get("e_data"), Some(&Value::Scalar(7.0)));
+        assert_eq!(interpreted.workspace.get("e_data_dir"), Some(&Value::Scalar(7.0)));
+        assert_eq!(interpreted.workspace.get("e_data_file"), Some(&Value::Scalar(7.0)));
+        assert_eq!(interpreted.workspace.get("e_missing"), Some(&Value::Scalar(0.0)));
+        assert_eq!(
+            interpreted.workspace.get("e_missing_builtin"),
+            Some(&Value::Scalar(0.0))
+        );
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(bytecode.workspace.get("e_var"), Some(&Value::Scalar(1.0)));
+        assert_eq!(bytecode.workspace.get("e_var_only"), Some(&Value::Scalar(1.0)));
+        assert_eq!(bytecode.workspace.get("e_var_file"), Some(&Value::Scalar(0.0)));
+        assert_eq!(bytecode.workspace.get("e_local"), Some(&Value::Scalar(2.0)));
+        assert_eq!(bytecode.workspace.get("e_local_file"), Some(&Value::Scalar(2.0)));
+        assert_eq!(bytecode.workspace.get("e_hidden"), Some(&Value::Scalar(2.0)));
+        assert_eq!(bytecode.workspace.get("e_plot"), Some(&Value::Scalar(2.0)));
+        assert_eq!(bytecode.workspace.get("e_plot_builtin"), Some(&Value::Scalar(5.0)));
+        assert_eq!(bytecode.workspace.get("e_disp_builtin"), Some(&Value::Scalar(5.0)));
+        assert_eq!(bytecode.workspace.get("e_counter"), Some(&Value::Scalar(8.0)));
+        assert_eq!(bytecode.workspace.get("e_counter_class"), Some(&Value::Scalar(8.0)));
+        assert_eq!(bytecode.workspace.get("e_counter_file"), Some(&Value::Scalar(2.0)));
+        assert_eq!(bytecode.workspace.get("e_data"), Some(&Value::Scalar(7.0)));
+        assert_eq!(bytecode.workspace.get("e_data_dir"), Some(&Value::Scalar(7.0)));
+        assert_eq!(bytecode.workspace.get("e_data_file"), Some(&Value::Scalar(7.0)));
+        assert_eq!(bytecode.workspace.get("e_missing"), Some(&Value::Scalar(0.0)));
+        assert_eq!(
+            bytecode.workspace.get("e_missing_builtin"),
+            Some(&Value::Scalar(0.0))
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn what_builtin_lists_current_and_named_folders_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("what-builtin");
+        let package_dir = temp_dir.join("+pkg");
+        let class_dir = temp_dir.join("@Counter");
+        let data_dir = temp_dir.join("data");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        fs::create_dir_all(&class_dir).expect("create class dir");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+
+        fs::write(temp_dir.join("helper.m"), "function y = helper(x)\ny = x + 1;\nend\n")
+            .expect("write helper");
+        fs::write(temp_dir.join("app.mlapp"), "placeholder").expect("write mlapp");
+        fs::write(temp_dir.join("live.mlx"), "placeholder").expect("write mlx");
+        fs::write(temp_dir.join("saved.mat"), "placeholder").expect("write mat");
+        fs::write(temp_dir.join("model.slx"), "placeholder").expect("write slx");
+        fs::write(temp_dir.join("cached.p"), "placeholder").expect("write pcode");
+        fs::write(
+            class_dir.join("Counter.m"),
+            "classdef Counter\nmethods\nfunction obj = Counter()\nend\nend\nend\n",
+        )
+        .expect("write classdef");
+        fs::write(package_dir.join("tool.m"), "function y = tool(x)\ny = x;\nend\n")
+            .expect("write package tool");
+        fs::write(data_dir.join("dataset.m"), "function y = dataset(x)\ny = x;\nend\n")
+            .expect("write dataset");
+
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "current = what();\n\
+             classInfo = what('Counter');\n\
+             packageInfo = what pkg;\n\
+             dataInfo = what('data');\n\
+             what data\n",
+        )
+        .expect("write what main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        let current = workspace_struct(&interpreted.workspace, "current");
+        assert_eq!(struct_text_field(current, "path"), temp_dir.display().to_string());
+        assert_eq!(
+            struct_cell_texts(current, "m"),
+            vec!["helper.m".to_string(), "main.m".to_string()]
+        );
+        assert_eq!(struct_cell_texts(current, "mlapp"), vec!["app.mlapp".to_string()]);
+        assert_eq!(struct_cell_texts(current, "mlx"), vec!["live.mlx".to_string()]);
+        assert_eq!(struct_cell_texts(current, "mat"), vec!["saved.mat".to_string()]);
+        assert_eq!(struct_cell_texts(current, "slx"), vec!["model.slx".to_string()]);
+        assert_eq!(struct_cell_texts(current, "p"), vec!["cached.p".to_string()]);
+        assert_eq!(struct_cell_texts(current, "classes"), vec!["Counter".to_string()]);
+        assert_eq!(struct_cell_texts(current, "packages"), vec!["pkg".to_string()]);
+
+        let class_info = workspace_struct(&interpreted.workspace, "classInfo");
+        assert_eq!(struct_text_field(class_info, "path"), class_dir.display().to_string());
+        assert_eq!(struct_cell_texts(class_info, "m"), vec!["Counter.m".to_string()]);
+
+        let package_info = workspace_struct(&interpreted.workspace, "packageInfo");
+        assert_eq!(
+            struct_text_field(package_info, "path"),
+            package_dir.display().to_string()
+        );
+        assert_eq!(struct_cell_texts(package_info, "m"), vec!["tool.m".to_string()]);
+
+        let data_info = workspace_struct(&interpreted.workspace, "dataInfo");
+        assert_eq!(struct_text_field(data_info, "path"), data_dir.display().to_string());
+        assert_eq!(struct_cell_texts(data_info, "m"), vec!["dataset.m".to_string()]);
+        let rendered = render_matlab_execution_result(&interpreted);
+        assert!(rendered.contains("MATLAB Code files in folder"));
+        assert!(rendered.contains(&data_dir.display().to_string()));
+        assert!(rendered.contains("dataset"));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        let current = workspace_struct(&bytecode.workspace, "current");
+        assert_eq!(struct_text_field(current, "path"), temp_dir.display().to_string());
+        assert_eq!(
+            struct_cell_texts(current, "m"),
+            vec!["helper.m".to_string(), "main.m".to_string()]
+        );
+        assert_eq!(struct_cell_texts(current, "classes"), vec!["Counter".to_string()]);
+        assert_eq!(struct_cell_texts(current, "packages"), vec!["pkg".to_string()]);
+
+        let class_info = workspace_struct(&bytecode.workspace, "classInfo");
+        assert_eq!(struct_text_field(class_info, "path"), class_dir.display().to_string());
+        assert_eq!(struct_cell_texts(class_info, "m"), vec!["Counter.m".to_string()]);
+
+        let package_info = workspace_struct(&bytecode.workspace, "packageInfo");
+        assert_eq!(
+            struct_text_field(package_info, "path"),
+            package_dir.display().to_string()
+        );
+        assert_eq!(struct_cell_texts(package_info, "m"), vec!["tool.m".to_string()]);
+
+        let data_info = workspace_struct(&bytecode.workspace, "dataInfo");
+        assert_eq!(struct_text_field(data_info, "path"), data_dir.display().to_string());
+        assert_eq!(struct_cell_texts(data_info, "m"), vec!["dataset.m".to_string()]);
+        let rendered = render_matlab_execution_result(&bytecode);
+        assert!(rendered.contains("MATLAB Code files in folder"));
+        assert!(rendered.contains(&data_dir.display().to_string()));
+        assert!(rendered.contains("dataset"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn inmem_builtin_reports_loaded_functions_and_classes_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("inmem-builtin");
+        let helper_path = temp_dir.join("helper.m");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
+            .expect("write helper");
+        fs::write(
+            &class_path,
+            "classdef Counter\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write class");
+        fs::write(
+            &main_path,
+            "value = helper(4);\n\
+             c = Counter(9);\n\
+             f = inmem();\n\
+             [f3, m3, c3] = inmem;\n\
+             [ffull, mfull, cfull] = inmem('-completenames');\n\
+             [fignore, mignore, cignore] = inmem('ignored');\n",
+        )
+        .expect("write main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(interpreted.workspace.get("value"), Some(&Value::Scalar(5.0)));
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "f")),
+            vec!["helper".to_string()]
+        );
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "f3")),
+            vec!["helper".to_string()]
+        );
+        let m3 = workspace_cell(&interpreted.workspace, "m3");
+        assert_eq!(m3.rows, 0);
+        assert_eq!(m3.cols, 0);
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "c3")),
+            vec!["Counter".to_string()]
+        );
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "ffull")),
+            vec![helper_path.display().to_string()]
+        );
+        let mfull = workspace_cell(&interpreted.workspace, "mfull");
+        assert_eq!(mfull.rows, 0);
+        assert_eq!(mfull.cols, 0);
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "cfull")),
+            vec!["Counter".to_string()]
+        );
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "fignore")),
+            vec!["helper".to_string()]
+        );
+        let mignore = workspace_cell(&interpreted.workspace, "mignore");
+        assert_eq!(mignore.rows, 0);
+        assert_eq!(mignore.cols, 0);
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "cignore")),
+            vec!["Counter".to_string()]
+        );
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(bytecode.workspace.get("value"), Some(&Value::Scalar(5.0)));
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "f")),
+            vec!["helper".to_string()]
+        );
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "f3")),
+            vec!["helper".to_string()]
+        );
+        let m3 = workspace_cell(&bytecode.workspace, "m3");
+        assert_eq!(m3.rows, 0);
+        assert_eq!(m3.cols, 0);
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "c3")),
+            vec!["Counter".to_string()]
+        );
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "ffull")),
+            vec![helper_path.display().to_string()]
+        );
+        let mfull = workspace_cell(&bytecode.workspace, "mfull");
+        assert_eq!(mfull.rows, 0);
+        assert_eq!(mfull.cols, 0);
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "cfull")),
+            vec!["Counter".to_string()]
+        );
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "fignore")),
+            vec!["helper".to_string()]
+        );
+        let mignore = workspace_cell(&bytecode.workspace, "mignore");
+        assert_eq!(mignore.rows, 0);
+        assert_eq!(mignore.cols, 0);
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "cignore")),
+            vec!["Counter".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn help_builtin_reads_source_blocks_and_builtin_placeholders_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("help-builtin");
+        let helper_path = temp_dir.join("helper.m");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(
+            &helper_path,
+            "function y = helper(x)\n\
+             %HELPER Increment value.\n\
+             %   HELPER(X) returns X plus one.\n\
+             y = x + 1;\n\
+             end\n",
+        )
+        .expect("write helper");
+        fs::write(
+            &class_path,
+            "classdef Counter\n\
+             %COUNTER Counter test class.\n\
+             %   COUNTER(VALUE) stores VALUE.\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             function out = total(obj)\n\
+             %TOTAL Return stored value.\n\
+             %   TOTAL(OBJ) returns the stored value.\n\
+             out = obj.value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write class");
+        fs::write(
+            &main_path,
+            "obj = Counter(9);\n\
+             h_builtin = help('sum');\n\
+             h_helper = help('helper');\n\
+             h_class = help('Counter');\n\
+             h_method = help('Counter.total');\n\
+             h_local = help('localDoc');\n\
+             h_obj = help('obj');\n\
+             help helper\n\
+             help Counter.total\n\
+             help localDoc\n\
+             function y = localDoc()\n\
+             %LOCALDOC Local helper docs.\n\
+             %   LOCALDOC returns one.\n\
+             y = 1;\n\
+             end\n",
+        )
+        .expect("write main");
+
+        let expected_builtin = "sum is a built-in function.".to_string();
+        let expected_helper = "HELPER Increment value.\nHELPER(X) returns X plus one.".to_string();
+        let expected_class = "COUNTER Counter test class.\nCOUNTER(VALUE) stores VALUE.".to_string();
+        let expected_method =
+            "TOTAL Return stored value.\nTOTAL(OBJ) returns the stored value.".to_string();
+        let expected_local = "LOCALDOC Local helper docs.\nLOCALDOC returns one.".to_string();
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(
+            interpreted.workspace.get("h_builtin"),
+            Some(&Value::CharArray(expected_builtin.clone()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("h_helper"),
+            Some(&Value::CharArray(expected_helper.clone()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("h_class"),
+            Some(&Value::CharArray(expected_class.clone()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("h_method"),
+            Some(&Value::CharArray(expected_method.clone()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("h_local"),
+            Some(&Value::CharArray(expected_local.clone()))
+        );
+        assert_eq!(
+            interpreted.workspace.get("h_obj"),
+            Some(&Value::CharArray(expected_class.clone()))
+        );
+        let rendered = render_matlab_execution_result(&interpreted);
+        assert!(rendered.contains(&expected_helper));
+        assert!(rendered.contains(&expected_method));
+        assert!(rendered.contains(&expected_local));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(
+            bytecode.workspace.get("h_builtin"),
+            Some(&Value::CharArray(expected_builtin))
+        );
+        assert_eq!(
+            bytecode.workspace.get("h_helper"),
+            Some(&Value::CharArray(expected_helper))
+        );
+        assert_eq!(
+            bytecode.workspace.get("h_class"),
+            Some(&Value::CharArray(expected_class.clone()))
+        );
+        assert_eq!(
+            bytecode.workspace.get("h_method"),
+            Some(&Value::CharArray(expected_method))
+        );
+        assert_eq!(
+            bytecode.workspace.get("h_local"),
+            Some(&Value::CharArray(expected_local))
+        );
+        assert_eq!(
+            bytecode.workspace.get("h_obj"),
+            Some(&Value::CharArray(expected_class))
+        );
+        let rendered = render_matlab_execution_result(&bytecode);
+        assert!(rendered.contains("HELPER Increment value."));
+        assert!(rendered.contains("TOTAL Return stored value."));
+        assert!(rendered.contains("LOCALDOC Local helper docs."));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn lookfor_builtin_searches_help_summaries_and_all_lines_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("lookfor-builtin");
+        let package_dir = temp_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let helper_path = temp_dir.join("helper.m");
+        let package_path = package_dir.join("inverter.m");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(
+            &helper_path,
+            "function y = helper(x)\n\
+             %HELPER Rarealpha inverse helper.\n\
+             %   HELPER(X) increments X.\n\
+             y = x + 1;\n\
+             end\n",
+        )
+        .expect("write helper");
+        fs::write(
+            &package_path,
+            "function y = inverter(x)\n\
+             %INVERTER Rarealpha package utility.\n\
+             %   INVERTER(X) negates X.\n\
+             y = -x;\n\
+             end\n",
+        )
+        .expect("write inverter");
+        fs::write(
+            &class_path,
+            "classdef Counter\n\
+             %COUNTER Value counter.\n\
+             %   COUNTER storetag keeps a value.\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write class");
+        fs::write(
+            &main_path,
+            "lookfor rarealpha\n\
+             lookfor('storetag', '-all')\n",
+        )
+        .expect("write main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        let interpreted_rendered = render_matlab_execution_result(&interpreted);
+        assert!(interpreted_rendered.contains("helper - HELPER Rarealpha inverse helper."));
+        assert!(interpreted_rendered.contains("pkg.inverter - INVERTER Rarealpha package utility."));
+        assert!(interpreted_rendered.contains("Counter:"));
+        assert!(interpreted_rendered.contains("Counter - COUNTER Value counter."));
+        assert!(interpreted_rendered.contains("COUNTER storetag keeps a value."));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        let bytecode_rendered = render_matlab_execution_result(&bytecode);
+        assert!(bytecode_rendered.contains("helper - HELPER Rarealpha inverse helper."));
+        assert!(bytecode_rendered.contains("pkg.inverter - INVERTER Rarealpha package utility."));
+        assert!(bytecode_rendered.contains("Counter:"));
+        assert!(bytecode_rendered.contains("Counter - COUNTER Value counter."));
+        assert!(bytecode_rendered.contains("COUNTER storetag keeps a value."));
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -21227,6 +25947,61 @@ mod tests {
     }
 
     #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_str2func_plain_handles_without_source_tree()
+    {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-str2func-plain-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-str2func-plain-consumer");
+        let helper_path = source_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-str2func-plain-handle").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 5;\n\
+             end\n",
+        )
+        .expect("write snapshot str2func plain helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = str2func('helper');\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot str2func plain producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot str2func plain source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot str2func plain producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = f(7);\n"
+            ),
+        )
+        .expect("write snapshot str2func plain consumer");
+
+        let expected = "workspace\n  f = @helper\n  out = 12\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
     fn workspace_snapshot_load_preserves_bundle_backed_packaged_plain_function_handles_without_source_tree(
     ) {
         let source_dir = unique_temp_script_dir("snapshot-bundle-packaged-plain-handle-source");
@@ -21281,6 +26056,499 @@ mod tests {
         assert_eq!(render_execution_result(&bytecode), expected);
         assert_eq!(bytecode.bundle_modules().len(), 1);
         assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_str2func_packaged_handles_without_source_tree(
+    ) {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-str2func-packaged-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-packaged-consumer");
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let helper_path = package_dir.join("helper.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-str2func-packaged-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &helper_path,
+            "function out = helper(x)\n\
+             out = x + 8;\n\
+             end\n",
+        )
+        .expect("write snapshot str2func packaged helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = str2func('pkg.helper');\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot str2func packaged producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot str2func packaged source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot str2func packaged producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = f(4);\n"
+            ),
+        )
+        .expect("write snapshot str2func packaged consumer");
+
+        let expected = "workspace\n  f = @pkg.helper\n  out = 12\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_str2func_constructor_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-constructor-handle-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-constructor-handle-consumer");
+        let class_dir = source_dir.join("@Counter");
+        fs::create_dir_all(&class_dir).expect("create class dir");
+        let class_path = class_dir.join("Counter.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-str2func-constructor-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot str2func constructor class");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = str2func('Counter');\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot str2func constructor producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot str2func constructor source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot str2func constructor producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 c = f(10);\n\
+                 out = c.value;\n"
+            ),
+        )
+        .expect("write snapshot str2func constructor consumer");
+
+        let expected =
+            "workspace\n  c = Counter with properties {value=10}\n  f = @Counter\n  out = 10\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_str2func_packaged_constructor_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-packaged-constructor-handle-source");
+        let consumer_dir = unique_temp_script_dir(
+            "snapshot-bundle-str2func-packaged-constructor-handle-consumer",
+        );
+        let class_dir = source_dir.join("+pkg").join("@Counter");
+        fs::create_dir_all(&class_dir).expect("create package class dir");
+        let class_path = class_dir.join("Counter.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-str2func-packaged-constructor-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot str2func packaged constructor class");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = str2func('pkg.Counter');\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot str2func packaged constructor producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot str2func packaged constructor source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot str2func packaged constructor producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 c = f(10);\n\
+                 out = c.value;\n"
+            ),
+        )
+        .expect("write snapshot str2func packaged constructor consumer");
+
+        let expected =
+            "workspace\n  c = pkg.Counter with properties {value=10}\n  f = @pkg.Counter\n  out = 10\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_str2func_static_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-static-handle-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-static-handle-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-str2func-static-handle").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = origin()\n\
+             out = [4 5];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot str2func static class");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = str2func('Point.origin');\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot str2func static producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot str2func static source tree");
+        execute_script_bytecode_bundle(&bundle).expect("execute snapshot str2func static producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = f();\n"
+            ),
+        )
+        .expect("write snapshot str2func static consumer");
+
+        let expected = "workspace\n  f = @Point.origin\n  out = [4, 5]\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_str2func_packaged_static_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-packaged-static-handle-source");
+        let consumer_dir = unique_temp_script_dir(
+            "snapshot-bundle-str2func-packaged-static-handle-consumer",
+        );
+        let package_dir = source_dir.join("+pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        let class_path = package_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-str2func-packaged-static-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             methods (Static)\n\
+             function out = unit()\n\
+             out = [8 9];\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot str2func packaged static class");
+        fs::write(
+            &producer_path,
+            format!(
+                "f = str2func('pkg.Point.unit');\n\
+                 save('{snapshot_text}', 'f');\n"
+            ),
+        )
+        .expect("write snapshot str2func packaged static producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot str2func packaged static source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot str2func packaged static producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 out = f();\n"
+            ),
+        )
+        .expect("write snapshot str2func packaged static consumer");
+
+        let expected = "workspace\n  f = @pkg.Point.unit\n  out = [8, 9]\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_str2func_unbound_instance_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-instance-handle-source");
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-instance-handle-consumer");
+        let class_path = source_dir.join("Point.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-str2func-instance-handle").with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 1;\n\
+             y = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x, y)\n\
+             obj.x = x;\n\
+             obj.y = y;\n\
+             end\n\
+             function total = total(obj)\n\
+             total = obj.x + obj.y;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot str2func instance class");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = Point(1, 2);\n\
+                 f = str2func('Point.total');\n\
+                 save('{snapshot_text}', 'seed', 'f');\n"
+            ),
+        )
+        .expect("write snapshot str2func instance producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir).expect("remove snapshot str2func instance source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot str2func instance producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 p = Point(10, 20);\n\
+                 out = f(p);\n"
+            ),
+        )
+        .expect("write snapshot str2func instance consumer");
+
+        let expected =
+            "workspace\n  f = @Point.total\n  out = 30\n  p = Point with properties {x=10, y=20}\n  seed = Point with properties {x=1, y=2}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 1);
+        assert_eq!(interpreted.bundle_modules()[0].module_id, "dep0");
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 1);
+        assert_eq!(bytecode.bundle_modules()[0].module_id, "dep0");
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(consumer_dir);
+    }
+
+    #[test]
+    fn workspace_snapshot_load_preserves_bundle_backed_str2func_packaged_unbound_instance_handles_without_source_tree(
+    ) {
+        let source_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-packaged-instance-handle-source");
+        let consumer_dir = unique_temp_script_dir(
+            "snapshot-bundle-str2func-packaged-instance-handle-consumer",
+        );
+        let class_dir = source_dir.join("+pkg").join("@Counter");
+        let private_dir = class_dir.join("private");
+        fs::create_dir_all(&private_dir).expect("create package class private dir");
+        let class_path = class_dir.join("Counter.m");
+        let method_path = class_dir.join("plusWithOffset.m");
+        let helper_path = private_dir.join("offset.m");
+        let producer_path = source_dir.join("producer.m");
+        let consumer_path = consumer_dir.join("consumer.m");
+        let snapshot_path =
+            unique_temp_mat_path("snapshot-bundle-str2func-packaged-instance-handle")
+                .with_extension("matws");
+        let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            &class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write snapshot str2func packaged instance class");
+        fs::write(
+            &method_path,
+            "function out = plusWithOffset(obj, delta)\n\
+             out = obj.value + offset(delta);\n\
+             end\n",
+        )
+        .expect("write snapshot str2func packaged instance method");
+        fs::write(
+            &helper_path,
+            "function out = offset(delta)\n\
+             out = delta + 2;\n\
+             end\n",
+        )
+        .expect("write snapshot str2func packaged instance helper");
+        fs::write(
+            &producer_path,
+            format!(
+                "seed = pkg.Counter(1);\n\
+                 f = str2func('pkg.Counter.plusWithOffset');\n\
+                 save('{snapshot_text}', 'seed', 'f');\n"
+            ),
+        )
+        .expect("write snapshot str2func packaged instance producer");
+
+        let bundle = compile_bytecode_bundle(&producer_path);
+        fs::remove_dir_all(&source_dir)
+            .expect("remove snapshot str2func packaged instance source tree");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot str2func packaged instance producer");
+
+        fs::write(
+            &consumer_path,
+            format!(
+                "load('{snapshot_text}');\n\
+                 c = pkg.Counter(10);\n\
+                 out = f(c, 5);\n"
+            ),
+        )
+        .expect("write snapshot str2func packaged instance consumer");
+
+        let expected =
+            "workspace\n  c = pkg.Counter with properties {value=10}\n  f = @pkg.Counter.plusWithOffset\n  out = 17\n  seed = pkg.Counter with properties {value=1}\n";
+        let interpreted = execute_path(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+        assert_eq!(interpreted.bundle_modules().len(), 3);
+
+        let bytecode = execute_path_bytecode(&consumer_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+        assert_eq!(bytecode.bundle_modules().len(), 3);
 
         let _ = fs::remove_file(snapshot_path);
         let _ = fs::remove_dir_all(consumer_dir);

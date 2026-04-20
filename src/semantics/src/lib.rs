@@ -10,7 +10,8 @@ pub mod workspace;
 use std::collections::HashMap;
 
 pub use binder::{
-    analyze_compilation_unit, analyze_compilation_unit_with_source_context, AnalysisResult,
+    analyze_compilation_unit, analyze_compilation_unit_with_source_context,
+    builtin_function_names, is_builtin_function_name, AnalysisResult,
 };
 use matlab_frontend::{
     ast::{CompilationUnit, Expression, ExpressionKind, FunctionHandleTarget, IndexArgument},

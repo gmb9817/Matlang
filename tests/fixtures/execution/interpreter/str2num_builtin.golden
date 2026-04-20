@@ -1,0 +1,13 @@
+workspace
+  a = 12.5
+  b = [1, 2, 3]
+  c = [1, 2 ; 3, 4]
+  d = 1 + 2i
+  e = []
+  f = []
+  g = 1
+  ok_b = true
+  ok_c = true
+  ok_d = true
+  ok_e = false
+  ok_f = true

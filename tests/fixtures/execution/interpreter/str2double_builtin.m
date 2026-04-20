@@ -1,0 +1,11 @@
+a = str2double("12.5");
+b = str2double('3.25');
+c = str2double(["1" "bad"; "Inf" "-2.5"]);
+d = str2double({'1+2i', '-3i'; 'NaN', '1e-3'});
+e = str2double("");
+f = str2double("  -4.5e1  ");
+g = str2double({'i', '-i'; '2j', '1-2j'});
+h = str2double("1 + 2i");
+i = str2double("1 - i");
+j = str2double("2e3 + 4e-2i");
+k = str2double("1 2");

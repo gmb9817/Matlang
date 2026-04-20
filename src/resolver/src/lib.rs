@@ -222,6 +222,95 @@ pub fn resolve_callable(name: &str, context: &ResolverContext) -> Option<Resolve
     None
 }
 
+pub fn resolve_all_callables(name: &str, context: &ResolverContext) -> Vec<ResolvedCallable> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(source_dir) = context.source_dir() {
+        if let Some(private) = resolve_private_function(name, source_dir) {
+            push_unique_callable_match(
+                &mut matches,
+                &mut seen,
+                ResolvedCallable::Function(private),
+            );
+        }
+    }
+
+    for root in context.effective_search_roots() {
+        if let Some(class_def) = resolve_folder_class_definition(name, &root, context) {
+            push_unique_callable_match(
+                &mut matches,
+                &mut seen,
+                ResolvedCallable::Class(class_def),
+            );
+        }
+
+        if let Some(package) = resolve_package_function(name, &root) {
+            push_unique_callable_match(
+                &mut matches,
+                &mut seen,
+                ResolvedCallable::Function(package),
+            );
+        }
+
+        if let Some(class_def) = resolve_static_class_reference(name, &root, context) {
+            push_unique_callable_match(
+                &mut matches,
+                &mut seen,
+                ResolvedCallable::Class(class_def),
+            );
+        }
+
+        let candidate = root.join(format!("{name}.m"));
+        if candidate.is_file() && !m_file_looks_like_classdef(&candidate) {
+            let kind = if context.source_dir().is_some_and(|dir| dir == root.as_path()) {
+                ResolvedFunctionKind::CurrentDirectory
+            } else {
+                ResolvedFunctionKind::SearchPath
+            };
+            push_unique_callable_match(
+                &mut matches,
+                &mut seen,
+                ResolvedCallable::Function(ResolvedFunction {
+                    name: name.to_string(),
+                    kind,
+                    path: candidate,
+                    root: root.clone(),
+                    package: None,
+                }),
+            );
+        }
+
+        if let Some(class_def) = resolve_plain_class_definition(name, &root, context) {
+            push_unique_callable_match(
+                &mut matches,
+                &mut seen,
+                ResolvedCallable::Class(class_def),
+            );
+        }
+    }
+
+    matches
+}
+
+fn push_unique_callable_match(
+    matches: &mut Vec<ResolvedCallable>,
+    seen: &mut HashSet<PathBuf>,
+    resolved: ResolvedCallable,
+) {
+    let path = match &resolved {
+        ResolvedCallable::Function(function) => function.path.clone(),
+        ResolvedCallable::Class(class_def) => class_def.path.clone(),
+    };
+    if seen.insert(path) {
+        matches.push(resolved);
+    }
+}
+
 fn resolve_static_class_reference(
     name: &str,
     root: &Path,

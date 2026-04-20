@@ -1,0 +1,15 @@
+workspace
+  cos_handle = @cos
+  cos_name = 'cos'
+  cos_value = 1
+  direct_builtin_name = 'sin'
+  direct_helper_name = 'helper'
+  helper_handle = @helper
+  helper_name = 'helper'
+  helper_value = 6
+  plus_handle = @plus
+  plus_name = 'plus'
+  plus_value = 5
+  sin_handle = @sin
+  sin_name = 'sin'
+  sin_value = 1

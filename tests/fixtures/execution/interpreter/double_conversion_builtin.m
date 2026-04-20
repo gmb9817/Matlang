@@ -1,0 +1,9 @@
+a = double(5);
+b = double(true);
+c = double(false);
+d = double([true false; false true]);
+e = double(1 + 2i);
+f = double([1 + 2i 0; 3 - 4i 5]);
+g = double('AB');
+h = double('');
+i = double([]);

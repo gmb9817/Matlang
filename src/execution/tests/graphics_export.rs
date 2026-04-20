@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use matlab_execution::{execute_script, execute_script_bytecode};
+use matlab_execution::{execute_script_bytecode_with_identity, execute_script_with_identity};
 use matlab_frontend::{
     parser::{parse_source, ParseMode},
     source::SourceFileId,
@@ -3317,7 +3317,7 @@ fn execute_source(
     let unit = parsed.unit.expect("compilation unit");
     let analysis = analyze_compilation_unit_with_context(
         &unit,
-        &ResolverContext::from_source_file(source_path),
+        &ResolverContext::from_source_file(source_path.clone()),
     );
     assert!(
         !analysis.has_errors(),
@@ -3327,8 +3327,12 @@ fn execute_source(
 
     let hir = lower_to_hir(&unit, &analysis);
     match kind {
-        ExecutionKind::Interpreter => execute_script(&hir),
-        ExecutionKind::Bytecode => execute_script_bytecode(&hir),
+        ExecutionKind::Interpreter => {
+            execute_script_with_identity(&hir, source_path.display().to_string(), None)
+        }
+        ExecutionKind::Bytecode => {
+            execute_script_bytecode_with_identity(&hir, source_path.display().to_string(), None)
+        }
     }
     .map(|_| ())
 }

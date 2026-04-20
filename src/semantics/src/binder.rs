@@ -357,6 +357,7 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "char",
     "string",
     "num2str",
+    "int2str",
     "disp",
     "display",
     "sprintf",
@@ -392,13 +393,33 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "strcmpi",
     "strncmp",
     "strncmpi",
+    "functions",
+    "localfunctions",
+    "exist",
+    "inmem",
+    "help",
+    "lookfor",
+    "what",
+    "which",
+    "filemarker",
+    "func2str",
+    "str2func",
     "strlength",
+    "str2double",
+    "str2num",
+    "base2dec",
+    "dec2base",
+    "dec2hex",
+    "dec2bin",
+    "hex2dec",
+    "bin2dec",
     "contains",
     "count",
     "strfind",
     "matches",
     "upper",
     "lower",
+    "mat2str",
     "startsWith",
     "endsWith",
     "append",
@@ -1026,7 +1047,11 @@ impl Binder {
     ) {
         match &statement.kind {
             StatementKind::Assignment { targets, value, .. } => {
-                self.bind_expression(value, scope_id);
+                if self.expression_prefers_zero_arg_builtin_call(value, scope_id) {
+                    self.bind_apply_target(value, scope_id);
+                } else {
+                    self.bind_expression(value, scope_id);
+                }
                 for target in targets {
                     self.bind_assignment_target(target, scope_id, workspace_id);
                 }
@@ -1476,6 +1501,25 @@ impl Binder {
             && !is_builtin_value(root)
     }
 
+    fn expression_prefers_zero_arg_builtin_call(
+        &self,
+        expression: &Expression,
+        scope_id: ScopeId,
+    ) -> bool {
+        let Some(qualified) = self.expression_as_qualified_name(expression) else {
+            return false;
+        };
+        if qualified.segments.len() != 1 {
+            return false;
+        }
+
+        let root = &qualified.segments[0].name;
+        self.lookup_resolvable_value_symbol(scope_id, root)
+            .is_none()
+            && !is_builtin_value(root)
+            && is_builtin_function_name(root)
+    }
+
     fn bind_expression(&mut self, expression: &Expression, scope_id: ScopeId) {
         match &expression.kind {
             ExpressionKind::Identifier(identifier) => {
@@ -1705,7 +1749,7 @@ impl Binder {
             return;
         }
 
-        let resolution = if is_builtin_function(&identifier.name) {
+        let resolution = if is_builtin_function_name(&identifier.name) {
             ReferenceResolution::BuiltinFunction
         } else {
             ReferenceResolution::ExternalFunctionCandidate
@@ -1732,7 +1776,7 @@ impl Binder {
             return;
         }
 
-        let resolution = if is_builtin_function(&identifier.name) {
+        let resolution = if is_builtin_function_name(&identifier.name) {
             ReferenceResolution::BuiltinFunction
         } else {
             ReferenceResolution::ExternalFunctionCandidate
@@ -2138,8 +2182,12 @@ impl Binder {
     }
 }
 
-fn is_builtin_function(name: &str) -> bool {
+pub fn is_builtin_function_name(name: &str) -> bool {
     BUILTIN_FUNCTIONS.iter().any(|builtin| *builtin == name)
+}
+
+pub fn builtin_function_names() -> &'static [&'static str] {
+    BUILTIN_FUNCTIONS
 }
 
 fn is_builtin_value(name: &str) -> bool {
@@ -2581,6 +2629,26 @@ mod tests {
                 && reference.role == ReferenceRole::CallTarget
                 && reference.resolution == ReferenceResolution::BuiltinFunction
         }));
+    }
+
+    #[test]
+    fn assignment_rhs_can_resolve_zero_arg_builtin_calls() {
+        let parsed = parse_source(
+            "token = tic;\nnames = who;\nsummary = whos;\n",
+            SourceFileId(1),
+            ParseMode::Script,
+        );
+        let unit = parsed.unit.expect("parsed unit");
+        let analysis = analyze_compilation_unit(&unit);
+
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        for builtin_name in ["tic", "who", "whos"] {
+            assert!(analysis.references.iter().any(|reference| {
+                reference.name == builtin_name
+                    && reference.role == ReferenceRole::CallTarget
+                    && reference.resolution == ReferenceResolution::BuiltinFunction
+            }));
+        }
     }
 
     #[test]

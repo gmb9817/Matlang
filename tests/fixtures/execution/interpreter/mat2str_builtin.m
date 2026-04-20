@@ -1,0 +1,10 @@
+a = mat2str(5);
+b = mat2str([1 2; 3 4]);
+c = mat2str(1 + 2i);
+d = mat2str([1 + 2i 0; -3i 4]);
+e = mat2str(true);
+f = mat2str([true false; false true]);
+g = mat2str([]);
+h = mat2str(pi, 4);
+i = mat2str([1/3 2/3], 3);
+j = mat2str([NaN, Inf, -Inf]);

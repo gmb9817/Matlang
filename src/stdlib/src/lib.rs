@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use matlab_runtime::{
-    ArrayStorageClass, CellValue, ComplexValue, FunctionHandleTarget, MatrixValue, RuntimeError,
-    RuntimeStackFrame, StructValue, Value,
+    ArrayStorageClass, CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue,
+    MatrixValue, RuntimeError, RuntimeStackFrame, StructValue, Value,
 };
 use regex::Regex;
 use statrs::distribution::{ContinuousCDF, Normal, StudentsT};
@@ -27,6 +27,8 @@ pub fn invoke_builtin_outputs(
         "ones" => Ok(vec![builtin_fill(args, 1.0)?]),
         "true" => Ok(vec![builtin_logical_fill(args, true)?]),
         "false" => Ok(vec![builtin_logical_fill(args, false)?]),
+        "logical" => Ok(vec![builtin_logical(args)?]),
+        "double" => Ok(vec![builtin_double(args)?]),
         "pi" => Ok(vec![builtin_constant_scalar(
             args,
             "pi",
@@ -188,12 +190,23 @@ pub fn invoke_builtin_outputs(
         "strcmpi" => Ok(vec![builtin_strcmpi(args)?]),
         "strncmp" => Ok(vec![builtin_strncmp(args)?]),
         "strncmpi" => Ok(vec![builtin_strncmpi(args)?]),
+        "func2str" => Ok(vec![builtin_func2str(args)?]),
+        "str2func" => Ok(vec![builtin_str2func(args)?]),
         "strlength" => Ok(vec![builtin_strlength(args)?]),
         "contains" => Ok(vec![builtin_contains(args)?]),
         "count" => Ok(vec![builtin_count(args)?]),
         "strfind" => Ok(vec![builtin_strfind(args)?]),
         "matches" => Ok(vec![builtin_matches(args)?]),
         "num2str" => Ok(vec![builtin_num2str(args)?]),
+        "int2str" => Ok(vec![builtin_int2str(args)?]),
+        "mat2str" => Ok(vec![builtin_mat2str(args)?]),
+        "base2dec" => Ok(vec![builtin_base2dec(args)?]),
+        "dec2base" => Ok(vec![builtin_dec2base(args)?]),
+        "dec2hex" => Ok(vec![builtin_dec2hex(args)?]),
+        "dec2bin" => Ok(vec![builtin_dec2bin(args)?]),
+        "hex2dec" => Ok(vec![builtin_hex2dec(args)?]),
+        "bin2dec" => Ok(vec![builtin_bin2dec(args)?]),
+        "str2double" => Ok(vec![builtin_str2double(args)?]),
         "cellstr" => Ok(vec![builtin_cellstr(args)?]),
         "upper" => Ok(vec![builtin_upper(args)?]),
         "lower" => Ok(vec![builtin_lower(args)?]),
@@ -417,34 +430,33 @@ fn builtin_fill_value(
 fn builtin_eye(args: &[Value]) -> Result<Value, RuntimeError> {
     let (rows, cols) = match args {
         [] => return Ok(Value::Scalar(1.0)),
-        [size] => match size {
-            Value::Matrix(matrix) if matrix.rows == 0 || matrix.cols == 0 => (0, 0),
-            Value::Matrix(matrix) => {
-                let dims = matrix
-                    .iter()
-                    .map(parse_eye_dimension)
-                    .collect::<Result<Vec<_>, _>>()?;
-                match dims.as_slice() {
-                    [size] => (*size, *size),
-                    [rows, cols] => (*rows, *cols),
-                    _ => {
-                        return Err(RuntimeError::Unsupported(
+        [size] => {
+            match size {
+                Value::Matrix(matrix) if matrix.rows == 0 || matrix.cols == 0 => (0, 0),
+                Value::Matrix(matrix) => {
+                    let dims = matrix
+                        .iter()
+                        .map(parse_eye_dimension)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    match dims.as_slice() {
+                        [size] => (*size, *size),
+                        [rows, cols] => (*rows, *cols),
+                        _ => return Err(RuntimeError::Unsupported(
                             "eye currently supports `eye`, `eye(n)`, `eye(n, m)`, or `eye([m n])`"
                                 .to_string(),
-                        ))
+                        )),
                     }
                 }
+                _ => {
+                    let size = parse_eye_dimension(size)?;
+                    (size, size)
+                }
             }
-            _ => {
-                let size = parse_eye_dimension(size)?;
-                (size, size)
-            }
-        },
+        }
         [rows, cols] => (parse_eye_dimension(rows)?, parse_eye_dimension(cols)?),
         _ => {
             return Err(RuntimeError::Unsupported(
-                "eye currently supports `eye`, `eye(n)`, `eye(n, m)`, or `eye([m n])`"
-                    .to_string(),
+                "eye currently supports `eye`, `eye(n)`, `eye(n, m)`, or `eye([m n])`".to_string(),
             ))
         }
     };
@@ -484,8 +496,104 @@ fn builtin_logical_fill(args: &[Value], fill: bool) -> Result<Value, RuntimeErro
     )?))
 }
 
+fn builtin_logical(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "logical currently supports exactly one argument".to_string(),
+        ));
+    };
+    match value {
+        Value::Scalar(number) => Ok(logical_scalar(*number != 0.0)),
+        Value::Logical(flag) => Ok(logical_scalar(*flag)),
+        Value::Complex(number) => Ok(logical_scalar(number.real != 0.0 || number.imag != 0.0)),
+        Value::CharArray(text) => build_scalar_matrix_result(
+            1,
+            text.chars().count(),
+            text.chars().map(|ch| logical_scalar(ch != '\0')).collect(),
+        ),
+        Value::Matrix(matrix) => build_scalar_matrix_result_with_dimensions(
+            matrix.dims.clone(),
+            matrix
+                .elements()
+                .iter()
+                .map(|element| logical_value_from_operand(element, "logical"))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        other => Err(RuntimeError::TypeError(format!(
+            "logical currently expects numeric, logical, complex, or char array input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn logical_value_from_operand(value: &Value, builtin_name: &str) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Scalar(number) => Ok(logical_scalar(*number != 0.0)),
+        Value::Logical(flag) => Ok(logical_scalar(*flag)),
+        Value::Complex(number) => Ok(logical_scalar(number.real != 0.0 || number.imag != 0.0)),
+        other => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects numeric, logical, or complex matrix input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn builtin_double(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "double currently supports exactly one argument".to_string(),
+        ));
+    };
+    match value {
+        Value::Scalar(number) => Ok(Value::Scalar(*number)),
+        Value::Logical(flag) => Ok(Value::Scalar(if *flag { 1.0 } else { 0.0 })),
+        Value::Complex(number) => Ok(Value::Complex(number.clone())),
+        Value::CharArray(text) => numeric_values_to_row_matrix(
+            text.chars().map(|ch| ch as u32 as f64).collect::<Vec<_>>(),
+        ),
+        Value::Matrix(matrix)
+            if matrix_is_numeric_or_complex(matrix) || matrix_is_logical(matrix) =>
+        {
+            build_scalar_matrix_result_with_dimensions(
+                matrix.dims.clone(),
+                matrix
+                    .elements()
+                    .iter()
+                    .map(|element| double_value_from_operand(element))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "double currently expects numeric, logical, complex, or char array input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn double_value_from_operand(value: &Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Scalar(number) => Ok(Value::Scalar(*number)),
+        Value::Logical(flag) => Ok(Value::Scalar(if *flag { 1.0 } else { 0.0 })),
+        Value::Complex(number) => Ok(Value::Complex(number.clone())),
+        other => Err(RuntimeError::TypeError(format!(
+            "double currently expects numeric, logical, or complex matrix elements, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
 fn builtin_sum(args: &[Value]) -> Result<Value, RuntimeError> {
-    let (value, selection, missing_flag) = parse_statistic_selection_with_missing_args(args, "sum")?;
+    let (value, selection, missing_flag) =
+        parse_statistic_selection_with_missing_args(args, "sum")?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+    let promote = |result| {
+        if let Some(ref reduce_dims) = vecdim_shape_promotion {
+            promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+        } else {
+            Ok(result)
+        }
+    };
     let reducer = |values: &[ComplexParts]| {
         complex_reduce_with_missing(
             values,
@@ -499,18 +607,23 @@ fn builtin_sum(args: &[Value]) -> Result<Value, RuntimeError> {
             reduce_numeric_or_complex_value(value, "sum", Value::Scalar(0.0), reducer)
         }
         _ => match collapsed_statistic_selection(&selection, mean_default_dimension(value)?) {
-        CollapsedStatisticSelection::All => {
-            reduce_numeric_or_complex_value_all(value, "sum", Value::Scalar(0.0), reducer)
-        }
-        CollapsedStatisticSelection::Dim(dim) => {
-            reduce_numeric_or_complex_value_along_dimension(
-                value,
-                "sum",
-                dim,
-                Value::Scalar(0.0),
-                reducer,
-            )
-        }
+            CollapsedStatisticSelection::All => {
+                promote(reduce_numeric_or_complex_value_all(
+                    value,
+                    "sum",
+                    Value::Scalar(0.0),
+                    reducer,
+                )?)
+            }
+            CollapsedStatisticSelection::Dim(dim) => promote(
+                reduce_numeric_or_complex_value_along_dimension(
+                    value,
+                    "sum",
+                    dim,
+                    Value::Scalar(0.0),
+                    reducer,
+                )?,
+            ),
         },
     }
 }
@@ -1318,6 +1431,15 @@ fn builtin_ne(args: &[Value]) -> Result<Value, RuntimeError> {
 fn builtin_prod(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, selection, missing_flag) =
         parse_statistic_selection_with_missing_args(args, "prod")?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+    let promote = |result| {
+        if let Some(ref reduce_dims) = vecdim_shape_promotion {
+            promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+        } else {
+            Ok(result)
+        }
+    };
     let reducer = |values: &[ComplexParts]| {
         complex_reduce_with_missing(
             values,
@@ -1331,18 +1453,23 @@ fn builtin_prod(args: &[Value]) -> Result<Value, RuntimeError> {
             reduce_numeric_or_complex_value(value, "prod", Value::Scalar(1.0), reducer)
         }
         _ => match collapsed_statistic_selection(&selection, mean_default_dimension(value)?) {
-        CollapsedStatisticSelection::All => {
-            reduce_numeric_or_complex_value_all(value, "prod", Value::Scalar(1.0), reducer)
-        }
-        CollapsedStatisticSelection::Dim(dim) => {
-            reduce_numeric_or_complex_value_along_dimension(
-                value,
-                "prod",
-                dim,
-                Value::Scalar(1.0),
-                reducer,
-            )
-        }
+            CollapsedStatisticSelection::All => {
+                promote(reduce_numeric_or_complex_value_all(
+                    value,
+                    "prod",
+                    Value::Scalar(1.0),
+                    reducer,
+                )?)
+            }
+            CollapsedStatisticSelection::Dim(dim) => promote(
+                reduce_numeric_or_complex_value_along_dimension(
+                    value,
+                    "prod",
+                    dim,
+                    Value::Scalar(1.0),
+                    reducer,
+                )?,
+            ),
         },
     }
 }
@@ -1481,15 +1608,25 @@ fn builtin_bounds(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
     }
 
     let logical_output = matrix_is_logical(&matrix);
+    let input_dims = canonical_size_vector(&matrix.dims);
     let (mut lower, mut upper) = match selection {
         BoundsSelection::Default => {
-            let dim = if matrix.rows == 1 && matrix.cols > 1 { 2 } else { 1 };
-            bounds_value_and_range(&matrix, dim, missing_flag)?
+            let dim = default_reduction_dimension_from_dims(&input_dims);
+            if input_dims.len() > 2 {
+                bounds_value_and_range_over_dimensions(&matrix, &[dim], missing_flag)?
+            } else {
+                bounds_value_and_range(&matrix, dim, missing_flag)?
+            }
         }
-        BoundsSelection::Dim(dim) => bounds_value_and_range(&matrix, dim, missing_flag)?,
+        BoundsSelection::Dim(dim) => {
+            if input_dims.len() > 2 || dim > 2 {
+                bounds_value_and_range_over_dimensions(&matrix, &[dim], missing_flag)?
+            } else {
+                bounds_value_and_range(&matrix, dim, missing_flag)?
+            }
+        }
         BoundsSelection::All => {
-            let dims = canonical_size_vector(&matrix.dims);
-            let operating_dims = (1..=dims.len()).collect::<Vec<_>>();
+            let operating_dims = (1..=input_dims.len()).collect::<Vec<_>>();
             bounds_value_and_range_over_dimensions(&matrix, &operating_dims, missing_flag)?
         }
         BoundsSelection::VecDim(dims) => {
@@ -1536,7 +1673,9 @@ enum BoundsMissingFlag {
     IncludeNan,
 }
 
-fn parse_bounds_args(args: &[Value]) -> Result<(&Value, BoundsSelection, BoundsMissingFlag), RuntimeError> {
+fn parse_bounds_args(
+    args: &[Value],
+) -> Result<(&Value, BoundsSelection, BoundsMissingFlag), RuntimeError> {
     match args {
         [value] => Ok((value, BoundsSelection::Default, BoundsMissingFlag::OmitNan)),
         [value, option] => {
@@ -1568,7 +1707,8 @@ fn parse_bounds_selection(value: &Value) -> Result<BoundsSelection, RuntimeError
                 .map(|dimension| {
                     if !dimension.is_finite() || dimension < 1.0 || dimension.fract() != 0.0 {
                         return Err(RuntimeError::TypeError(
-                            "bounds currently expects dimensions to be positive integers".to_string(),
+                            "bounds currently expects dimensions to be positive integers"
+                                .to_string(),
                         ));
                     }
                     Ok(dimension as usize)
@@ -1606,7 +1746,11 @@ fn empty_bounds_result(
 ) -> Option<(Value, Value)> {
     let dims = canonical_size_vector(&matrix.dims);
     let operating_dims = match selection {
-        BoundsSelection::Default => vec![if matrix.rows == 1 && matrix.cols > 1 { 2 } else { 1 }],
+        BoundsSelection::Default => vec![if matrix.rows == 1 && matrix.cols > 1 {
+            2
+        } else {
+            1
+        }],
         BoundsSelection::Dim(dim) => vec![*dim],
         BoundsSelection::All => (1..=dims.len()).collect(),
         BoundsSelection::VecDim(dims) => dims.clone(),
@@ -1695,8 +1839,16 @@ fn builtin_extreme(
             selection,
             index_mode,
         } => {
-            if let Some(outputs) =
-                extreme_empty_reduction_outputs(value, &selection, output_arity)?
+            let input_dims = canonical_size_vector(&value_dimensions(value));
+            let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+            let promote = |result| {
+                if let Some(ref reduce_dims) = vecdim_shape_promotion {
+                    promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+                } else {
+                    Ok(result)
+                }
+            };
+            if let Some(outputs) = extreme_empty_reduction_outputs(value, &selection, output_arity)?
             {
                 return Ok(outputs);
             }
@@ -1705,8 +1857,8 @@ fn builtin_extreme(
                     let (extreme_value, index_value) =
                         extreme_value_and_index(value, name, prefer_candidate)?;
                     match output_arity {
-                        0 | 1 => Ok(vec![extreme_value]),
-                        2 => Ok(vec![extreme_value, index_value]),
+                        0 | 1 => Ok(vec![promote(extreme_value)?]),
+                        2 => Ok(vec![promote(extreme_value)?, promote(index_value)?]),
                         _ => Err(RuntimeError::Unsupported(format!(
                             "{name} currently supports one or two outputs"
                         ))),
@@ -1726,33 +1878,37 @@ fn builtin_extreme(
                             let extreme_value = extreme_value_all(value, name, prefer_candidate)?;
                             if output_arity == 2 {
                                 Ok(vec![
-                                    extreme_value,
-                                    extreme_linear_index_all(value, name, prefer_candidate)?,
+                                    promote(extreme_value)?,
+                                    promote(extreme_linear_index_all(
+                                        value,
+                                        name,
+                                        prefer_candidate,
+                                    )?)?,
                                 ])
                             } else {
-                                Ok(vec![extreme_value])
+                                Ok(vec![promote(extreme_value)?])
                             }
                         }
                         CollapsedStatisticSelection::Dim(dim) => {
-                            let (extreme_value, index_value) = if index_mode == ExtremeIndexMode::Linear
-                            {
-                                extreme_value_and_linear_index_along_dimension(
-                                    value,
-                                    name,
-                                    dim,
-                                    prefer_candidate,
-                                )?
-                            } else {
-                                extreme_value_and_index_along_dimension(
-                                    value,
-                                    name,
-                                    dim,
-                                    prefer_candidate,
-                                )?
-                            };
+                            let (extreme_value, index_value) =
+                                if index_mode == ExtremeIndexMode::Linear {
+                                    extreme_value_and_linear_index_along_dimension(
+                                        value,
+                                        name,
+                                        dim,
+                                        prefer_candidate,
+                                    )?
+                                } else {
+                                    extreme_value_and_index_along_dimension(
+                                        value,
+                                        name,
+                                        dim,
+                                        prefer_candidate,
+                                    )?
+                                };
                             match output_arity {
-                                0 | 1 => Ok(vec![extreme_value]),
-                                2 => Ok(vec![extreme_value, index_value]),
+                                0 | 1 => Ok(vec![promote(extreme_value)?]),
+                                2 => Ok(vec![promote(extreme_value)?, promote(index_value)?]),
                                 _ => Err(RuntimeError::Unsupported(format!(
                                     "{name} currently supports one or two outputs"
                                 ))),
@@ -1873,6 +2029,15 @@ fn empty_numeric_matrix_with_dimensions(dims: Vec<usize>) -> Result<Value, Runti
 
 fn builtin_mean(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, selection, missing_flag) = parse_mean_args(args)?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+    let promote = |result| {
+        if let Some(ref reduce_dims) = vecdim_shape_promotion {
+            promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+        } else {
+            Ok(result)
+        }
+    };
     let reducer = |values: &[ComplexParts]| {
         complex_reduce_with_missing(
             values,
@@ -1885,24 +2050,36 @@ fn builtin_mean(args: &[Value]) -> Result<Value, RuntimeError> {
         )
     };
     match collapsed_statistic_selection(&selection, mean_default_dimension(value)?) {
-        CollapsedStatisticSelection::All => {
-            reduce_numeric_or_complex_value_all(value, "mean", Value::Scalar(f64::NAN), reducer)
-        }
-        CollapsedStatisticSelection::Dim(dim) => {
+        CollapsedStatisticSelection::All => promote(reduce_numeric_or_complex_value_all(
+            value,
+            "mean",
+            Value::Scalar(f64::NAN),
+            reducer,
+        )?),
+        CollapsedStatisticSelection::Dim(dim) => promote(
             reduce_numeric_or_complex_value_along_dimension(
                 value,
                 "mean",
                 dim,
                 Value::Scalar(f64::NAN),
                 reducer,
-            )
-        }
+            )?,
+        ),
     }
 }
 
 fn builtin_median(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, selection, missing_flag) =
         parse_statistic_selection_with_missing_args(args, "median")?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+    let promote = |result| {
+        if let Some(ref reduce_dims) = vecdim_shape_promotion {
+            promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+        } else {
+            Ok(result)
+        }
+    };
     let reducer = |values: &[f64]| {
         numeric_reduce_with_missing(values, missing_flag, f64::NAN, median_of_values)
     };
@@ -1910,45 +2087,59 @@ fn builtin_median(args: &[Value]) -> Result<Value, RuntimeError> {
         StatisticSelection::Default => {
             reduce_numeric_value(value, "median", Value::Scalar(f64::NAN), reducer)
         }
-        _ => match collapsed_statistic_selection(&selection, variance_default_dimension(value, "median")?) {
-            CollapsedStatisticSelection::All => {
-                reduce_numeric_value_all(value, "median", Value::Scalar(f64::NAN), reducer)
-            }
-            CollapsedStatisticSelection::Dim(dim) => {
-                reduce_numeric_value_along_dimension(
-                    value,
-                    "median",
-                    dim,
-                    Value::Scalar(f64::NAN),
-                    reducer,
-                )
-            }
+        _ => match collapsed_statistic_selection(
+            &selection,
+            variance_default_dimension(value, "median")?,
+        ) {
+            CollapsedStatisticSelection::All => promote(reduce_numeric_value_all(
+                value,
+                "median",
+                Value::Scalar(f64::NAN),
+                reducer,
+            )?),
+            CollapsedStatisticSelection::Dim(dim) => promote(reduce_numeric_value_along_dimension(
+                value,
+                "median",
+                dim,
+                Value::Scalar(f64::NAN),
+                reducer,
+            )?),
         },
     }
 }
 
 fn builtin_mode(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, selection) = parse_sum_like_args(args, "mode")?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+    let promote = |result| {
+        if let Some(ref reduce_dims) = vecdim_shape_promotion {
+            promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+        } else {
+            Ok(result)
+        }
+    };
     match selection {
         StatisticSelection::Default => {
             reduce_numeric_value(value, "mode", Value::Scalar(f64::NAN), mode_of_values)
         }
-        _ => match collapsed_statistic_selection(&selection, variance_default_dimension(value, "mode")?) {
-            CollapsedStatisticSelection::All => reduce_numeric_value_all(
+        _ => match collapsed_statistic_selection(
+            &selection,
+            variance_default_dimension(value, "mode")?,
+        ) {
+            CollapsedStatisticSelection::All => promote(reduce_numeric_value_all(
                 value,
                 "mode",
                 Value::Scalar(f64::NAN),
                 mode_of_values,
-            ),
-            CollapsedStatisticSelection::Dim(dim) => {
-                reduce_numeric_value_along_dimension(
-                    value,
-                    "mode",
-                    dim,
-                    Value::Scalar(f64::NAN),
-                    mode_of_values,
-                )
-            }
+            )?),
+            CollapsedStatisticSelection::Dim(dim) => promote(reduce_numeric_value_along_dimension(
+                value,
+                "mode",
+                dim,
+                Value::Scalar(f64::NAN),
+                mode_of_values,
+            )?),
         },
     }
 }
@@ -1956,26 +2147,54 @@ fn builtin_mode(args: &[Value]) -> Result<Value, RuntimeError> {
 fn builtin_var(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, normalization, selection, missing_flag) =
         parse_variance_selection_args(args, "var")?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+    let promote = |result| {
+        if let Some(ref reduce_dims) = vecdim_shape_promotion {
+            promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+        } else {
+            Ok(result)
+        }
+    };
     match collapsed_statistic_selection(&selection, variance_default_dimension(value, "var")?) {
         CollapsedStatisticSelection::All => {
-            variance_or_std_all(value, "var", normalization, missing_flag, false)
+            promote(variance_or_std_all(value, "var", normalization, missing_flag, false)?)
         }
-        CollapsedStatisticSelection::Dim(dim) => {
-            variance_or_std_along_dimension(value, "var", dim, normalization, missing_flag, false)
-        }
+        CollapsedStatisticSelection::Dim(dim) => promote(variance_or_std_along_dimension(
+            value,
+            "var",
+            dim,
+            normalization,
+            missing_flag,
+            false,
+        )?),
     }
 }
 
 fn builtin_std(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, normalization, selection, missing_flag) =
         parse_variance_selection_args(args, "std")?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+    let promote = |result| {
+        if let Some(ref reduce_dims) = vecdim_shape_promotion {
+            promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+        } else {
+            Ok(result)
+        }
+    };
     match collapsed_statistic_selection(&selection, variance_default_dimension(value, "std")?) {
         CollapsedStatisticSelection::All => {
-            variance_or_std_all(value, "std", normalization, missing_flag, true)
+            promote(variance_or_std_all(value, "std", normalization, missing_flag, true)?)
         }
-        CollapsedStatisticSelection::Dim(dim) => {
-            variance_or_std_along_dimension(value, "std", dim, normalization, missing_flag, true)
-        }
+        CollapsedStatisticSelection::Dim(dim) => promote(variance_or_std_along_dimension(
+            value,
+            "std",
+            dim,
+            normalization,
+            missing_flag,
+            true,
+        )?),
     }
 }
 
@@ -2074,8 +2293,10 @@ fn builtin_corrcoef(args: &[Value], output_arity: usize) -> Result<Vec<Value>, R
     let inputs = parse_correlation_inputs(args)?;
     let (correlation, p_values) = match inputs.options.rows_flag {
         CorrcoefRowsFlag::All => {
-            let correlation =
-                correlation_matrix(&covariance_matrix(&inputs.dataset, VarianceNormalization::Sample));
+            let correlation = correlation_matrix(&covariance_matrix(
+                &inputs.dataset,
+                VarianceNormalization::Sample,
+            ));
             let p_values = corrcoef_p_values_for_matrix(&correlation, inputs.dataset.rows);
             (correlation, p_values)
         }
@@ -2085,8 +2306,10 @@ fn builtin_corrcoef(args: &[Value], output_arity: usize) -> Result<Vec<Value>, R
                 let nans = nan_numeric_operand(inputs.dataset.cols);
                 (nans.clone(), nans)
             } else {
-                let correlation =
-                    correlation_matrix(&covariance_matrix(&filtered, VarianceNormalization::Sample));
+                let correlation = correlation_matrix(&covariance_matrix(
+                    &filtered,
+                    VarianceNormalization::Sample,
+                ));
                 let p_values = corrcoef_p_values_for_matrix(&correlation, filtered.rows);
                 (correlation, p_values)
             }
@@ -2110,14 +2333,18 @@ fn builtin_corrcoef(args: &[Value], output_arity: usize) -> Result<Vec<Value>, R
 
 fn covariance_empty_result(args: &[Value]) -> Result<Option<Value>, RuntimeError> {
     match args {
-        [value] if is_empty_numeric_matrix(value) => Ok(Some(covariance_empty_single_result(value)?)),
+        [value] if is_empty_numeric_matrix(value) => {
+            Ok(Some(covariance_empty_single_result(value)?))
+        }
         [value, weight]
             if is_empty_numeric_matrix(value) && is_variance_normalization_value(weight) =>
         {
             Ok(Some(covariance_empty_single_result(value)?))
         }
         [lhs, rhs]
-            if is_empty_numeric_matrix(lhs) && is_empty_numeric_matrix(rhs) && same_matrix_shape(lhs, rhs) =>
+            if is_empty_numeric_matrix(lhs)
+                && is_empty_numeric_matrix(rhs)
+                && same_matrix_shape(lhs, rhs) =>
         {
             Ok(Some(nan_matrix(2, 2)?))
         }
@@ -2143,10 +2370,15 @@ fn covariance_empty_single_result(value: &Value) -> Result<Value, RuntimeError> 
     nan_matrix(matrix.cols, matrix.cols)
 }
 
-fn corrcoef_empty_result(args: &[Value], output_arity: usize) -> Result<Option<Vec<Value>>, RuntimeError> {
+fn corrcoef_empty_result(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Option<Vec<Value>>, RuntimeError> {
     match args {
         [lhs, rhs]
-            if is_empty_numeric_matrix(lhs) && is_empty_numeric_matrix(rhs) && same_matrix_shape(lhs, rhs) =>
+            if is_empty_numeric_matrix(lhs)
+                && is_empty_numeric_matrix(rhs)
+                && same_matrix_shape(lhs, rhs) =>
         {
             let result = nan_matrix(2, 2)?;
             let mut outputs = vec![result.clone()];
@@ -2185,13 +2417,15 @@ fn nan_matrix(rows: usize, cols: usize) -> Result<Value, RuntimeError> {
 }
 
 fn builtin_quantile(args: &[Value]) -> Result<Value, RuntimeError> {
+    let input_dims = canonical_size_vector(&value_dimensions(&args[0]));
     let (data, probabilities, selection) = parse_quantile_args(args)?;
-    quantile_result(&data, &probabilities, &selection, "quantile")
+    quantile_result(&data, &input_dims, &probabilities, &selection, "quantile")
 }
 
 fn builtin_prctile(args: &[Value]) -> Result<Value, RuntimeError> {
+    let input_dims = canonical_size_vector(&value_dimensions(&args[0]));
     let (data, probabilities, selection) = parse_prctile_args(args)?;
-    quantile_result(&data, &probabilities, &selection, "prctile")
+    quantile_result(&data, &input_dims, &probabilities, &selection, "prctile")
 }
 
 fn builtin_iqr(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
@@ -2203,6 +2437,56 @@ fn builtin_iqr(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runtim
 
     let (data, selection) = parse_spread_selection_args(args, "iqr")?;
     let input_dims = canonical_size_vector(&value_dimensions(&args[0]));
+    if let StatisticSelection::VecDim(dims) = &selection {
+        let mut reduce_dims = dims.clone();
+        reduce_dims.sort_unstable();
+        reduce_dims.dedup();
+        if input_dims.len() > 2 || vecdim_requires_nd_path(&reduce_dims) {
+            let rank = input_dims
+                .len()
+                .max(reduce_dims.iter().copied().max().unwrap_or(0));
+            if reduce_dims == (1..=rank).collect::<Vec<_>>() {
+                let quartiles = NumericOperand {
+                    rows: 1,
+                    cols: 2,
+                    values: quantiles_for_sample(&data.values, &[0.25, 0.75]),
+                };
+                let spread = NumericOperand {
+                    rows: 1,
+                    cols: 1,
+                    values: vec![zero_small(quartiles.values[1] - quartiles.values[0])],
+                };
+                let mut outputs = vec![numeric_operand_to_value(&spread)?];
+                if output_arity == 2 {
+                    outputs.push(numeric_operand_to_value(&quartiles)?);
+                }
+                return Ok(outputs);
+            }
+            let (spread_dims, spread_values) =
+                reduce_numeric_vecdim_values(&data.values, &input_dims, &reduce_dims, 1, |sample| {
+                    let quartiles = quantiles_for_sample(sample, &[0.25, 0.75]);
+                    vec![zero_small(quartiles[1] - quartiles[0])]
+                });
+            let mut outputs = vec![numeric_matrix_result_with_dimensions(
+                spread_dims,
+                spread_values,
+            )?];
+            if output_arity == 2 {
+                let (quartile_dims, quartile_values) = reduce_numeric_vecdim_values(
+                    &data.values,
+                    &input_dims,
+                    &reduce_dims,
+                    2,
+                    |sample| quantiles_for_sample(sample, &[0.25, 0.75]),
+                );
+                outputs.push(numeric_matrix_result_with_dimensions(
+                    quartile_dims,
+                    quartile_values,
+                )?);
+            }
+            return Ok(outputs);
+        }
+    }
     let collapsed = collapsed_statistic_selection(&selection, default_statistic_dimension(&data));
     if data.rows == 0 || data.cols == 0 {
         return empty_iqr_outputs(&data, collapsed, output_arity);
@@ -2341,11 +2625,27 @@ fn empty_iqr_outputs(
 fn builtin_range(args: &[Value]) -> Result<Value, RuntimeError> {
     let (data, selection) = parse_spread_selection_args(args, "range")?;
     let input_dims = canonical_size_vector(&value_dimensions(&args[0]));
+    if let StatisticSelection::VecDim(dims) = &selection {
+        let mut reduce_dims = dims.clone();
+        reduce_dims.sort_unstable();
+        reduce_dims.dedup();
+        if input_dims.len() > 2 || vecdim_requires_nd_path(&reduce_dims) {
+            let rank = input_dims
+                .len()
+                .max(reduce_dims.iter().copied().max().unwrap_or(0));
+            if reduce_dims == (1..=rank).collect::<Vec<_>>() {
+                return Ok(Value::Scalar(sample_range(&data.values)));
+            }
+            let (output_dims, values) =
+                reduce_numeric_vecdim_values(&data.values, &input_dims, &reduce_dims, 1, |sample| {
+                    vec![sample_range(sample)]
+                });
+            return numeric_matrix_result_with_dimensions(output_dims, values);
+        }
+    }
     match collapsed_statistic_selection(&selection, default_statistic_dimension(&data)) {
         CollapsedStatisticSelection::All => Ok(Value::Scalar(sample_range(&data.values))),
-        CollapsedStatisticSelection::Dim(dim)
-            if input_dims.len() > 2 || dim > 2 =>
-        {
+        CollapsedStatisticSelection::Dim(dim) if input_dims.len() > 2 || dim > 2 => {
             range_numeric_value_with_dimensions(&data.values, &input_dims, dim)
         }
         CollapsedStatisticSelection::Dim(dim) => {
@@ -2361,52 +2661,242 @@ fn builtin_zscore(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
         ));
     }
 
+    let input_dims = canonical_size_vector(&value_dimensions(&args[0]));
     let (data, normalization, selection) = parse_zscore_args(args)?;
-    let (z, mu, sigma) = zscore_numeric_outputs(&data, normalization, &selection)?;
-    let mut outputs = vec![numeric_operand_to_value(&z)?];
+    let (z, mu, sigma) =
+        zscore_value_outputs(&data, &input_dims, normalization, &selection)?;
+    let mut outputs = vec![z];
     if output_arity >= 2 {
-        outputs.push(numeric_operand_to_value(&mu)?);
+        outputs.push(mu);
     }
     if output_arity >= 3 {
-        outputs.push(numeric_operand_to_value(&sigma)?);
+        outputs.push(sigma);
     }
     Ok(outputs)
 }
 
+fn zscore_value_outputs(
+    data: &NumericOperand,
+    input_dims: &[usize],
+    normalization: VarianceNormalization,
+    selection: &StatisticSelection,
+) -> Result<(Value, Value, Value), RuntimeError> {
+    let use_nd_path = input_dims.len() > 2
+        || matches!(selection, StatisticSelection::VecDim(dims) if vecdim_requires_nd_path(dims));
+    if !use_nd_path {
+        let (z, mu, sigma) = zscore_numeric_outputs(data, normalization, selection)?;
+        return Ok((
+            numeric_operand_to_value(&z)?,
+            numeric_operand_to_value(&mu)?,
+            numeric_operand_to_value(&sigma)?,
+        ));
+    }
+
+    match selection {
+        StatisticSelection::Default => {
+            zscore_value_outputs_for_dim(
+                data,
+                input_dims,
+                normalization,
+                default_reduction_dimension_from_dims(input_dims),
+            )
+        }
+        StatisticSelection::Dim(dim) => {
+            zscore_value_outputs_for_dim(data, input_dims, normalization, *dim)
+        }
+        StatisticSelection::All => {
+            let (zs, mean, sigma) = zscore_sample(&data.values, normalization);
+            Ok((
+                numeric_matrix_result_with_dimensions(input_dims.to_vec(), zs)?,
+                Value::Scalar(mean),
+                Value::Scalar(sigma),
+            ))
+        }
+        StatisticSelection::VecDim(dims) => {
+            let mut reduce_dims = dims.clone();
+            reduce_dims.sort_unstable();
+            reduce_dims.dedup();
+            let rank = input_dims
+                .len()
+                .max(reduce_dims.iter().copied().max().unwrap_or(0));
+            if reduce_dims == (1..=rank).collect::<Vec<_>>() {
+                let (zs, mean, sigma) = zscore_sample(&data.values, normalization);
+                return Ok((
+                    numeric_matrix_result_with_dimensions(input_dims.to_vec(), zs)?,
+                    Value::Scalar(mean),
+                    Value::Scalar(sigma),
+                ));
+            }
+
+            let layout = nd_vecdim_reduction_layout(input_dims, &reduce_dims);
+            let reduced_dims = nd_vecdim_output_dims(&layout, 1);
+            let mut z_values = vec![0.0; data.values.len()];
+            let mut mu_values = vec![0.0; reduced_dims.iter().product::<usize>()];
+            let mut sigma_values = vec![0.0; reduced_dims.iter().product::<usize>()];
+            for sequence_index in 0..nd_vecdim_sequence_count(&layout) {
+                let sample_positions = nd_vecdim_sample_positions(&layout, sequence_index);
+                let sample = sample_positions
+                    .iter()
+                    .map(|position| data.values[*position])
+                    .collect::<Vec<_>>();
+                let (zs, mean, sigma) = zscore_sample(&sample, normalization);
+                for (position, z) in sample_positions.into_iter().zip(zs.into_iter()) {
+                    z_values[position] = z;
+                }
+                let reduced_position =
+                    nd_vecdim_output_position(&layout, sequence_index, 0, &reduced_dims);
+                mu_values[reduced_position] = mean;
+                sigma_values[reduced_position] = sigma;
+            }
+            Ok((
+                numeric_matrix_result_with_dimensions(input_dims.to_vec(), z_values)?,
+                numeric_matrix_result_with_dimensions(reduced_dims.clone(), mu_values)?,
+                numeric_matrix_result_with_dimensions(reduced_dims, sigma_values)?,
+            ))
+        }
+    }
+}
+
+fn zscore_value_outputs_for_dim(
+    data: &NumericOperand,
+    input_dims: &[usize],
+    normalization: VarianceNormalization,
+    dim: usize,
+) -> Result<(Value, Value, Value), RuntimeError> {
+    let mut normalized_dims = input_dims.to_vec();
+    while normalized_dims.len() < dim {
+        normalized_dims.push(1);
+    }
+
+    if dim > input_dims.len() {
+        return Ok((
+            numeric_matrix_result_with_dimensions(
+                input_dims.to_vec(),
+                vec![0.0; data.values.len()],
+            )?,
+            numeric_matrix_result_with_dimensions(input_dims.to_vec(), data.values.clone())?,
+            numeric_matrix_result_with_dimensions(
+                input_dims.to_vec(),
+                vec![0.0; data.values.len()],
+            )?,
+        ));
+    }
+
+    let axis = dim - 1;
+    let axis_len = normalized_dims[axis];
+    let mut reduced_dims = normalized_dims.clone();
+    reduced_dims[axis] = if axis_len == 0 { 0 } else { 1 };
+
+    if normalized_dims.iter().any(|&size| size == 0) {
+        return Ok((
+            numeric_matrix_result_with_dimensions(normalized_dims, Vec::new())?,
+            numeric_matrix_result_with_dimensions(reduced_dims.clone(), Vec::new())?,
+            numeric_matrix_result_with_dimensions(reduced_dims, Vec::new())?,
+        ));
+    }
+
+    let sequence_dims = normalized_dims
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &size)| (position != axis).then_some(size))
+        .collect::<Vec<_>>();
+    let sequence_count = if sequence_dims.is_empty() {
+        1
+    } else {
+        sequence_dims.iter().product::<usize>()
+    };
+
+    let mut z_values = vec![0.0; data.values.len()];
+    let mut mu_values = vec![0.0; reduced_dims.iter().product::<usize>()];
+    let mut sigma_values = vec![0.0; reduced_dims.iter().product::<usize>()];
+
+    for sequence_index in 0..sequence_count {
+        let reduced_index = row_major_multi_index(sequence_index, &sequence_dims);
+        let sample = (0..axis_len)
+            .map(|axis_value| {
+                let full_index =
+                    nd_reduction_full_index(&normalized_dims, axis, axis_value, &reduced_index);
+                let linear = row_major_linear_index(&full_index, &normalized_dims);
+                data.values[linear]
+            })
+            .collect::<Vec<_>>();
+        let (zs, mean, sigma) = zscore_sample(&sample, normalization);
+        for (axis_value, z_value) in zs.into_iter().enumerate() {
+            let full_index =
+                nd_reduction_full_index(&normalized_dims, axis, axis_value, &reduced_index);
+            let linear = row_major_linear_index(&full_index, &normalized_dims);
+            z_values[linear] = z_value;
+        }
+        let reduced_full_index =
+            nd_reduction_full_index(&reduced_dims, axis, 0, &reduced_index);
+        let reduced_linear = row_major_linear_index(&reduced_full_index, &reduced_dims);
+        mu_values[reduced_linear] = mean;
+        sigma_values[reduced_linear] = sigma;
+    }
+
+    Ok((
+        numeric_matrix_result_with_dimensions(normalized_dims, z_values)?,
+        numeric_matrix_result_with_dimensions(reduced_dims.clone(), mu_values)?,
+        numeric_matrix_result_with_dimensions(reduced_dims, sigma_values)?,
+    ))
+}
+
 fn builtin_any(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, selection) = parse_sum_like_args(args, "any")?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+    let promote = |result| {
+        if let Some(ref reduce_dims) = vecdim_shape_promotion {
+            promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+        } else {
+            Ok(result)
+        }
+    };
     match selection {
         StatisticSelection::Default => reduce_truth_value(value, "any", |values| {
             values.iter().any(|value| *value != 0.0)
         }),
         _ => match collapsed_statistic_selection(&selection, mean_default_dimension(value)?) {
-            CollapsedStatisticSelection::All => reduce_truth_value_all(value, "any", |values| {
-                values.iter().any(|value| *value != 0.0)
-            }),
-            CollapsedStatisticSelection::Dim(dim) => {
+            CollapsedStatisticSelection::All => promote(reduce_truth_value_all(
+                value,
+                "any",
+                |values| values.iter().any(|value| *value != 0.0),
+            )?),
+            CollapsedStatisticSelection::Dim(dim) => promote(
                 reduce_truth_value_along_dimension(value, "any", dim, |values| {
                     values.iter().any(|value| *value != 0.0)
-                })
-            }
+                })?,
+            ),
         },
     }
 }
 
 fn builtin_all(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, selection) = parse_sum_like_args(args, "all")?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let vecdim_shape_promotion = vecdim_shape_promotion_dims(&input_dims, &selection);
+    let promote = |result| {
+        if let Some(ref reduce_dims) = vecdim_shape_promotion {
+            promote_value_for_vecdim_shape(result, &input_dims, reduce_dims)
+        } else {
+            Ok(result)
+        }
+    };
     match selection {
         StatisticSelection::Default => reduce_truth_value(value, "all", |values| {
             values.iter().all(|value| *value != 0.0)
         }),
         _ => match collapsed_statistic_selection(&selection, mean_default_dimension(value)?) {
-            CollapsedStatisticSelection::All => reduce_truth_value_all(value, "all", |values| {
-                values.iter().all(|value| *value != 0.0)
-            }),
-            CollapsedStatisticSelection::Dim(dim) => {
+            CollapsedStatisticSelection::All => promote(reduce_truth_value_all(
+                value,
+                "all",
+                |values| values.iter().all(|value| *value != 0.0),
+            )?),
+            CollapsedStatisticSelection::Dim(dim) => promote(
                 reduce_truth_value_along_dimension(value, "all", dim, |values| {
                     values.iter().all(|value| *value != 0.0)
-                })
-            }
+                })?,
+            ),
         },
     }
 }
@@ -2419,9 +2909,13 @@ fn builtin_nnz(args: &[Value]) -> Result<Value, RuntimeError> {
     };
 
     match value {
-        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) => Ok(Value::Scalar(
-            if find_value_is_nonzero(value)? { 1.0 } else { 0.0 },
-        )),
+        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) => {
+            Ok(Value::Scalar(if find_value_is_nonzero(value)? {
+                1.0
+            } else {
+                0.0
+            }))
+        }
         Value::Matrix(matrix) if matrix_is_numeric_like(matrix) => Ok(Value::Scalar(
             matrix
                 .iter()
@@ -2462,8 +2956,7 @@ fn builtin_ismember(args: &[Value], output_arity: usize) -> Result<Vec<Value>, R
             return Ok(outputs);
         }
         return Err(RuntimeError::TypeError(
-            "ismember currently expects numeric or text matrix input when using 'rows'"
-                .to_string(),
+            "ismember currently expects numeric or text matrix input when using 'rows'".to_string(),
         ));
     }
 
@@ -2519,27 +3012,18 @@ fn builtin_find(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runti
     let selected = select_find_matches(&matches, count, direction);
     match output_arity {
         0 | 1 => Ok(vec![find_indices_to_value(
-            selected
-                .iter()
-                .map(|entry| (entry.col - 1) * matches.rows + entry.row)
-                .collect(),
+            selected.iter().map(|entry| entry.linear_index).collect(),
             matches.row_output,
             matches.empty_matrix_input,
         )?]),
         2 => Ok(vec![
             find_indices_to_value(
-                selected
-                    .iter()
-                    .map(|entry| entry.row)
-                    .collect::<Vec<_>>(),
+                selected.iter().map(|entry| entry.row).collect::<Vec<_>>(),
                 matches.row_output,
                 matches.empty_matrix_input,
             )?,
             find_indices_to_value(
-                selected
-                    .iter()
-                    .map(|entry| entry.col)
-                    .collect::<Vec<_>>(),
+                selected.iter().map(|entry| entry.col).collect::<Vec<_>>(),
                 matches.row_output,
                 matches.empty_matrix_input,
             )?,
@@ -2887,7 +3371,9 @@ fn builtin_strcmpi(args: &[Value]) -> Result<Value, RuntimeError> {
             "strcmpi currently supports exactly two arguments".to_string(),
         ));
     };
-    map_text_binary_logical(lhs, rhs, |lhs, rhs| lhs.to_lowercase() == rhs.to_lowercase())
+    map_text_binary_logical(lhs, rhs, |lhs, rhs| {
+        lhs.to_lowercase() == rhs.to_lowercase()
+    })
 }
 
 fn builtin_strncmp(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -2943,7 +3429,9 @@ fn builtin_contains(args: &[Value]) -> Result<Value, RuntimeError> {
 
 fn builtin_count(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, patterns, ignore_case) = parse_text_search_args(args, "count")?;
-    map_text_unary_numeric(value, |text| count_text_matches(text, &patterns, ignore_case))
+    map_text_unary_numeric(value, |text| {
+        count_text_matches(text, &patterns, ignore_case)
+    })
 }
 
 fn builtin_strfind(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -2958,7 +3446,9 @@ fn builtin_strfind(args: &[Value]) -> Result<Value, RuntimeError> {
 fn builtin_matches(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, patterns, ignore_case) = parse_text_search_args(args, "matches")?;
     map_text_value_logical(value, |value| {
-        text_matches_any_pattern(value, &patterns, ignore_case, |value, pattern| value == pattern)
+        text_matches_any_pattern(value, &patterns, ignore_case, |value, pattern| {
+            value == pattern
+        })
     })
 }
 
@@ -2966,26 +3456,584 @@ fn builtin_num2str(args: &[Value]) -> Result<Value, RuntimeError> {
     match args {
         [value] => match value {
             Value::Scalar(number) => Ok(Value::CharArray(render_scalar(*number))),
+            Value::Logical(flag) => Ok(Value::CharArray(if *flag { "1" } else { "0" }.to_string())),
             Value::Complex(number) => Ok(Value::CharArray(render_complex_text(
                 number.real,
                 number.imag,
             ))),
+            Value::Matrix(matrix)
+                if (matrix_is_numeric_or_complex(matrix) || matrix_is_logical(matrix))
+                    && matrix.rows <= 1 =>
+            {
+                let parts = matrix
+                    .elements()
+                    .iter()
+                    .map(num2str_element_text)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::CharArray(parts.join("  ")))
+            }
             _ => Err(RuntimeError::TypeError(
-                "num2str currently expects scalar numeric or complex input".to_string(),
+                "num2str currently expects numeric, logical, or complex scalar/row-vector input"
+                    .to_string(),
             )),
         },
-        [Value::Scalar(number), format] => Ok(Value::CharArray(format_text_builtin(
-            text_value(format)?,
-            &[Value::Scalar(*number)],
-            "num2str",
-        )?)),
-        [_, _] => Err(RuntimeError::Unsupported(
-            "num2str currently supports a format string only for scalar real input".to_string(),
-        )),
+        [value, format] => {
+            let format = text_value(format)?;
+            match value {
+                Value::Scalar(_) | Value::Logical(_) => Ok(Value::CharArray(format_text_builtin(
+                    format,
+                    std::slice::from_ref(value),
+                    "num2str",
+                )?)),
+                Value::Matrix(matrix)
+                    if (matrix_is_numeric(matrix) || matrix_is_logical(matrix))
+                        && matrix.rows <= 1 =>
+                {
+                    let parts = matrix
+                        .elements()
+                        .iter()
+                        .map(|element| format_text_builtin(format, std::slice::from_ref(element), "num2str"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(Value::CharArray(parts.join("  ")))
+                }
+                _ => Err(RuntimeError::Unsupported(
+                    "num2str currently supports a format string for scalar real/logical input and 1xN real/logical row vectors"
+                        .to_string(),
+                )),
+            }
+        }
         _ => Err(RuntimeError::Unsupported(
             "num2str currently supports `num2str(x)` or `num2str(x, format)`".to_string(),
         )),
     }
+}
+
+fn num2str_element_text(value: &Value) -> Result<String, RuntimeError> {
+    match value {
+        Value::Scalar(number) => Ok(render_scalar(*number)),
+        Value::Logical(flag) => Ok(if *flag { "1" } else { "0" }.to_string()),
+        Value::Complex(number) => Ok(render_complex_text(number.real, number.imag)),
+        other => Err(RuntimeError::TypeError(format!(
+            "num2str currently expects numeric, logical, or complex row-vector elements, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn builtin_int2str(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "int2str currently supports exactly one argument".to_string(),
+        ));
+    };
+
+    match value {
+        Value::Scalar(number) => Ok(Value::CharArray(int2str_scalar(*number))),
+        Value::Logical(flag) => Ok(Value::CharArray(if *flag { "1" } else { "0" }.to_string())),
+        Value::Matrix(matrix) if matrix_is_numeric(matrix) || matrix_is_logical(matrix) => {
+            if matrix.rows > 1 {
+                return Err(RuntimeError::Unsupported(
+                    "int2str currently supports scalar and 1xN row-vector input".to_string(),
+                ));
+            }
+            let parts = matrix
+                .elements()
+                .iter()
+                .map(|element| Ok(int2str_scalar(element.as_scalar()?)))
+                .collect::<Result<Vec<_>, RuntimeError>>()?;
+            Ok(Value::CharArray(parts.join(" ")))
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "int2str currently expects numeric or logical scalar/row-vector input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn builtin_func2str(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "func2str currently supports exactly one argument".to_string(),
+        ));
+    };
+
+    let Value::FunctionHandle(handle) = value else {
+        return Err(RuntimeError::TypeError(format!(
+            "func2str currently expects a function handle input, found {}",
+            value.kind_name()
+        )));
+    };
+    if handle.display_name.starts_with("<anonymous:") {
+        return Err(RuntimeError::Unsupported(
+            "func2str currently supports named, package-qualified, and bound method handles, not anonymous function handles"
+                .to_string(),
+        ));
+    }
+    Ok(Value::CharArray(handle.display_name.clone()))
+}
+
+fn builtin_str2func(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "str2func currently supports exactly one argument".to_string(),
+        ));
+    };
+    let text = text_value(value)?.trim();
+    let name = text.strip_prefix('@').unwrap_or(text).trim();
+    if name.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "str2func currently expects a nonempty function name".to_string(),
+        ));
+    }
+    Ok(Value::FunctionHandle(FunctionHandleValue {
+        display_name: name.to_string(),
+        target: FunctionHandleTarget::Named(name.to_string()),
+    }))
+}
+
+fn int2str_scalar(number: f64) -> String {
+    if number.is_finite() {
+        format!("{:.0}", number.round())
+    } else if number.is_nan() {
+        "NaN".to_string()
+    } else if number.is_sign_negative() {
+        "-Inf".to_string()
+    } else {
+        "Inf".to_string()
+    }
+}
+
+fn builtin_hex2dec(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "hex2dec currently supports exactly one argument".to_string(),
+        ));
+    };
+    builtin_base_text_to_double_value(value, 16, "hex2dec", true)
+}
+
+fn builtin_bin2dec(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "bin2dec currently supports exactly one argument".to_string(),
+        ));
+    };
+    builtin_base_text_to_double_value(value, 2, "bin2dec", true)
+}
+
+fn builtin_base2dec(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value, base] = args else {
+        return Err(RuntimeError::Unsupported(
+            "base2dec currently supports exactly two arguments".to_string(),
+        ));
+    };
+    builtin_base_text_to_double_value(value, base_conversion_radix(base, "base2dec")?, "base2dec", false)
+}
+
+fn builtin_dec2hex(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (value, min_digits) = match args {
+        [value] => (value, 0usize),
+        [value, min_digits] => (
+            value,
+            base_conversion_min_digits(min_digits, "dec2hex")?,
+        ),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "dec2hex currently supports `dec2hex(d)` or `dec2hex(d, n)`".to_string(),
+            ))
+        }
+    };
+    builtin_decimal_to_base(value, 16, min_digits, "dec2hex")
+}
+
+fn builtin_dec2bin(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (value, min_digits) = match args {
+        [value] => (value, 0usize),
+        [value, min_digits] => (
+            value,
+            base_conversion_min_digits(min_digits, "dec2bin")?,
+        ),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "dec2bin currently supports `dec2bin(d)` or `dec2bin(d, n)`".to_string(),
+            ))
+        }
+    };
+    builtin_decimal_to_base(value, 2, min_digits, "dec2bin")
+}
+
+fn builtin_dec2base(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (value, base, min_digits) = match args {
+        [value, base] => (value, base_conversion_radix(base, "dec2base")?, 0usize),
+        [value, base, min_digits] => (
+            value,
+            base_conversion_radix(base, "dec2base")?,
+            base_conversion_min_digits(min_digits, "dec2base")?,
+        ),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "dec2base currently supports `dec2base(d, base)` or `dec2base(d, base, n)`"
+                    .to_string(),
+            ))
+        }
+    };
+    builtin_decimal_to_base(value, base, min_digits, "dec2base")
+}
+
+fn builtin_base_text_to_double_value(
+    value: &Value,
+    base: u32,
+    builtin_name: &str,
+    allow_signed_suffix: bool,
+) -> Result<Value, RuntimeError> {
+    let (values, dims) = base_text_operand(value, builtin_name)?;
+    let parts = values
+        .iter()
+        .map(|text| parse_base_text_value(text, base, builtin_name, allow_signed_suffix))
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    build_scalar_matrix_result_with_dimensions(dims, parts.into_iter().map(Value::Scalar).collect())
+}
+
+fn base_text_operand(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(Vec<String>, Vec<usize>), RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => Ok((vec![text.clone()], vec![1, 1])),
+        Value::Matrix(matrix) if matrix_is_text(matrix) => Ok((
+            matrix
+                .elements()
+                .iter()
+                .map(|element| text_value(element).map(str::to_string))
+                .collect::<Result<Vec<_>, _>>()?,
+            canonical_size_vector(matrix.dims()),
+        )),
+        Value::Cell(cell) => Ok((
+            cell.elements()
+                .iter()
+                .map(|element| match element {
+                    Value::CharArray(text) | Value::String(text) => Ok(text.clone()),
+                    other => Err(RuntimeError::TypeError(format!(
+                        "{builtin_name} currently expects cell array inputs to contain char or string values, found {}",
+                        other.kind_name()
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            canonical_size_vector(cell.dims()),
+        )),
+        other => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects text scalars, text arrays, or cell arrays of text, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn parse_base_text_value(
+    text: &str,
+    base: u32,
+    builtin_name: &str,
+    allow_signed_suffix: bool,
+) -> Result<f64, RuntimeError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects nonempty text values"
+        )));
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let without_prefix = match base {
+        16 => lower
+            .strip_prefix("0x")
+            .unwrap_or(&lower),
+        2 => lower
+            .strip_prefix("0b")
+            .unwrap_or(&lower),
+        _ => &lower,
+    };
+    let (digits, signed_bits) = if allow_signed_suffix {
+        parse_base_literal_suffix(without_prefix, base, builtin_name)?
+    } else {
+        (without_prefix, None)
+    };
+    if digits.is_empty() {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects at least one base-{base} digit"
+        )));
+    }
+    let unsigned = u64::from_str_radix(digits, base).map_err(|error| {
+        RuntimeError::TypeError(format!(
+            "{builtin_name} could not parse `{text}` as a base-{base} integer: {error}"
+        ))
+    })?;
+
+    if let Some(bits) = signed_bits {
+        if bits == 0 || bits > 64 {
+            return Err(RuntimeError::Unsupported(format!(
+                "{builtin_name} signed suffix width `{bits}` is not supported"
+            )));
+        }
+        let sign_bit = 1u64 << (bits - 1);
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let value = unsigned & mask;
+        if value & sign_bit != 0 {
+            let signed = (value as i128) - ((mask as i128) + 1);
+            Ok(signed as f64)
+        } else {
+            Ok(value as f64)
+        }
+    } else {
+        Ok(unsigned as f64)
+    }
+}
+
+fn parse_base_literal_suffix<'a>(
+    text: &'a str,
+    base: u32,
+    builtin_name: &str,
+) -> Result<(&'a str, Option<u32>), RuntimeError> {
+    let Some(suffix_index) = text.find(['s', 'u']) else {
+        return Ok((text, None));
+    };
+    let (digits, suffix) = text.split_at(suffix_index);
+    if digits.is_empty() {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects at least one base-{base} digit"
+        )));
+    }
+    let signed = suffix.starts_with('s');
+    let bits = suffix[1..].parse::<u32>().map_err(|error| {
+        RuntimeError::TypeError(format!(
+            "{builtin_name} could not parse signedness suffix `{suffix}`: {error}"
+        ))
+    })?;
+    if signed {
+        Ok((digits, Some(bits)))
+    } else {
+        Ok((digits, None))
+    }
+}
+
+fn base_conversion_radix(value: &Value, builtin_name: &str) -> Result<u32, RuntimeError> {
+    let scalar = value.as_scalar()?;
+    if !scalar.is_finite() || scalar.fract() != 0.0 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects an integer scalar base"
+        )));
+    }
+    if !(2.0..=36.0).contains(&scalar) {
+        return Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports bases from 2 through 36"
+        )));
+    }
+    Ok(scalar as u32)
+}
+
+fn base_conversion_min_digits(value: &Value, builtin_name: &str) -> Result<usize, RuntimeError> {
+    nonnegative_integer_scalar_with_label(
+        value,
+        builtin_name,
+        "a nonnegative integer minimum digit count",
+    )
+}
+
+fn builtin_decimal_to_base(
+    value: &Value,
+    base: u32,
+    min_digits: usize,
+    builtin_name: &str,
+) -> Result<Value, RuntimeError> {
+    let (numbers, dims) = decimal_base_operand(value, builtin_name)?;
+    let mut rendered = numbers
+        .into_iter()
+        .map(|number| format_unsigned_integer_in_base(number, base))
+        .collect::<Vec<_>>();
+    let width = rendered
+        .iter()
+        .map(|text| text.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(min_digits);
+    for text in &mut rendered {
+        if text.chars().count() < width {
+            *text = format!("{}{}", "0".repeat(width - text.chars().count()), text);
+        }
+    }
+
+    let (rows, cols) = storage_shape_from_dimensions(&dims);
+    if rows == 1 && cols == 1 && rendered.len() == 1 {
+        return Ok(Value::CharArray(rendered.into_iter().next().unwrap()));
+    }
+
+    build_text_result_with_dimensions(
+        dims,
+        rendered,
+        vec![TextPrototype::String; rows * cols],
+        false,
+    )
+}
+
+fn decimal_base_operand(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(Vec<u64>, Vec<usize>), RuntimeError> {
+    match value {
+        Value::Scalar(_) | Value::Logical(_) => Ok((
+            vec![decimal_base_scalar(value, builtin_name)?],
+            vec![1, 1],
+        )),
+        Value::Matrix(matrix) if matrix_is_numeric(matrix) || matrix_is_logical(matrix) => Ok((
+            matrix
+                .elements()
+                .iter()
+                .map(|element| decimal_base_scalar(element, builtin_name))
+                .collect::<Result<Vec<_>, _>>()?,
+            canonical_size_vector(matrix.dims()),
+        )),
+        other => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects real numeric or logical scalar/matrix input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn decimal_base_scalar(value: &Value, builtin_name: &str) -> Result<u64, RuntimeError> {
+    let scalar = real_numeric_scalar(value, builtin_name)?;
+    if !scalar.is_finite() || scalar < 0.0 || scalar.fract() != 0.0 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects nonnegative integer-valued real numeric or logical inputs"
+        )));
+    }
+    if scalar > u64::MAX as f64 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently received an out-of-range integer value {scalar}"
+        )));
+    }
+    Ok(scalar as u64)
+}
+
+fn format_unsigned_integer_in_base(mut value: u64, base: u32) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    if value == 0 {
+        return "0".to_string();
+    }
+
+    let mut rendered = Vec::new();
+    let radix = u64::from(base);
+    while value > 0 {
+        rendered.push(DIGITS[(value % radix) as usize] as char);
+        value /= radix;
+    }
+    rendered.into_iter().rev().collect()
+}
+
+fn builtin_mat2str(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (value, precision) = match args {
+        [value] => (value, None),
+        [value, precision] => (value, Some(mat2str_precision(precision)?)),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "mat2str currently supports `mat2str(x)` or `mat2str(x, n)`".to_string(),
+            ))
+        }
+    };
+
+    let text = match value {
+        Value::Scalar(number) => mat2str_number(*number, precision),
+        Value::Logical(flag) => render_logical(*flag),
+        Value::Complex(number) => mat2str_complex(number.real, number.imag, precision),
+        Value::Matrix(matrix) if matrix_is_numeric_or_complex(matrix) || matrix_is_logical(matrix) => {
+            if canonical_size_vector(matrix.dims()).len() > 2 {
+                return Err(RuntimeError::Unsupported(
+                    "mat2str currently expects scalar or 2-D numeric/logical/complex input"
+                        .to_string(),
+                ));
+            }
+            mat2str_matrix(matrix, precision)?
+        }
+        other => {
+            return Err(RuntimeError::TypeError(format!(
+                "mat2str currently expects numeric, logical, or complex scalar/matrix input, found {}",
+                other.kind_name()
+            )))
+        }
+    };
+    Ok(Value::CharArray(text))
+}
+
+fn mat2str_precision(value: &Value) -> Result<usize, RuntimeError> {
+    let scalar = value.as_scalar()?;
+    if !scalar.is_finite() || scalar.fract() != 0.0 || scalar < 0.0 {
+        return Err(RuntimeError::TypeError(
+            "mat2str precision currently expects a nonnegative integer scalar".to_string(),
+        ));
+    }
+    Ok(scalar as usize)
+}
+
+fn mat2str_matrix(matrix: &MatrixValue, precision: Option<usize>) -> Result<String, RuntimeError> {
+    if matrix.rows == 0 || matrix.cols == 0 {
+        return Ok("[]".to_string());
+    }
+
+    let rows = (0..matrix.rows)
+        .map(|row| {
+            (0..matrix.cols)
+                .map(|col| mat2str_element(matrix.get(row, col), precision))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|parts| parts.join(" "))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!("[{}]", rows.join(";")))
+}
+
+fn mat2str_element(value: &Value, precision: Option<usize>) -> Result<String, RuntimeError> {
+    match value {
+        Value::Scalar(number) => Ok(mat2str_number(*number, precision)),
+        Value::Logical(flag) => Ok(render_logical(*flag)),
+        Value::Complex(number) => Ok(mat2str_complex(number.real, number.imag, precision)),
+        other => Err(RuntimeError::TypeError(format!(
+            "mat2str currently expects numeric, logical, or complex matrix elements, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn mat2str_number(number: f64, precision: Option<usize>) -> String {
+    if number.is_nan() {
+        return "NaN".to_string();
+    }
+    if number == f64::INFINITY {
+        return "Inf".to_string();
+    }
+    if number == f64::NEG_INFINITY {
+        return "-Inf".to_string();
+    }
+    match precision {
+        Some(precision) => format_general(number, precision.max(1), false, FormatFlags::default()),
+        None => format_general(number, 15, false, FormatFlags::default()),
+    }
+}
+
+fn mat2str_complex(real: f64, imag: f64, precision: Option<usize>) -> String {
+    if imag == 0.0 {
+        return mat2str_number(real, precision);
+    }
+    if real == 0.0 {
+        return format!("{}i", mat2str_number(imag, precision));
+    }
+
+    let sign = if imag.is_sign_negative() { "-" } else { "+" };
+    format!(
+        "{}{}{}i",
+        mat2str_number(real, precision),
+        sign,
+        mat2str_number(imag.abs(), precision)
+    )
 }
 
 fn builtin_upper(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -3078,7 +4126,9 @@ fn builtin_strrep(args: &[Value]) -> Result<Value, RuntimeError> {
             "strrep currently supports exactly three arguments".to_string(),
         ));
     };
-    map_text_ternary_text(value, old, new, |text, old, new| Ok(apply_strrep(text, old, new)))
+    map_text_ternary_text(value, old, new, |text, old, new| {
+        Ok(apply_strrep(text, old, new))
+    })
 }
 
 fn builtin_strcat(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -3448,8 +4498,7 @@ fn split_text_with_multiple_regex_delimiters(
 fn regex_delimiter_match_at_start(text: &str, delimiters: &[Regex]) -> Option<String> {
     delimiters.iter().find_map(|delimiter| {
         delimiter.find(text).and_then(|matched| {
-            (matched.start() == 0 && matched.end() > 0)
-                .then(|| matched.as_str().to_string())
+            (matched.start() == 0 && matched.end() > 0).then(|| matched.as_str().to_string())
         })
     })
 }
@@ -3614,7 +4663,10 @@ fn builtin_strjoin(args: &[Value]) -> Result<Value, RuntimeError> {
     strjoin_value(value, delimiter, "strjoin")
 }
 
-fn builtin_strsplit_outputs(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+fn builtin_strsplit_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
     let (value, delimiter, collapse_delimiters) = parse_strsplit_arguments(args)?;
     let (parts, matches) =
         strsplit_parts_and_matches(text_value(value)?, &delimiter, collapse_delimiters)?;
@@ -3716,7 +4768,9 @@ fn builtin_strtok_outputs(args: &[Value], output_arity: usize) -> Result<Vec<Val
     }
 }
 
-fn parse_strsplit_arguments(args: &[Value]) -> Result<(&Value, SplitDelimiterSpec, bool), RuntimeError> {
+fn parse_strsplit_arguments(
+    args: &[Value],
+) -> Result<(&Value, SplitDelimiterSpec, bool), RuntimeError> {
     let Some((value, rest)) = args.split_first() else {
         return Err(RuntimeError::Unsupported(
             "strsplit currently supports `strsplit(str)`, `strsplit(str, delimiter)`, and common name/value forms"
@@ -3817,7 +4871,12 @@ fn parse_strtok_delimiters(delimiter: Option<&Value>) -> Result<Option<Vec<char>
         None => Ok(None),
         Some(value) => {
             let (parts, _) = text_sequence_parts(value, "strtok delimiter")?;
-            Ok(Some(parts.into_iter().flat_map(|part| part.chars().collect::<Vec<_>>()).collect()))
+            Ok(Some(
+                parts
+                    .into_iter()
+                    .flat_map(|part| part.chars().collect::<Vec<_>>())
+                    .collect(),
+            ))
         }
     }
 }
@@ -4258,26 +5317,26 @@ fn builtin_pad(args: &[Value]) -> Result<Value, RuntimeError> {
         .values
         .iter()
         .map(|text| {
-        let current = text.chars().count();
-        if current >= width {
-            return text.to_string();
-        }
-
-        let missing = width - current;
-        let (left, right) = match direction {
-            PadDirection::Left => (missing, 0),
-            PadDirection::Right => (0, missing),
-            PadDirection::Both => {
-                let left = missing / 2;
-                (left, missing - left)
+            let current = text.chars().count();
+            if current >= width {
+                return text.to_string();
             }
-        };
 
-        let mut result = String::with_capacity(width);
-        result.push_str(&pad_character.repeat(left));
-        result.push_str(text);
-        result.push_str(&pad_character.repeat(right));
-        result
+            let missing = width - current;
+            let (left, right) = match direction {
+                PadDirection::Left => (missing, 0),
+                PadDirection::Right => (0, missing),
+                PadDirection::Both => {
+                    let left = missing / 2;
+                    (left, missing - left)
+                }
+            };
+
+            let mut result = String::with_capacity(width);
+            result.push_str(&pad_character.repeat(left));
+            result.push_str(text);
+            result.push_str(&pad_character.repeat(right));
+            result
         })
         .collect::<Vec<_>>();
 
@@ -4313,7 +5372,9 @@ fn compose_literal_text(value: &Value) -> Result<Value, RuntimeError> {
         Value::CharArray(text) => Ok(Value::Cell(CellValue::new(
             1,
             1,
-            vec![Value::CharArray(translate_compose_escapes(text, "compose")?)],
+            vec![Value::CharArray(translate_compose_escapes(
+                text, "compose",
+            )?)],
         )?)),
         Value::Matrix(matrix) if matrix_is_string(matrix) => {
             let elements = matrix
@@ -4538,7 +5599,9 @@ fn parse_pad_character(value: &Value) -> Result<String, RuntimeError> {
     Ok(text.to_string())
 }
 
-fn parse_pad_args(args: &[Value]) -> Result<(&Value, Option<usize>, PadDirection, String), RuntimeError> {
+fn parse_pad_args(
+    args: &[Value],
+) -> Result<(&Value, Option<usize>, PadDirection, String), RuntimeError> {
     match args {
         [value] => Ok((value, None, PadDirection::Right, " ".to_string())),
         [value, second] => {
@@ -4715,7 +5778,12 @@ fn format_fixed_point(number: f64, precision: usize, flags: FormatFlags) -> Stri
     rendered
 }
 
-fn format_general(number: f64, significant_digits: usize, uppercase: bool, flags: FormatFlags) -> String {
+fn format_general(
+    number: f64,
+    significant_digits: usize,
+    uppercase: bool,
+    flags: FormatFlags,
+) -> String {
     if !number.is_finite() {
         let mut rendered = if uppercase {
             render_scalar(number).replace("inf", "INF")
@@ -4772,11 +5840,12 @@ fn format_general(number: f64, significant_digits: usize, uppercase: bool, flags
 }
 
 fn trim_trailing_zeros(mut rendered: String) -> String {
-    let sign_prefix = if rendered.starts_with('+') || rendered.starts_with('-') || rendered.starts_with(' ') {
-        rendered.remove(0).to_string()
-    } else {
-        String::new()
-    };
+    let sign_prefix =
+        if rendered.starts_with('+') || rendered.starts_with('-') || rendered.starts_with(' ') {
+            rendered.remove(0).to_string()
+        } else {
+            String::new()
+        };
     if let Some(dot_index) = rendered.find('.') {
         while rendered.ends_with('0') {
             rendered.pop();
@@ -4891,7 +5960,10 @@ fn apply_format_width(
     }
 
     let pad_count = width - current;
-    let is_numeric = matches!(specifier, 'd' | 'i' | 'f' | 'e' | 'E' | 'g' | 'G' | 'u' | 'o' | 'x' | 'X');
+    let is_numeric = matches!(
+        specifier,
+        'd' | 'i' | 'f' | 'e' | 'E' | 'g' | 'G' | 'u' | 'o' | 'x' | 'X'
+    );
     let pad_char = if flags.zero_pad && !flags.left_justify && is_numeric {
         '0'
     } else {
@@ -5325,7 +6397,9 @@ fn builtin_orderfields(args: &[Value], output_arity: usize) -> Result<Vec<Value>
                     let Value::Struct(struct_value) = element else {
                         unreachable!("matrix_is_struct checked every element");
                     };
-                    Ok(Value::Struct(order_struct_fields(struct_value, target_order.clone())?.0))
+                    Ok(Value::Struct(
+                        order_struct_fields(struct_value, target_order.clone())?.0,
+                    ))
                 })
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             (
@@ -5528,16 +6602,28 @@ fn apply_getfield_steps(value: &Value, steps: &[StructFieldStep]) -> Result<Valu
     };
     let next = match first {
         StructFieldStep::Field(field_name) => match value {
-            Value::Struct(struct_value) => struct_value.fields.get(field_name).cloned().ok_or_else(|| {
-                RuntimeError::MissingVariable(format!("getfield field `{field_name}` is not defined"))
-            })?,
+            Value::Struct(struct_value) => struct_value
+                .fields
+                .get(field_name)
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::MissingVariable(format!(
+                        "getfield field `{field_name}` is not defined"
+                    ))
+                })?,
             Value::Matrix(matrix) if matrix_is_struct(matrix) && matrix.element_count() == 1 => {
                 let Value::Struct(struct_value) = &matrix.elements()[0] else {
                     unreachable!("matrix_is_struct checked every element");
                 };
-                struct_value.fields.get(field_name).cloned().ok_or_else(|| {
-                    RuntimeError::MissingVariable(format!("getfield field `{field_name}` is not defined"))
-                })?
+                struct_value
+                    .fields
+                    .get(field_name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        RuntimeError::MissingVariable(format!(
+                            "getfield field `{field_name}` is not defined"
+                        ))
+                    })?
             }
             other => {
                 return Err(RuntimeError::TypeError(format!(
@@ -5547,10 +6633,9 @@ fn apply_getfield_steps(value: &Value, steps: &[StructFieldStep]) -> Result<Valu
             }
         },
         StructFieldStep::Index(subscripts) => match value {
-            Value::Matrix(matrix) if matrix_is_struct(matrix) => {
-                matrix.elements()[struct_array_subscript_index(matrix, subscripts, "getfield")?]
-                    .clone()
-            }
+            Value::Matrix(matrix) if matrix_is_struct(matrix) => matrix.elements()
+                [struct_array_subscript_index(matrix, subscripts, "getfield")?]
+            .clone(),
             other => {
                 return Err(RuntimeError::TypeError(format!(
                     "getfield index selectors expect a struct array value, found {}",
@@ -5958,6 +7043,97 @@ fn char_code_text(
     Ok(text)
 }
 
+fn builtin_str2double(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "str2double currently supports exactly one argument".to_string(),
+        ));
+    };
+
+    let (operand, dims) = split_text_operand(value)?;
+    let values = operand
+        .values
+        .iter()
+        .map(|text| parse_str2double_text(text))
+        .collect::<Vec<_>>();
+    build_scalar_matrix_result_with_dimensions(dims, values)
+}
+
+fn parse_str2double_text(text: &str) -> Value {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Value::Scalar(f64::NAN);
+    }
+
+    if let Some(real) = parse_str2double_real(trimmed) {
+        return Value::Scalar(real);
+    }
+
+    if let Some(complex) = parse_str2double_complex(trimmed) {
+        return numeric_or_complex_value(complex);
+    }
+
+    Value::Scalar(f64::NAN)
+}
+
+fn parse_str2double_real(text: &str) -> Option<f64> {
+    let lower = text.to_ascii_lowercase();
+    match lower.as_str() {
+        "inf" | "+inf" | "infinity" | "+infinity" => Some(f64::INFINITY),
+        "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
+        "nan" | "+nan" | "-nan" => Some(f64::NAN),
+        _ => text.parse::<f64>().ok(),
+    }
+}
+
+fn parse_str2double_complex(text: &str) -> Option<ComplexParts> {
+    let compact = text.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+    let lower = compact.to_ascii_lowercase();
+    if !(lower.ends_with('i') || lower.ends_with('j')) {
+        return None;
+    }
+
+    let body = &compact[..compact.len() - 1];
+    if body.is_empty() || body == "+" || body == "-" {
+        return Some(ComplexParts {
+            real: 0.0,
+            imag: if body == "-" { -1.0 } else { 1.0 },
+        });
+    }
+
+    if let Some(imag) = parse_str2double_real(body) {
+        return Some(ComplexParts { real: 0.0, imag });
+    }
+
+    let split = split_str2double_complex_parts(body)?;
+    let real = parse_str2double_real(split.0)?;
+    let imag = if split.1.is_empty() || split.1 == "+" || split.1 == "-" {
+        if split.1 == "-" { -1.0 } else { 1.0 }
+    } else {
+        parse_str2double_real(split.1)?
+    };
+    Some(ComplexParts { real, imag })
+}
+
+fn split_str2double_complex_parts(text: &str) -> Option<(&str, &str)> {
+    let chars = text.char_indices().collect::<Vec<_>>();
+    for (offset, ch) in chars.iter().copied().skip(1).rev() {
+        if (ch == '+' || ch == '-')
+            && !matches!(
+                chars
+                    .iter()
+                    .take_while(|(index, _)| *index < offset)
+                    .last()
+                    .map(|(_, prev)| *prev),
+                Some('e' | 'E')
+            )
+        {
+            return Some((&text[..offset], &text[offset..]));
+        }
+    }
+    None
+}
+
 fn builtin_cellstr(args: &[Value]) -> Result<Value, RuntimeError> {
     let [value] = args else {
         return Err(RuntimeError::Unsupported(
@@ -5971,8 +7147,8 @@ fn builtin_cellstr(args: &[Value]) -> Result<Value, RuntimeError> {
             1,
             vec![Value::CharArray(text.clone())],
         )?)),
-        Value::Matrix(matrix) if matrix_is_text(matrix) => Ok(Value::Cell(
-            CellValue::with_dimensions(
+        Value::Matrix(matrix) if matrix_is_text(matrix) => {
+            Ok(Value::Cell(CellValue::with_dimensions(
                 matrix.rows,
                 matrix.cols,
                 matrix.dims().to_vec(),
@@ -5981,8 +7157,8 @@ fn builtin_cellstr(args: &[Value]) -> Result<Value, RuntimeError> {
                     .iter()
                     .map(|element| Ok(Value::CharArray(text_value(element)?.to_string())))
                     .collect::<Result<Vec<_>, RuntimeError>>()?,
-            )?,
-        )),
+            )?))
+        }
         other => Err(RuntimeError::TypeError(format!(
             "cellstr currently expects char, string, or a text matrix input, found {}",
             other.kind_name()
@@ -6214,11 +7390,7 @@ fn builtin_diag(args: &[Value]) -> Result<Value, RuntimeError> {
                     .collect::<Result<Vec<_>, _>>()?;
                 diag_build_from_values(diagonal, offset)
             } else {
-                let start_row = if offset < 0 {
-                    offset.unsigned_abs()
-                } else {
-                    0
-                };
+                let start_row = if offset < 0 { offset.unsigned_abs() } else { 0 };
                 let start_col = if offset > 0 { offset as usize } else { 0 };
                 let size = matrix
                     .rows
@@ -6238,11 +7410,7 @@ fn builtin_diag(args: &[Value]) -> Result<Value, RuntimeError> {
 
 fn diag_build_from_values(values: Vec<ComplexParts>, offset: isize) -> Result<Value, RuntimeError> {
     let size = values.len() + offset.unsigned_abs();
-    let row_offset = if offset < 0 {
-        offset.unsigned_abs()
-    } else {
-        0
-    };
+    let row_offset = if offset < 0 { offset.unsigned_abs() } else { 0 };
     let col_offset = if offset > 0 { offset as usize } else { 0 };
     let mut elements = vec![Value::Scalar(0.0); size * size];
     for (index, value) in values.into_iter().enumerate() {
@@ -6762,17 +7930,16 @@ fn builtin_qr(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runtime
                 }
             }
         }
-        [value, rhs, third] if second_is_rhs(rhs) => {
-            match third {
-                Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("econ") => {
-                    (value, Some(rhs), None)
-                }
-                _ => {
-                    let output_form = match third {
-                        Value::Scalar(number) if *number == 0.0 => "vector".to_string(),
-                        _ => text_value(third)?.to_ascii_lowercase(),
-                    };
-                    match output_form.as_str() {
+        [value, rhs, third] if second_is_rhs(rhs) => match third {
+            Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("econ") => {
+                (value, Some(rhs), None)
+            }
+            _ => {
+                let output_form = match third {
+                    Value::Scalar(number) if *number == 0.0 => "vector".to_string(),
+                    _ => text_value(third)?.to_ascii_lowercase(),
+                };
+                match output_form.as_str() {
                         "matrix" | "vector" if output_arity == 3 => {
                             (value, Some(rhs), Some(output_form))
                         }
@@ -6783,9 +7950,8 @@ fn builtin_qr(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runtime
                             ))
                         }
                     }
-                }
             }
-        }
+        },
         [value, econ, output_form] => {
             let econ = text_value(econ)?.to_ascii_lowercase();
             let output_form = text_value(output_form)?.to_ascii_lowercase();
@@ -6804,12 +7970,10 @@ fn builtin_qr(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runtime
                 }
             }
         }
-        _ => {
-            return Err(RuntimeError::Unsupported(
-                "qr currently supports `qr(A)`, `qr(A, mode)`, `qr(A, B)`, and `qr(A, B, outputForm)`"
-                    .to_string(),
-            ))
-        }
+        _ => return Err(RuntimeError::Unsupported(
+            "qr currently supports `qr(A)`, `qr(A, mode)`, `qr(A, B)`, and `qr(A, B, outputForm)`"
+                .to_string(),
+        )),
     };
 
     let operand = numeric_or_complex_operand(value, "qr")?;
@@ -6856,7 +8020,9 @@ fn builtin_qr(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runtime
                                 .map(|index| (*index + 1) as f64)
                                 .collect::<Vec<_>>(),
                         )?,
-                        _ => numeric_or_complex_operand_to_value(&permutation_operand(&permutation))?,
+                        _ => {
+                            numeric_or_complex_operand_to_value(&permutation_operand(&permutation))?
+                        }
                     },
                 ])
             }
@@ -8134,11 +9300,8 @@ fn builtin_diff(args: &[Value]) -> Result<Value, RuntimeError> {
 
     if diff_dims.len() > 2 || dim > 2 {
         for _ in 0..order {
-            let (next, next_dims) = diff_numeric_or_complex_operand_once_with_dimensions(
-                &operand,
-                &diff_dims,
-                dim,
-            );
+            let (next, next_dims) =
+                diff_numeric_or_complex_operand_once_with_dimensions(&operand, &diff_dims, dim);
             operand = next;
             diff_dims = next_dims;
         }
@@ -8182,12 +9345,10 @@ fn builtin_conv(args: &[Value]) -> Result<Value, RuntimeError> {
                 };
                 vec![ComplexParts::zero(); len]
             }
-            ConvolutionShape::Full => {
-                return Err(RuntimeError::Unsupported(
-                    "conv currently supports empty vector inputs only for `same` and `valid` shapes"
-                        .to_string(),
-                ))
-            }
+            ConvolutionShape::Full => return Err(RuntimeError::Unsupported(
+                "conv currently supports empty vector inputs only for `same` and `valid` shapes"
+                    .to_string(),
+            )),
         };
         let (rows, cols) = if lhs_is_row {
             (1, values.len())
@@ -8226,7 +9387,16 @@ fn builtin_conv2(args: &[Value]) -> Result<Value, RuntimeError> {
     numeric_or_complex_operand_to_value(&result)
 }
 
-fn parse_conv2_args(args: &[Value]) -> Result<(NumericOrComplexOperand, NumericOrComplexOperand, ConvolutionShape), RuntimeError> {
+fn parse_conv2_args(
+    args: &[Value],
+) -> Result<
+    (
+        NumericOrComplexOperand,
+        NumericOrComplexOperand,
+        ConvolutionShape,
+    ),
+    RuntimeError,
+> {
     match args {
         [lhs, rhs] => Ok((
             numeric_or_complex_operand(lhs, "conv2")?,
@@ -8829,7 +9999,11 @@ fn ndgrid_outputs(x: &[f64], y: &[f64]) -> Result<(Value, Value), RuntimeError> 
     ))
 }
 
-fn meshgrid_outputs_3d(x: &[f64], y: &[f64], z: &[f64]) -> Result<(Value, Value, Value), RuntimeError> {
+fn meshgrid_outputs_3d(
+    x: &[f64],
+    y: &[f64],
+    z: &[f64],
+) -> Result<(Value, Value, Value), RuntimeError> {
     let dims = vec![y.len(), x.len(), z.len()];
     let len = dims.iter().product::<usize>();
     let mut x_elements = vec![Value::Scalar(0.0); len];
@@ -8847,8 +10021,18 @@ fn meshgrid_outputs_3d(x: &[f64], y: &[f64], z: &[f64]) -> Result<(Value, Value,
     }
     let (rows, cols) = storage_shape_from_dimensions(&dims);
     Ok((
-        Value::Matrix(MatrixValue::with_dimensions(rows, cols, dims.clone(), x_elements)?),
-        Value::Matrix(MatrixValue::with_dimensions(rows, cols, dims.clone(), y_elements)?),
+        Value::Matrix(MatrixValue::with_dimensions(
+            rows,
+            cols,
+            dims.clone(),
+            x_elements,
+        )?),
+        Value::Matrix(MatrixValue::with_dimensions(
+            rows,
+            cols,
+            dims.clone(),
+            y_elements,
+        )?),
         Value::Matrix(MatrixValue::with_dimensions(rows, cols, dims, z_elements)?),
     ))
 }
@@ -8895,7 +10079,11 @@ fn meshgrid_outputs_nd(vectors: &[Vec<f64>]) -> Result<Vec<Value>, RuntimeError>
         .collect()
 }
 
-fn ndgrid_outputs_3d(x: &[f64], y: &[f64], z: &[f64]) -> Result<(Value, Value, Value), RuntimeError> {
+fn ndgrid_outputs_3d(
+    x: &[f64],
+    y: &[f64],
+    z: &[f64],
+) -> Result<(Value, Value, Value), RuntimeError> {
     let dims = vec![x.len(), y.len(), z.len()];
     let len = dims.iter().product::<usize>();
     let mut x_elements = vec![Value::Scalar(0.0); len];
@@ -8913,8 +10101,18 @@ fn ndgrid_outputs_3d(x: &[f64], y: &[f64], z: &[f64]) -> Result<(Value, Value, V
     }
     let (rows, cols) = storage_shape_from_dimensions(&dims);
     Ok((
-        Value::Matrix(MatrixValue::with_dimensions(rows, cols, dims.clone(), x_elements)?),
-        Value::Matrix(MatrixValue::with_dimensions(rows, cols, dims.clone(), y_elements)?),
+        Value::Matrix(MatrixValue::with_dimensions(
+            rows,
+            cols,
+            dims.clone(),
+            x_elements,
+        )?),
+        Value::Matrix(MatrixValue::with_dimensions(
+            rows,
+            cols,
+            dims.clone(),
+            y_elements,
+        )?),
         Value::Matrix(MatrixValue::with_dimensions(rows, cols, dims, z_elements)?),
     ))
 }
@@ -9490,13 +10688,15 @@ fn parse_interpolation_method(
             Ok(InterpolationMethod::Previous)
         }
         "next" if builtin_name.eq_ignore_ascii_case("interp1") => Ok(InterpolationMethod::Next),
-        _ => Err(RuntimeError::Unsupported(if builtin_name.eq_ignore_ascii_case("interp1") {
-            format!(
+        _ => Err(RuntimeError::Unsupported(
+            if builtin_name.eq_ignore_ascii_case("interp1") {
+                format!(
                 "{builtin_name} currently supports only `linear`, `nearest`, `previous`, and `next` methods"
             )
-        } else {
-            format!("{builtin_name} currently supports only `linear` and `nearest` methods")
-        })),
+            } else {
+                format!("{builtin_name} currently supports only `linear` and `nearest` methods")
+            },
+        )),
     }
 }
 
@@ -9580,12 +10780,7 @@ fn interp1_scalar(
                 if query < x[0] {
                     match method {
                         InterpolationMethod::Previous => f64::NAN,
-                        _ => interp1_interval_value(
-                            0,
-                            (query - x[0]) / (x[1] - x[0]),
-                            v,
-                            method,
-                        ),
+                        _ => interp1_interval_value(0, (query - x[0]) / (x[1] - x[0]), v, method),
                     }
                 } else if query > x[x.len() - 1] {
                     match method {
@@ -9610,7 +10805,12 @@ fn interp1_scalar(
     interp1_interval_value(index, weight, v, method)
 }
 
-fn interp1_interval_value(index: usize, weight: f64, v: &[f64], method: InterpolationMethod) -> f64 {
+fn interp1_interval_value(
+    index: usize,
+    weight: f64,
+    v: &[f64],
+    method: InterpolationMethod,
+) -> f64 {
     let v0 = v[index];
     let v1 = v[index + 1];
     match method {
@@ -10209,10 +11409,7 @@ fn diff_numeric_or_complex_operand_once_with_dimensions(
         values.push(rhs.minus(lhs));
     }
     let (rows, cols) = storage_shape_from_dimensions(&output_dims);
-    (
-        NumericOrComplexOperand { rows, cols, values },
-        output_dims,
-    )
+    (NumericOrComplexOperand { rows, cols, values }, output_dims)
 }
 
 fn parse_convolution_shape(
@@ -12274,12 +13471,23 @@ fn singular_value_decomposition(
     include_vectors: bool,
 ) -> Result<(Value, Value, Value), RuntimeError> {
     if value.rows == 0 || value.cols == 0 {
-        let singular_output =
-            svd_singular_values_output(&[], value.rows, value.cols, econ, output_form, include_vectors)?;
+        let singular_output = svd_singular_values_output(
+            &[],
+            value.rows,
+            value.cols,
+            econ,
+            output_form,
+            include_vectors,
+        )?;
         if !include_vectors {
             return Ok((Value::Scalar(0.0), singular_output, Value::Scalar(0.0)));
         }
-        return Ok(empty_svd_outputs(value.rows, value.cols, econ, singular_output));
+        return Ok(empty_svd_outputs(
+            value.rows,
+            value.cols,
+            econ,
+            singular_output,
+        ));
     }
 
     let tolerance = default_rank_tolerance(value)?.max(1e-12);
@@ -12304,7 +13512,12 @@ fn singular_value_decomposition(
     ))
 }
 
-fn empty_svd_outputs(rows: usize, cols: usize, econ: bool, singular_output: Value) -> (Value, Value, Value) {
+fn empty_svd_outputs(
+    rows: usize,
+    cols: usize,
+    econ: bool,
+    singular_output: Value,
+) -> (Value, Value, Value) {
     let u = if econ && rows > cols {
         zero_numeric_or_complex_operand(rows, cols)
     } else {
@@ -13732,6 +14945,14 @@ fn default_flip_dimension(value: &Value) -> usize {
         .unwrap_or(1)
 }
 
+fn default_reduction_dimension_from_dims(dims: &[usize]) -> usize {
+    canonical_size_vector(dims)
+        .iter()
+        .position(|&dim| dim != 1)
+        .map(|index| index + 1)
+        .unwrap_or(1)
+}
+
 fn squeeze_dimensions(dims: &[usize]) -> Vec<usize> {
     if dims.len() <= 2 {
         return canonical_size_vector(dims);
@@ -14884,7 +16105,8 @@ fn gradient_empty_outputs(
     component_count: usize,
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let empty = numeric_matrix_result_with_dimensions(canonical_size_vector(input_dims), Vec::new())?;
+    let empty =
+        numeric_matrix_result_with_dimensions(canonical_size_vector(input_dims), Vec::new())?;
     let max_outputs = component_count.max(1);
     match output_arity {
         0 | 1 => Ok(vec![empty]),
@@ -15281,8 +16503,8 @@ fn builtin_repelem(args: &[Value]) -> Result<Value, RuntimeError> {
     };
     if reps.is_empty() {
         return Err(RuntimeError::Unsupported(
-        "repelem currently expects an input array plus repetition counts".to_string(),
-    ));
+            "repelem currently expects an input array plus repetition counts".to_string(),
+        ));
     }
 
     match value {
@@ -15358,7 +16580,11 @@ fn builtin_repelem(args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
-fn repelem_vector_counts(value: &Value, len: usize, builtin_name: &str) -> Result<Vec<usize>, RuntimeError> {
+fn repelem_vector_counts(
+    value: &Value,
+    len: usize,
+    builtin_name: &str,
+) -> Result<Vec<usize>, RuntimeError> {
     match value {
         Value::Matrix(matrix) if matrix.rows == 0 || matrix.cols == 0 => Ok(vec![0; len]),
         Value::Matrix(matrix) => {
@@ -15481,11 +16707,17 @@ fn repelem_array_result(
 
     if cell_output {
         Ok(Value::Cell(CellValue::with_dimensions(
-            rows, cols, output_dims, elements,
+            rows,
+            cols,
+            output_dims,
+            elements,
         )?))
     } else {
         Ok(Value::Matrix(MatrixValue::with_dimensions(
-            rows, cols, output_dims, elements,
+            rows,
+            cols,
+            output_dims,
+            elements,
         )?))
     }
 }
@@ -15610,17 +16842,29 @@ fn builtin_movmean(args: &[Value]) -> Result<Value, RuntimeError> {
 fn builtin_movmax(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, backward, forward, dimension, endpoints) =
         parse_moving_window_args(args, "movmax")?;
-    moving_numeric_value(value, "movmax", backward, forward, dimension, endpoints, |window| {
-        builtin_extreme_value_from_slice(window, |candidate, best| candidate > best).0
-    })
+    moving_numeric_value(
+        value,
+        "movmax",
+        backward,
+        forward,
+        dimension,
+        endpoints,
+        |window| builtin_extreme_value_from_slice(window, |candidate, best| candidate > best).0,
+    )
 }
 
 fn builtin_movmin(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, backward, forward, dimension, endpoints) =
         parse_moving_window_args(args, "movmin")?;
-    moving_numeric_value(value, "movmin", backward, forward, dimension, endpoints, |window| {
-        builtin_extreme_value_from_slice(window, |candidate, best| candidate < best).0
-    })
+    moving_numeric_value(
+        value,
+        "movmin",
+        backward,
+        forward,
+        dimension,
+        endpoints,
+        |window| builtin_extreme_value_from_slice(window, |candidate, best| candidate < best).0,
+    )
 }
 
 fn builtin_movprod(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -15654,17 +16898,29 @@ fn builtin_movmedian(args: &[Value]) -> Result<Value, RuntimeError> {
 fn builtin_movvar(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, backward, forward, normalization, dimension, endpoints) =
         parse_moving_variance_args(args, "movvar")?;
-    moving_numeric_value(value, "movvar", backward, forward, dimension, endpoints, |window| {
-        variance_with_normalization(window, normalization)
-    })
+    moving_numeric_value(
+        value,
+        "movvar",
+        backward,
+        forward,
+        dimension,
+        endpoints,
+        |window| variance_with_normalization(window, normalization),
+    )
 }
 
 fn builtin_movstd(args: &[Value]) -> Result<Value, RuntimeError> {
     let (value, backward, forward, normalization, dimension, endpoints) =
         parse_moving_variance_args(args, "movstd")?;
-    moving_numeric_value(value, "movstd", backward, forward, dimension, endpoints, |window| {
-        variance_with_normalization(window, normalization).sqrt()
-    })
+    moving_numeric_value(
+        value,
+        "movstd",
+        backward,
+        forward,
+        dimension,
+        endpoints,
+        |window| variance_with_normalization(window, normalization).sqrt(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15693,7 +16949,10 @@ fn builtin_sort(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runti
     }
 }
 
-fn parse_sort_args<'a>(args: &'a [Value], builtin_name: &str) -> Result<(&'a Value, SortOptions), RuntimeError> {
+fn parse_sort_args<'a>(
+    args: &'a [Value],
+    builtin_name: &str,
+) -> Result<(&'a Value, SortOptions), RuntimeError> {
     let Some((value, options)) = args.split_first() else {
         return Err(RuntimeError::Unsupported(format!(
             "{builtin_name} currently expects at least one input argument"
@@ -15781,7 +17040,15 @@ fn parse_sort_missing_placement(
 fn parse_sortrows_args<'a>(
     args: &'a [Value],
     builtin_name: &str,
-) -> Result<(&'a Value, Option<&'a Value>, Option<bool>, SortMissingPlacement), RuntimeError> {
+) -> Result<
+    (
+        &'a Value,
+        Option<&'a Value>,
+        Option<bool>,
+        SortMissingPlacement,
+    ),
+    RuntimeError,
+> {
     let Some((value, options)) = args.split_first() else {
         return Err(RuntimeError::Unsupported(format!(
             "{builtin_name} currently expects at least one input argument"
@@ -15850,8 +17117,7 @@ fn builtin_sortrows(args: &[Value], output_arity: usize) -> Result<Vec<Value>, R
     };
     if !(matrix_is_numeric(&matrix) || matrix_is_logical(&matrix) || matrix_is_text(&matrix)) {
         return Err(RuntimeError::TypeError(
-            "sortrows currently expects numeric, logical, or text scalar/matrix input"
-                .to_string(),
+            "sortrows currently expects numeric, logical, or text scalar/matrix input".to_string(),
         ));
     }
     let mut columns = parse_sortrows_columns(columns, matrix.cols)?;
@@ -15886,8 +17152,7 @@ fn builtin_issorted(args: &[Value]) -> Result<Value, RuntimeError> {
     };
     if !(matrix_is_numeric(&matrix) || matrix_is_logical(&matrix) || matrix_is_text(&matrix)) {
         return Err(RuntimeError::TypeError(
-            "issorted currently expects numeric, logical, or text scalar/matrix input"
-                .to_string(),
+            "issorted currently expects numeric, logical, or text scalar/matrix input".to_string(),
         ));
     }
 
@@ -15907,8 +17172,7 @@ fn builtin_issorted(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 fn builtin_issortedrows(args: &[Value]) -> Result<Value, RuntimeError> {
-    let (value, columns, direction, missing_placement) =
-        parse_sortrows_args(args, "issortedrows")?;
+    let (value, columns, direction, missing_placement) = parse_sortrows_args(args, "issortedrows")?;
 
     let matrix = match value {
         Value::Logical(flag) => MatrixValue::new(1, 1, vec![Value::Logical(*flag)])?,
@@ -15953,8 +17217,7 @@ fn builtin_union(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runt
             return Ok(outputs);
         }
         return Err(RuntimeError::TypeError(
-            "union currently expects numeric or text matrix input when using 'rows'"
-                .to_string(),
+            "union currently expects numeric or text matrix input when using 'rows'".to_string(),
         ));
     }
 
@@ -16052,8 +17315,7 @@ fn builtin_setdiff(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Ru
             return Ok(outputs);
         }
         return Err(RuntimeError::TypeError(
-            "setdiff currently expects numeric or text matrix input when using 'rows'"
-                .to_string(),
+            "setdiff currently expects numeric or text matrix input when using 'rows'".to_string(),
         ));
     }
 
@@ -16102,8 +17364,7 @@ fn builtin_setxor(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
             return Ok(outputs);
         }
         return Err(RuntimeError::TypeError(
-            "setxor currently expects numeric or text matrix input when using 'rows'"
-                .to_string(),
+            "setxor currently expects numeric or text matrix input when using 'rows'".to_string(),
         ));
     }
 
@@ -16156,11 +17417,19 @@ fn builtin_unique(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
         ));
     }
     match value {
-        Value::Scalar(_) | Value::Logical(_) => unique_numeric_outputs(value, options, output_arity),
-        Value::Matrix(matrix) if matrix_is_text(matrix) => unique_text_outputs(value, options, output_arity),
+        Value::Scalar(_) | Value::Logical(_) => {
+            unique_numeric_outputs(value, options, output_arity)
+        }
+        Value::Matrix(matrix) if matrix_is_text(matrix) => {
+            unique_text_outputs(value, options, output_arity)
+        }
         Value::Matrix(_) => unique_numeric_outputs(value, options, output_arity),
-        Value::CharArray(_) | Value::String(_) | Value::Cell(_) => unique_text_outputs(value, options, output_arity),
-        _ => Err(RuntimeError::TypeError("unique currently expects numeric or text vector/matrix input".to_string())),
+        Value::CharArray(_) | Value::String(_) | Value::Cell(_) => {
+            unique_text_outputs(value, options, output_arity)
+        }
+        _ => Err(RuntimeError::TypeError(
+            "unique currently expects numeric or text vector/matrix input".to_string(),
+        )),
     }
 }
 
@@ -16217,9 +17486,7 @@ fn builtin_blkdiag(args: &[Value]) -> Result<Value, RuntimeError> {
     }
 
     Ok(Value::Matrix(MatrixValue::new(
-        total_rows,
-        total_cols,
-        elements,
+        total_rows, total_cols, elements,
     )?))
 }
 
@@ -16284,7 +17551,9 @@ fn builtin_mat2cell(args: &[Value]) -> Result<Value, RuntimeError> {
     };
 
     match value {
-        Value::Matrix(matrix) => mat2cell_from_elements(matrix.dims(), matrix.elements(), partitions, false),
+        Value::Matrix(matrix) => {
+            mat2cell_from_elements(matrix.dims(), matrix.elements(), partitions, false)
+        }
         Value::Cell(cell) => mat2cell_from_elements(cell.dims(), cell.elements(), partitions, true),
         other => Err(RuntimeError::TypeError(format!(
             "mat2cell currently expects a matrix or cell array input, found {}",
@@ -16389,7 +17658,8 @@ fn mat2cell_from_elements(
                 .enumerate()
                 .map(|(axis, &offset)| start_index[axis] + offset)
                 .collect::<Vec<_>>();
-            piece_elements.push(elements[row_major_linear_index(&source_index, &input_dims)].clone());
+            piece_elements
+                .push(elements[row_major_linear_index(&source_index, &input_dims)].clone());
         }
 
         if nested_cell_output {
@@ -16401,7 +17671,12 @@ fn mat2cell_from_elements(
                 piece_elements,
             )?));
         } else if piece_count == 1 {
-            cell_elements.push(piece_elements.into_iter().next().expect("single element piece"));
+            cell_elements.push(
+                piece_elements
+                    .into_iter()
+                    .next()
+                    .expect("single element piece"),
+            );
         } else {
             let (rows, cols) = storage_shape_from_dimensions(&piece_dims);
             cell_elements.push(Value::Matrix(MatrixValue::with_dimensions(
@@ -16551,7 +17826,10 @@ fn builtin_struct2cell(args: &[Value]) -> Result<Value, RuntimeError> {
                 elements.push(field_value.clone());
             }
             Ok(Value::Cell(CellValue::with_dimensions(
-                rows, cols, output_dims, elements,
+                rows,
+                cols,
+                output_dims,
+                elements,
             )?))
         }
         other => Err(RuntimeError::TypeError(format!(
@@ -16623,7 +17901,10 @@ fn builtin_cell2struct(args: &[Value]) -> Result<Value, RuntimeError> {
         Ok(elements.into_iter().next().expect("scalar struct result"))
     } else {
         Ok(Value::Matrix(MatrixValue::with_dimensions(
-            rows, cols, output_dims, elements,
+            rows,
+            cols,
+            output_dims,
+            elements,
         )?))
     }
 }
@@ -16658,8 +17939,7 @@ fn builtin_cell2mat(args: &[Value]) -> Result<Value, RuntimeError> {
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Value::Matrix(concatenate_cell2mat_blocks(
-        blocks,
-        &cell_dims,
+        blocks, &cell_dims,
     )?))
 }
 
@@ -16727,10 +18007,12 @@ fn concatenate_values(args: &[Value], axis: ConcatAxis) -> Result<Value, Runtime
         ));
     }
 
-    if args
-        .iter()
-        .all(|value| matches!(value, Value::Scalar(_) | Value::Matrix(_) | Value::Object(_)))
-    {
+    if args.iter().all(|value| {
+        matches!(
+            value,
+            Value::Scalar(_) | Value::Matrix(_) | Value::Object(_)
+        )
+    }) {
         let matrices = args
             .iter()
             .map(coerce_matrix)
@@ -17464,52 +18746,83 @@ fn cumulative_numeric_or_complex_value(
     step: impl Fn(ComplexParts, ComplexParts) -> ComplexParts + Copy,
     identity: ComplexParts,
 ) -> Result<Value, RuntimeError> {
-    let operand = numeric_or_complex_operand(value, name)?;
-    if operand.rows == 0 || operand.cols == 0 {
-        return Ok(value.clone());
-    }
-
-    if operand.rows == 1 && operand.cols == 1 {
-        return Ok(numeric_or_complex_value(operand.values[0]));
-    }
-
-    let dimension = dimension.unwrap_or_else(|| {
-        if operand.rows == 1 && operand.cols > 1 {
-            2
-        } else {
-            1
-        }
-    });
-    if dimension > 2 {
-        return numeric_or_complex_operand_to_value(&operand);
-    }
-
-    let mut elements = vec![ComplexParts::zero(); operand.values.len()];
-    match dimension {
-        1 => {
-            for col in 0..operand.cols {
-                let mut accumulator = identity;
-                for row in 0..operand.rows {
-                    let offset = row * operand.cols + col;
-                    accumulator = step(accumulator, operand.values[offset]);
-                    elements[offset] = accumulator;
-                }
+    match value {
+        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) => Ok(numeric_or_complex_value(
+            numeric_or_complex_scalar(value, name)?,
+        )),
+        Value::Matrix(matrix) => {
+            let input_dims = canonical_size_vector(matrix.dims());
+            let values = matrix
+                .iter()
+                .map(|element| numeric_or_complex_scalar(element, name))
+                .collect::<Result<Vec<_>, _>>()?;
+            if values.is_empty() {
+                return numeric_or_complex_matrix_result_with_dimensions(input_dims, values);
             }
-        }
-        2 => {
-            for row in 0..operand.rows {
-                let mut accumulator = identity;
-                for col in 0..operand.cols {
-                    let offset = row * operand.cols + col;
-                    accumulator = step(accumulator, operand.values[offset]);
-                    elements[offset] = accumulator;
-                }
-            }
-        }
-        _ => unreachable!("cumulative dimensions are normalized earlier"),
-    }
 
-    build_numeric_or_complex_matrix_result(operand.rows, operand.cols, elements)
+            let dimension =
+                dimension.unwrap_or_else(|| default_reduction_dimension_from_dims(&input_dims));
+            if input_dims.len() > 2 || dimension > 2 {
+                if dimension > input_dims.len() {
+                    return numeric_or_complex_matrix_result_with_dimensions(input_dims, values);
+                }
+                let (output_dims, output_values) = cumulative_numeric_or_complex_slices_nd(
+                    &values,
+                    &input_dims,
+                    dimension,
+                    step,
+                    identity,
+                );
+                return numeric_or_complex_matrix_result_with_dimensions(
+                    output_dims,
+                    output_values,
+                );
+            }
+
+            let operand = NumericOrComplexOperand {
+                rows: matrix.rows,
+                cols: matrix.cols,
+                values,
+            };
+            if operand.rows == 1 && operand.cols == 1 {
+                return Ok(numeric_or_complex_value(operand.values[0]));
+            }
+
+            if dimension > 2 {
+                return numeric_or_complex_operand_to_value(&operand);
+            }
+
+            let mut elements = vec![ComplexParts::zero(); operand.values.len()];
+            match dimension {
+                1 => {
+                    for col in 0..operand.cols {
+                        let mut accumulator = identity;
+                        for row in 0..operand.rows {
+                            let offset = row * operand.cols + col;
+                            accumulator = step(accumulator, operand.values[offset]);
+                            elements[offset] = accumulator;
+                        }
+                    }
+                }
+                2 => {
+                    for row in 0..operand.rows {
+                        let mut accumulator = identity;
+                        for col in 0..operand.cols {
+                            let offset = row * operand.cols + col;
+                            accumulator = step(accumulator, operand.values[offset]);
+                            elements[offset] = accumulator;
+                        }
+                    }
+                }
+                _ => unreachable!("cumulative dimensions are normalized earlier"),
+            }
+
+            build_numeric_or_complex_matrix_result(operand.rows, operand.cols, elements)
+        }
+        _ => Err(RuntimeError::TypeError(format!(
+            "{name} currently expects numeric or complex scalar or matrix input"
+        ))),
+    }
 }
 
 fn cumulative_extreme_outputs(
@@ -17532,6 +18845,67 @@ fn cumulative_extreme_outputs(
         return Err(RuntimeError::Unsupported(format!(
             "{builtin_name} currently supports one or two outputs"
         )));
+    }
+
+    if let Value::Matrix(matrix) = value {
+        let input_dims = canonical_size_vector(matrix.dims());
+        let dimension =
+            dimension.unwrap_or_else(|| default_reduction_dimension_from_dims(&input_dims));
+        if input_dims.len() > 2 || dimension > 2 {
+            let values = matrix
+                .iter()
+                .map(Value::as_scalar)
+                .collect::<Result<Vec<_>, _>>()?;
+            let logical_output = matrix_is_logical(matrix);
+            if values.is_empty() {
+                let empty = Value::Matrix(MatrixValue::with_dimensions(
+                    matrix.rows,
+                    matrix.cols,
+                    input_dims.clone(),
+                    Vec::new(),
+                )?);
+                let mut outputs = vec![if logical_output { empty.clone() } else { empty }];
+                if output_arity == 2 {
+                    outputs.push(Value::Matrix(MatrixValue::with_dimensions(
+                        matrix.rows,
+                        matrix.cols,
+                        input_dims,
+                        Vec::new(),
+                    )?));
+                }
+                return Ok(outputs);
+            }
+
+            if dimension > input_dims.len() {
+                let mut outputs = vec![extreme_matrix_value_with_dimensions(
+                    input_dims.clone(),
+                    values.clone(),
+                    logical_output,
+                )?];
+                if output_arity == 2 {
+                    outputs.push(numeric_matrix_result_with_dimensions(
+                        input_dims,
+                        vec![1.0; values.len()],
+                    )?);
+                }
+                return Ok(outputs);
+            }
+
+            let (output_dims, reduced_values, reduced_indices) =
+                cumulative_extreme_slices_nd(&values, &input_dims, dimension, prefer_candidate);
+            let mut outputs = vec![extreme_matrix_value_with_dimensions(
+                output_dims.clone(),
+                reduced_values,
+                logical_output,
+            )?];
+            if output_arity == 2 {
+                outputs.push(numeric_matrix_result_with_dimensions(
+                    output_dims,
+                    reduced_indices,
+                )?);
+            }
+            return Ok(outputs);
+        }
     }
 
     let operand = numeric_operand(value, builtin_name)?;
@@ -17709,7 +19083,14 @@ fn parse_moving_variance_args<'a>(
     };
 
     let (backward, forward) = parse_moving_window(window, builtin_name)?;
-    Ok((value, backward, forward, normalization, dimension, endpoints))
+    Ok((
+        value,
+        backward,
+        forward,
+        normalization,
+        dimension,
+        endpoints,
+    ))
 }
 
 fn parse_trailing_moving_endpoints<'a>(
@@ -17895,11 +19276,7 @@ fn moving_numeric_or_complex_value(
     match endpoints {
         MovingEndpoints::Discard => {
             return moving_numeric_or_complex_value_discard(
-                &operand,
-                dimension,
-                backward,
-                forward,
-                reducer,
+                &operand, dimension, backward, forward, reducer,
             );
         }
         MovingEndpoints::FillNan | MovingEndpoints::FillScalar(_) => {
@@ -18315,6 +19692,22 @@ fn extreme_matrix_value(
     build_scalar_matrix_result(rows, cols, elements)
 }
 
+fn extreme_matrix_value_with_dimensions(
+    dims: Vec<usize>,
+    values: Vec<f64>,
+    logical_output: bool,
+) -> Result<Value, RuntimeError> {
+    let elements = if logical_output {
+        values
+            .into_iter()
+            .map(|value| Value::Logical(value != 0.0))
+            .collect::<Vec<_>>()
+    } else {
+        values.into_iter().map(Value::Scalar).collect::<Vec<_>>()
+    };
+    build_scalar_matrix_result_with_dimensions(dims, elements)
+}
+
 fn extreme_value_all(
     value: &Value,
     name: &str,
@@ -18365,6 +19758,14 @@ fn extreme_value_and_index(
                     "{name} does not yet support empty matrices"
                 )));
             }
+            if canonical_size_vector(matrix.dims()).len() > 2 {
+                return extreme_value_and_index_along_dimension(
+                    value,
+                    name,
+                    default_reduction_dimension_from_dims(matrix.dims()),
+                    prefer_candidate,
+                );
+            }
             let logical_output = matrix_is_logical(matrix);
 
             if matrix.rows == 1 || matrix.cols == 1 {
@@ -18373,7 +19774,10 @@ fn extreme_value_and_index(
                     .map(Value::as_scalar)
                     .collect::<Result<Vec<_>, _>>()?;
                 let (best, index) = builtin_extreme_value_from_slice(&values, prefer_candidate);
-                return Ok((extreme_scalar_value(best, logical_output), Value::Scalar(index as f64)));
+                return Ok((
+                    extreme_scalar_value(best, logical_output),
+                    Value::Scalar(index as f64),
+                ));
             }
 
             let mut best_values = Vec::with_capacity(matrix.cols);
@@ -18404,6 +19808,38 @@ fn extreme_value_and_index_along_dimension(
     dim: usize,
     prefer_candidate: impl Fn(f64, f64) -> bool + Copy,
 ) -> Result<(Value, Value), RuntimeError> {
+    if let Value::Matrix(matrix) = value {
+        let input_dims = canonical_size_vector(matrix.dims());
+        if matrix.rows != 0 && matrix.cols != 0 && (input_dims.len() > 2 || dim > 2) {
+            let values = matrix
+                .iter()
+                .map(Value::as_scalar)
+                .collect::<Result<Vec<_>, _>>()?;
+            let logical_output = matrix_is_logical(matrix);
+            if dim > input_dims.len() {
+                return Ok((
+                    extreme_matrix_value_with_dimensions(
+                        input_dims.clone(),
+                        values.clone(),
+                        logical_output,
+                    )?,
+                    numeric_matrix_result_with_dimensions(input_dims, vec![1.0; values.len()])?,
+                ));
+            }
+
+            let (output_dims, reduced_values, reduced_indices) =
+                extreme_slices_nd(&values, &input_dims, dim, prefer_candidate, false);
+            return Ok((
+                extreme_matrix_value_with_dimensions(
+                    output_dims.clone(),
+                    reduced_values,
+                    logical_output,
+                )?,
+                numeric_matrix_result_with_dimensions(output_dims, reduced_indices)?,
+            ));
+        }
+    }
+
     let operand = numeric_operand(value, name)?;
     if operand.rows == 0 || operand.cols == 0 {
         return Err(RuntimeError::Unsupported(format!(
@@ -18490,6 +19926,44 @@ fn extreme_value_and_linear_index_along_dimension(
     dim: usize,
     prefer_candidate: impl Fn(f64, f64) -> bool + Copy,
 ) -> Result<(Value, Value), RuntimeError> {
+    if let Value::Matrix(matrix) = value {
+        let input_dims = canonical_size_vector(matrix.dims());
+        if matrix.rows != 0 && matrix.cols != 0 && (input_dims.len() > 2 || dim > 2) {
+            let values = matrix
+                .iter()
+                .map(Value::as_scalar)
+                .collect::<Result<Vec<_>, _>>()?;
+            let logical_output = matrix_is_logical(matrix);
+            if dim > input_dims.len() {
+                let linear_indices = (0..values.len())
+                    .map(|linear| {
+                        let index = row_major_multi_index(linear, &input_dims);
+                        column_major_linear_index_one_based(&index, &input_dims) as f64
+                    })
+                    .collect::<Vec<_>>();
+                return Ok((
+                    extreme_matrix_value_with_dimensions(
+                        input_dims.clone(),
+                        values,
+                        logical_output,
+                    )?,
+                    numeric_matrix_result_with_dimensions(input_dims, linear_indices)?,
+                ));
+            }
+
+            let (output_dims, reduced_values, reduced_indices) =
+                extreme_slices_nd(&values, &input_dims, dim, prefer_candidate, true);
+            return Ok((
+                extreme_matrix_value_with_dimensions(
+                    output_dims.clone(),
+                    reduced_values,
+                    logical_output,
+                )?,
+                numeric_matrix_result_with_dimensions(output_dims, reduced_indices)?,
+            ));
+        }
+    }
+
     let operand = numeric_operand(value, name)?;
     if operand.rows == 0 || operand.cols == 0 {
         return Err(RuntimeError::Unsupported(format!(
@@ -18503,9 +19977,8 @@ fn extreme_value_and_linear_index_along_dimension(
     if dim > 2 {
         let values = (0..operand.rows)
             .flat_map(|row| {
-                (0..operand.cols).map(move |col| {
-                    column_major_linear_index_one_based(&[row, col], &dims) as f64
-                })
+                (0..operand.cols)
+                    .map(move |col| column_major_linear_index_one_based(&[row, col], &dims) as f64)
             })
             .collect::<Vec<_>>();
         return Ok((
@@ -18542,9 +20015,8 @@ fn extreme_value_and_linear_index_along_dimension(
                 }
                 let (best, index) = builtin_extreme_value_from_slice(&values, prefer_candidate);
                 best_values.push(best);
-                index_values.push(
-                    column_major_linear_index_one_based(&[index - 1, col], &dims) as f64,
-                );
+                index_values
+                    .push(column_major_linear_index_one_based(&[index - 1, col], &dims) as f64);
             }
             Ok((
                 extreme_matrix_value(1, operand.cols, best_values, logical_output)?,
@@ -18560,12 +20032,13 @@ fn extreme_value_and_linear_index_along_dimension(
             let mut index_values = Vec::with_capacity(operand.rows);
             for row in 0..operand.rows {
                 let start = row * operand.cols;
-                let (best, index) =
-                    builtin_extreme_value_from_slice(&operand.values[start..start + operand.cols], prefer_candidate);
-                best_values.push(best);
-                index_values.push(
-                    column_major_linear_index_one_based(&[row, index - 1], &dims) as f64,
+                let (best, index) = builtin_extreme_value_from_slice(
+                    &operand.values[start..start + operand.cols],
+                    prefer_candidate,
                 );
+                best_values.push(best);
+                index_values
+                    .push(column_major_linear_index_one_based(&[row, index - 1], &dims) as f64);
             }
             Ok((
                 extreme_matrix_value(operand.rows, 1, best_values, logical_output)?,
@@ -18595,6 +20068,24 @@ fn reduce_numeric_or_complex_value(
     empty_value: Value,
     reducer: impl Fn(&[ComplexParts]) -> ComplexParts,
 ) -> Result<Value, RuntimeError> {
+    if let Value::Matrix(matrix) = value {
+        let input_dims = canonical_size_vector(matrix.dims());
+        if matrix.rows != 0 && matrix.cols != 0 && input_dims.len() > 2 {
+            let values = matrix
+                .iter()
+                .map(|element| numeric_or_complex_scalar(element, name))
+                .collect::<Result<Vec<_>, _>>()?;
+            let dimension = default_reduction_dimension_from_dims(&input_dims);
+            let (output_dims, reduced_values) = reduce_numeric_or_complex_slices_nd_values(
+                &values,
+                &input_dims,
+                dimension,
+                reducer,
+            );
+            return numeric_or_complex_matrix_result_with_dimensions(output_dims, reduced_values);
+        }
+    }
+
     let operand = numeric_or_complex_operand(value, name)?;
     if operand.rows == 0 || operand.cols == 0 {
         return empty_default_reduction_result(operand.rows, operand.cols, empty_value);
@@ -18640,9 +20131,30 @@ fn reduce_numeric_or_complex_value_along_dimension(
     empty_value: Value,
     reducer: impl Fn(&[ComplexParts]) -> ComplexParts,
 ) -> Result<Value, RuntimeError> {
+    if let Value::Matrix(matrix) = value {
+        let input_dims = canonical_size_vector(matrix.dims());
+        if matrix.rows != 0 && matrix.cols != 0 && (input_dims.len() > 2 || dim > 2) {
+            let values = matrix
+                .iter()
+                .map(|element| numeric_or_complex_scalar(element, name))
+                .collect::<Result<Vec<_>, _>>()?;
+            if dim > input_dims.len() {
+                return numeric_or_complex_matrix_result_with_dimensions(input_dims, values);
+            }
+            let (output_dims, reduced_values) =
+                reduce_numeric_or_complex_slices_nd_values(&values, &input_dims, dim, reducer);
+            return numeric_or_complex_matrix_result_with_dimensions(output_dims, reduced_values);
+        }
+    }
+
     let operand = numeric_or_complex_operand(value, name)?;
     if operand.rows == 0 || operand.cols == 0 {
-        return empty_reduction_result_along_dimension(operand.rows, operand.cols, dim, empty_value);
+        return empty_reduction_result_along_dimension(
+            operand.rows,
+            operand.cols,
+            dim,
+            empty_value,
+        );
     }
 
     if dim > 2 {
@@ -18684,6 +20196,18 @@ fn reduce_numeric_value_with_scalar(
         Value::Scalar(number) => Ok(Value::Scalar(scalar_reducer(*number))),
         Value::Logical(flag) => Ok(Value::Scalar(scalar_reducer(if *flag { 1.0 } else { 0.0 }))),
         Value::Matrix(matrix) => {
+            let input_dims = canonical_size_vector(matrix.dims());
+            if matrix.rows != 0 && matrix.cols != 0 && input_dims.len() > 2 {
+                let values = matrix
+                    .iter()
+                    .map(Value::as_scalar)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dimension = default_reduction_dimension_from_dims(&input_dims);
+                let (output_dims, reduced_values) =
+                    reduce_numeric_slices_nd_values(&values, &input_dims, dimension, reducer);
+                return numeric_matrix_result_with_dimensions(output_dims, reduced_values);
+            }
+
             if matrix.rows == 0 || matrix.cols == 0 {
                 return empty_default_reduction_result(matrix.rows, matrix.cols, empty_value);
             }
@@ -18719,9 +20243,30 @@ fn reduce_numeric_value_along_dimension(
     empty_value: Value,
     reducer: impl Fn(&[f64]) -> f64,
 ) -> Result<Value, RuntimeError> {
+    if let Value::Matrix(matrix) = value {
+        let input_dims = canonical_size_vector(matrix.dims());
+        if matrix.rows != 0 && matrix.cols != 0 && (input_dims.len() > 2 || dim > 2) {
+            let values = matrix
+                .iter()
+                .map(Value::as_scalar)
+                .collect::<Result<Vec<_>, _>>()?;
+            if dim > input_dims.len() {
+                return numeric_matrix_result_with_dimensions(input_dims, values);
+            }
+            let (output_dims, reduced_values) =
+                reduce_numeric_slices_nd_values(&values, &input_dims, dim, reducer);
+            return numeric_matrix_result_with_dimensions(output_dims, reduced_values);
+        }
+    }
+
     let operand = numeric_operand(value, name)?;
     if operand.rows == 0 || operand.cols == 0 {
-        return empty_reduction_result_along_dimension(operand.rows, operand.cols, dim, empty_value);
+        return empty_reduction_result_along_dimension(
+            operand.rows,
+            operand.cols,
+            dim,
+            empty_value,
+        );
     }
 
     if dim > 2 {
@@ -18788,13 +20333,7 @@ fn reduce_numeric_value_all(
 fn mean_default_dimension(value: &Value) -> Result<usize, RuntimeError> {
     match value {
         Value::Scalar(_) | Value::Complex(_) => Ok(1),
-        Value::Matrix(matrix) => Ok(if matrix.rows != 1 {
-            1
-        } else if matrix.cols != 1 {
-            2
-        } else {
-            1
-        }),
+        Value::Matrix(matrix) => Ok(default_reduction_dimension_from_dims(matrix.dims())),
         _ => Ok(1),
     }
 }
@@ -18802,7 +20341,11 @@ fn mean_default_dimension(value: &Value) -> Result<usize, RuntimeError> {
 fn variance_default_dimension(value: &Value, builtin_name: &str) -> Result<usize, RuntimeError> {
     match value {
         Value::Scalar(_) => Ok(1),
-        _ => Ok(default_statistic_dimension(&numeric_operand(value, builtin_name)?)),
+        Value::Matrix(matrix) => Ok(default_reduction_dimension_from_dims(matrix.dims())),
+        _ => Ok(default_statistic_dimension(&numeric_operand(
+            value,
+            builtin_name,
+        )?)),
     }
 }
 
@@ -18876,6 +20419,34 @@ fn variance_or_std_along_dimension(
     missing_flag: StatisticMissingFlag,
     standard_deviation: bool,
 ) -> Result<Value, RuntimeError> {
+    if let Value::Matrix(matrix) = value {
+        let input_dims = canonical_size_vector(matrix.dims());
+        if input_dims.len() > 2 || dim > 2 {
+            let values = matrix
+                .iter()
+                .map(Value::as_scalar)
+                .collect::<Result<Vec<_>, _>>()?;
+            if dim > input_dims.len() {
+                return numeric_matrix_result_with_dimensions(input_dims, vec![0.0; values.len()]);
+            }
+
+            let reducer = |sample: &[f64]| {
+                let variance =
+                    numeric_reduce_with_missing(sample, missing_flag, f64::NAN, |filtered| {
+                        variance_with_normalization(filtered, normalization)
+                    });
+                if standard_deviation {
+                    variance.sqrt()
+                } else {
+                    variance
+                }
+            };
+            let (output_dims, reduced_values) =
+                reduce_numeric_slices_nd_values(&values, &input_dims, dim, reducer);
+            return numeric_matrix_result_with_dimensions(output_dims, reduced_values);
+        }
+    }
+
     let operand = numeric_operand(value, name)?;
     if operand.rows == 0 || operand.cols == 0 {
         if dim > 2 {
@@ -18955,9 +20526,10 @@ fn variance_or_std_all(
     if operand.rows == 0 || operand.cols == 0 {
         return Ok(Value::Scalar(f64::NAN));
     }
-    let variance = numeric_reduce_with_missing(&operand.values, missing_flag, f64::NAN, |filtered| {
-        variance_with_normalization(filtered, normalization)
-    });
+    let variance =
+        numeric_reduce_with_missing(&operand.values, missing_flag, f64::NAN, |filtered| {
+            variance_with_normalization(filtered, normalization)
+        });
     Ok(Value::Scalar(if standard_deviation {
         variance.sqrt()
     } else {
@@ -19080,7 +20652,11 @@ fn omit_nan_covariance_rows(dataset: &NumericOperand) -> NumericOperand {
         }
     }
     NumericOperand {
-        rows: if dataset.cols == 0 { 0 } else { values.len() / dataset.cols },
+        rows: if dataset.cols == 0 {
+            0
+        } else {
+            values.len() / dataset.cols
+        },
         cols: dataset.cols,
         values,
     }
@@ -19131,7 +20707,10 @@ fn parse_correlation_inputs(args: &[Value]) -> Result<CorrcoefInputs, RuntimeErr
             covariance_pair_dataset(first, second, "corrcoef")?,
             &args[2..],
         ),
-        _ => (covariance_dataset_from_value(first, "corrcoef")?, &args[1..]),
+        _ => (
+            covariance_dataset_from_value(first, "corrcoef")?,
+            &args[1..],
+        ),
     };
     if tail.len() % 2 != 0 {
         return Err(RuntimeError::Unsupported(
@@ -19341,7 +20920,12 @@ fn empty_default_reduction_result(
     if (rows == 0 && cols == 0) || rows == 1 || cols == 1 {
         return Ok(empty_value);
     }
-    empty_reduction_result_along_dimension(rows, cols, default_reduction_dimension(rows, cols), empty_value)
+    empty_reduction_result_along_dimension(
+        rows,
+        cols,
+        default_reduction_dimension(rows, cols),
+        empty_value,
+    )
 }
 
 fn empty_reduction_result_along_dimension(
@@ -19665,7 +21249,15 @@ fn parse_statistic_selection_with_missing_args<'a>(
 fn parse_variance_selection_args<'a>(
     args: &'a [Value],
     builtin_name: &str,
-) -> Result<(&'a Value, VarianceNormalization, StatisticSelection, StatisticMissingFlag), RuntimeError> {
+) -> Result<
+    (
+        &'a Value,
+        VarianceNormalization,
+        StatisticSelection,
+        StatisticMissingFlag,
+    ),
+    RuntimeError,
+> {
     match args {
         [value] => Ok((
             value,
@@ -19917,8 +21509,53 @@ fn is_empty_matrix_placeholder(value: &Value) -> bool {
     matches!(value, Value::Matrix(matrix) if matrix.rows == 0 && matrix.cols == 0)
 }
 
+fn vecdim_requires_nd_path(dims: &[usize]) -> bool {
+    dims.iter().any(|&dim| dim > 2)
+}
+
+fn normalized_vecdim_reduce_dims(dims: &[usize]) -> Vec<usize> {
+    let mut reduce_dims = dims.to_vec();
+    reduce_dims.sort_unstable();
+    reduce_dims.dedup();
+    reduce_dims
+}
+
+fn vecdim_shape_promotion_dims(
+    input_dims: &[usize],
+    selection: &StatisticSelection,
+) -> Option<Vec<usize>> {
+    if input_dims.len() > 2 {
+        return None;
+    }
+    let StatisticSelection::VecDim(dims) = selection else {
+        return None;
+    };
+    let reduce_dims = normalized_vecdim_reduce_dims(dims);
+    vecdim_requires_nd_path(&reduce_dims).then_some(reduce_dims)
+}
+
+fn promote_value_for_vecdim_shape(
+    value: Value,
+    input_dims: &[usize],
+    reduce_dims: &[usize],
+) -> Result<Value, RuntimeError> {
+    let Value::Matrix(matrix) = value else {
+        return Ok(value);
+    };
+    let layout = nd_vecdim_reduction_layout(input_dims, reduce_dims);
+    let output_dims = nd_vecdim_output_dims(&layout, 1);
+    if canonical_size_vector(matrix.dims()) == output_dims {
+        return Ok(Value::Matrix(matrix));
+    }
+    if matrix.element_count() != output_dims.iter().product::<usize>() {
+        return Ok(Value::Matrix(matrix));
+    }
+    build_scalar_matrix_result_with_dimensions(output_dims, matrix.elements)
+}
+
 fn quantile_result(
     data: &NumericOperand,
+    input_dims: &[usize],
     probabilities: &NumericOperand,
     selection: &StatisticSelection,
     builtin_name: &str,
@@ -19927,13 +21564,20 @@ fn quantile_result(
         StatisticSelection::Default => {
             return quantile_result_for_dim(
                 data,
+                input_dims,
                 probabilities,
-                default_statistic_dimension(data),
+                default_reduction_dimension_from_dims(input_dims),
                 builtin_name,
             );
         }
         StatisticSelection::Dim(dim) => {
-            return quantile_result_for_dim(data, probabilities, *dim, builtin_name);
+            return quantile_result_for_dim(
+                data,
+                input_dims,
+                probabilities,
+                *dim,
+                builtin_name,
+            );
         }
         StatisticSelection::All => {
             let values = quantiles_for_sample(&data.values, &probabilities.values);
@@ -19944,6 +21588,30 @@ fn quantile_result(
             });
         }
         StatisticSelection::VecDim(dims) => {
+            let mut reduce_dims = dims.clone();
+            reduce_dims.sort_unstable();
+            reduce_dims.dedup();
+            if input_dims.len() > 2 || vecdim_requires_nd_path(&reduce_dims) {
+                let rank = input_dims
+                    .len()
+                    .max(reduce_dims.iter().copied().max().unwrap_or(0));
+                if reduce_dims == (1..=rank).collect::<Vec<_>>() {
+                    return numeric_operand_to_value(&NumericOperand {
+                        rows: probabilities.rows,
+                        cols: probabilities.cols,
+                        values: quantiles_for_sample(&data.values, &probabilities.values),
+                    });
+                }
+                let (output_dims, values) = reduce_numeric_vecdim_values(
+                    &data.values,
+                    input_dims,
+                    &reduce_dims,
+                    probabilities.values.len(),
+                    |sample| quantiles_for_sample(sample, &probabilities.values),
+                );
+                return numeric_matrix_result_with_dimensions(output_dims, values);
+            }
+
             let reduces_rows = dims.contains(&1);
             let reduces_cols = dims.contains(&2);
             return match (reduces_rows, reduces_cols) {
@@ -19952,8 +21620,12 @@ fn quantile_result(
                     cols: probabilities.cols,
                     values: quantiles_for_sample(&data.values, &probabilities.values),
                 }),
-                (true, false) => quantile_result_for_dim(data, probabilities, 1, builtin_name),
-                (false, true) => quantile_result_for_dim(data, probabilities, 2, builtin_name),
+                (true, false) => {
+                    quantile_result_for_dim(data, input_dims, probabilities, 1, builtin_name)
+                }
+                (false, true) => {
+                    quantile_result_for_dim(data, input_dims, probabilities, 2, builtin_name)
+                }
                 (false, false) => Err(RuntimeError::Unsupported(format!(
                     "{builtin_name} currently expects vecdim to include dimension 1 and/or 2 in the current 2-D runtime"
                 ))),
@@ -19964,12 +21636,13 @@ fn quantile_result(
 
 fn quantile_result_for_dim(
     data: &NumericOperand,
+    input_dims: &[usize],
     probabilities: &NumericOperand,
     dim: usize,
     builtin_name: &str,
 ) -> Result<Value, RuntimeError> {
-    if dim > 2 {
-        return singleton_dimension_quantile_value(data, probabilities, dim);
+    if input_dims.len() > 2 || dim > 2 {
+        return quantile_value_with_dimensions(input_dims, &data.values, probabilities, dim);
     }
     numeric_operand_to_value(&quantile_numeric_result(
         data,
@@ -20041,6 +21714,64 @@ fn quantile_numeric_result(
     }
 }
 
+fn quantile_value_with_dimensions(
+    input_dims: &[usize],
+    input_values: &[f64],
+    probabilities: &NumericOperand,
+    dim: usize,
+) -> Result<Value, RuntimeError> {
+    let mut normalized_dims = input_dims.to_vec();
+    while normalized_dims.len() < dim {
+        normalized_dims.push(1);
+    }
+    let axis = dim - 1;
+    let axis_len = normalized_dims[axis];
+    let probability_count = probabilities.values.len();
+    let mut output_dims = normalized_dims.clone();
+    output_dims[axis] = probability_count;
+
+    let sequence_dims = normalized_dims
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &size)| (position != axis).then_some(size))
+        .collect::<Vec<_>>();
+    let sequence_count = if sequence_dims.is_empty() {
+        1
+    } else {
+        sequence_dims.iter().product::<usize>()
+    };
+    let output_count = output_dims.iter().product::<usize>();
+    let mut output_values = vec![f64::NAN; output_count];
+
+    if sequence_count == 0 {
+        return numeric_matrix_result_with_dimensions(output_dims, output_values);
+    }
+
+    for sequence_index in 0..sequence_count {
+        let reduced_index = row_major_multi_index(sequence_index, &sequence_dims);
+        let mut sample = Vec::with_capacity(axis_len.max(1));
+        for axis_value in 0..axis_len {
+            let full_index =
+                nd_reduction_full_index(&normalized_dims, axis, axis_value, &reduced_index);
+            let linear = row_major_linear_index(&full_index, &normalized_dims);
+            sample.push(input_values[linear]);
+        }
+        let quantiles = quantiles_for_sample(&sample, &probabilities.values);
+        for (probability_index, value) in quantiles.into_iter().enumerate() {
+            let full_index = nd_reduction_full_index(
+                &output_dims,
+                axis,
+                probability_index,
+                &reduced_index,
+            );
+            let linear = row_major_linear_index(&full_index, &output_dims);
+            output_values[linear] = value;
+        }
+    }
+
+    numeric_matrix_result_with_dimensions(output_dims, output_values)
+}
+
 fn empty_quantile_numeric_result(
     data: &NumericOperand,
     probabilities: &NumericOperand,
@@ -20077,17 +21808,6 @@ fn empty_quantile_numeric_result(
             "{builtin_name} currently supports only dimensions 1 and 2 for the current 2-D runtime"
         ))),
     }
-}
-
-fn singleton_dimension_quantile_value(
-    data: &NumericOperand,
-    probabilities: &NumericOperand,
-    dim: usize,
-) -> Result<Value, RuntimeError> {
-    numeric_matrix_result_with_dimensions(
-        singleton_dimension_output_dims(data.rows, data.cols, dim, probabilities.values.len()),
-        singleton_dimension_repeated_values(&data.values, probabilities.values.len()),
-    )
 }
 
 fn vector_singleton_quantile_result(
@@ -20349,14 +22069,386 @@ fn nd_reduction_full_index(
     full_index
 }
 
+#[derive(Debug, Clone)]
+struct NdVecdimReductionLayout {
+    normalized_dims: Vec<usize>,
+    keep_dims: Vec<usize>,
+    reduce_axes: Vec<usize>,
+    reduce_dims: Vec<usize>,
+}
+
+fn nd_vecdim_reduction_layout(input_dims: &[usize], reduce_dims: &[usize]) -> NdVecdimReductionLayout {
+    let mut reduce_axes = Vec::new();
+    for &dim in reduce_dims {
+        let axis = dim.saturating_sub(1);
+        if !reduce_axes.contains(&axis) {
+            reduce_axes.push(axis);
+        }
+    }
+    let rank = input_dims
+        .len()
+        .max(reduce_axes.iter().copied().max().map(|axis| axis + 1).unwrap_or(0))
+        .max(2);
+    let mut normalized_dims = input_dims.to_vec();
+    while normalized_dims.len() < rank {
+        normalized_dims.push(1);
+    }
+    let keep_axes = (0..rank)
+        .filter(|axis| !reduce_axes.contains(axis))
+        .collect::<Vec<_>>();
+    let keep_dims = keep_axes
+        .iter()
+        .map(|axis| normalized_dims[*axis])
+        .collect::<Vec<_>>();
+    let reduce_dims = reduce_axes
+        .iter()
+        .map(|axis| normalized_dims[*axis])
+        .collect::<Vec<_>>();
+    NdVecdimReductionLayout {
+        normalized_dims,
+        keep_dims,
+        reduce_axes,
+        reduce_dims,
+    }
+}
+
+fn nd_vecdim_output_dims(layout: &NdVecdimReductionLayout, reduced_axis_extent: usize) -> Vec<usize> {
+    let mut dims = layout.normalized_dims.clone();
+    if let Some(&first_axis) = layout.reduce_axes.first() {
+        dims[first_axis] = reduced_axis_extent;
+        for &axis in layout.reduce_axes.iter().skip(1) {
+            dims[axis] = 1;
+        }
+    }
+    dims
+}
+
+fn nd_vecdim_sequence_count(layout: &NdVecdimReductionLayout) -> usize {
+    if layout.keep_dims.is_empty() {
+        1
+    } else {
+        layout.keep_dims.iter().product::<usize>()
+    }
+}
+
+fn nd_vecdim_sample_positions(
+    layout: &NdVecdimReductionLayout,
+    sequence_index: usize,
+) -> Vec<usize> {
+    let keep_index = if layout.keep_dims.is_empty() {
+        Vec::new()
+    } else {
+        row_major_multi_index(sequence_index, &layout.keep_dims)
+    };
+    let reduce_count = if layout.reduce_dims.is_empty() {
+        1
+    } else {
+        layout.reduce_dims.iter().product::<usize>()
+    };
+    let mut positions = Vec::with_capacity(reduce_count);
+    for reduced_linear in 0..reduce_count {
+        let reduce_index = if layout.reduce_dims.is_empty() {
+            Vec::new()
+        } else {
+            row_major_multi_index(reduced_linear, &layout.reduce_dims)
+        };
+        let mut full_index = vec![0usize; layout.normalized_dims.len()];
+        let mut keep_offset = 0usize;
+        let mut reduce_offset = 0usize;
+        for axis in 0..layout.normalized_dims.len() {
+            if layout.reduce_axes.contains(&axis) {
+                full_index[axis] = reduce_index[reduce_offset];
+                reduce_offset += 1;
+            } else {
+                full_index[axis] = keep_index[keep_offset];
+                keep_offset += 1;
+            }
+        }
+        positions.push(row_major_linear_index(&full_index, &layout.normalized_dims));
+    }
+    positions
+}
+
+fn nd_vecdim_output_position(
+    layout: &NdVecdimReductionLayout,
+    sequence_index: usize,
+    reduced_axis_index: usize,
+    output_dims: &[usize],
+) -> usize {
+    let keep_index = if layout.keep_dims.is_empty() {
+        Vec::new()
+    } else {
+        row_major_multi_index(sequence_index, &layout.keep_dims)
+    };
+    let mut output_index = vec![0usize; output_dims.len()];
+    let mut keep_offset = 0usize;
+    for axis in 0..output_dims.len() {
+        if let Some(first_reduce_axis) = layout.reduce_axes.first() {
+            if axis == *first_reduce_axis {
+                output_index[axis] = reduced_axis_index;
+                continue;
+            }
+        }
+        if layout.reduce_axes.contains(&axis) {
+            output_index[axis] = 0;
+        } else {
+            output_index[axis] = keep_index[keep_offset];
+            keep_offset += 1;
+        }
+    }
+    row_major_linear_index(&output_index, output_dims)
+}
+
+fn reduce_numeric_vecdim_values(
+    input_values: &[f64],
+    input_dims: &[usize],
+    reduce_dims: &[usize],
+    reduced_axis_extent: usize,
+    reducer: impl Fn(&[f64]) -> Vec<f64>,
+) -> (Vec<usize>, Vec<f64>) {
+    let layout = nd_vecdim_reduction_layout(input_dims, reduce_dims);
+    let output_dims = nd_vecdim_output_dims(&layout, reduced_axis_extent);
+    let output_count = output_dims.iter().product::<usize>();
+    let mut output_values = vec![f64::NAN; output_count];
+
+    for sequence_index in 0..nd_vecdim_sequence_count(&layout) {
+        let sample_positions = nd_vecdim_sample_positions(&layout, sequence_index);
+        let sample = sample_positions
+            .iter()
+            .map(|position| input_values[*position])
+            .collect::<Vec<_>>();
+        for (result_index, value) in reducer(&sample).into_iter().enumerate() {
+            let output_position =
+                nd_vecdim_output_position(&layout, sequence_index, result_index, &output_dims);
+            output_values[output_position] = value;
+        }
+    }
+
+    (output_dims, output_values)
+}
+
+fn reduce_numeric_slices_nd_values(
+    input_values: &[f64],
+    input_dims: &[usize],
+    dim: usize,
+    reducer: impl Fn(&[f64]) -> f64,
+) -> (Vec<usize>, Vec<f64>) {
+    reduce_numeric_slices_nd(input_values, input_dims, dim, 1, |sample| {
+        vec![reducer(sample)]
+    })
+}
+
+fn reduce_numeric_or_complex_slices_nd_values(
+    input_values: &[ComplexParts],
+    input_dims: &[usize],
+    dim: usize,
+    reducer: impl Fn(&[ComplexParts]) -> ComplexParts,
+) -> (Vec<usize>, Vec<ComplexParts>) {
+    let mut normalized_dims = canonical_size_vector(input_dims);
+    while normalized_dims.len() < dim {
+        normalized_dims.push(1);
+    }
+    let axis = dim - 1;
+    let axis_len = normalized_dims[axis];
+    let mut output_dims = normalized_dims.clone();
+    output_dims[axis] = if axis_len == 0 { 0 } else { 1 };
+
+    if normalized_dims.iter().any(|&size| size == 0) {
+        return (output_dims, Vec::new());
+    }
+
+    let sequence_dims = normalized_dims
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &size)| (position != axis).then_some(size))
+        .collect::<Vec<_>>();
+    let sequence_count = if sequence_dims.is_empty() {
+        1
+    } else {
+        sequence_dims.iter().product::<usize>()
+    };
+    let output_count = output_dims.iter().product::<usize>();
+    let mut output_values = vec![ComplexParts::zero(); output_count];
+
+    for sequence_index in 0..sequence_count {
+        let reduced_index = row_major_multi_index(sequence_index, &sequence_dims);
+        let sample = (0..axis_len)
+            .map(|axis_value| {
+                let full_index =
+                    nd_reduction_full_index(&normalized_dims, axis, axis_value, &reduced_index);
+                let linear = row_major_linear_index(&full_index, &normalized_dims);
+                input_values[linear]
+            })
+            .collect::<Vec<_>>();
+        let full_output_index = nd_reduction_full_index(&output_dims, axis, 0, &reduced_index);
+        let linear = row_major_linear_index(&full_output_index, &output_dims);
+        output_values[linear] = reducer(&sample);
+    }
+
+    (output_dims, output_values)
+}
+
+fn cumulative_numeric_or_complex_slices_nd(
+    input_values: &[ComplexParts],
+    input_dims: &[usize],
+    dim: usize,
+    step: impl Fn(ComplexParts, ComplexParts) -> ComplexParts + Copy,
+    identity: ComplexParts,
+) -> (Vec<usize>, Vec<ComplexParts>) {
+    let normalized_dims = canonical_size_vector(input_dims);
+    let axis = dim - 1;
+    let axis_len = normalized_dims[axis];
+    if normalized_dims.iter().any(|&size| size == 0) {
+        return (normalized_dims, Vec::new());
+    }
+
+    let sequence_dims = normalized_dims
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &size)| (position != axis).then_some(size))
+        .collect::<Vec<_>>();
+    let sequence_count = if sequence_dims.is_empty() {
+        1
+    } else {
+        sequence_dims.iter().product::<usize>()
+    };
+    let mut output_values = vec![ComplexParts::zero(); input_values.len()];
+
+    for sequence_index in 0..sequence_count {
+        let reduced_index = row_major_multi_index(sequence_index, &sequence_dims);
+        let mut accumulator = identity;
+        for axis_value in 0..axis_len {
+            let full_index =
+                nd_reduction_full_index(&normalized_dims, axis, axis_value, &reduced_index);
+            let linear = row_major_linear_index(&full_index, &normalized_dims);
+            accumulator = step(accumulator, input_values[linear]);
+            output_values[linear] = accumulator;
+        }
+    }
+
+    (normalized_dims, output_values)
+}
+
+fn cumulative_extreme_slices_nd(
+    input_values: &[f64],
+    input_dims: &[usize],
+    dim: usize,
+    prefer_candidate: impl Fn(f64, f64) -> bool + Copy,
+) -> (Vec<usize>, Vec<f64>, Vec<f64>) {
+    let normalized_dims = canonical_size_vector(input_dims);
+    let axis = dim - 1;
+    let axis_len = normalized_dims[axis];
+    if normalized_dims.iter().any(|&size| size == 0) {
+        return (normalized_dims, Vec::new(), Vec::new());
+    }
+
+    let sequence_dims = normalized_dims
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &size)| (position != axis).then_some(size))
+        .collect::<Vec<_>>();
+    let sequence_count = if sequence_dims.is_empty() {
+        1
+    } else {
+        sequence_dims.iter().product::<usize>()
+    };
+    let mut output_values = vec![0.0; input_values.len()];
+    let mut output_indices = vec![1.0; input_values.len()];
+
+    for sequence_index in 0..sequence_count {
+        let reduced_index = row_major_multi_index(sequence_index, &sequence_dims);
+        let mut best = 0.0;
+        let mut best_index = 1usize;
+        for axis_value in 0..axis_len {
+            let full_index =
+                nd_reduction_full_index(&normalized_dims, axis, axis_value, &reduced_index);
+            let linear = row_major_linear_index(&full_index, &normalized_dims);
+            let candidate = input_values[linear];
+            if axis_value == 0 || prefer_candidate(candidate, best) {
+                best = candidate;
+                best_index = axis_value + 1;
+            }
+            output_values[linear] = best;
+            output_indices[linear] = best_index as f64;
+        }
+    }
+
+    (normalized_dims, output_values, output_indices)
+}
+
+fn extreme_slices_nd(
+    input_values: &[f64],
+    input_dims: &[usize],
+    dim: usize,
+    prefer_candidate: impl Fn(f64, f64) -> bool + Copy,
+    linear_indices: bool,
+) -> (Vec<usize>, Vec<f64>, Vec<f64>) {
+    let mut normalized_dims = canonical_size_vector(input_dims);
+    while normalized_dims.len() < dim {
+        normalized_dims.push(1);
+    }
+    let axis = dim - 1;
+    let axis_len = normalized_dims[axis];
+    let mut output_dims = normalized_dims.clone();
+    output_dims[axis] = if axis_len == 0 { 0 } else { 1 };
+
+    if normalized_dims.iter().any(|&size| size == 0) {
+        return (output_dims, Vec::new(), Vec::new());
+    }
+
+    let sequence_dims = normalized_dims
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &size)| (position != axis).then_some(size))
+        .collect::<Vec<_>>();
+    let sequence_count = if sequence_dims.is_empty() {
+        1
+    } else {
+        sequence_dims.iter().product::<usize>()
+    };
+    let output_count = output_dims.iter().product::<usize>();
+    let mut output_values = vec![0.0; output_count];
+    let mut output_indices = vec![1.0; output_count];
+
+    for sequence_index in 0..sequence_count {
+        let reduced_index = row_major_multi_index(sequence_index, &sequence_dims);
+        let mut best = 0.0;
+        let mut best_axis = 0usize;
+        for axis_value in 0..axis_len {
+            let full_index =
+                nd_reduction_full_index(&normalized_dims, axis, axis_value, &reduced_index);
+            let linear = row_major_linear_index(&full_index, &normalized_dims);
+            let candidate = input_values[linear];
+            if axis_value == 0 || prefer_candidate(candidate, best) {
+                best = candidate;
+                best_axis = axis_value;
+            }
+        }
+
+        let output_index = nd_reduction_full_index(&output_dims, axis, 0, &reduced_index);
+        let output_linear = row_major_linear_index(&output_index, &output_dims);
+        output_values[output_linear] = best;
+        output_indices[output_linear] = if linear_indices {
+            let best_index =
+                nd_reduction_full_index(&normalized_dims, axis, best_axis, &reduced_index);
+            column_major_linear_index_one_based(&best_index, &normalized_dims) as f64
+        } else {
+            (best_axis + 1) as f64
+        };
+    }
+
+    (output_dims, output_values, output_indices)
+}
+
 fn range_numeric_value_with_dimensions(
     input_values: &[f64],
     input_dims: &[usize],
     dim: usize,
 ) -> Result<Value, RuntimeError> {
-    let (output_dims, values) = reduce_numeric_slices_nd(input_values, input_dims, dim, 1, |sample| {
-        vec![sample_range(sample)]
-    });
+    let (output_dims, values) =
+        reduce_numeric_slices_nd(input_values, input_dims, dim, 1, |sample| {
+            vec![sample_range(sample)]
+        });
     numeric_matrix_result_with_dimensions(output_dims, values)
 }
 
@@ -20376,9 +22468,15 @@ fn iqr_nd_outputs(
             let quartiles = quantiles_for_sample(sample, &quartile_probabilities);
             vec![zero_small(quartiles[1] - quartiles[0])]
         });
-    let mut outputs = vec![numeric_matrix_result_with_dimensions(spread_dims, spread_values)?];
+    let mut outputs = vec![numeric_matrix_result_with_dimensions(
+        spread_dims,
+        spread_values,
+    )?];
     if output_arity == 2 {
-        outputs.push(numeric_matrix_result_with_dimensions(quartile_dims, quartile_values)?);
+        outputs.push(numeric_matrix_result_with_dimensions(
+            quartile_dims,
+            quartile_values,
+        )?);
     }
     Ok(outputs)
 }
@@ -20809,11 +22907,7 @@ fn covariance_matrix_pairwise(
     }
 }
 
-fn covariance_of_samples(
-    lhs: &[f64],
-    rhs: &[f64],
-    normalization: VarianceNormalization,
-) -> f64 {
+fn covariance_of_samples(lhs: &[f64], rhs: &[f64], normalization: VarianceNormalization) -> f64 {
     let observations = lhs.len();
     let lhs_mean = lhs.iter().sum::<f64>() / observations as f64;
     let rhs_mean = rhs.iter().sum::<f64>() / observations as f64;
@@ -20891,7 +22985,8 @@ fn corrcoef_pairwise_outputs(dataset: &NumericOperand) -> (NumericOperand, Numer
                     zero_small(covariance / denominator)
                 }
             };
-            p_values[offset] = corrcoef_probability(correlations[offset], lhs_values.len(), lhs_col == rhs_col);
+            p_values[offset] =
+                corrcoef_probability(correlations[offset], lhs_values.len(), lhs_col == rhs_col);
         }
     }
     (
@@ -20930,7 +23025,10 @@ fn corrcoef_confidence_bounds(
     }
 }
 
-fn corrcoef_p_values_for_matrix(correlation: &NumericOperand, observations: usize) -> NumericOperand {
+fn corrcoef_p_values_for_matrix(
+    correlation: &NumericOperand,
+    observations: usize,
+) -> NumericOperand {
     let mut values = Vec::with_capacity(correlation.values.len());
     for row in 0..correlation.rows {
         for col in 0..correlation.cols {
@@ -21098,7 +23196,9 @@ fn corr_outputs(inputs: &CorrInputs) -> Result<(NumericOperand, NumericOperand),
     }
 }
 
-fn corr_outputs_all_rows(inputs: &CorrInputs) -> Result<(NumericOperand, NumericOperand), RuntimeError> {
+fn corr_outputs_all_rows(
+    inputs: &CorrInputs,
+) -> Result<(NumericOperand, NumericOperand), RuntimeError> {
     let rhs = inputs.rhs.as_ref().unwrap_or(&inputs.lhs);
     let cols_lhs = inputs.lhs.cols;
     let cols_rhs = rhs.cols;
@@ -21109,10 +23209,13 @@ fn corr_outputs_all_rows(inputs: &CorrInputs) -> Result<(NumericOperand, Numeric
             let offset = lhs_col * cols_rhs + rhs_col;
             let lhs_values = column_values(&inputs.lhs, lhs_col);
             let rhs_values = column_values(rhs, rhs_col);
-            if lhs_values.iter().any(|value| value.is_nan()) || rhs_values.iter().any(|value| value.is_nan()) {
+            if lhs_values.iter().any(|value| value.is_nan())
+                || rhs_values.iter().any(|value| value.is_nan())
+            {
                 continue;
             }
-            let correlation = corr_of_samples_with_type(&lhs_values, &rhs_values, inputs.options.corr_type);
+            let correlation =
+                corr_of_samples_with_type(&lhs_values, &rhs_values, inputs.options.corr_type);
             correlations[offset] = correlation;
             p_values[offset] = corr_probability_with_type(
                 correlation,
@@ -21136,7 +23239,9 @@ fn corr_outputs_all_rows(inputs: &CorrInputs) -> Result<(NumericOperand, Numeric
     ))
 }
 
-fn corr_outputs_complete_rows(inputs: &CorrInputs) -> Result<(NumericOperand, NumericOperand), RuntimeError> {
+fn corr_outputs_complete_rows(
+    inputs: &CorrInputs,
+) -> Result<(NumericOperand, NumericOperand), RuntimeError> {
     let rhs = inputs.rhs.as_ref().unwrap_or(&inputs.lhs);
     let complete_rows = (0..inputs.lhs.rows)
         .filter(|row| {
@@ -21157,7 +23262,9 @@ fn corr_outputs_complete_rows(inputs: &CorrInputs) -> Result<(NumericOperand, Nu
     })
 }
 
-fn corr_outputs_pairwise(inputs: &CorrInputs) -> Result<(NumericOperand, NumericOperand), RuntimeError> {
+fn corr_outputs_pairwise(
+    inputs: &CorrInputs,
+) -> Result<(NumericOperand, NumericOperand), RuntimeError> {
     let rhs = inputs.rhs.as_ref().unwrap_or(&inputs.lhs);
     let cols_lhs = inputs.lhs.cols;
     let cols_rhs = rhs.cols;
@@ -21166,8 +23273,10 @@ fn corr_outputs_pairwise(inputs: &CorrInputs) -> Result<(NumericOperand, Numeric
     for lhs_col in 0..cols_lhs {
         for rhs_col in 0..cols_rhs {
             let offset = lhs_col * cols_rhs + rhs_col;
-            let (lhs_values, rhs_values) = pairwise_column_values(&inputs.lhs, lhs_col, rhs, rhs_col);
-            let correlation = corr_of_samples_with_type(&lhs_values, &rhs_values, inputs.options.corr_type);
+            let (lhs_values, rhs_values) =
+                pairwise_column_values(&inputs.lhs, lhs_col, rhs, rhs_col);
+            let correlation =
+                corr_of_samples_with_type(&lhs_values, &rhs_values, inputs.options.corr_type);
             correlations[offset] = correlation;
             p_values[offset] = corr_probability_with_type(
                 correlation,
@@ -21258,11 +23367,7 @@ fn corr_of_samples_with_type(lhs: &[f64], rhs: &[f64], corr_type: CorrType) -> f
 }
 
 fn tied_ranks(values: &[f64]) -> Vec<f64> {
-    let mut indexed = values
-        .iter()
-        .copied()
-        .enumerate()
-        .collect::<Vec<_>>();
+    let mut indexed = values.iter().copied().enumerate().collect::<Vec<_>>();
     indexed.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1));
     let mut ranks = vec![0.0; values.len()];
     let mut start = 0usize;
@@ -21301,8 +23406,8 @@ fn kendall_tau_b(lhs: &[f64], rhs: &[f64]) -> f64 {
             }
         }
     }
-    let denominator = ((concordant + discordant + tied_lhs) * (concordant + discordant + tied_rhs))
-        .sqrt();
+    let denominator =
+        ((concordant + discordant + tied_lhs) * (concordant + discordant + tied_rhs)).sqrt();
     if denominator <= f64::EPSILON {
         f64::NAN
     } else {
@@ -21363,7 +23468,8 @@ fn kendall_probability(correlation: f64, observations: usize, tail: CorrTail) ->
     if !correlation.is_finite() || observations <= 1 {
         return f64::NAN;
     }
-    let variance = (2.0 * (2 * observations + 5) as f64) / (9.0 * observations as f64 * (observations - 1) as f64);
+    let variance = (2.0 * (2 * observations + 5) as f64)
+        / (9.0 * observations as f64 * (observations - 1) as f64);
     let z = correlation / variance.sqrt();
     let distribution = match Normal::new(0.0, 1.0) {
         Ok(distribution) => distribution,
@@ -21376,14 +23482,20 @@ fn kendall_probability(correlation: f64, observations: usize, tail: CorrTail) ->
     }
 }
 
-fn partialcorr_outputs(inputs: &PartialcorrInputs) -> Result<(NumericOperand, NumericOperand), RuntimeError> {
+fn partialcorr_outputs(
+    inputs: &PartialcorrInputs,
+) -> Result<(NumericOperand, NumericOperand), RuntimeError> {
     let prepared = if matches!(inputs.options.rows_flag, CorrcoefRowsFlag::Complete) {
         partialcorr_filter_complete_rows(inputs)
     } else {
         inputs.clone()
     };
     let rows = prepared.x.cols;
-    let cols = prepared.y.as_ref().map(|y| y.cols).unwrap_or(prepared.x.cols);
+    let cols = prepared
+        .y
+        .as_ref()
+        .map(|y| y.cols)
+        .unwrap_or(prepared.x.cols);
     let mut rho = vec![f64::NAN; rows * cols];
     let mut p = vec![f64::NAN; rows * cols];
     for lhs_col in 0..rows {
@@ -21399,15 +23511,19 @@ fn partialcorr_outputs(inputs: &PartialcorrInputs) -> Result<(NumericOperand, Nu
                 None => continue,
             };
             let control_count = pair.controls.len();
-            let (lhs_values, rhs_values, controls) = if matches!(prepared.options.corr_type, CorrType::Spearman) {
-                (
-                    tied_ranks(&pair.lhs),
-                    tied_ranks(&pair.rhs),
-                    pair.controls.into_iter().map(|values| tied_ranks(&values)).collect::<Vec<_>>(),
-                )
-            } else {
-                (pair.lhs, pair.rhs, pair.controls)
-            };
+            let (lhs_values, rhs_values, controls) =
+                if matches!(prepared.options.corr_type, CorrType::Spearman) {
+                    (
+                        tied_ranks(&pair.lhs),
+                        tied_ranks(&pair.rhs),
+                        pair.controls
+                            .into_iter()
+                            .map(|values| tied_ranks(&values))
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    (pair.lhs, pair.rhs, pair.controls)
+                };
             let lhs_residuals = partialcorr_residuals(&lhs_values, &controls)?;
             let rhs_residuals = partialcorr_residuals(&rhs_values, &controls)?;
             let correlation = corr_of_samples(&lhs_residuals, &rhs_residuals);
@@ -21424,8 +23540,16 @@ fn partialcorr_outputs(inputs: &PartialcorrInputs) -> Result<(NumericOperand, Nu
         }
     }
     Ok((
-        NumericOperand { rows, cols, values: rho },
-        NumericOperand { rows, cols, values: p },
+        NumericOperand {
+            rows,
+            cols,
+            values: rho,
+        },
+        NumericOperand {
+            rows,
+            cols,
+            values: p,
+        },
     ))
 }
 
@@ -21444,22 +23568,30 @@ fn partialcorr_filter_complete_rows(inputs: &PartialcorrInputs) -> PartialcorrIn
                     .y
                     .as_ref()
                     .map(|operand| {
-                        (0..operand.cols).all(|col| !operand.values[row * operand.cols + col].is_nan())
+                        (0..operand.cols)
+                            .all(|col| !operand.values[row * operand.cols + col].is_nan())
                     })
                     .unwrap_or(true)
                 && inputs
                     .z
                     .as_ref()
                     .map(|operand| {
-                        (0..operand.cols).all(|col| !operand.values[row * operand.cols + col].is_nan())
+                        (0..operand.cols)
+                            .all(|col| !operand.values[row * operand.cols + col].is_nan())
                     })
                     .unwrap_or(true)
         })
         .collect::<Vec<_>>();
     PartialcorrInputs {
         x: filter_numeric_operand_rows(&inputs.x, &rows),
-        y: inputs.y.as_ref().map(|operand| filter_numeric_operand_rows(operand, &rows)),
-        z: inputs.z.as_ref().map(|operand| filter_numeric_operand_rows(operand, &rows)),
+        y: inputs
+            .y
+            .as_ref()
+            .map(|operand| filter_numeric_operand_rows(operand, &rows)),
+        z: inputs
+            .z
+            .as_ref()
+            .map(|operand| filter_numeric_operand_rows(operand, &rows)),
         options: inputs.options,
     }
 }
@@ -21478,7 +23610,11 @@ fn partialcorr_pair_data(
         let lhs_value = inputs.x.values[row * inputs.x.cols + lhs_col];
         let rhs_value = rhs_operand.values[row * rhs_operand.cols + rhs_col];
         let mut values = vec![lhs_value, rhs_value];
-        values.extend(controls.iter().map(|(operand, col)| operand.values[row * operand.cols + col]));
+        values.extend(
+            controls
+                .iter()
+                .map(|(operand, col)| operand.values[row * operand.cols + col]),
+        );
         if values.iter().any(|value| value.is_nan()) {
             if matches!(inputs.options.rows_flag, CorrcoefRowsFlag::All) {
                 return None;
@@ -21546,11 +23682,15 @@ fn partialcorr_residuals(target: &[f64], controls: &[Vec<f64>]) -> Result<Vec<f6
         values: target
             .iter()
             .copied()
-            .map(|value| ComplexParts { real: value, imag: 0.0 })
+            .map(|value| ComplexParts {
+                real: value,
+                imag: 0.0,
+            })
             .collect(),
     };
     let tolerance = default_rank_tolerance(&design)?.max(1e-12);
-    let pseudoinverse = pseudoinverse_numeric_or_complex_operand(&design, tolerance, "partialcorr")?;
+    let pseudoinverse =
+        pseudoinverse_numeric_or_complex_operand(&design, tolerance, "partialcorr")?;
     let coefficients = matrix_multiply_operands(&pseudoinverse, &target_operand, "partialcorr")?;
     let fitted = matrix_multiply_operands(&design, &coefficients, "partialcorr")?;
     Ok(target
@@ -21577,6 +23717,26 @@ fn reduce_truth_value(
         Value::Scalar(number) => Ok(logical_scalar(*number != 0.0)),
         Value::Logical(flag) => Ok(logical_scalar(*flag)),
         Value::Matrix(matrix) => {
+            let input_dims = canonical_size_vector(matrix.dims());
+            if matrix.rows != 0
+                && matrix.cols != 0
+                && input_dims.len() > 2
+            {
+                let values = matrix
+                    .iter()
+                    .map(Value::as_scalar)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dimension = default_reduction_dimension_from_dims(&input_dims);
+                let (output_dims, reduced_values) =
+                    reduce_numeric_slices_nd_values(&values, &input_dims, dimension, |sample| {
+                        if reducer(sample) { 1.0 } else { 0.0 }
+                    });
+                return logical_matrix_result_with_dimensions(
+                    output_dims,
+                    reduced_values.into_iter().map(|value| value != 0.0).collect(),
+                );
+            }
+
             if matrix.rows == 0 || matrix.cols == 0 {
                 return Ok(logical_scalar(false));
             }
@@ -21615,6 +23775,28 @@ fn reduce_truth_value_along_dimension(
         Value::Scalar(number) => Ok(logical_scalar(*number != 0.0)),
         Value::Logical(flag) => Ok(logical_scalar(*flag)),
         Value::Matrix(matrix) => {
+            let input_dims = canonical_size_vector(matrix.dims());
+            if input_dims.len() > 2 || dim > 2 {
+                let values = matrix
+                    .iter()
+                    .map(Value::as_scalar)
+                    .collect::<Result<Vec<_>, _>>()?;
+                if dim > input_dims.len() {
+                    return logical_matrix_result_with_dimensions(
+                        input_dims,
+                        values.into_iter().map(|value| value != 0.0).collect(),
+                    );
+                }
+                let (output_dims, reduced_values) =
+                    reduce_numeric_slices_nd_values(&values, &input_dims, dim, |sample| {
+                        if reducer(sample) { 1.0 } else { 0.0 }
+                    });
+                return logical_matrix_result_with_dimensions(
+                    output_dims,
+                    reduced_values.into_iter().map(|value| value != 0.0).collect(),
+                );
+            }
+
             if matrix.rows == 0 || matrix.cols == 0 {
                 return Ok(logical_scalar(false));
             }
@@ -21690,11 +23872,11 @@ fn reduce_truth_value_all(
 struct FindMatchEntry {
     row: usize,
     col: usize,
+    linear_index: usize,
     value: Value,
 }
 
 struct FindMatches {
-    rows: usize,
     row_output: bool,
     empty_matrix_input: bool,
     entries: Vec<FindMatchEntry>,
@@ -21709,13 +23891,13 @@ enum FindDirection {
 fn find_matches(value: &Value) -> Result<FindMatches, RuntimeError> {
     match value {
         Value::Scalar(number) => Ok(FindMatches {
-            rows: 1,
             row_output: false,
             empty_matrix_input: false,
             entries: if *number != 0.0 {
                 vec![FindMatchEntry {
                     row: 1,
                     col: 1,
+                    linear_index: 1,
                     value: Value::Scalar(*number),
                 }]
             } else {
@@ -21723,13 +23905,13 @@ fn find_matches(value: &Value) -> Result<FindMatches, RuntimeError> {
             },
         }),
         Value::Logical(flag) => Ok(FindMatches {
-            rows: 1,
             row_output: false,
             empty_matrix_input: false,
             entries: if *flag {
                 vec![FindMatchEntry {
                     row: 1,
                     col: 1,
+                    linear_index: 1,
                     value: Value::Logical(*flag),
                 }]
             } else {
@@ -21737,13 +23919,13 @@ fn find_matches(value: &Value) -> Result<FindMatches, RuntimeError> {
             },
         }),
         Value::Complex(number) => Ok(FindMatches {
-            rows: 1,
             row_output: false,
             empty_matrix_input: false,
             entries: if number.real != 0.0 || number.imag != 0.0 {
                 vec![FindMatchEntry {
                     row: 1,
                     col: 1,
+                    linear_index: 1,
                     value: Value::Complex(number.clone()),
                 }]
             } else {
@@ -21752,27 +23934,27 @@ fn find_matches(value: &Value) -> Result<FindMatches, RuntimeError> {
         }),
         Value::Matrix(matrix) => {
             let mut entries = Vec::new();
-            for col in 0..matrix.cols {
-                for row in 0..matrix.rows {
-                    let element = matrix.get(row, col);
-                    if find_value_is_nonzero(element)? {
-                        entries.push(FindMatchEntry {
-                            row: row + 1,
-                            col: col + 1,
-                            value: element.clone(),
-                        });
-                    }
+            for (position, element) in matrix.elements().iter().enumerate() {
+                if find_value_is_nonzero(element)? {
+                    let row = position / matrix.cols;
+                    let col = position % matrix.cols;
+                    let index = row_major_multi_index(position, matrix.dims());
+                    entries.push(FindMatchEntry {
+                        row: row + 1,
+                        col: col + 1,
+                        linear_index: column_major_linear_index_one_based(&index, matrix.dims()),
+                        value: element.clone(),
+                    });
                 }
             }
+            entries.sort_by_key(|entry| entry.linear_index);
             Ok(FindMatches {
-                rows: matrix.rows,
                 row_output: matrix.rows == 1 && canonical_size_vector(&matrix.dims).len() <= 2,
                 empty_matrix_input: matrix.rows == 0 && matrix.cols == 0,
                 entries,
             })
         }
         Value::CharArray(text) => Ok(FindMatches {
-            rows: 1,
             row_output: true,
             empty_matrix_input: false,
             entries: text
@@ -21781,6 +23963,7 @@ fn find_matches(value: &Value) -> Result<FindMatches, RuntimeError> {
                 .map(|(offset, ch)| FindMatchEntry {
                     row: 1,
                     col: offset + 1,
+                    linear_index: offset + 1,
                     value: Value::CharArray(ch.to_string()),
                 })
                 .collect(),
@@ -21793,11 +23976,16 @@ fn find_matches(value: &Value) -> Result<FindMatches, RuntimeError> {
 
 fn matrix_is_numeric_like(matrix: &MatrixValue) -> bool {
     matrix.iter().all(|element| {
-        matches!(element, Value::Scalar(_) | Value::Logical(_) | Value::Complex(_))
+        matches!(
+            element,
+            Value::Scalar(_) | Value::Logical(_) | Value::Complex(_)
+        )
     })
 }
 
-fn parse_find_arguments(args: &[Value]) -> Result<(&Value, Option<usize>, FindDirection), RuntimeError> {
+fn parse_find_arguments(
+    args: &[Value],
+) -> Result<(&Value, Option<usize>, FindDirection), RuntimeError> {
     match args {
         [value] => Ok((value, None, FindDirection::First)),
         [value, count] => Ok((value, Some(scalar_dimension(count)?), FindDirection::First)),
@@ -21807,7 +23995,8 @@ fn parse_find_arguments(args: &[Value]) -> Result<(&Value, Option<usize>, FindDi
             parse_find_direction(direction)?,
         )),
         _ => Err(RuntimeError::Unsupported(
-            "find currently supports `find(x)`, `find(x, n)`, or `find(x, n, direction)`".to_string(),
+            "find currently supports `find(x)`, `find(x, n)`, or `find(x, n, direction)`"
+                .to_string(),
         )),
     }
 }
@@ -21827,7 +24016,9 @@ fn select_find_matches(
     count: Option<usize>,
     direction: FindDirection,
 ) -> Vec<FindMatchEntry> {
-    let count = count.unwrap_or(matches.entries.len()).min(matches.entries.len());
+    let count = count
+        .unwrap_or(matches.entries.len())
+        .min(matches.entries.len());
     match direction {
         FindDirection::First => matches.entries.iter().take(count).cloned().collect(),
         FindDirection::Last => matches
@@ -21902,7 +24093,11 @@ fn find_values_to_value(
     match values.len() {
         0 => find_empty_result(row_output, empty_matrix_input),
         1 => Ok(values.into_iter().next().expect("single find value")),
-        _ if values.iter().all(|value| matches!(value, Value::CharArray(text) if text.chars().count() == 1)) && row_output => {
+        _ if values
+            .iter()
+            .all(|value| matches!(value, Value::CharArray(text) if text.chars().count() == 1))
+            && row_output =>
+        {
             Ok(Value::CharArray(
                 values
                     .into_iter()
@@ -22089,7 +24284,10 @@ fn tile_char_array(text: &str, repetitions: &[usize]) -> Result<Value, RuntimeEr
     Ok(Value::CharArray(text.repeat(col_repetitions)))
 }
 
-fn sorted_value_and_indices(value: &Value, options: SortOptions) -> Result<(Value, Value), RuntimeError> {
+fn sorted_value_and_indices(
+    value: &Value,
+    options: SortOptions,
+) -> Result<(Value, Value), RuntimeError> {
     match value {
         Value::Scalar(number) => Ok((Value::Scalar(*number), Value::Scalar(1.0))),
         Value::Logical(flag) => Ok((Value::Logical(*flag), Value::Scalar(1.0))),
@@ -22100,14 +24298,34 @@ fn sorted_value_and_indices(value: &Value, options: SortOptions) -> Result<(Valu
                 return Ok((Value::Matrix(empty.clone()), Value::Matrix(empty)));
             }
 
+            let input_dims = canonical_size_vector(matrix.dims());
+            let dim = options
+                .dim
+                .unwrap_or_else(|| default_reduction_dimension_from_dims(&input_dims));
+
             if matrix_is_text(matrix) {
-                let dim = options.dim.unwrap_or_else(|| {
-                    if matrix.rows == 1 && matrix.cols > 1 {
-                        2
-                    } else {
-                        1
-                    }
-                });
+                if input_dims.len() > 2 || dim > 2 {
+                    return sort_text_matrix_nd(matrix, &input_dims, dim, options.descending);
+                }
+            } else {
+                let logical = matrix_is_logical(matrix);
+                if !(matrix_is_numeric(matrix) || logical) {
+                    return Err(RuntimeError::TypeError(
+                        "sort currently expects numeric or logical scalar/matrix input".to_string(),
+                    ));
+                }
+                if input_dims.len() > 2 || dim > 2 {
+                    return sort_numeric_matrix_nd(
+                        matrix,
+                        &input_dims,
+                        dim,
+                        options.descending,
+                        options.missing_placement,
+                    );
+                }
+            }
+
+            if matrix_is_text(matrix) {
                 let operand = text_operand(value)?;
                 let mut sorted_values = operand.values.clone();
                 let mut sorted_prototypes = operand.prototypes.clone();
@@ -22134,7 +24352,8 @@ fn sorted_value_and_indices(value: &Value, options: SortOptions) -> Result<(Valu
                     2 => {
                         for row in 0..matrix.rows {
                             let row_start = row * matrix.cols;
-                            let values = operand.values[row_start..row_start + matrix.cols].to_vec();
+                            let values =
+                                operand.values[row_start..row_start + matrix.cols].to_vec();
                             let prototypes =
                                 operand.prototypes[row_start..row_start + matrix.cols].to_vec();
                             let (sorted, sorted_proto, indices) =
@@ -22152,30 +24371,12 @@ fn sorted_value_and_indices(value: &Value, options: SortOptions) -> Result<(Valu
                     }
                 }
                 return Ok((
-                    build_text_result(
-                        matrix.rows,
-                        matrix.cols,
-                        sorted_values,
-                        sorted_prototypes,
-                    )?,
+                    build_text_result(matrix.rows, matrix.cols, sorted_values, sorted_prototypes)?,
                     build_scalar_matrix_result(matrix.rows, matrix.cols, index_elements)?,
                 ));
             }
 
             let logical = matrix_is_logical(matrix);
-            if !(matrix_is_numeric(matrix) || logical) {
-                return Err(RuntimeError::TypeError(
-                    "sort currently expects numeric or logical scalar/matrix input".to_string(),
-                ));
-            }
-
-            let dim = options.dim.unwrap_or_else(|| {
-                if matrix.rows == 1 && matrix.cols > 1 {
-                    2
-                } else {
-                    1
-                }
-            });
             let mut sorted_elements = vec![
                 if logical {
                     Value::Logical(false)
@@ -22242,6 +24443,128 @@ fn sorted_value_and_indices(value: &Value, options: SortOptions) -> Result<(Valu
             "sort currently expects numeric or logical scalar/matrix input".to_string(),
         )),
     }
+}
+
+fn sort_text_matrix_nd(
+    matrix: &MatrixValue,
+    input_dims: &[usize],
+    dim: usize,
+    descending: bool,
+) -> Result<(Value, Value), RuntimeError> {
+    let operand = text_operand(&Value::Matrix(matrix.clone()))?;
+    if dim > input_dims.len() {
+        return Ok((
+            build_text_result_with_dimensions(
+                input_dims.to_vec(),
+                operand.values.clone(),
+                operand.prototypes.clone(),
+                false,
+            )?,
+            build_scalar_matrix_result_with_dimensions(
+                input_dims.to_vec(),
+                vec![Value::Scalar(1.0); operand.values.len()],
+            )?,
+        ));
+    }
+
+    let axis = dim - 1;
+    let mut slice_dims = input_dims.to_vec();
+    let axis_len = slice_dims[axis];
+    slice_dims[axis] = 1;
+    let slice_count = slice_dims.iter().product::<usize>();
+    let mut sorted_values = vec![String::new(); operand.values.len()];
+    let mut sorted_prototypes = vec![TextPrototype::String; operand.values.len()];
+    let mut index_values = vec![Value::Scalar(0.0); operand.values.len()];
+
+    for slice_linear in 0..slice_count {
+        let mut index = row_major_multi_index(slice_linear, &slice_dims);
+        let mut values = Vec::with_capacity(axis_len);
+        let mut prototypes = Vec::with_capacity(axis_len);
+        for axis_index in 0..axis_len {
+            index[axis] = axis_index;
+            let offset = row_major_linear_index(&index, input_dims);
+            values.push(operand.values[offset].clone());
+            prototypes.push(operand.prototypes[offset]);
+        }
+        let (sorted, sorted_proto, indices) =
+            sorted_text_with_indices(&values, &prototypes, descending);
+        for axis_index in 0..axis_len {
+            index[axis] = axis_index;
+            let offset = row_major_linear_index(&index, input_dims);
+            sorted_values[offset] = sorted[axis_index].clone();
+            sorted_prototypes[offset] = sorted_proto[axis_index];
+            index_values[offset] = Value::Scalar(indices[axis_index] as f64);
+        }
+    }
+
+    Ok((
+        build_text_result_with_dimensions(input_dims.to_vec(), sorted_values, sorted_prototypes, false)?,
+        build_scalar_matrix_result_with_dimensions(input_dims.to_vec(), index_values)?,
+    ))
+}
+
+fn sort_numeric_matrix_nd(
+    matrix: &MatrixValue,
+    input_dims: &[usize],
+    dim: usize,
+    descending: bool,
+    missing_placement: SortMissingPlacement,
+) -> Result<(Value, Value), RuntimeError> {
+    let logical = matrix_is_logical(matrix);
+    if dim > input_dims.len() {
+        return Ok((
+            build_scalar_matrix_result_with_dimensions(
+                input_dims.to_vec(),
+                matrix.elements().to_vec(),
+            )?,
+            build_scalar_matrix_result_with_dimensions(
+                input_dims.to_vec(),
+                vec![Value::Scalar(1.0); matrix.element_count()],
+            )?,
+        ));
+    }
+
+    let axis = dim - 1;
+    let mut slice_dims = input_dims.to_vec();
+    let axis_len = slice_dims[axis];
+    slice_dims[axis] = 1;
+    let slice_count = slice_dims.iter().product::<usize>();
+    let mut sorted_elements = vec![
+        if logical {
+            Value::Logical(false)
+        } else {
+            Value::Scalar(0.0)
+        };
+        matrix.element_count()
+    ];
+    let mut index_values = vec![Value::Scalar(0.0); matrix.element_count()];
+
+    for slice_linear in 0..slice_count {
+        let mut index = row_major_multi_index(slice_linear, &slice_dims);
+        let values = (0..axis_len)
+            .map(|axis_index| {
+                index[axis] = axis_index;
+                matrix.elements[row_major_linear_index(&index, input_dims)].as_scalar()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (sorted, indices) =
+            sorted_numeric_with_indices(&values, descending, missing_placement);
+        for axis_index in 0..axis_len {
+            index[axis] = axis_index;
+            let offset = row_major_linear_index(&index, input_dims);
+            sorted_elements[offset] = if logical {
+                Value::Logical(sorted[axis_index] != 0.0)
+            } else {
+                Value::Scalar(sorted[axis_index])
+            };
+            index_values[offset] = Value::Scalar(indices[axis_index] as f64);
+        }
+    }
+
+    Ok((
+        build_scalar_matrix_result_with_dimensions(input_dims.to_vec(), sorted_elements)?,
+        build_scalar_matrix_result_with_dimensions(input_dims.to_vec(), index_values)?,
+    ))
 }
 
 fn bounds_value_and_range(
@@ -22319,7 +24642,7 @@ fn bounds_value_and_range_over_dimensions(
     for &dim in operating_dims {
         output_dims[dim - 1] = 1;
     }
-    let output_dims = canonical_size_vector(&output_dims);
+    let render_dims = canonical_size_vector(&output_dims);
     let output_len = output_dims.iter().product::<usize>();
     let mut accumulators = vec![BoundsAccumulator::default(); output_len];
 
@@ -22346,17 +24669,18 @@ fn bounds_value_and_range_over_dimensions(
         return Ok((lower_values[0].clone(), upper_values[0].clone()));
     }
 
+    let (rows, cols) = storage_shape_from_dimensions(&render_dims);
     Ok((
         Value::Matrix(MatrixValue::with_dimensions(
-            storage_shape_from_dimensions(&output_dims).0,
-            storage_shape_from_dimensions(&output_dims).1,
-            output_dims.clone(),
+            rows,
+            cols,
+            render_dims.clone(),
             lower_values,
         )?),
         Value::Matrix(MatrixValue::with_dimensions(
-            storage_shape_from_dimensions(&output_dims).0,
-            storage_shape_from_dimensions(&output_dims).1,
-            output_dims,
+            rows,
+            cols,
+            render_dims,
             upper_values,
         )?),
     ))
@@ -22416,7 +24740,10 @@ fn bounds_min_max(values: &[f64], missing_flag: BoundsMissingFlag) -> (f64, f64)
     for value in values {
         accumulator.observe(*value, missing_flag);
     }
-    (accumulator.lower(missing_flag), accumulator.upper(missing_flag))
+    (
+        accumulator.lower(missing_flag),
+        accumulator.upper(missing_flag),
+    )
 }
 
 fn topk_value_and_indices(
@@ -22437,10 +24764,7 @@ fn topk_value_and_indices(
     }
 
     if matrix.rows == 1 && matrix.cols == 1 && count == 1 {
-        return Ok((
-            matrix.get(0, 0).clone(),
-            Value::Scalar(1.0),
-        ));
+        return Ok((matrix.get(0, 0).clone(), Value::Scalar(1.0)));
     }
 
     let mut input_dims = canonical_size_vector(&matrix.dims);
@@ -22597,7 +24921,11 @@ fn matrix_is_sorted(
         return Ok(true);
     }
 
+    let input_dims = canonical_size_vector(matrix.dims());
     if matrix_is_text(matrix) {
+        if input_dims.len() > 2 || dim > 2 {
+            return matrix_is_sorted_nd_text(matrix, &input_dims, dim, descending);
+        }
         return match dim {
             1 => {
                 for col in 0..matrix.cols {
@@ -22625,6 +24953,10 @@ fn matrix_is_sorted(
         };
     }
 
+    if input_dims.len() > 2 || dim > 2 {
+        return matrix_is_sorted_nd_numeric(matrix, &input_dims, dim, descending, missing_placement);
+    }
+
     match dim {
         1 => {
             for col in 0..matrix.cols {
@@ -22650,6 +24982,67 @@ fn matrix_is_sorted(
         }
         _ => Ok(true),
     }
+}
+
+fn matrix_is_sorted_nd_text(
+    matrix: &MatrixValue,
+    input_dims: &[usize],
+    dim: usize,
+    descending: bool,
+) -> Result<bool, RuntimeError> {
+    if dim > input_dims.len() {
+        return Ok(true);
+    }
+    let axis = dim - 1;
+    let mut slice_dims = input_dims.to_vec();
+    let axis_len = slice_dims[axis];
+    slice_dims[axis] = 1;
+    let slice_count = slice_dims.iter().product::<usize>();
+
+    for slice_linear in 0..slice_count {
+        let mut index = row_major_multi_index(slice_linear, &slice_dims);
+        let mut values = Vec::with_capacity(axis_len);
+        for axis_index in 0..axis_len {
+            index[axis] = axis_index;
+            let offset = row_major_linear_index(&index, input_dims);
+            values.push(text_value(&matrix.elements[offset])?.to_string());
+        }
+        if !slice_is_sorted_text(&values, descending) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn matrix_is_sorted_nd_numeric(
+    matrix: &MatrixValue,
+    input_dims: &[usize],
+    dim: usize,
+    descending: bool,
+    missing_placement: SortMissingPlacement,
+) -> Result<bool, RuntimeError> {
+    if dim > input_dims.len() {
+        return Ok(true);
+    }
+    let axis = dim - 1;
+    let mut slice_dims = input_dims.to_vec();
+    let axis_len = slice_dims[axis];
+    slice_dims[axis] = 1;
+    let slice_count = slice_dims.iter().product::<usize>();
+
+    for slice_linear in 0..slice_count {
+        let mut index = row_major_multi_index(slice_linear, &slice_dims);
+        let values = (0..axis_len)
+            .map(|axis_index| {
+                index[axis] = axis_index;
+                matrix.elements[row_major_linear_index(&index, input_dims)].as_scalar()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !slice_is_sorted_numeric(&values, descending, missing_placement) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Clone, Copy)]
@@ -22716,9 +25109,8 @@ fn sortrows_value_and_indices(
     }
 
     let mut row_indices = (0..matrix.rows).collect::<Vec<_>>();
-    row_indices.sort_by(|lhs, rhs| {
-        compare_sortrows_rows(matrix, columns, *lhs, *rhs, missing_placement)
-    });
+    row_indices
+        .sort_by(|lhs, rhs| compare_sortrows_rows(matrix, columns, *lhs, *rhs, missing_placement));
 
     let mut permutation = Vec::with_capacity(matrix.rows);
     if matrix_is_text(matrix) {
@@ -22850,7 +25242,10 @@ fn slice_is_sorted_text(values: &[String], descending: bool) -> bool {
     })
 }
 
-fn numeric_set_vector(value: &Value, builtin_name: &str) -> Result<(Vec<f64>, bool, bool), RuntimeError> {
+fn numeric_set_vector(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(Vec<f64>, bool, bool), RuntimeError> {
     let matrix = match value {
         Value::Logical(flag) => MatrixValue::new(1, 1, vec![Value::Logical(*flag)])?,
         _ => coerce_matrix(value)?,
@@ -23076,7 +25471,10 @@ fn unique_numeric_outputs(
         UniqueOrder::Sorted => {
             let mut unique = Vec::<(f64, usize, usize)>::new();
             for (value, index) in &tagged {
-                if let Some((_, first, last)) = unique.iter_mut().find(|(existing, _, _)| *existing == *value) {
+                if let Some((_, first, last)) = unique
+                    .iter_mut()
+                    .find(|(existing, _, _)| *existing == *value)
+                {
                     *first = (*first).min(*index);
                     *last = (*last).max(*index);
                 } else {
@@ -23085,7 +25483,10 @@ fn unique_numeric_outputs(
             }
             unique.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0).then(lhs.1.cmp(&rhs.1)));
             (
-                unique.iter().map(|(value, _, _)| *value).collect::<Vec<_>>(),
+                unique
+                    .iter()
+                    .map(|(value, _, _)| *value)
+                    .collect::<Vec<_>>(),
                 unique
                     .iter()
                     .map(|(_, first, last)| match options.occurrence {
@@ -23099,7 +25500,10 @@ fn unique_numeric_outputs(
             let mut unique_values = Vec::new();
             let mut unique_indices = Vec::new();
             for (value, index) in &tagged {
-                if let Some(position) = unique_values.iter().position(|existing| *existing == *value) {
+                if let Some(position) = unique_values
+                    .iter()
+                    .position(|existing| *existing == *value)
+                {
                     if matches!(options.occurrence, UniqueOccurrence::Last) {
                         unique_indices[position] = *index;
                     }
@@ -23126,10 +25530,7 @@ fn unique_numeric_outputs(
 
     match output_arity {
         0 | 1 => Ok(vec![unique_value]),
-        2 => Ok(vec![
-            unique_value,
-            indices_to_value(unique_indices, false)?,
-        ]),
+        2 => Ok(vec![unique_value, indices_to_value(unique_indices, false)?]),
         3 => Ok(vec![
             unique_value,
             indices_to_value(unique_indices, false)?,
@@ -23207,8 +25608,9 @@ fn unique_text_outputs(
         UniqueOrder::Sorted => {
             let mut unique = Vec::<(String, TextPrototype, usize, usize)>::new();
             for (value, prototype, index) in &tagged {
-                if let Some((_, existing_prototype, first, last)) =
-                    unique.iter_mut().find(|(existing, _, _, _)| *existing == *value)
+                if let Some((_, existing_prototype, first, last)) = unique
+                    .iter_mut()
+                    .find(|(existing, _, _, _)| *existing == *value)
                 {
                     if matches!(options.occurrence, UniqueOccurrence::Last) {
                         *existing_prototype = *prototype;
@@ -23221,8 +25623,14 @@ fn unique_text_outputs(
             }
             unique.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then(lhs.2.cmp(&rhs.2)));
             (
-                unique.iter().map(|(value, _, _, _)| value.clone()).collect::<Vec<_>>(),
-                unique.iter().map(|(_, prototype, _, _)| *prototype).collect::<Vec<_>>(),
+                unique
+                    .iter()
+                    .map(|(value, _, _, _)| value.clone())
+                    .collect::<Vec<_>>(),
+                unique
+                    .iter()
+                    .map(|(_, prototype, _, _)| *prototype)
+                    .collect::<Vec<_>>(),
                 unique
                     .iter()
                     .map(|(_, _, first, last)| match options.occurrence {
@@ -23237,7 +25645,10 @@ fn unique_text_outputs(
             let mut unique_prototypes = Vec::new();
             let mut unique_indices = Vec::new();
             for (value, prototype, index) in &tagged {
-                if let Some(position) = unique_values.iter().position(|existing| *existing == *value) {
+                if let Some(position) = unique_values
+                    .iter()
+                    .position(|existing| *existing == *value)
+                {
                     if matches!(options.occurrence, UniqueOccurrence::Last) {
                         unique_indices[position] = *index;
                         unique_prototypes[position] = *prototype;
@@ -23252,11 +25663,7 @@ fn unique_text_outputs(
         }
     };
 
-    let unique_value = unique_text_output(
-        &input,
-        unique_values.clone(),
-        unique_prototypes,
-    )?;
+    let unique_value = unique_text_output(&input, unique_values.clone(), unique_prototypes)?;
     let inverse_indices = tagged
         .iter()
         .map(|(value, _, _)| {
@@ -23270,10 +25677,7 @@ fn unique_text_outputs(
 
     match output_arity {
         0 | 1 => Ok(vec![unique_value]),
-        2 => Ok(vec![
-            unique_value,
-            indices_to_value(unique_indices, false)?,
-        ]),
+        2 => Ok(vec![unique_value, indices_to_value(unique_indices, false)?]),
         3 => Ok(vec![
             unique_value,
             indices_to_value(unique_indices, false)?,
@@ -23319,7 +25723,8 @@ fn unique_numeric_row_outputs(
         Value::Matrix(matrix) => {
             if !(matrix_is_numeric(matrix) || matrix_is_logical(matrix)) {
                 return Err(RuntimeError::TypeError(
-                    "unique(...,'rows') currently expects numeric or logical matrix input".to_string(),
+                    "unique(...,'rows') currently expects numeric or logical matrix input"
+                        .to_string(),
                 ));
             }
             matrix.clone()
@@ -23342,7 +25747,10 @@ fn unique_numeric_row_outputs(
 
     let mut unique_rows = Vec::<(Vec<f64>, usize, usize)>::new();
     for (row_index, key) in row_keys.iter().cloned().enumerate() {
-        if let Some((_, first, last)) = unique_rows.iter_mut().find(|(existing, _, _)| *existing == key) {
+        if let Some((_, first, last)) = unique_rows
+            .iter_mut()
+            .find(|(existing, _, _)| *existing == key)
+        {
             *first = (*first).min(row_index);
             *last = (*last).max(row_index);
         } else {
@@ -23351,7 +25759,8 @@ fn unique_numeric_row_outputs(
     }
 
     if matches!(options.order, UniqueOrder::Sorted) {
-        unique_rows.sort_by(|lhs, rhs| compare_numeric_row_keys(&lhs.0, &rhs.0).then(lhs.1.cmp(&rhs.1)));
+        unique_rows
+            .sort_by(|lhs, rhs| compare_numeric_row_keys(&lhs.0, &rhs.0).then(lhs.1.cmp(&rhs.1)));
     }
 
     let mut elements = Vec::with_capacity(unique_rows.len() * matrix.cols);
@@ -23433,7 +25842,10 @@ fn unique_text_row_outputs(
         });
     }
 
-    let ia = unique_rows.iter().map(|entry| entry.index).collect::<Vec<_>>();
+    let ia = unique_rows
+        .iter()
+        .map(|entry| entry.index)
+        .collect::<Vec<_>>();
     let ic = rows
         .iter()
         .map(|entry| {
@@ -23512,7 +25924,10 @@ fn numeric_row_entries(
             let key = (0..matrix.cols)
                 .map(|col| matrix.get(row, col).as_scalar())
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(NumericRowEntry { key, index: row + 1 })
+            Ok(NumericRowEntry {
+                key,
+                index: row + 1,
+            })
         })
         .collect::<Result<Vec<_>, RuntimeError>>()?;
     Ok((matrix.cols, entries, logical_output))
@@ -23571,7 +25986,11 @@ fn row_entries_output(
             })
         })
         .collect::<Vec<_>>();
-    Ok(Value::Matrix(MatrixValue::new(entries.len(), cols, elements)?))
+    Ok(Value::Matrix(MatrixValue::new(
+        entries.len(),
+        cols,
+        elements,
+    )?))
 }
 
 fn text_row_entries_output(entries: &[TextRowEntry], cols: usize) -> Result<Value, RuntimeError> {
@@ -23589,7 +26008,10 @@ fn text_row_entries_output(entries: &[TextRowEntry], cols: usize) -> Result<Valu
 fn unique_row_first_occurrences(entries: &[NumericRowEntry]) -> Vec<NumericRowEntry> {
     let mut unique = Vec::new();
     for entry in entries {
-        if unique.iter().any(|existing: &NumericRowEntry| existing.key == entry.key) {
+        if unique
+            .iter()
+            .any(|existing: &NumericRowEntry| existing.key == entry.key)
+        {
             continue;
         }
         unique.push(entry.clone());
@@ -23628,7 +26050,10 @@ fn union_numeric_rows_outputs(
         .map(|entry| (entry, true))
         .collect::<Vec<_>>();
     for entry in unique_row_first_occurrences(&rhs_rows) {
-        if lhs_unique.iter().any(|lhs_entry| lhs_entry.key == entry.key) {
+        if lhs_unique
+            .iter()
+            .any(|lhs_entry| lhs_entry.key == entry.key)
+        {
             continue;
         }
         combined.push((entry, false));
@@ -23637,7 +26062,10 @@ fn union_numeric_rows_outputs(
         combined.sort_by(|lhs, rhs| compare_numeric_row_keys(&lhs.0.key, &rhs.0.key));
     }
 
-    let values = combined.iter().map(|(entry, _)| entry.clone()).collect::<Vec<_>>();
+    let values = combined
+        .iter()
+        .map(|(entry, _)| entry.clone())
+        .collect::<Vec<_>>();
     let ia = combined
         .iter()
         .filter_map(|(entry, from_lhs)| (*from_lhs).then_some(entry.index))
@@ -23676,7 +26104,10 @@ fn intersect_numeric_rows_outputs(
     let rhs_unique = unique_row_first_occurrences(&rhs_rows);
     let mut common = Vec::<(NumericRowEntry, usize)>::new();
     for lhs_entry in lhs_unique {
-        if let Some(rhs_entry) = rhs_unique.iter().find(|rhs_entry| rhs_entry.key == lhs_entry.key) {
+        if let Some(rhs_entry) = rhs_unique
+            .iter()
+            .find(|rhs_entry| rhs_entry.key == lhs_entry.key)
+        {
             common.push((lhs_entry, rhs_entry.index));
         }
     }
@@ -23684,9 +26115,18 @@ fn intersect_numeric_rows_outputs(
         common.sort_by(|lhs, rhs| compare_numeric_row_keys(&lhs.0.key, &rhs.0.key));
     }
 
-    let values = common.iter().map(|(entry, _)| entry.clone()).collect::<Vec<_>>();
-    let ia = common.iter().map(|(entry, _)| entry.index).collect::<Vec<_>>();
-    let ib = common.iter().map(|(_, rhs_index)| *rhs_index).collect::<Vec<_>>();
+    let values = common
+        .iter()
+        .map(|(entry, _)| entry.clone())
+        .collect::<Vec<_>>();
+    let ia = common
+        .iter()
+        .map(|(entry, _)| entry.index)
+        .collect::<Vec<_>>();
+    let ib = common
+        .iter()
+        .map(|(_, rhs_index)| *rhs_index)
+        .collect::<Vec<_>>();
 
     let intersect_value = row_entries_output(&values, lhs_cols, lhs_logical && rhs_logical)?;
     match output_arity {
@@ -23716,13 +26156,20 @@ fn setdiff_numeric_rows_outputs(
     let rhs_unique = unique_row_first_occurrences(&rhs_rows);
     let mut difference = unique_row_first_occurrences(&lhs_rows)
         .into_iter()
-        .filter(|entry| !rhs_unique.iter().any(|rhs_entry| rhs_entry.key == entry.key))
+        .filter(|entry| {
+            !rhs_unique
+                .iter()
+                .any(|rhs_entry| rhs_entry.key == entry.key)
+        })
         .collect::<Vec<_>>();
     if matches!(order, SetOrder::Sorted) {
         difference.sort_by(|lhs, rhs| compare_numeric_row_keys(&lhs.key, &rhs.key));
     }
 
-    let ia = difference.iter().map(|entry| entry.index).collect::<Vec<_>>();
+    let ia = difference
+        .iter()
+        .map(|entry| entry.index)
+        .collect::<Vec<_>>();
     let difference_value = row_entries_output(&difference, lhs_cols, lhs_logical && rhs_logical)?;
     match output_arity {
         0 | 1 => Ok(vec![difference_value]),
@@ -23747,14 +26194,22 @@ fn setxor_numeric_rows_outputs(
     let rhs_unique = unique_row_first_occurrences(&rhs_rows);
     let mut exclusive = lhs_unique
         .iter()
-        .filter(|entry| !rhs_unique.iter().any(|rhs_entry| rhs_entry.key == entry.key))
+        .filter(|entry| {
+            !rhs_unique
+                .iter()
+                .any(|rhs_entry| rhs_entry.key == entry.key)
+        })
         .cloned()
         .map(|entry| (entry, true))
         .collect::<Vec<_>>();
     exclusive.extend(
         rhs_unique
             .iter()
-            .filter(|entry| !lhs_unique.iter().any(|lhs_entry| lhs_entry.key == entry.key))
+            .filter(|entry| {
+                !lhs_unique
+                    .iter()
+                    .any(|lhs_entry| lhs_entry.key == entry.key)
+            })
             .cloned()
             .map(|entry| (entry, false)),
     );
@@ -23762,7 +26217,10 @@ fn setxor_numeric_rows_outputs(
         exclusive.sort_by(|lhs, rhs| compare_numeric_row_keys(&lhs.0.key, &rhs.0.key));
     }
 
-    let values = exclusive.iter().map(|(entry, _)| entry.clone()).collect::<Vec<_>>();
+    let values = exclusive
+        .iter()
+        .map(|(entry, _)| entry.clone())
+        .collect::<Vec<_>>();
     let ia = exclusive
         .iter()
         .filter_map(|(entry, from_lhs)| (*from_lhs).then_some(entry.index))
@@ -23804,7 +26262,10 @@ fn union_text_rows_outputs(
         .map(|entry| (entry, true))
         .collect::<Vec<_>>();
     for entry in unique_text_row_first_occurrences(&rhs_rows) {
-        if lhs_unique.iter().any(|lhs_entry| lhs_entry.key == entry.key) {
+        if lhs_unique
+            .iter()
+            .any(|lhs_entry| lhs_entry.key == entry.key)
+        {
             continue;
         }
         combined.push((entry, false));
@@ -23813,7 +26274,10 @@ fn union_text_rows_outputs(
         combined.sort_by(|lhs, rhs| compare_text_row_keys(&lhs.0.key, &rhs.0.key));
     }
 
-    let values = combined.iter().map(|(entry, _)| entry.clone()).collect::<Vec<_>>();
+    let values = combined
+        .iter()
+        .map(|(entry, _)| entry.clone())
+        .collect::<Vec<_>>();
     let ia = combined
         .iter()
         .filter_map(|(entry, from_lhs)| (*from_lhs).then_some(entry.index))
@@ -23852,7 +26316,9 @@ fn intersect_text_rows_outputs(
     let rhs_unique = unique_text_row_first_occurrences(&rhs_rows);
     let mut common = Vec::<(TextRowEntry, usize)>::new();
     for lhs_entry in lhs_unique {
-        if let Some(rhs_entry) = rhs_unique.iter().find(|rhs_entry| rhs_entry.key == lhs_entry.key)
+        if let Some(rhs_entry) = rhs_unique
+            .iter()
+            .find(|rhs_entry| rhs_entry.key == lhs_entry.key)
         {
             common.push((lhs_entry, rhs_entry.index));
         }
@@ -23861,9 +26327,18 @@ fn intersect_text_rows_outputs(
         common.sort_by(|lhs, rhs| compare_text_row_keys(&lhs.0.key, &rhs.0.key));
     }
 
-    let values = common.iter().map(|(entry, _)| entry.clone()).collect::<Vec<_>>();
-    let ia = common.iter().map(|(entry, _)| entry.index).collect::<Vec<_>>();
-    let ib = common.iter().map(|(_, rhs_index)| *rhs_index).collect::<Vec<_>>();
+    let values = common
+        .iter()
+        .map(|(entry, _)| entry.clone())
+        .collect::<Vec<_>>();
+    let ia = common
+        .iter()
+        .map(|(entry, _)| entry.index)
+        .collect::<Vec<_>>();
+    let ib = common
+        .iter()
+        .map(|(_, rhs_index)| *rhs_index)
+        .collect::<Vec<_>>();
 
     let intersect_value = text_row_entries_output(&values, lhs_cols)?;
     match output_arity {
@@ -23893,13 +26368,20 @@ fn setdiff_text_rows_outputs(
     let rhs_unique = unique_text_row_first_occurrences(&rhs_rows);
     let mut difference = unique_text_row_first_occurrences(&lhs_rows)
         .into_iter()
-        .filter(|entry| !rhs_unique.iter().any(|rhs_entry| rhs_entry.key == entry.key))
+        .filter(|entry| {
+            !rhs_unique
+                .iter()
+                .any(|rhs_entry| rhs_entry.key == entry.key)
+        })
         .collect::<Vec<_>>();
     if matches!(order, SetOrder::Sorted) {
         difference.sort_by(|lhs, rhs| compare_text_row_keys(&lhs.key, &rhs.key));
     }
 
-    let ia = difference.iter().map(|entry| entry.index).collect::<Vec<_>>();
+    let ia = difference
+        .iter()
+        .map(|entry| entry.index)
+        .collect::<Vec<_>>();
     let difference_value = text_row_entries_output(&difference, lhs_cols)?;
     match output_arity {
         0 | 1 => Ok(vec![difference_value]),
@@ -23924,14 +26406,22 @@ fn setxor_text_rows_outputs(
     let rhs_unique = unique_text_row_first_occurrences(&rhs_rows);
     let mut exclusive = lhs_unique
         .iter()
-        .filter(|entry| !rhs_unique.iter().any(|rhs_entry| rhs_entry.key == entry.key))
+        .filter(|entry| {
+            !rhs_unique
+                .iter()
+                .any(|rhs_entry| rhs_entry.key == entry.key)
+        })
         .cloned()
         .map(|entry| (entry, true))
         .collect::<Vec<_>>();
     exclusive.extend(
         rhs_unique
             .iter()
-            .filter(|entry| !lhs_unique.iter().any(|lhs_entry| lhs_entry.key == entry.key))
+            .filter(|entry| {
+                !lhs_unique
+                    .iter()
+                    .any(|lhs_entry| lhs_entry.key == entry.key)
+            })
             .cloned()
             .map(|entry| (entry, false)),
     );
@@ -23939,7 +26429,10 @@ fn setxor_text_rows_outputs(
         exclusive.sort_by(|lhs, rhs| compare_text_row_keys(&lhs.0.key, &rhs.0.key));
     }
 
-    let values = exclusive.iter().map(|(entry, _)| entry.clone()).collect::<Vec<_>>();
+    let values = exclusive
+        .iter()
+        .map(|(entry, _)| entry.clone())
+        .collect::<Vec<_>>();
     let ia = exclusive
         .iter()
         .filter_map(|(entry, from_lhs)| (*from_lhs).then_some(entry.index))
@@ -24051,7 +26544,10 @@ fn ismember_numeric_rows_outputs(
     let member_value = build_scalar_matrix_result(lhs_rows.len(), 1, members)?;
     match output_arity {
         0 | 1 => Ok(vec![member_value]),
-        2 => Ok(vec![member_value, build_scalar_matrix_result(lhs_rows.len(), 1, locations)?]),
+        2 => Ok(vec![
+            member_value,
+            build_scalar_matrix_result(lhs_rows.len(), 1, locations)?,
+        ]),
         _ => Err(RuntimeError::Unsupported(
             "ismember currently supports one or two outputs".to_string(),
         )),
@@ -24083,7 +26579,10 @@ fn ismember_text_rows_outputs(
     let member_value = build_scalar_matrix_result(lhs_rows.len(), 1, members)?;
     match output_arity {
         0 | 1 => Ok(vec![member_value]),
-        2 => Ok(vec![member_value, build_scalar_matrix_result(lhs_rows.len(), 1, locations)?]),
+        2 => Ok(vec![
+            member_value,
+            build_scalar_matrix_result(lhs_rows.len(), 1, locations)?,
+        ]),
         _ => Err(RuntimeError::Unsupported(
             "ismember currently supports one or two outputs".to_string(),
         )),
@@ -24664,7 +27163,37 @@ fn numeric_matrix_result_with_dimensions(
     )?))
 }
 
-fn numeric_set_output(values: Vec<f64>, row_output: bool, logical_output: bool) -> Result<Value, RuntimeError> {
+fn logical_matrix_result_with_dimensions(
+    dims: Vec<usize>,
+    values: Vec<bool>,
+) -> Result<Value, RuntimeError> {
+    build_scalar_matrix_result_with_dimensions(
+        dims,
+        values
+            .into_iter()
+            .map(Value::Logical)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn numeric_or_complex_matrix_result_with_dimensions(
+    dims: Vec<usize>,
+    values: Vec<ComplexParts>,
+) -> Result<Value, RuntimeError> {
+    build_scalar_matrix_result_with_dimensions(
+        dims,
+        values
+            .into_iter()
+            .map(numeric_or_complex_value)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn numeric_set_output(
+    values: Vec<f64>,
+    row_output: bool,
+    logical_output: bool,
+) -> Result<Value, RuntimeError> {
     match values.len() {
         0 => Ok(Value::Matrix(MatrixValue::new(0, 0, Vec::new())?)),
         1 if logical_output => Ok(Value::Logical(values[0] != 0.0)),
@@ -24672,7 +27201,10 @@ fn numeric_set_output(values: Vec<f64>, row_output: bool, logical_output: bool) 
         _ if logical_output => Ok(Value::Matrix(MatrixValue::new(
             if row_output { 1 } else { values.len() },
             if row_output { values.len() } else { 1 },
-            values.into_iter().map(|value| Value::Logical(value != 0.0)).collect(),
+            values
+                .into_iter()
+                .map(|value| Value::Logical(value != 0.0))
+                .collect(),
         )?)),
         _ if row_output => numeric_values_to_row_matrix(values),
         _ => numeric_values_to_column_matrix(values),
@@ -24773,16 +27305,12 @@ fn histogram_edges_from_method_1d(
             uniform_histogram_edges_with_limits(values, count, limits)
         }
         HistogramBinMethod::Integers => integer_histogram_edges(values, limits, 65_536),
-        HistogramBinMethod::Scott => histogram_edges_from_width(
-            values,
-            scott_width_1d(values, limits),
-            limits,
-        ),
-        HistogramBinMethod::Fd => histogram_edges_from_width(
-            values,
-            fd_width_1d(values, limits),
-            limits,
-        ),
+        HistogramBinMethod::Scott => {
+            histogram_edges_from_width(values, scott_width_1d(values, limits), limits)
+        }
+        HistogramBinMethod::Fd => {
+            histogram_edges_from_width(values, fd_width_1d(values, limits), limits)
+        }
     }
 }
 
@@ -24851,7 +27379,11 @@ fn integer_histogram_edges(
     let integer_upper = upper.ceil();
     let integer_count = ((integer_upper - integer_lower).abs() as usize).saturating_add(1);
     let step = integer_count.div_ceil(max_bins.max(1)).max(1) as f64;
-    histogram_edges_from_width(values, step, Some((integer_lower - 0.5, integer_upper + 0.5)))
+    histogram_edges_from_width(
+        values,
+        step,
+        Some((integer_lower - 0.5, integer_upper + 0.5)),
+    )
 }
 
 fn filtered_values_with_limits(values: &[f64], limits: Option<(f64, f64)>) -> Vec<f64> {
@@ -24921,7 +27453,11 @@ fn sanitize_histogram_width(width: f64, values: &[f64], limits: Option<(f64, f64
     }
     let (lower, upper) = finite_range_with_limits(values, limits);
     let range = (upper - lower).abs();
-    if range > f64::EPSILON { range } else { 1.0 }
+    if range > f64::EPSILON {
+        range
+    } else {
+        1.0
+    }
 }
 
 fn histogram_edges(value: &Value, builtin_name: &str) -> Result<Vec<f64>, RuntimeError> {
@@ -24981,7 +27517,11 @@ fn parse_histogram_builtin_args<'a>(
                         "{builtin_name} currently expects a value after the 'BinLimits' option"
                     )));
                 };
-                options.bin_limits = Some(parse_histogram_limit_pair(value, builtin_name, "BinLimits")?);
+                options.bin_limits = Some(parse_histogram_limit_pair(
+                    value,
+                    builtin_name,
+                    "BinLimits",
+                )?);
                 index += 2;
                 continue;
             }
@@ -24991,7 +27531,11 @@ fn parse_histogram_builtin_args<'a>(
                         "{builtin_name} currently expects a value after the 'BinWidth' option"
                     )));
                 };
-                options.bin_width = Some(parse_histogram_positive_width(value, builtin_name, "BinWidth")?);
+                options.bin_width = Some(parse_histogram_positive_width(
+                    value,
+                    builtin_name,
+                    "BinWidth",
+                )?);
                 options.num_bins = None;
                 index += 2;
                 continue;
@@ -25037,7 +27581,16 @@ fn parse_histogram_builtin_args<'a>(
 fn parse_histogram2_builtin_args<'a>(
     args: &'a [Value],
     builtin_name: &str,
-) -> Result<(&'a Value, &'a Value, Option<&'a Value>, Option<&'a Value>, Histogram2Options), RuntimeError> {
+) -> Result<
+    (
+        &'a Value,
+        &'a Value,
+        Option<&'a Value>,
+        Option<&'a Value>,
+        Histogram2Options,
+    ),
+    RuntimeError,
+> {
     let [x_value, y_value, tail @ ..] = args else {
         return Err(RuntimeError::Unsupported(format!(
             "{builtin_name} currently expects at least two input arguments"
@@ -25072,7 +27625,11 @@ fn parse_histogram2_builtin_args<'a>(
                         "{builtin_name} currently expects a value after the 'XBinLimits' option"
                     )));
                 };
-                options.x_bin_limits = Some(parse_histogram_limit_pair(value, builtin_name, "XBinLimits")?);
+                options.x_bin_limits = Some(parse_histogram_limit_pair(
+                    value,
+                    builtin_name,
+                    "XBinLimits",
+                )?);
                 index += 2;
                 continue;
             }
@@ -25082,7 +27639,11 @@ fn parse_histogram2_builtin_args<'a>(
                         "{builtin_name} currently expects a value after the 'YBinLimits' option"
                     )));
                 };
-                options.y_bin_limits = Some(parse_histogram_limit_pair(value, builtin_name, "YBinLimits")?);
+                options.y_bin_limits = Some(parse_histogram_limit_pair(
+                    value,
+                    builtin_name,
+                    "YBinLimits",
+                )?);
                 index += 2;
                 continue;
             }
@@ -25196,7 +27757,10 @@ fn parse_histogram2_width(value: &Value, builtin_name: &str) -> Result<(f64, f64
     }
 }
 
-fn parse_histogram2_nbins(value: &Value, builtin_name: &str) -> Result<(usize, usize), RuntimeError> {
+fn parse_histogram2_nbins(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(usize, usize), RuntimeError> {
     let counts = meshgrid_vector(value)?;
     match counts.len() {
         1 => {
@@ -26524,7 +29088,8 @@ fn matrix_object_class_name(matrix: &MatrixValue) -> Option<String> {
     });
     let first = objects.next()?;
     if objects.all(|object| {
-        object.class.class_name == first.class.class_name && object.class.package == first.class.package
+        object.class.class_name == first.class.class_name
+            && object.class.package == first.class.package
     }) {
         Some(first.class.qualified_name())
     } else {
@@ -26559,9 +29124,8 @@ fn runtime_class_name(value: &Value) -> String {
 
 fn runtime_class_matches(value: &Value, requested_class: &str) -> bool {
     let direct = requested_class.eq_ignore_ascii_case(&runtime_class_name(value));
-    let error_struct_alias =
-        matches!(value, Value::Struct(struct_value) if is_error_struct_value(struct_value))
-            && requested_class.eq_ignore_ascii_case("struct");
+    let error_struct_alias = matches!(value, Value::Struct(struct_value) if is_error_struct_value(struct_value))
+        && requested_class.eq_ignore_ascii_case("struct");
     let object_ancestor = matches!(
         value,
         Value::Object(object)
@@ -26571,9 +29135,8 @@ fn runtime_class_matches(value: &Value, requested_class: &str) -> bool {
                 .iter()
                 .any(|ancestor| requested_class.eq_ignore_ascii_case(ancestor))
     );
-    let object_handle =
-        matches!(value, Value::Object(object) if object.class.storage_kind == matlab_runtime::ObjectStorageKind::Handle)
-            && requested_class.eq_ignore_ascii_case("handle");
+    let object_handle = matches!(value, Value::Object(object) if object.class.storage_kind == matlab_runtime::ObjectStorageKind::Handle)
+        && requested_class.eq_ignore_ascii_case("handle");
     let object_matrix_ancestor = matches!(
         value,
         Value::Matrix(matrix)
@@ -26601,7 +29164,12 @@ fn runtime_class_matches(value: &Value, requested_class: &str) -> bool {
             })
     ) && requested_class.eq_ignore_ascii_case("handle");
 
-    direct || error_struct_alias || object_ancestor || object_handle || object_matrix_ancestor || object_matrix_handle
+    direct
+        || error_struct_alias
+        || object_ancestor
+        || object_handle
+        || object_matrix_ancestor
+        || object_matrix_handle
 }
 
 fn runtime_error_from_value(
@@ -26738,11 +29306,13 @@ fn runtime_error_stack_value(stack: &[RuntimeStackFrame]) -> Value {
                 .iter()
                 .rev()
                 .map(|frame| {
-                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                        [
                             ("file".to_string(), Value::String(frame.file.clone())),
                             ("line".to_string(), Value::Scalar(frame.line as f64)),
                             ("name".to_string(), Value::String(frame.name.clone())),
-                        ])))
+                        ],
+                    )))
                 })
                 .collect(),
         )
@@ -26989,7 +29559,11 @@ fn build_text_result_with_dimensions(
     }
 }
 
-fn broadcast_text_result_dimensions(primary_dims: &[usize], rows: usize, cols: usize) -> Vec<usize> {
+fn broadcast_text_result_dimensions(
+    primary_dims: &[usize],
+    rows: usize,
+    cols: usize,
+) -> Vec<usize> {
     let primary_dims = canonical_size_vector(primary_dims);
     let primary_shape = storage_shape_from_dimensions(&primary_dims);
     if primary_shape != (1, 1) && primary_shape == (rows, cols) {
@@ -27086,10 +29660,7 @@ fn map_text_binary_positions(
         .map(|offset| {
             let lhs_offset = text_operand_offset(&lhs, rows, cols, offset);
             let rhs_offset = text_operand_offset(&rhs, rows, cols, offset);
-            numeric_row_vector(mapper(
-                &lhs.values[lhs_offset],
-                &rhs.values[rhs_offset],
-            ))
+            numeric_row_vector(mapper(&lhs.values[lhs_offset], &rhs.values[rhs_offset]))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -28192,8 +30763,7 @@ mod tests {
         ])
         .expect("logical reshape");
         let permuted = permute_value(&reshaped, &[2, 1], "permute").expect("logical permute");
-        let shifted =
-            circshift_value(&permuted, &[1, 0], "circshift").expect("logical circshift");
+        let shifted = circshift_value(&permuted, &[1, 0], "circshift").expect("logical circshift");
         let flipped = flip_along_dimension(&shifted, 1, "flip").expect("logical flip");
         let Value::Matrix(logical_matrix) = flipped else {
             panic!("logical shape helper result should stay matrix");
@@ -28216,15 +30786,11 @@ mod tests {
             )
             .expect("string input"),
         );
-        let reshaped = builtin_reshape(&[
-            string_input.clone(),
-            Value::Scalar(2.0),
-            Value::Scalar(2.0),
-        ])
-        .expect("string reshape");
+        let reshaped =
+            builtin_reshape(&[string_input.clone(), Value::Scalar(2.0), Value::Scalar(2.0)])
+                .expect("string reshape");
         let permuted = permute_value(&reshaped, &[2, 1], "permute").expect("string permute");
-        let shifted =
-            circshift_value(&permuted, &[0, 1], "circshift").expect("string circshift");
+        let shifted = circshift_value(&permuted, &[0, 1], "circshift").expect("string circshift");
         let flipped = flip_along_dimension(&shifted, 2, "flip").expect("string flip");
         let Value::Matrix(string_matrix) = flipped else {
             panic!("string shape helper result should stay matrix");
@@ -28342,21 +30908,23 @@ mod tests {
         );
         let error =
             builtin_circshift(&[value.clone(), Value::Scalar(1.5)]).expect_err("fractional shift");
-        assert_eq!(error.to_string(), "circshift shift values must be finite integers");
+        assert_eq!(
+            error.to_string(),
+            "circshift shift values must be finite integers"
+        );
 
         let error = builtin_circshift(&[
             value,
             Value::Matrix(
-                MatrixValue::new(
-                    1,
-                    2,
-                    vec![Value::Scalar(1.0), Value::Scalar(f64::INFINITY)],
-                )
-                .expect("shift vector"),
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(f64::INFINITY)])
+                    .expect("shift vector"),
             ),
         ])
         .expect_err("nonfinite shift");
-        assert_eq!(error.to_string(), "circshift shift values must be finite integers");
+        assert_eq!(
+            error.to_string(),
+            "circshift shift values must be finite integers"
+        );
     }
 
     #[test]
@@ -28442,8 +31010,10 @@ mod tests {
             Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("empty eye matrix")),
         );
         assert_eq!(
-            builtin_eye(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty size vector"))])
-                .expect("eye empty size vector"),
+            builtin_eye(&[Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty size vector")
+            )])
+            .expect("eye empty size vector"),
             Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty eye")),
         );
     }
@@ -28458,14 +31028,17 @@ mod tests {
             Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("empty zeros")),
         );
         assert_eq!(
-            builtin_fill(&[Value::Matrix(
-                MatrixValue::new(1, 3, vec![
-                    Value::Scalar(2.0),
-                    Value::Scalar(-1.0),
-                    Value::Scalar(3.0),
-                ])
-                .expect("size vector"),
-            )], 1.0)
+            builtin_fill(
+                &[Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(2.0), Value::Scalar(-1.0), Value::Scalar(3.0),]
+                    )
+                    .expect("size vector"),
+                )],
+                1.0
+            )
             .expect("negative ones size vector"),
             Value::Matrix(
                 MatrixValue::with_dimensions(2, 0, vec![2, 0, 3], Vec::new())
@@ -28516,21 +31089,13 @@ mod tests {
                     2,
                     vec![
                         Value::Matrix(
-                            MatrixValue::new(
-                                1,
-                                2,
-                                vec![Value::Scalar(1.0), Value::Scalar(2.0)],
-                            )
-                            .expect("first block"),
+                            MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)],)
+                                .expect("first block"),
                         ),
                         Value::Scalar(3.0),
                         Value::Matrix(
-                            MatrixValue::new(
-                                1,
-                                2,
-                                vec![Value::Scalar(4.0), Value::Scalar(5.0)],
-                            )
-                            .expect("second block"),
+                            MatrixValue::new(1, 2, vec![Value::Scalar(4.0), Value::Scalar(5.0)],)
+                                .expect("second block"),
                         ),
                         Value::Scalar(6.0),
                     ],
@@ -28564,9 +31129,7 @@ mod tests {
                 CellValue::new(1, 2, vec![left.clone(), right.clone()]).expect("struct cell"),
             )])
             .expect("struct cell2mat"),
-            Value::Matrix(
-                MatrixValue::new(1, 2, vec![left, right]).expect("struct array result"),
-            )
+            Value::Matrix(MatrixValue::new(1, 2, vec![left, right]).expect("struct array result"),)
         );
     }
 
@@ -28621,20 +31184,12 @@ mod tests {
                     2,
                     vec![
                         Value::Matrix(
-                            MatrixValue::new(
-                                2,
-                                1,
-                                vec![Value::Scalar(1.0), Value::Scalar(3.0)],
-                            )
-                            .expect("first column"),
+                            MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(3.0)],)
+                                .expect("first column"),
                         ),
                         Value::Matrix(
-                            MatrixValue::new(
-                                2,
-                                1,
-                                vec![Value::Scalar(2.0), Value::Scalar(4.0)],
-                            )
-                            .expect("second column"),
+                            MatrixValue::new(2, 1, vec![Value::Scalar(2.0), Value::Scalar(4.0)],)
+                                .expect("second column"),
                         ),
                     ],
                 )
@@ -28847,11 +31402,8 @@ mod tests {
         );
 
         assert_eq!(
-            builtin_blkdiag(&[
-                Value::Logical(true),
-                Value::Logical(false),
-            ])
-            .expect("logical blkdiag"),
+            builtin_blkdiag(&[Value::Logical(true), Value::Logical(false),])
+                .expect("logical blkdiag"),
             Value::Matrix(
                 MatrixValue::new(
                     2,
@@ -28876,11 +31428,7 @@ mod tests {
                     MatrixValue::new(
                         1,
                         3,
-                        vec![
-                            Value::Scalar(1.0),
-                            Value::Scalar(2.0),
-                            Value::Scalar(3.0),
-                        ],
+                        vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0),],
                     )
                     .expect("row vector"),
                 ),
@@ -29001,12 +31549,230 @@ mod tests {
                 MatrixValue::new(
                     1,
                     3,
-                    vec![Value::Scalar(65.0), Value::Scalar(66.0), Value::Scalar(67.0)],
+                    vec![
+                        Value::Scalar(65.0),
+                        Value::Scalar(66.0),
+                        Value::Scalar(67.0)
+                    ],
                 )
                 .expect("char code row"),
             )])
             .expect("row char codes"),
             Value::CharArray("ABC".to_string())
+        );
+        assert_eq!(
+            builtin_double(&[Value::Logical(true)]).expect("double logical"),
+            Value::Scalar(1.0)
+        );
+        assert_eq!(
+            builtin_double(&[Value::CharArray("AB".to_string())]).expect("double char"),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(65.0), Value::Scalar(66.0)])
+                    .expect("double char result"),
+            )
+        );
+        assert_eq!(
+            builtin_double(&[Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Logical(true),
+                        Value::Logical(false),
+                        Value::Logical(false),
+                        Value::Logical(true),
+                    ],
+                )
+                .expect("double logical matrix"),
+            )])
+            .expect("double logical matrix"),
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                    ],
+                )
+                .expect("double logical matrix result"),
+            )
+        );
+        assert_eq!(
+            builtin_str2double(&[Value::String("12.5".to_string())]).expect("str2double real"),
+            Value::Scalar(12.5)
+        );
+        assert_eq!(
+            builtin_str2double(&[Value::CharArray("1+2i".to_string())])
+                .expect("str2double complex"),
+            Value::Complex(ComplexValue {
+                real: 1.0,
+                imag: 2.0,
+            })
+        );
+        assert_eq!(
+            builtin_str2double(&[Value::CharArray("1 + 2i".to_string())])
+                .expect("str2double spaced complex"),
+            Value::Complex(ComplexValue {
+                real: 1.0,
+                imag: 2.0,
+            })
+        );
+        assert_eq!(
+            builtin_str2double(&[Value::CharArray("1 - i".to_string())])
+                .expect("str2double unit imaginary"),
+            Value::Complex(ComplexValue {
+                real: 1.0,
+                imag: -1.0,
+            })
+        );
+        assert!(
+            builtin_str2double(&[Value::CharArray("1 2".to_string())])
+                .expect("str2double invalid spaced real")
+                .as_scalar()
+                .expect("str2double invalid scalar")
+                .is_nan()
+        );
+        let Value::Matrix(str2double_cell) = builtin_str2double(&[Value::Cell(
+            CellValue::new(
+                1,
+                2,
+                vec![
+                    Value::CharArray("bad".to_string()),
+                    Value::CharArray("-3i".to_string()),
+                ],
+            )
+            .expect("str2double cell"),
+        )])
+        .expect("str2double cell") else {
+            panic!("str2double cell should return a matrix");
+        };
+        assert!(str2double_cell.get(0, 0).as_scalar().expect("nan result").is_nan());
+        assert_eq!(
+            str2double_cell.get(0, 1),
+            &Value::Complex(ComplexValue {
+                real: 0.0,
+                imag: -3.0,
+            })
+        );
+        assert_eq!(
+            builtin_mat2str(&[Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(4.0),
+                    ],
+                )
+                .expect("mat2str matrix"),
+            )])
+            .expect("mat2str matrix"),
+            Value::CharArray("[1 2;3 4]".to_string())
+        );
+        assert_eq!(
+            builtin_mat2str(&[
+                Value::Complex(ComplexValue {
+                    real: 1.0,
+                    imag: 2.0,
+                }),
+                Value::Scalar(4.0),
+            ])
+            .expect("mat2str complex precision"),
+            Value::CharArray("1+2i".to_string())
+        );
+        assert_eq!(
+            builtin_mat2str(&[Value::Matrix(
+                MatrixValue::new(1, 0, Vec::new()).expect("mat2str empty"),
+            )])
+            .expect("mat2str empty"),
+            Value::CharArray("[]".to_string())
+        );
+        assert_eq!(
+            builtin_int2str(&[Value::Scalar(42.5)]).expect("int2str scalar"),
+            Value::CharArray("43".to_string())
+        );
+        assert_eq!(
+            builtin_int2str(&[Value::Logical(true)]).expect("int2str logical"),
+            Value::CharArray("1".to_string())
+        );
+        assert_eq!(
+            builtin_int2str(&[Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    3,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(20.0),
+                        Value::Scalar(-3.0),
+                    ],
+                )
+                .expect("int2str row vector"),
+            )])
+            .expect("int2str row vector"),
+            Value::CharArray("1 20 -3".to_string())
+        );
+        assert_eq!(
+            builtin_hex2dec(&[Value::String("3FF".to_string())]).expect("hex2dec"),
+            Value::Scalar(1023.0)
+        );
+        assert_eq!(
+            builtin_bin2dec(&[Value::String("0b11111111s8".to_string())]).expect("bin2dec signed"),
+            Value::Scalar(-1.0)
+        );
+        assert_eq!(
+            builtin_base2dec(&[Value::String("ZZ".to_string()), Value::Scalar(36.0)])
+                .expect("base2dec"),
+            Value::Scalar(1295.0)
+        );
+        assert_eq!(
+            builtin_dec2hex(&[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(15.0), Value::Scalar(16.0)])
+                        .expect("dec2hex input"),
+                ),
+                Value::Scalar(2.0),
+            ])
+            .expect("dec2hex"),
+            Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    2,
+                    vec![
+                        Value::String("0F".to_string()),
+                        Value::String("10".to_string()),
+                    ],
+                )
+                .expect("dec2hex output"),
+            )
+        );
+        assert_eq!(
+            builtin_dec2base(&[
+                Value::Scalar(0.0),
+                Value::Scalar(2.0),
+                Value::Scalar(3.0),
+            ])
+            .expect("dec2base"),
+            Value::CharArray("000".to_string())
+        );
+        assert_eq!(
+            builtin_str2func(&[Value::String("@sin".to_string())]).expect("str2func"),
+            Value::FunctionHandle(FunctionHandleValue {
+                display_name: "sin".to_string(),
+                target: FunctionHandleTarget::Named("sin".to_string()),
+            })
+        );
+        assert_eq!(
+            builtin_func2str(&[Value::FunctionHandle(FunctionHandleValue {
+                display_name: "helper".to_string(),
+                target: FunctionHandleTarget::Named("helper".to_string()),
+            })])
+            .expect("func2str"),
+            Value::CharArray("helper".to_string())
         );
         assert_eq!(string_value, Value::String("beta".to_string()));
         assert_eq!(
@@ -29022,10 +31788,7 @@ mod tests {
                 CellValue::new(
                     1,
                     2,
-                    vec![
-                        Value::CharArray("alpha".to_string()),
-                        Value::Logical(true),
-                    ],
+                    vec![Value::CharArray("alpha".to_string()), Value::Logical(true),],
                 )
                 .expect("string cell"),
             )])
@@ -29100,12 +31863,8 @@ mod tests {
             ])
             .expect("strncmpi cell"),
             Value::Matrix(
-                MatrixValue::new(
-                    1,
-                    2,
-                    vec![Value::Logical(true), Value::Logical(true)],
-                )
-                .expect("strncmpi cell result"),
+                MatrixValue::new(1, 2, vec![Value::Logical(true), Value::Logical(true)],)
+                    .expect("strncmpi cell result"),
             )
         );
     }
@@ -29143,8 +31902,10 @@ mod tests {
             Value::Logical(false)
         );
         assert_eq!(
-            builtin_iscellstr(&[Value::Cell(CellValue::new(0, 0, Vec::new()).expect("empty cell"))])
-                .expect("iscellstr empty cell"),
+            builtin_iscellstr(&[Value::Cell(
+                CellValue::new(0, 0, Vec::new()).expect("empty cell")
+            )])
+            .expect("iscellstr empty cell"),
             Value::Logical(true)
         );
         assert_eq!(
@@ -29205,8 +31966,10 @@ mod tests {
         );
 
         assert_eq!(
-            builtin_cellstr(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty"))])
-                .expect("cellstr empty"),
+            builtin_cellstr(&[Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty")
+            )])
+            .expect("cellstr empty"),
             Value::Cell(CellValue::new(0, 0, Vec::new()).expect("empty cellstr")),
         );
     }
@@ -29305,10 +32068,9 @@ mod tests {
         assert_eq!(
             builtin_rmfield(&[struct_value.clone(), Value::CharArray("name".to_string()),])
                 .expect("rmfield"),
-            Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                    "value".to_string(),
-                    Value::Scalar(3.0),
-                )])))
+            Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                [("value".to_string(), Value::Scalar(3.0),)]
+            )))
         );
         assert_eq!(
             builtin_rmfield(&[
@@ -29347,10 +32109,12 @@ mod tests {
     #[test]
     fn struct_array_helpers_cover_matrix_of_structs() {
         let make_struct = |name: &str, value: f64| {
-            Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+            Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                [
                     ("name".to_string(), Value::String(name.to_string())),
                     ("value".to_string(), Value::Scalar(value)),
-                ])))
+                ],
+            )))
         };
         let struct_array = Value::Matrix(
             MatrixValue::new(
@@ -29408,14 +32172,12 @@ mod tests {
                     1,
                     2,
                     vec![
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                                "name".to_string(),
-                                Value::String("alpha".to_string()),
-                            )]))),
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                                "name".to_string(),
-                                Value::String("beta".to_string()),
-                            )]))),
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [("name".to_string(), Value::String("alpha".to_string()),)]
+                        ))),
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [("name".to_string(), Value::String("beta".to_string()),)]
+                        ))),
                     ],
                 )
                 .expect("rmfield result"),
@@ -29433,16 +32195,20 @@ mod tests {
                 Value::Scalar(3.0),
             ])
             .expect("scalar struct"),
-            Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+            Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                [
                     ("name".to_string(), Value::String("alpha".to_string())),
                     ("value".to_string(), Value::Scalar(3.0)),
-                ])))
+                ]
+            )))
         );
         assert_eq!(
-            builtin_struct2cell(&[Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+            builtin_struct2cell(&[Value::Struct(StructValue::from_fields(
+                std::collections::BTreeMap::from([
                     ("x".to_string(), Value::Scalar(1.0)),
                     ("y".to_string(), Value::String("two".to_string())),
-                ])))])
+                ])
+            ))])
             .expect("scalar struct2cell"),
             Value::Cell(
                 CellValue::new(
@@ -29484,16 +32250,20 @@ mod tests {
                     1,
                     2,
                     vec![
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [
                                 ("flag".to_string(), Value::Logical(true)),
                                 ("name".to_string(), Value::String("alpha".to_string())),
                                 ("value".to_string(), Value::Scalar(1.0)),
-                            ]))),
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+                            ]
+                        ))),
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [
                                 ("flag".to_string(), Value::Logical(true)),
                                 ("name".to_string(), Value::String("beta".to_string())),
                                 ("value".to_string(), Value::Scalar(2.0)),
-                            ]))),
+                            ]
+                        ))),
                     ],
                 )
                 .expect("expected struct array"),
@@ -29532,14 +32302,18 @@ mod tests {
                     2,
                     vec![1, 1, 2],
                     vec![
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [
                                 ("name".to_string(), Value::String("alpha".to_string())),
                                 ("value".to_string(), Value::Scalar(1.0)),
-                            ]))),
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+                            ]
+                        ))),
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [
                                 ("name".to_string(), Value::String("beta".to_string())),
                                 ("value".to_string(), Value::Scalar(2.0)),
-                            ]))),
+                            ]
+                        ))),
                     ],
                 )
                 .expect("expected nd struct array"),
@@ -29579,14 +32353,18 @@ mod tests {
                     1,
                     2,
                     vec![
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [
                                 ("name".to_string(), Value::String("alpha".to_string())),
                                 ("value".to_string(), Value::Scalar(1.0)),
-                            ]))),
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+                            ]
+                        ))),
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [
                                 ("name".to_string(), Value::String("beta".to_string())),
                                 ("value".to_string(), Value::Scalar(2.0)),
-                            ]))),
+                            ]
+                        ))),
                     ],
                 )
                 .expect("cell2struct array result"),
@@ -29653,14 +32431,18 @@ mod tests {
                     2,
                     vec![1, 1, 2],
                     vec![
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [
                                 ("name".to_string(), Value::String("alpha".to_string())),
                                 ("value".to_string(), Value::Scalar(1.0)),
-                            ]))),
-                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([
+                            ]
+                        ))),
+                        Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                            [
                                 ("name".to_string(), Value::String("beta".to_string())),
                                 ("value".to_string(), Value::Scalar(2.0)),
-                            ]))),
+                            ]
+                        ))),
                     ],
                 )
                 .expect("nd cell2struct result"),
@@ -29815,13 +32597,11 @@ mod tests {
             Value::String("beta".to_string())
         );
         assert_eq!(
-            builtin_setfield(
-                &[
-                    struct_value.clone(),
-                    Value::CharArray("name".to_string()),
-                    Value::String("omega".to_string()),
-                ],
-            )
+            builtin_setfield(&[
+                struct_value.clone(),
+                Value::CharArray("name".to_string()),
+                Value::String("omega".to_string()),
+            ],)
             .expect("setfield scalar"),
             Value::Struct(StructValue::with_field_order(
                 std::collections::BTreeMap::from([
@@ -29832,14 +32612,12 @@ mod tests {
             ))
         );
         assert_eq!(
-            builtin_setfield(
-                &[
-                    Value::Struct(StructValue::default()),
-                    Value::CharArray("inner".to_string()),
-                    Value::CharArray("score".to_string()),
-                    Value::Scalar(7.0),
-                ],
-            )
+            builtin_setfield(&[
+                Value::Struct(StructValue::default()),
+                Value::CharArray("inner".to_string()),
+                Value::CharArray("score".to_string()),
+                Value::Scalar(7.0),
+            ],)
             .expect("setfield nested create"),
             Value::Struct(StructValue::with_field_order(
                 std::collections::BTreeMap::from([(
@@ -29908,24 +32686,24 @@ mod tests {
         assert_eq!(
             builtin_getfield(&[
                 struct_grid.clone(),
-                Value::Cell(CellValue::new(1, 1, vec![Value::Scalar(2.0)]).expect("linear selector")),
+                Value::Cell(
+                    CellValue::new(1, 1, vec![Value::Scalar(2.0)]).expect("linear selector")
+                ),
                 Value::CharArray("name".to_string()),
             ])
             .expect("getfield linear cell selector"),
             Value::CharArray("r2c1".to_string())
         );
         assert_eq!(
-            builtin_setfield(
-                &[
-                    struct_grid,
-                    Value::Cell(
-                        CellValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
-                            .expect("set selector"),
-                    ),
-                    Value::CharArray("name".to_string()),
-                    Value::CharArray("R1C2".to_string()),
-                ],
-            )
+            builtin_setfield(&[
+                struct_grid,
+                Value::Cell(
+                    CellValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                        .expect("set selector"),
+                ),
+                Value::CharArray("name".to_string()),
+                Value::CharArray("R1C2".to_string()),
+            ],)
             .expect("setfield nd selector"),
             Value::Matrix(
                 MatrixValue::new(
@@ -30565,7 +33343,10 @@ mod tests {
                     MatrixValue::new(
                         1,
                         2,
-                        vec![Value::String(",".to_string()), Value::String(";".to_string())],
+                        vec![
+                            Value::String(",".to_string()),
+                            Value::String(";".to_string())
+                        ],
                     )
                     .expect("matches"),
                 ),
@@ -30886,12 +33667,47 @@ mod tests {
             Value::CharArray("42.5".to_string())
         );
         assert_eq!(
+            builtin_num2str(&[Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    3,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(3.0),
+                    ],
+                )
+                .expect("num2str row vector"),
+            )])
+            .expect("num2str row vector"),
+            Value::CharArray("1  2  3".to_string())
+        );
+        assert_eq!(
             builtin_num2str(&[
                 Value::Scalar(std::f64::consts::PI),
                 Value::CharArray("%.2e".to_string()),
             ])
             .expect("num2str scientific"),
             Value::CharArray("3.14e+00".to_string())
+        );
+        assert_eq!(
+            builtin_num2str(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                        ],
+                    )
+                    .expect("formatted row vector"),
+                ),
+                Value::CharArray("%.1f".to_string()),
+            ])
+            .expect("num2str formatted row vector"),
+            Value::CharArray("1.0  2.0  3.0".to_string())
         );
         assert_eq!(
             builtin_string(&[Value::Scalar(7.0)]).expect("string scalar"),
@@ -30933,12 +33749,10 @@ mod tests {
         assert_eq!(
             builtin_compose(&[Value::CharArray("left\\tright".to_string())])
                 .expect("compose literal char escapes"),
-            Value::Cell(CellValue::new(
-                1,
-                1,
-                vec![Value::CharArray("left\tright".to_string())],
+            Value::Cell(
+                CellValue::new(1, 1, vec![Value::CharArray("left\tright".to_string())],)
+                    .expect("compose literal char cell")
             )
-            .expect("compose literal char cell"))
         );
         assert_eq!(
             builtin_compose(&[Value::Matrix(
@@ -31027,11 +33841,8 @@ mod tests {
             Value::String("num=3.141593e+00".to_string())
         );
         assert_eq!(
-            builtin_compose(&[
-                Value::String("code=%s".to_string()),
-                Value::Scalar(65.0),
-            ])
-            .expect("compose integer text conversion"),
+            builtin_compose(&[Value::String("code=%s".to_string()), Value::Scalar(65.0),])
+                .expect("compose integer text conversion"),
             Value::String("code=A".to_string())
         );
         assert_eq!(
@@ -31812,64 +34623,40 @@ mod tests {
             builtin_max(
                 &[
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Logical(true), Value::Logical(false)],
-                        )
-                        .expect("logical lhs"),
+                        MatrixValue::new(1, 2, vec![Value::Logical(true), Value::Logical(false)],)
+                            .expect("logical lhs"),
                     ),
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Logical(false), Value::Logical(true)],
-                        )
-                        .expect("logical rhs"),
+                        MatrixValue::new(1, 2, vec![Value::Logical(false), Value::Logical(true)],)
+                            .expect("logical rhs"),
                     ),
                 ],
                 1,
             )
             .expect("logical elementwise max"),
             vec![Value::Matrix(
-                MatrixValue::new(
-                    1,
-                    2,
-                    vec![Value::Logical(true), Value::Logical(true)],
-                )
-                .expect("logical elementwise max result"),
+                MatrixValue::new(1, 2, vec![Value::Logical(true), Value::Logical(true)],)
+                    .expect("logical elementwise max result"),
             )]
         );
         assert_eq!(
             builtin_min(
                 &[
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Logical(true), Value::Logical(false)],
-                        )
-                        .expect("logical lhs"),
+                        MatrixValue::new(1, 2, vec![Value::Logical(true), Value::Logical(false)],)
+                            .expect("logical lhs"),
                     ),
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Logical(false), Value::Logical(true)],
-                        )
-                        .expect("logical rhs"),
+                        MatrixValue::new(1, 2, vec![Value::Logical(false), Value::Logical(true)],)
+                            .expect("logical rhs"),
                     ),
                 ],
                 1,
             )
             .expect("logical elementwise min"),
             vec![Value::Matrix(
-                MatrixValue::new(
-                    1,
-                    2,
-                    vec![Value::Logical(false), Value::Logical(false)],
-                )
-                .expect("logical elementwise min result"),
+                MatrixValue::new(1, 2, vec![Value::Logical(false), Value::Logical(false)],)
+                    .expect("logical elementwise min result"),
             )]
         );
         assert_eq!(
@@ -31903,7 +34690,12 @@ mod tests {
             ])
             .expect("mean vecdim"),
             Value::Matrix(
-                MatrixValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(3.5)])
+                MatrixValue::with_dimensions(
+                    1,
+                    2,
+                    vec![1, 2, 1],
+                    vec![Value::Scalar(2.0), Value::Scalar(3.5)],
+                )
                     .expect("mean vecdim result"),
             )
         );
@@ -31921,7 +34713,12 @@ mod tests {
             ])
             .expect("prod vecdim"),
             Value::Matrix(
-                MatrixValue::new(1, 2, vec![Value::Scalar(3.0), Value::Scalar(10.0)])
+                MatrixValue::with_dimensions(
+                    1,
+                    2,
+                    vec![1, 2, 1],
+                    vec![Value::Scalar(3.0), Value::Scalar(10.0)],
+                )
                     .expect("prod vecdim result"),
             )
         );
@@ -31947,7 +34744,12 @@ mod tests {
             ])
             .expect("median vecdim"),
             Value::Matrix(
-                MatrixValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(3.5)])
+                MatrixValue::with_dimensions(
+                    1,
+                    2,
+                    vec![1, 2, 1],
+                    vec![Value::Scalar(2.0), Value::Scalar(3.5)],
+                )
                     .expect("median vecdim result"),
             )
         );
@@ -31989,7 +34791,12 @@ mod tests {
             ])
             .expect("mode vecdim"),
             Value::Matrix(
-                MatrixValue::new(1, 2, vec![Value::Scalar(3.0), Value::Scalar(2.0)])
+                MatrixValue::with_dimensions(
+                    1,
+                    2,
+                    vec![1, 2, 1],
+                    vec![Value::Scalar(3.0), Value::Scalar(2.0)],
+                )
                     .expect("mode vecdim result"),
             )
         );
@@ -32048,50 +34855,54 @@ mod tests {
             Value::Scalar(0.0)
         );
         assert_eq!(
-            builtin_sum(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("sum empty"))])
-                .expect("sum empty"),
+            builtin_sum(&[Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("sum empty")
+            )])
+            .expect("sum empty"),
             Value::Scalar(0.0)
         );
         assert_eq!(
-            builtin_prod(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("prod empty"))])
-                .expect("prod empty"),
+            builtin_prod(&[Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("prod empty")
+            )])
+            .expect("prod empty"),
             Value::Scalar(1.0)
         );
-        assert!(
-            builtin_mean(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("mean empty"))])
-                .expect("mean empty")
-                .as_scalar()
-                .expect("mean empty scalar")
-                .is_nan()
-        );
-        assert!(
-            builtin_median(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("median empty"))])
-                .expect("median empty")
-                .as_scalar()
-                .expect("median empty scalar")
-                .is_nan()
-        );
-        assert!(
-            builtin_mode(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("mode empty"))])
-                .expect("mode empty")
-                .as_scalar()
-                .expect("mode empty scalar")
-                .is_nan()
-        );
-        assert!(
-            builtin_var(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("var empty"))])
-                .expect("var empty")
-                .as_scalar()
-                .expect("var empty scalar")
-                .is_nan()
-        );
-        assert!(
-            builtin_std(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("std empty"))])
-                .expect("std empty")
-                .as_scalar()
-                .expect("std empty scalar")
-                .is_nan()
-        );
+        assert!(builtin_mean(&[Value::Matrix(
+            MatrixValue::new(0, 0, Vec::new()).expect("mean empty")
+        )])
+        .expect("mean empty")
+        .as_scalar()
+        .expect("mean empty scalar")
+        .is_nan());
+        assert!(builtin_median(&[Value::Matrix(
+            MatrixValue::new(0, 0, Vec::new()).expect("median empty")
+        )])
+        .expect("median empty")
+        .as_scalar()
+        .expect("median empty scalar")
+        .is_nan());
+        assert!(builtin_mode(&[Value::Matrix(
+            MatrixValue::new(0, 0, Vec::new()).expect("mode empty")
+        )])
+        .expect("mode empty")
+        .as_scalar()
+        .expect("mode empty scalar")
+        .is_nan());
+        assert!(builtin_var(&[Value::Matrix(
+            MatrixValue::new(0, 0, Vec::new()).expect("var empty")
+        )])
+        .expect("var empty")
+        .as_scalar()
+        .expect("var empty scalar")
+        .is_nan());
+        assert!(builtin_std(&[Value::Matrix(
+            MatrixValue::new(0, 0, Vec::new()).expect("std empty")
+        )])
+        .expect("std empty")
+        .as_scalar()
+        .expect("std empty scalar")
+        .is_nan());
         assert_eq!(
             builtin_sum(&[
                 Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("sum 0x3")),
@@ -32157,7 +34968,11 @@ mod tests {
                     MatrixValue::new(
                         1,
                         3,
-                        vec![Value::Scalar(1.0), Value::Scalar(f64::NAN), Value::Scalar(3.0)],
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(f64::NAN),
+                            Value::Scalar(3.0)
+                        ],
                     )
                     .expect("sum omitnan input"),
                 ),
@@ -32172,7 +34987,11 @@ mod tests {
                     MatrixValue::new(
                         1,
                         3,
-                        vec![Value::Scalar(2.0), Value::Scalar(f64::NAN), Value::Scalar(4.0)],
+                        vec![
+                            Value::Scalar(2.0),
+                            Value::Scalar(f64::NAN),
+                            Value::Scalar(4.0)
+                        ],
                     )
                     .expect("prod omitnan input"),
                 ),
@@ -32211,7 +35030,11 @@ mod tests {
                     MatrixValue::new(
                         1,
                         3,
-                        vec![Value::Scalar(1.0), Value::Scalar(f64::NAN), Value::Scalar(3.0)],
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(f64::NAN),
+                            Value::Scalar(3.0)
+                        ],
                     )
                     .expect("median omitnan input"),
                 ),
@@ -32226,7 +35049,11 @@ mod tests {
                     MatrixValue::new(
                         1,
                         3,
-                        vec![Value::Scalar(1.0), Value::Scalar(f64::NAN), Value::Scalar(3.0)],
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(f64::NAN),
+                            Value::Scalar(3.0)
+                        ],
                     )
                     .expect("var omitnan input"),
                 ),
@@ -32265,52 +35092,42 @@ mod tests {
                 .expect("std omitnan dim2 result"),
             )
         );
-        assert!(
-            builtin_mean(&[
-                Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        2,
-                        vec![Value::Scalar(f64::NAN), Value::Scalar(f64::NAN)],
-                    )
+        assert!(builtin_mean(&[
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(f64::NAN), Value::Scalar(f64::NAN)],)
                     .expect("mean all nan input"),
-                ),
-                Value::String("omitnan".to_string()),
-            ])
-            .expect("mean all nan omitnan")
-            .as_scalar()
-            .expect("mean all nan scalar")
-            .is_nan()
-        );
-        assert!(
-            builtin_var(&[
-                Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        2,
-                        vec![Value::Scalar(f64::NAN), Value::Scalar(f64::NAN)],
-                    )
+            ),
+            Value::String("omitnan".to_string()),
+        ])
+        .expect("mean all nan omitnan")
+        .as_scalar()
+        .expect("mean all nan scalar")
+        .is_nan());
+        assert!(builtin_var(&[
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(f64::NAN), Value::Scalar(f64::NAN)],)
                     .expect("var all nan input"),
-                ),
-                Value::Scalar(0.0),
-                Value::String("omitnan".to_string()),
-            ])
-            .expect("var all nan omitnan")
-            .as_scalar()
-            .expect("var all nan scalar")
-            .is_nan()
-        );
-        let range_empty_default =
-            builtin_range(&[Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("range empty 0x3"))])
-                .expect("range empty default");
+            ),
+            Value::Scalar(0.0),
+            Value::String("omitnan".to_string()),
+        ])
+        .expect("var all nan omitnan")
+        .as_scalar()
+        .expect("var all nan scalar")
+        .is_nan());
+        let range_empty_default = builtin_range(&[Value::Matrix(
+            MatrixValue::new(0, 3, Vec::new()).expect("range empty 0x3"),
+        )])
+        .expect("range empty default");
         let Value::Matrix(range_empty_default) = range_empty_default else {
             panic!("expected matrix result for range empty default");
         };
         assert_eq!(range_empty_default.rows, 0);
         assert_eq!(range_empty_default.cols, 3);
-        let range_empty_rows =
-            builtin_range(&[Value::Matrix(MatrixValue::new(3, 0, Vec::new()).expect("range empty 3x0"))])
-                .expect("range empty 3x0 default");
+        let range_empty_rows = builtin_range(&[Value::Matrix(
+            MatrixValue::new(3, 0, Vec::new()).expect("range empty 3x0"),
+        )])
+        .expect("range empty 3x0 default");
         let Value::Matrix(range_empty_rows) = range_empty_rows else {
             panic!("expected matrix result for range empty 3x0 default");
         };
@@ -32326,16 +35143,14 @@ mod tests {
         };
         assert_eq!(range_empty_dim2.rows, 0);
         assert_eq!(range_empty_dim2.cols, 1);
-        assert!(
-            builtin_quantile(&[
-                Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("quantile empty")),
-                Value::Scalar(0.5),
-            ])
-            .expect("quantile empty")
-            .as_scalar()
-            .expect("quantile empty scalar")
-            .is_nan()
-        );
+        assert!(builtin_quantile(&[
+            Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("quantile empty")),
+            Value::Scalar(0.5),
+        ])
+        .expect("quantile empty")
+        .as_scalar()
+        .expect("quantile empty scalar")
+        .is_nan());
         let quantile_empty_cols = builtin_quantile(&[
             Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("quantile empty 0x3")),
             Value::Scalar(0.5),
@@ -32346,10 +35161,10 @@ mod tests {
         };
         assert_eq!(quantile_empty_cols.rows, 1);
         assert_eq!(quantile_empty_cols.cols, 3);
-        assert!(quantile_empty_cols
-            .elements()
-            .iter()
-            .all(|value| value.as_scalar().expect("quantile empty col element").is_nan()));
+        assert!(quantile_empty_cols.elements().iter().all(|value| value
+            .as_scalar()
+            .expect("quantile empty col element")
+            .is_nan()));
         let quantile_empty_rows = builtin_quantile(&[
             Value::Matrix(MatrixValue::new(3, 0, Vec::new()).expect("quantile empty 3x0")),
             Value::Scalar(0.5),
@@ -32360,16 +35175,14 @@ mod tests {
         };
         assert_eq!(quantile_empty_rows.rows, 1);
         assert_eq!(quantile_empty_rows.cols, 0);
-        assert!(
-            builtin_prctile(&[
-                Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("prctile empty")),
-                Value::Scalar(50.0),
-            ])
-            .expect("prctile empty")
-            .as_scalar()
-            .expect("prctile empty scalar")
-            .is_nan()
-        );
+        assert!(builtin_prctile(&[
+            Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("prctile empty")),
+            Value::Scalar(50.0),
+        ])
+        .expect("prctile empty")
+        .as_scalar()
+        .expect("prctile empty scalar")
+        .is_nan());
     }
 
     #[test]
@@ -32738,7 +35551,8 @@ mod tests {
             )]
         );
         assert_eq!(
-            builtin_corrcoef(std::slice::from_ref(&sample_matrix), 2).expect("corrcoef two outputs"),
+            builtin_corrcoef(std::slice::from_ref(&sample_matrix), 2)
+                .expect("corrcoef two outputs"),
             vec![
                 Value::Matrix(
                     MatrixValue::new(
@@ -32854,7 +35668,10 @@ mod tests {
             1,
         )
         .expect("corrcoef rows all");
-        let Value::Matrix(rows_all_corr) = rows_all_corr.into_iter().next().expect("rows all corr output")
+        let Value::Matrix(rows_all_corr) = rows_all_corr
+            .into_iter()
+            .next()
+            .expect("rows all corr output")
         else {
             panic!("expected matrix result for corrcoef rows all");
         };
@@ -32881,7 +35698,10 @@ mod tests {
             1,
         )
         .expect("corrcoef rows complete");
-        let Value::Matrix(complete_corr) = complete_corr.into_iter().next().expect("complete corr output")
+        let Value::Matrix(complete_corr) = complete_corr
+            .into_iter()
+            .next()
+            .expect("complete corr output")
         else {
             panic!("expected matrix result for corrcoef complete");
         };
@@ -32908,7 +35728,10 @@ mod tests {
             1,
         )
         .expect("corrcoef rows pairwise");
-        let Value::Matrix(pairwise_corr) = pairwise_corr.into_iter().next().expect("pairwise corr output")
+        let Value::Matrix(pairwise_corr) = pairwise_corr
+            .into_iter()
+            .next()
+            .expect("pairwise corr output")
         else {
             panic!("expected matrix result for corrcoef pairwise");
         };
@@ -33021,13 +35844,11 @@ mod tests {
                 .expect("partial self diagonal"),
             1.0
         );
-        assert!(
-            partial_self_corr
-                .get(0, 1)
-                .as_scalar()
-                .expect("partial self nan")
-                .is_nan()
-        );
+        assert!(partial_self_corr
+            .get(0, 1)
+            .as_scalar()
+            .expect("partial self nan")
+            .is_nan());
         assert!(
             (partial_self_corr
                 .get(0, 2)
@@ -33044,13 +35865,11 @@ mod tests {
                 .expect("partial self p diagonal"),
             0.0
         );
-        assert!(
-            partial_self_p
-                .get(0, 1)
-                .as_scalar()
-                .expect("partial self p nan")
-                .is_nan()
-        );
+        assert!(partial_self_p
+            .get(0, 1)
+            .as_scalar()
+            .expect("partial self p nan")
+            .is_nan());
         let partial_xy_outputs = builtin_partialcorr(
             &[
                 Value::Matrix(
@@ -33119,7 +35938,11 @@ mod tests {
         };
         assert_eq!(partial_xy_corr.rows, 2);
         assert_eq!(partial_xy_corr.cols, 2);
-        assert!(partial_xy_corr.get(0, 0).as_scalar().expect("partial xy nan").is_nan());
+        assert!(partial_xy_corr
+            .get(0, 0)
+            .as_scalar()
+            .expect("partial xy nan")
+            .is_nan());
         assert!(
             (partial_xy_corr
                 .get(1, 0)
@@ -33138,13 +35961,13 @@ mod tests {
                 .abs()
                 <= 1e-12
         );
-        assert!(
-            builtin_cov(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty cov"))])
-                .expect("empty cov")
-                .as_scalar()
-                .expect("empty cov scalar")
-                .is_nan()
-        );
+        assert!(builtin_cov(&[Value::Matrix(
+            MatrixValue::new(0, 0, Vec::new()).expect("empty cov")
+        )])
+        .expect("empty cov")
+        .as_scalar()
+        .expect("empty cov scalar")
+        .is_nan());
         let empty_pair_cov = builtin_cov(&[
             Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty cov lhs")),
             Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty cov rhs")),
@@ -33187,7 +36010,8 @@ mod tests {
             1,
         )
         .expect("empty paired corr");
-        let Value::Matrix(empty_pair_corr) = empty_pair_corr.into_iter().next().expect("corr output")
+        let Value::Matrix(empty_pair_corr) =
+            empty_pair_corr.into_iter().next().expect("corr output")
         else {
             panic!("expected matrix for empty paired correlation");
         };
@@ -33204,7 +36028,10 @@ mod tests {
             1,
         )
         .expect("empty row corrcoef");
-        let Value::Matrix(empty_row_corr) = empty_row_corr.into_iter().next().expect("empty row corr output")
+        let Value::Matrix(empty_row_corr) = empty_row_corr
+            .into_iter()
+            .next()
+            .expect("empty row corr output")
         else {
             panic!("expected matrix for empty row correlation");
         };
@@ -33297,11 +36124,10 @@ mod tests {
                 .expect("includenan covariance first variance"),
             0.5
         ));
-        assert!(includenan_cov
-            .elements()
-            .iter()
-            .skip(1)
-            .all(|value| value.as_scalar().expect("includenan covariance nan element").is_nan()));
+        assert!(includenan_cov.elements().iter().skip(1).all(|value| value
+            .as_scalar()
+            .expect("includenan covariance nan element")
+            .is_nan()));
         let partialrows_cov = builtin_cov(&[
             Value::Matrix(
                 MatrixValue::new(
@@ -33345,7 +36171,10 @@ mod tests {
             1.7951284891666666,
         ];
         for (actual, expected) in partialrows_cov.iter().zip(expected_partialrows) {
-            assert!((actual.as_scalar().expect("partialrows covariance element") - expected).abs() <= 1e-12);
+            assert!(
+                (actual.as_scalar().expect("partialrows covariance element") - expected).abs()
+                    <= 1e-12
+            );
         }
 
         let vector_cov = builtin_cov(&[Value::Matrix(
@@ -33581,9 +36410,10 @@ mod tests {
             ])
             .expect("vecdim quantiles"),
             Value::Matrix(
-                MatrixValue::new(
+                MatrixValue::with_dimensions(
                     3,
                     2,
+                    vec![3, 2, 1],
                     vec![
                         Value::Scalar(1.5),
                         Value::Scalar(2.75),
@@ -34204,11 +37034,15 @@ mod tests {
         assert_eq!(cube_default_quartiles.dims(), &[2, 2, 3]);
         assert_eq!(cube_default_quartiles.elements().len(), 12);
         assert_eq!(
-            cube_default_quartiles.elements()[0].as_scalar().expect("q0"),
+            cube_default_quartiles.elements()[0]
+                .as_scalar()
+                .expect("q0"),
             1.0
         );
         assert_eq!(
-            cube_default_quartiles.elements()[11].as_scalar().expect("q11"),
+            cube_default_quartiles.elements()[11]
+                .as_scalar()
+                .expect("q11"),
             12.0
         );
         let cube_dim3_iqr = builtin_iqr(&[cube, Value::Scalar(3.0)], 2).expect("cube dim3 iqr");
@@ -34226,11 +37060,15 @@ mod tests {
         assert_eq!(cube_dim3_quartiles.dims(), &[2, 2, 2]);
         assert_eq!(cube_dim3_quartiles.elements().len(), 8);
         assert_eq!(
-            cube_dim3_quartiles.elements()[0].as_scalar().expect("cube dim3 q0"),
+            cube_dim3_quartiles.elements()[0]
+                .as_scalar()
+                .expect("cube dim3 q0"),
             2.0
         );
         assert_eq!(
-            cube_dim3_quartiles.elements()[7].as_scalar().expect("cube dim3 q7"),
+            cube_dim3_quartiles.elements()[7]
+                .as_scalar()
+                .expect("cube dim3 q7"),
             11.0
         );
         assert_eq!(
@@ -34406,7 +37244,9 @@ mod tests {
         assert!(nan_z.values[5].is_nan());
 
         let empty_default_outputs = builtin_zscore(
-            &[Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("empty zscore matrix"))],
+            &[Value::Matrix(
+                MatrixValue::new(0, 3, Vec::new()).expect("empty zscore matrix"),
+            )],
             3,
         )
         .expect("empty default zscore");
@@ -34414,8 +37254,9 @@ mod tests {
             numeric_operand(&empty_default_outputs[0], "empty default zscore").expect("empty z");
         let empty_default_mu =
             numeric_operand(&empty_default_outputs[1], "empty default zscore").expect("empty mu");
-        let empty_default_sigma = numeric_operand(&empty_default_outputs[2], "empty default zscore")
-            .expect("empty sigma");
+        let empty_default_sigma =
+            numeric_operand(&empty_default_outputs[2], "empty default zscore")
+                .expect("empty sigma");
         assert_eq!(empty_default_z.rows, 0);
         assert_eq!(empty_default_z.cols, 3);
         assert_eq!(empty_default_mu.rows, 1);
@@ -34423,7 +37264,10 @@ mod tests {
         assert!(empty_default_mu.values.iter().all(|value| value.is_nan()));
         assert_eq!(empty_default_sigma.rows, 1);
         assert_eq!(empty_default_sigma.cols, 3);
-        assert!(empty_default_sigma.values.iter().all(|value| value.is_nan()));
+        assert!(empty_default_sigma
+            .values
+            .iter()
+            .all(|value| value.is_nan()));
 
         let empty_dim2_outputs = builtin_zscore(
             &[
@@ -34438,8 +37282,8 @@ mod tests {
             numeric_operand(&empty_dim2_outputs[0], "empty dim2 zscore").expect("empty dim2 z");
         let empty_dim2_mu =
             numeric_operand(&empty_dim2_outputs[1], "empty dim2 zscore").expect("empty dim2 mu");
-        let empty_dim2_sigma = numeric_operand(&empty_dim2_outputs[2], "empty dim2 zscore")
-            .expect("empty dim2 sigma");
+        let empty_dim2_sigma =
+            numeric_operand(&empty_dim2_outputs[2], "empty dim2 zscore").expect("empty dim2 sigma");
         assert_eq!(empty_dim2_z.rows, 3);
         assert_eq!(empty_dim2_z.cols, 0);
         assert_eq!(empty_dim2_mu.rows, 3);
@@ -34571,8 +37415,14 @@ mod tests {
                     1,
                     2,
                     vec![
-                        Value::Complex(ComplexValue { real: 0.0, imag: 1.0 }),
-                        Value::Complex(ComplexValue { real: 2.0, imag: 0.0 }),
+                        Value::Complex(ComplexValue {
+                            real: 0.0,
+                            imag: 1.0
+                        }),
+                        Value::Complex(ComplexValue {
+                            real: 2.0,
+                            imag: 0.0
+                        }),
                     ],
                 )
                 .expect("complex nnz"),
@@ -34607,28 +37457,37 @@ mod tests {
             )
         );
         assert_eq!(
-            builtin_find(&[Value::Complex(ComplexValue { real: 0.0, imag: 2.0 })], 1)
-                .expect("find complex scalar")
-                .into_iter()
-                .next()
-                .expect("find complex scalar output"),
+            builtin_find(
+                &[Value::Complex(ComplexValue {
+                    real: 0.0,
+                    imag: 2.0
+                })],
+                1
+            )
+            .expect("find complex scalar")
+            .into_iter()
+            .next()
+            .expect("find complex scalar output"),
             Value::Scalar(1.0)
         );
         assert_eq!(
             builtin_find(
-                &[Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        4,
-                        vec![
-                            Value::Scalar(1.0),
-                            Value::Scalar(0.0),
-                            Value::Scalar(2.0),
-                            Value::Scalar(3.0),
-                        ],
-                    )
-                    .expect("row find matrix"),
-                ), Value::Scalar(2.0)],
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            4,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                            ],
+                        )
+                        .expect("row find matrix"),
+                    ),
+                    Value::Scalar(2.0)
+                ],
                 1,
             )
             .expect("find row first")
@@ -34642,19 +37501,23 @@ mod tests {
         );
         assert_eq!(
             builtin_find(
-                &[Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        4,
-                        vec![
-                            Value::Scalar(1.0),
-                            Value::Scalar(0.0),
-                            Value::Scalar(2.0),
-                            Value::Scalar(3.0),
-                        ],
-                    )
-                    .expect("row find matrix"),
-                ), Value::Scalar(2.0), Value::String("last".to_string())],
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            4,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                            ],
+                        )
+                        .expect("row find matrix"),
+                    ),
+                    Value::Scalar(2.0),
+                    Value::String("last".to_string())
+                ],
                 1,
             )
             .expect("find row last")
@@ -34712,7 +37575,9 @@ mod tests {
                 1,
             )
             .expect("find empty row"),
-            vec![Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("empty row result"))]
+            vec![Value::Matrix(
+                MatrixValue::new(1, 0, Vec::new()).expect("empty row result")
+            )]
         );
         assert_eq!(
             builtin_find(
@@ -34727,12 +37592,21 @@ mod tests {
                 1,
             )
             .expect("find empty col"),
-            vec![Value::Matrix(MatrixValue::new(0, 1, Vec::new()).expect("empty col result"))]
+            vec![Value::Matrix(
+                MatrixValue::new(0, 1, Vec::new()).expect("empty col result")
+            )]
         );
         assert_eq!(
-            builtin_find(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty"))], 1)
-                .expect("find empty matrix"),
-            vec![Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty matrix result"))]
+            builtin_find(
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty")
+                )],
+                1
+            )
+            .expect("find empty matrix"),
+            vec![Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty matrix result")
+            )]
         );
         assert_eq!(
             builtin_find(
@@ -34777,8 +37651,8 @@ mod tests {
                         1,
                         vec![
                             Value::Scalar(1.0),
-                            Value::Scalar(2.0),
                             Value::Scalar(3.0),
+                            Value::Scalar(2.0),
                             Value::Scalar(4.0),
                         ],
                     )
@@ -34790,8 +37664,8 @@ mod tests {
                         1,
                         vec![
                             Value::Scalar(1.0),
-                            Value::Scalar(3.0),
                             Value::Scalar(4.0),
+                            Value::Scalar(3.0),
                             Value::Scalar(2.0),
                         ],
                     )
@@ -34809,16 +37683,28 @@ mod tests {
         );
         assert_eq!(
             builtin_isequal(&[
-                Value::Complex(ComplexValue { real: 1.0, imag: 2.0 }),
-                Value::Complex(ComplexValue { real: 1.0, imag: 2.0 }),
+                Value::Complex(ComplexValue {
+                    real: 1.0,
+                    imag: 2.0
+                }),
+                Value::Complex(ComplexValue {
+                    real: 1.0,
+                    imag: 2.0
+                }),
             ])
             .expect("isequal complex true"),
             Value::Logical(true)
         );
         assert_eq!(
             builtin_isequal(&[
-                Value::Complex(ComplexValue { real: 1.0, imag: 2.0 }),
-                Value::Complex(ComplexValue { real: 1.0, imag: -2.0 }),
+                Value::Complex(ComplexValue {
+                    real: 1.0,
+                    imag: 2.0
+                }),
+                Value::Complex(ComplexValue {
+                    real: 1.0,
+                    imag: -2.0
+                }),
             ])
             .expect("isequal complex false"),
             Value::Logical(false)
@@ -34883,11 +37769,7 @@ mod tests {
                         MatrixValue::new(
                             1,
                             3,
-                            vec![
-                                Value::Scalar(2.0),
-                                Value::Scalar(4.0),
-                                Value::Scalar(7.0),
-                            ],
+                            vec![Value::Scalar(2.0), Value::Scalar(4.0), Value::Scalar(7.0),],
                         )
                         .expect("ismember nd rhs"),
                     ),
@@ -35717,12 +38599,8 @@ mod tests {
                         .expect("rows setdiff lhs"),
                     ),
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Scalar(3.0), Value::Scalar(1.0)],
-                        )
-                        .expect("rows setdiff rhs"),
+                        MatrixValue::new(1, 2, vec![Value::Scalar(3.0), Value::Scalar(1.0)],)
+                            .expect("rows setdiff rhs"),
                     ),
                     Value::String("rows".to_string()),
                     Value::String("stable".to_string()),
@@ -35971,12 +38849,8 @@ mod tests {
                         .expect("logical union lhs"),
                     ),
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Logical(false), Value::Logical(false)],
-                        )
-                        .expect("logical union rhs"),
+                        MatrixValue::new(1, 2, vec![Value::Logical(false), Value::Logical(false)],)
+                            .expect("logical union rhs"),
                     ),
                     Value::String("stable".to_string()),
                 ],
@@ -35985,12 +38859,8 @@ mod tests {
             .expect("logical union stable two outputs"),
             vec![
                 Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        2,
-                        vec![Value::Logical(true), Value::Logical(false)],
-                    )
-                    .expect("logical union values"),
+                    MatrixValue::new(1, 2, vec![Value::Logical(true), Value::Logical(false)],)
+                        .expect("logical union values"),
                 ),
                 Value::Matrix(
                     MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
@@ -36014,12 +38884,8 @@ mod tests {
                         .expect("logical intersect lhs"),
                     ),
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Logical(false), Value::Logical(true)],
-                        )
-                        .expect("logical intersect rhs"),
+                        MatrixValue::new(1, 2, vec![Value::Logical(false), Value::Logical(true)],)
+                            .expect("logical intersect rhs"),
                     ),
                     Value::String("stable".to_string()),
                 ],
@@ -36028,12 +38894,8 @@ mod tests {
             .expect("logical intersect stable"),
             vec![
                 Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        2,
-                        vec![Value::Logical(true), Value::Logical(false)],
-                    )
-                    .expect("logical intersect values"),
+                    MatrixValue::new(1, 2, vec![Value::Logical(true), Value::Logical(false)],)
+                        .expect("logical intersect values"),
                 ),
                 Value::Matrix(
                     MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
@@ -36061,12 +38923,8 @@ mod tests {
                         .expect("logical setdiff lhs"),
                     ),
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Logical(false), Value::Logical(false)],
-                        )
-                        .expect("logical setdiff rhs"),
+                        MatrixValue::new(1, 2, vec![Value::Logical(false), Value::Logical(false)],)
+                            .expect("logical setdiff rhs"),
                     ),
                     Value::String("stable".to_string()),
                 ],
@@ -36079,27 +38937,23 @@ mod tests {
             builtin_setxor(
                 &[
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Logical(true), Value::Logical(false)],
-                        )
-                        .expect("logical setxor lhs"),
+                        MatrixValue::new(1, 2, vec![Value::Logical(true), Value::Logical(false)],)
+                            .expect("logical setxor lhs"),
                     ),
                     Value::Matrix(
-                        MatrixValue::new(
-                            1,
-                            2,
-                            vec![Value::Logical(false), Value::Logical(false)],
-                        )
-                        .expect("logical setxor rhs"),
+                        MatrixValue::new(1, 2, vec![Value::Logical(false), Value::Logical(false)],)
+                            .expect("logical setxor rhs"),
                     ),
                     Value::String("stable".to_string()),
                 ],
                 3,
             )
             .expect("logical setxor stable"),
-            vec![Value::Logical(true), Value::Scalar(1.0), Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty ib"))]
+            vec![
+                Value::Logical(true),
+                Value::Scalar(1.0),
+                Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty ib"))
+            ]
         );
         assert_eq!(
             builtin_unique(
@@ -36123,12 +38977,8 @@ mod tests {
             .expect("logical unique stable"),
             vec![
                 Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        2,
-                        vec![Value::Logical(true), Value::Logical(false)],
-                    )
-                    .expect("logical unique values"),
+                    MatrixValue::new(1, 2, vec![Value::Logical(true), Value::Logical(false)],)
+                        .expect("logical unique values"),
                 ),
                 Value::Matrix(
                     MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
@@ -36678,16 +39528,22 @@ mod tests {
                 ),
             ]
         );
-        let iqr_empty =
-            builtin_iqr(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("iqr empty"))], 1)
-                .expect("iqr empty");
+        let iqr_empty = builtin_iqr(
+            &[Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("iqr empty"),
+            )],
+            1,
+        )
+        .expect("iqr empty");
         let Value::Matrix(iqr_empty) = &iqr_empty[0] else {
             panic!("expected matrix result for iqr empty");
         };
         assert_eq!(iqr_empty.rows, 1);
         assert_eq!(iqr_empty.cols, 0);
         let iqr_empty_cols = builtin_iqr(
-            &[Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("iqr empty 0x3"))],
+            &[Value::Matrix(
+                MatrixValue::new(0, 3, Vec::new()).expect("iqr empty 0x3"),
+            )],
             2,
         )
         .expect("iqr empty 0x3");
@@ -36705,12 +39561,14 @@ mod tests {
         };
         assert_eq!(iqr_empty_cols_quartiles.rows, 2);
         assert_eq!(iqr_empty_cols_quartiles.cols, 3);
-        assert!(iqr_empty_cols_quartiles
-            .elements()
-            .iter()
-            .all(|value| value.as_scalar().expect("iqr empty quartile element").is_nan()));
+        assert!(iqr_empty_cols_quartiles.elements().iter().all(|value| value
+            .as_scalar()
+            .expect("iqr empty quartile element")
+            .is_nan()));
         let iqr_empty_rows = builtin_iqr(
-            &[Value::Matrix(MatrixValue::new(3, 0, Vec::new()).expect("iqr empty 3x0"))],
+            &[Value::Matrix(
+                MatrixValue::new(3, 0, Vec::new()).expect("iqr empty 3x0"),
+            )],
             2,
         )
         .expect("iqr empty 3x0");
@@ -36917,11 +39775,37 @@ mod tests {
         let Value::Matrix(sort_missing_first_values) = &sort_missing_first[0] else {
             panic!("expected sorted matrix for missing-first sort");
         };
-        assert!(sort_missing_first_values.get(0, 0).as_scalar().expect("missing-first nan 1").is_nan());
-        assert!(sort_missing_first_values.get(0, 1).as_scalar().expect("missing-first nan 2").is_nan());
-        assert_eq!(sort_missing_first_values.get(0, 2).as_scalar().expect("missing-first one"), 1.0);
-        assert_eq!(sort_missing_first_values.get(0, 3).as_scalar().expect("missing-first two"), 2.0);
-        assert_eq!(sort_missing_first_values.get(0, 4).as_scalar().expect("missing-first three"), 3.0);
+        assert!(sort_missing_first_values
+            .get(0, 0)
+            .as_scalar()
+            .expect("missing-first nan 1")
+            .is_nan());
+        assert!(sort_missing_first_values
+            .get(0, 1)
+            .as_scalar()
+            .expect("missing-first nan 2")
+            .is_nan());
+        assert_eq!(
+            sort_missing_first_values
+                .get(0, 2)
+                .as_scalar()
+                .expect("missing-first one"),
+            1.0
+        );
+        assert_eq!(
+            sort_missing_first_values
+                .get(0, 3)
+                .as_scalar()
+                .expect("missing-first two"),
+            2.0
+        );
+        assert_eq!(
+            sort_missing_first_values
+                .get(0, 4)
+                .as_scalar()
+                .expect("missing-first three"),
+            3.0
+        );
         assert_eq!(
             sort_missing_first[1],
             Value::Matrix(
@@ -36974,20 +39858,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3.0, 2.0, 1.0]
         );
-        assert!(
-            sort_missing_last_desc_values
-                .get(0, 3)
-                .as_scalar()
-                .expect("missing-last descend nan 1")
-                .is_nan()
-        );
-        assert!(
-            sort_missing_last_desc_values
-                .get(0, 4)
-                .as_scalar()
-                .expect("missing-last descend nan 2")
-                .is_nan()
-        );
+        assert!(sort_missing_last_desc_values
+            .get(0, 3)
+            .as_scalar()
+            .expect("missing-last descend nan 1")
+            .is_nan());
+        assert!(sort_missing_last_desc_values
+            .get(0, 4)
+            .as_scalar()
+            .expect("missing-last descend nan 2")
+            .is_nan());
         assert_eq!(
             sort_missing_last_desc[1],
             Value::Matrix(
@@ -37032,12 +39912,44 @@ mod tests {
         let Value::Matrix(sort_dim2_missing_first_values) = &sort_dim2_missing_first[0] else {
             panic!("expected sorted matrix for dim2 missing-first sort");
         };
-        assert!(sort_dim2_missing_first_values.get(0, 0).as_scalar().expect("dim2 missing-first r1c1").is_nan());
-        assert_eq!(sort_dim2_missing_first_values.get(0, 1).as_scalar().expect("dim2 missing-first r1c2"), 1.0);
-        assert_eq!(sort_dim2_missing_first_values.get(0, 2).as_scalar().expect("dim2 missing-first r1c3"), 2.0);
-        assert!(sort_dim2_missing_first_values.get(1, 0).as_scalar().expect("dim2 missing-first r2c1").is_nan());
-        assert_eq!(sort_dim2_missing_first_values.get(1, 1).as_scalar().expect("dim2 missing-first r2c2"), 0.0);
-        assert_eq!(sort_dim2_missing_first_values.get(1, 2).as_scalar().expect("dim2 missing-first r2c3"), 3.0);
+        assert!(sort_dim2_missing_first_values
+            .get(0, 0)
+            .as_scalar()
+            .expect("dim2 missing-first r1c1")
+            .is_nan());
+        assert_eq!(
+            sort_dim2_missing_first_values
+                .get(0, 1)
+                .as_scalar()
+                .expect("dim2 missing-first r1c2"),
+            1.0
+        );
+        assert_eq!(
+            sort_dim2_missing_first_values
+                .get(0, 2)
+                .as_scalar()
+                .expect("dim2 missing-first r1c3"),
+            2.0
+        );
+        assert!(sort_dim2_missing_first_values
+            .get(1, 0)
+            .as_scalar()
+            .expect("dim2 missing-first r2c1")
+            .is_nan());
+        assert_eq!(
+            sort_dim2_missing_first_values
+                .get(1, 1)
+                .as_scalar()
+                .expect("dim2 missing-first r2c2"),
+            0.0
+        );
+        assert_eq!(
+            sort_dim2_missing_first_values
+                .get(1, 2)
+                .as_scalar()
+                .expect("dim2 missing-first r2c3"),
+            3.0
+        );
         assert_eq!(
             sort_dim2_missing_first[1],
             Value::Matrix(
@@ -37367,13 +40279,11 @@ mod tests {
         let Value::Matrix(sortrows_missing_first_values) = &sortrows_missing_first[0] else {
             panic!("expected matrix result for sortrows missing first");
         };
-        assert!(
-            sortrows_missing_first_values
-                .get(0, 0)
-                .as_scalar()
-                .expect("sortrows missing first r1c1")
-                .is_nan()
-        );
+        assert!(sortrows_missing_first_values
+            .get(0, 0)
+            .as_scalar()
+            .expect("sortrows missing first r1c1")
+            .is_nan());
         assert_eq!(
             sortrows_missing_first_values
                 .get(0, 1)
@@ -37388,13 +40298,11 @@ mod tests {
                 .expect("sortrows missing first r2c1"),
             1.0
         );
-        assert!(
-            sortrows_missing_first_values
-                .get(1, 1)
-                .as_scalar()
-                .expect("sortrows missing first r2c2")
-                .is_nan()
-        );
+        assert!(sortrows_missing_first_values
+            .get(1, 1)
+            .as_scalar()
+            .expect("sortrows missing first r2c2")
+            .is_nan());
         assert_eq!(
             sortrows_missing_first_values
                 .get(2, 0)
@@ -37465,7 +40373,8 @@ mod tests {
             2,
         )
         .expect("sortrows missing last descend");
-        let Value::Matrix(sortrows_missing_last_desc_values) = &sortrows_missing_last_desc[0] else {
+        let Value::Matrix(sortrows_missing_last_desc_values) = &sortrows_missing_last_desc[0]
+        else {
             panic!("expected matrix result for sortrows missing last descend");
         };
         assert_eq!(
@@ -37503,20 +40412,16 @@ mod tests {
                 .expect("sortrows missing last descend r3c1"),
             1.0
         );
-        assert!(
-            sortrows_missing_last_desc_values
-                .get(2, 1)
-                .as_scalar()
-                .expect("sortrows missing last descend r3c2")
-                .is_nan()
-        );
-        assert!(
-            sortrows_missing_last_desc_values
-                .get(3, 0)
-                .as_scalar()
-                .expect("sortrows missing last descend r4c1")
-                .is_nan()
-        );
+        assert!(sortrows_missing_last_desc_values
+            .get(2, 1)
+            .as_scalar()
+            .expect("sortrows missing last descend r3c2")
+            .is_nan());
+        assert!(sortrows_missing_last_desc_values
+            .get(3, 0)
+            .as_scalar()
+            .expect("sortrows missing last descend r4c1")
+            .is_nan());
         assert_eq!(
             sortrows_missing_last_desc_values
                 .get(3, 1)
@@ -37581,47 +40486,39 @@ mod tests {
             ]
         );
         assert_eq!(
-            builtin_maxk(
-                &[Value::Logical(true), Value::Scalar(1.0)],
-                2,
-            )
-            .expect("maxk logical scalar"),
+            builtin_maxk(&[Value::Logical(true), Value::Scalar(1.0)], 2,)
+                .expect("maxk logical scalar"),
             vec![Value::Logical(true), Value::Scalar(1.0)]
         );
         assert_eq!(
             builtin_mink(
-                &[Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        4,
-                        vec![
-                            Value::Logical(true),
-                            Value::Logical(false),
-                            Value::Logical(true),
-                            Value::Logical(false),
-                        ],
-                    )
-                    .expect("logical row"),
-                ), Value::Scalar(2.0)],
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            4,
+                            vec![
+                                Value::Logical(true),
+                                Value::Logical(false),
+                                Value::Logical(true),
+                                Value::Logical(false),
+                            ],
+                        )
+                        .expect("logical row"),
+                    ),
+                    Value::Scalar(2.0)
+                ],
                 2,
             )
             .expect("mink logical"),
             vec![
                 Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        2,
-                        vec![Value::Logical(false), Value::Logical(false)],
-                    )
-                    .expect("mink logical values"),
+                    MatrixValue::new(1, 2, vec![Value::Logical(false), Value::Logical(false)],)
+                        .expect("mink logical values"),
                 ),
                 Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        2,
-                        vec![Value::Scalar(2.0), Value::Scalar(4.0)],
-                    )
-                    .expect("mink logical indices"),
+                    MatrixValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(4.0)],)
+                        .expect("mink logical indices"),
                 ),
             ]
         );
@@ -37815,11 +40712,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            builtin_bounds(
-                &[matrix.clone(), Value::String("all".to_string())],
-                2,
-            )
-            .expect("bounds all outputs"),
+            builtin_bounds(&[matrix.clone(), Value::String("all".to_string())], 2,)
+                .expect("bounds all outputs"),
             vec![Value::Scalar(1.0), Value::Scalar(5.0)]
         );
         let empty_rows = Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("empty rows"));
@@ -37888,33 +40782,52 @@ mod tests {
         let Value::Matrix(nan_upper) = &nan_outputs[1] else {
             panic!("bounds nan include upper should be matrix");
         };
-        assert!(nan_lower.get(0, 0).as_scalar().expect("nan lower first").is_nan());
-        assert!(nan_lower.get(0, 1).as_scalar().expect("nan lower second").is_nan());
-        assert!(nan_upper.get(0, 0).as_scalar().expect("nan upper first").is_nan());
-        assert!(nan_upper.get(0, 1).as_scalar().expect("nan upper second").is_nan());
+        assert!(nan_lower
+            .get(0, 0)
+            .as_scalar()
+            .expect("nan lower first")
+            .is_nan());
+        assert!(nan_lower
+            .get(0, 1)
+            .as_scalar()
+            .expect("nan lower second")
+            .is_nan());
+        assert!(nan_upper
+            .get(0, 0)
+            .as_scalar()
+            .expect("nan upper first")
+            .is_nan());
+        assert!(nan_upper
+            .get(0, 1)
+            .as_scalar()
+            .expect("nan upper second")
+            .is_nan());
         assert_eq!(
             builtin_bounds(
-                &[Value::Matrix(
-                    MatrixValue::with_dimensions(
-                        2,
-                        4,
-                        vec![2, 2, 2],
-                        vec![
-                            Value::Scalar(3.0),
-                            Value::Scalar(8.0),
-                            Value::Scalar(4.0),
-                            Value::Scalar(7.0),
-                            Value::Scalar(1.0),
-                            Value::Scalar(5.0),
-                            Value::Scalar(2.0),
-                            Value::Scalar(6.0),
-                        ],
+                &[
+                    Value::Matrix(
+                        MatrixValue::with_dimensions(
+                            2,
+                            4,
+                            vec![2, 2, 2],
+                            vec![
+                                Value::Scalar(3.0),
+                                Value::Scalar(8.0),
+                                Value::Scalar(4.0),
+                                Value::Scalar(7.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(5.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(6.0),
+                            ],
+                        )
+                        .expect("bounds cube"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                            .expect("vecdim"),
                     )
-                    .expect("bounds cube"),
-                ), Value::Matrix(
-                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
-                        .expect("vecdim"),
-                )],
+                ],
                 2,
             )
             .expect("bounds vecdim outputs"),
@@ -38735,12 +41648,8 @@ mod tests {
                     .expect("text sortrows values"),
                 ),
                 Value::Matrix(
-                    MatrixValue::new(
-                        2,
-                        1,
-                        vec![Value::Scalar(2.0), Value::Scalar(1.0)],
-                    )
-                    .expect("text sortrows indices"),
+                    MatrixValue::new(2, 1, vec![Value::Scalar(2.0), Value::Scalar(1.0)],)
+                        .expect("text sortrows indices"),
                 ),
             ]
         );
@@ -40292,9 +43201,16 @@ mod tests {
             )]
         );
         assert_eq!(
-            builtin_qr(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty qr"))], 1)
-                .expect("empty qr one output"),
-            vec![Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty qr r"))]
+            builtin_qr(
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty qr")
+                )],
+                1
+            )
+            .expect("empty qr one output"),
+            vec![Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty qr r")
+            )]
         );
         assert_eq!(
             builtin_qr(
@@ -40361,7 +43277,9 @@ mod tests {
         );
         assert_eq!(
             builtin_qr(
-                &[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty qr factors"))],
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty qr factors")
+                )],
                 2,
             )
             .expect("empty qr two outputs"),
@@ -40509,7 +43427,9 @@ mod tests {
         );
         assert_eq!(
             builtin_qr(
-                &[Value::Matrix(MatrixValue::new(3, 0, Vec::new()).expect("tall empty qr"))],
+                &[Value::Matrix(
+                    MatrixValue::new(3, 0, Vec::new()).expect("tall empty qr")
+                )],
                 2,
             )
             .expect("tall empty qr factors"),
@@ -41158,9 +44078,16 @@ mod tests {
             ]
         );
         assert_eq!(
-            builtin_eig(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty eig"))], 1)
-                .expect("empty eig vector output"),
-            vec![Value::Matrix(MatrixValue::new(0, 1, Vec::new()).expect("empty eig values"))]
+            builtin_eig(
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty eig")
+                )],
+                1
+            )
+            .expect("empty eig vector output"),
+            vec![Value::Matrix(
+                MatrixValue::new(0, 1, Vec::new()).expect("empty eig values")
+            )]
         );
         assert_eq!(
             builtin_eig(
@@ -41171,11 +44098,18 @@ mod tests {
                 1,
             )
             .expect("empty eig matrix output"),
-            vec![Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty eig diagonal"))]
+            vec![Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty eig diagonal")
+            )]
         );
         assert_eq!(
-            builtin_eig(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty eig vectors"))], 2)
-                .expect("empty eig two outputs"),
+            builtin_eig(
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty eig vectors")
+                )],
+                2
+            )
+            .expect("empty eig two outputs"),
             vec![
                 Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty eig right vectors")),
                 Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty eig values matrix")),
@@ -41534,15 +44468,21 @@ mod tests {
         );
         assert_eq!(
             builtin_sqrtm(
-                &[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty sqrtm"))],
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty sqrtm")
+                )],
                 1,
             )
             .expect("empty sqrtm one output"),
-            vec![Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty sqrtm result"))]
+            vec![Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty sqrtm result")
+            )]
         );
         assert_eq!(
             builtin_sqrtm(
-                &[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty sqrtm residual"))],
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty sqrtm residual")
+                )],
                 2,
             )
             .expect("empty sqrtm two outputs"),
@@ -41557,11 +44497,15 @@ mod tests {
     fn svd_supports_empty_matrix_outputs() {
         assert_eq!(
             builtin_svd(
-                &[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty svd"))],
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty svd")
+                )],
                 1,
             )
             .expect("empty svd one output"),
-            vec![Value::Matrix(MatrixValue::new(0, 1, Vec::new()).expect("empty svd vector"))]
+            vec![Value::Matrix(
+                MatrixValue::new(0, 1, Vec::new()).expect("empty svd vector")
+            )]
         );
         assert_eq!(
             builtin_svd(
@@ -41572,7 +44516,9 @@ mod tests {
                 1,
             )
             .expect("empty svd matrix output"),
-            vec![Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty svd matrix"))]
+            vec![Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty svd matrix")
+            )]
         );
         assert_eq!(
             builtin_svd(
@@ -41762,15 +44708,21 @@ mod tests {
         );
         assert_eq!(
             builtin_logm(
-                &[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty logm"))],
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty logm")
+                )],
                 1,
             )
             .expect("empty logm one output"),
-            vec![Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty logm result"))]
+            vec![Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty logm result")
+            )]
         );
         assert_eq!(
             builtin_logm(
-                &[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty logm residual"))],
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty logm residual")
+                )],
                 2,
             )
             .expect("empty logm two outputs"),
@@ -41941,7 +44893,9 @@ mod tests {
                 1,
             )
             .expect("empty funm sqrt"),
-            vec![Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty funm sqrt result"))]
+            vec![Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty funm sqrt result")
+            )]
         );
         assert_eq!(
             builtin_funm(
@@ -44715,15 +47669,21 @@ mod tests {
         );
         assert_eq!(
             builtin_chol(
-                &[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty chol"))],
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty chol")
+                )],
                 1,
             )
             .expect("empty chol one output"),
-            vec![Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty chol matrix"))]
+            vec![Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty chol matrix")
+            )]
         );
         assert_eq!(
             builtin_chol(
-                &[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty chol flag"))],
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty chol flag")
+                )],
                 2,
             )
             .expect("empty chol two outputs"),
@@ -44911,7 +47871,9 @@ mod tests {
         );
         assert_eq!(
             builtin_ldl(
-                &[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty ldl"))],
+                &[Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty ldl")
+                )],
                 2,
             )
             .expect("empty ldl two outputs"),
@@ -44932,7 +47894,9 @@ mod tests {
             vec![
                 Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty ldl vector l")),
                 Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty ldl vector d")),
-                Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("empty ldl permutation vector")),
+                Value::Matrix(
+                    MatrixValue::new(1, 0, Vec::new()).expect("empty ldl permutation vector")
+                ),
             ]
         );
     }
@@ -45158,10 +48122,9 @@ mod tests {
                         )
                         .expect("rectangular rhs"),
                     ),
-                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                            "RECT".to_string(),
-                            Value::Logical(true),
-                        )]))),
+                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                        [("RECT".to_string(), Value::Logical(true),)]
+                    ))),
                 ],
                 2,
             )
@@ -45194,10 +48157,9 @@ mod tests {
                         MatrixValue::new(2, 1, vec![Value::Scalar(4.0), Value::Scalar(11.0)])
                             .expect("lower rhs"),
                     ),
-                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                            "LT".to_string(),
-                            Value::Logical(true),
-                        )]))),
+                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                        [("LT".to_string(), Value::Logical(true),)]
+                    ))),
                 ],
                 1,
             )
@@ -45227,10 +48189,9 @@ mod tests {
                         MatrixValue::new(2, 1, vec![Value::Scalar(8.0), Value::Scalar(20.0)])
                             .expect("upper rhs"),
                     ),
-                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                            "UT".to_string(),
-                            Value::Logical(true),
-                        )]))),
+                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                        [("UT".to_string(), Value::Logical(true),)]
+                    ))),
                 ],
                 1,
             )
@@ -45260,10 +48221,9 @@ mod tests {
                         MatrixValue::new(2, 1, vec![Value::Scalar(6.0), Value::Scalar(8.0)])
                             .expect("transa rhs"),
                     ),
-                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                            "TRANSA".to_string(),
-                            Value::Logical(true),
-                        )]))),
+                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                        [("TRANSA".to_string(), Value::Logical(true),)]
+                    ))),
                 ],
                 1,
             )
@@ -45293,10 +48253,9 @@ mod tests {
                         MatrixValue::new(2, 1, vec![Value::Scalar(6.0), Value::Scalar(7.0)])
                             .expect("posdef rhs"),
                     ),
-                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                            "POSDEF".to_string(),
-                            Value::Logical(true),
-                        )]))),
+                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                        [("POSDEF".to_string(), Value::Logical(true),)]
+                    ))),
                 ],
                 1,
             )
@@ -45342,10 +48301,9 @@ mod tests {
                         )
                         .expect("complex rhs"),
                     ),
-                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                            "LT".to_string(),
-                            Value::Logical(true),
-                        )]))),
+                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                        [("LT".to_string(), Value::Logical(true),)]
+                    ))),
                 ],
                 1,
             )
@@ -45445,10 +48403,9 @@ mod tests {
                         )
                         .expect("rectangular exact rhs"),
                     ),
-                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from([(
-                            "RECT".to_string(),
-                            Value::Logical(true),
-                        )]))),
+                    Value::Struct(StructValue::from_fields(std::collections::BTreeMap::from(
+                        [("RECT".to_string(), Value::Logical(true),)]
+                    ))),
                 ],
                 2,
             )
@@ -46086,13 +49043,17 @@ mod tests {
             )
         );
         assert_eq!(
-            builtin_cumsum(&[Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("cumsum empty"))])
-                .expect("cumsum empty"),
+            builtin_cumsum(&[Value::Matrix(
+                MatrixValue::new(0, 3, Vec::new()).expect("cumsum empty")
+            )])
+            .expect("cumsum empty"),
             Value::Matrix(MatrixValue::new(0, 3, Vec::new()).expect("cumsum empty result"))
         );
         assert_eq!(
-            builtin_cumprod(&[Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("cumprod empty row"))])
-                .expect("cumprod empty row"),
+            builtin_cumprod(&[Value::Matrix(
+                MatrixValue::new(1, 0, Vec::new()).expect("cumprod empty row")
+            )])
+            .expect("cumprod empty row"),
             Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("cumprod empty row result"))
         );
         assert_eq!(
@@ -46293,7 +49254,7 @@ mod tests {
             .expect("movsum discard"),
             Value::Matrix(
                 MatrixValue::new(1, 2, vec![Value::Scalar(6.0), Value::Scalar(9.0)])
-                .expect("movsum discard result"),
+                    .expect("movsum discard result"),
             )
         );
         let Value::Matrix(movsum_fill) = builtin_movsum(&[
@@ -46317,10 +49278,30 @@ mod tests {
         .expect("movsum fill") else {
             panic!("expected matrix for movsum fill");
         };
-        assert!(movsum_fill.get(0, 0).as_scalar().expect("movsum fill first").is_nan());
-        assert_eq!(movsum_fill.get(0, 1).as_scalar().expect("movsum fill second"), 6.0);
-        assert_eq!(movsum_fill.get(0, 2).as_scalar().expect("movsum fill third"), 9.0);
-        assert!(movsum_fill.get(0, 3).as_scalar().expect("movsum fill fourth").is_nan());
+        assert!(movsum_fill
+            .get(0, 0)
+            .as_scalar()
+            .expect("movsum fill first")
+            .is_nan());
+        assert_eq!(
+            movsum_fill
+                .get(0, 1)
+                .as_scalar()
+                .expect("movsum fill second"),
+            6.0
+        );
+        assert_eq!(
+            movsum_fill
+                .get(0, 2)
+                .as_scalar()
+                .expect("movsum fill third"),
+            9.0
+        );
+        assert!(movsum_fill
+            .get(0, 3)
+            .as_scalar()
+            .expect("movsum fill fourth")
+            .is_nan());
         assert_eq!(
             builtin_movmean(&[
                 Value::Matrix(
@@ -46384,7 +49365,7 @@ mod tests {
             .expect("movmean discard"),
             Value::Matrix(
                 MatrixValue::new(1, 2, vec![Value::Scalar(2.5), Value::Scalar(3.5)])
-                .expect("movmean discard result"),
+                    .expect("movmean discard result"),
             )
         );
         assert_eq!(
@@ -46516,7 +49497,7 @@ mod tests {
             .expect("movmax discard"),
             Value::Matrix(
                 MatrixValue::new(1, 2, vec![Value::Scalar(4.0), Value::Scalar(4.0)])
-                .expect("movmax discard result"),
+                    .expect("movmax discard result"),
             )
         );
         assert_eq!(
@@ -47302,7 +50283,7 @@ mod tests {
             vec![Value::Matrix(
                 MatrixValue::new(2, 1, vec![Value::Scalar(5.0), Value::Scalar(6.0)])
                     .expect("column vector"),
-                )]
+            )]
         );
         assert_eq!(
             builtin_ndgrid(
@@ -47799,11 +50780,7 @@ mod tests {
                     MatrixValue::new(
                         1,
                         3,
-                        vec![
-                            Value::Scalar(2.0),
-                            Value::Scalar(2.0),
-                            Value::Scalar(3.0),
-                        ],
+                        vec![Value::Scalar(2.0), Value::Scalar(2.0), Value::Scalar(3.0),],
                     )
                     .expect("width counts"),
                 ),
@@ -47869,22 +50846,14 @@ mod tests {
             .expect("histcounts bin limits"),
             vec![
                 Value::Matrix(
-                    MatrixValue::new(
-                        1,
-                        2,
-                        vec![Value::Scalar(2.0), Value::Scalar(3.0)],
-                    )
-                    .expect("limited counts"),
+                    MatrixValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(3.0)],)
+                        .expect("limited counts"),
                 ),
                 Value::Matrix(
                     MatrixValue::new(
                         1,
                         3,
-                        vec![
-                            Value::Scalar(0.0),
-                            Value::Scalar(1.0),
-                            Value::Scalar(2.0),
-                        ],
+                        vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(2.0),],
                     )
                     .expect("limited edges"),
                 ),
@@ -48372,11 +51341,7 @@ mod tests {
                     MatrixValue::new(
                         1,
                         3,
-                        vec![
-                            Value::Scalar(0.0),
-                            Value::Scalar(1.0),
-                            Value::Scalar(2.0),
-                        ],
+                        vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(2.0),],
                     )
                     .expect("limited x edges"),
                 ),
@@ -48601,11 +51566,7 @@ mod tests {
                     MatrixValue::new(
                         1,
                         3,
-                        vec![
-                            Value::Scalar(0.0),
-                            Value::Scalar(1.5),
-                            Value::Scalar(3.0),
-                        ],
+                        vec![Value::Scalar(0.0), Value::Scalar(1.5), Value::Scalar(3.0),],
                     )
                     .expect("numbins x edges"),
                 ),
@@ -48813,7 +51774,11 @@ mod tests {
                         MatrixValue::new(
                             1,
                             3,
-                            vec![Value::Scalar(10.0), Value::Scalar(15.0), Value::Scalar(30.0)],
+                            vec![
+                                Value::Scalar(10.0),
+                                Value::Scalar(15.0),
+                                Value::Scalar(30.0)
+                            ],
                         )
                         .expect("normalized y edges"),
                     ),
@@ -48882,7 +51847,11 @@ mod tests {
                         MatrixValue::new(
                             1,
                             3,
-                            vec![Value::Scalar(10.0), Value::Scalar(15.0), Value::Scalar(30.0)],
+                            vec![
+                                Value::Scalar(10.0),
+                                Value::Scalar(15.0),
+                                Value::Scalar(30.0)
+                            ],
                         )
                         .expect("normalized y edges pdf"),
                     ),
@@ -48951,7 +51920,11 @@ mod tests {
                         MatrixValue::new(
                             1,
                             3,
-                            vec![Value::Scalar(10.0), Value::Scalar(15.0), Value::Scalar(30.0)],
+                            vec![
+                                Value::Scalar(10.0),
+                                Value::Scalar(15.0),
+                                Value::Scalar(30.0)
+                            ],
                         )
                         .expect("normalized y edges cdf"),
                     ),
@@ -49149,7 +52122,7 @@ mod tests {
             .expect("descending interp1"),
             Value::Matrix(
                 MatrixValue::new(1, 2, vec![Value::Scalar(25.0), Value::Scalar(5.0)])
-                .expect("descending result"),
+                    .expect("descending result"),
             )
         );
         assert_eq!(
@@ -49196,7 +52169,11 @@ mod tests {
                 MatrixValue::new(
                     1,
                     3,
-                    vec![Value::Scalar(-10.0), Value::Scalar(5.0), Value::Scalar(35.0)],
+                    vec![
+                        Value::Scalar(-10.0),
+                        Value::Scalar(5.0),
+                        Value::Scalar(35.0)
+                    ],
                 )
                 .expect("linear extrap result"),
             )
@@ -49272,7 +52249,11 @@ mod tests {
                 MatrixValue::new(
                     1,
                     3,
-                    vec![Value::Scalar(-99.0), Value::Scalar(0.0), Value::Scalar(-99.0)],
+                    vec![
+                        Value::Scalar(-99.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(-99.0)
+                    ],
                 )
                 .expect("nearest fill result"),
             )
@@ -52187,8 +55168,10 @@ mod tests {
             Value::Scalar(7.5)
         );
         assert_eq!(
-            builtin_trapz(&[Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty trapz"))])
-                .expect("empty trapz"),
+            builtin_trapz(&[Value::Matrix(
+                MatrixValue::new(0, 0, Vec::new()).expect("empty trapz")
+            )])
+            .expect("empty trapz"),
             Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("empty trapz result"))
         );
         assert_eq!(
@@ -52461,8 +55444,12 @@ mod tests {
         assert_eq!(
             builtin_conv(&[
                 Value::Matrix(
-                    MatrixValue::new(1, 3, vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0)])
-                        .expect("conv lhs"),
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0)]
+                    )
+                    .expect("conv lhs"),
                 ),
                 Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("empty row rhs")),
                 Value::String("same".to_string()),
@@ -52480,8 +55467,12 @@ mod tests {
         assert_eq!(
             builtin_conv(&[
                 Value::Matrix(
-                    MatrixValue::new(1, 3, vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0)])
-                        .expect("conv lhs valid"),
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0)]
+                    )
+                    .expect("conv lhs valid"),
                 ),
                 Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("empty row rhs valid")),
                 Value::String("valid".to_string()),
@@ -52500,8 +55491,12 @@ mod tests {
             builtin_conv(&[
                 Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("empty row lhs")),
                 Value::Matrix(
-                    MatrixValue::new(1, 3, vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0)])
-                        .expect("conv rhs same"),
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0)]
+                    )
+                    .expect("conv rhs same"),
                 ),
                 Value::String("same".to_string()),
             ])
@@ -52511,8 +55506,12 @@ mod tests {
         assert_eq!(
             builtin_conv(&[
                 Value::Matrix(
-                    MatrixValue::new(3, 1, vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0)])
-                        .expect("conv col lhs valid"),
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0)]
+                    )
+                    .expect("conv col lhs valid"),
                 ),
                 Value::Matrix(MatrixValue::new(0, 1, Vec::new()).expect("empty col rhs valid")),
                 Value::String("valid".to_string()),
@@ -52718,7 +55717,11 @@ mod tests {
                 MatrixValue::new(
                     1,
                     3,
-                    vec![Value::Scalar(17.0), Value::Scalar(100.0), Value::Scalar(17.0)],
+                    vec![
+                        Value::Scalar(17.0),
+                        Value::Scalar(100.0),
+                        Value::Scalar(17.0),
+                    ],
                 )
                 .expect("interp1 previous extrap v"),
             ),
@@ -52736,13 +55739,23 @@ mod tests {
         .expect("interp1 previous extrap") else {
             panic!("expected matrix result for interp1 previous extrap");
         };
-        assert!(previous_extrap.get(0, 0).as_scalar().expect("previous extrap first").is_nan());
+        assert!(previous_extrap
+            .get(0, 0)
+            .as_scalar()
+            .expect("previous extrap first")
+            .is_nan());
         assert_eq!(
-            previous_extrap.get(0, 1).as_scalar().expect("previous extrap second"),
+            previous_extrap
+                .get(0, 1)
+                .as_scalar()
+                .expect("previous extrap second"),
             100.0
         );
         assert_eq!(
-            previous_extrap.get(0, 2).as_scalar().expect("previous extrap third"),
+            previous_extrap
+                .get(0, 2)
+                .as_scalar()
+                .expect("previous extrap third"),
             100.0
         );
         let Value::Matrix(next_extrap) = builtin_interp1(&[
@@ -52758,7 +55771,11 @@ mod tests {
                 MatrixValue::new(
                     1,
                     3,
-                    vec![Value::Scalar(17.0), Value::Scalar(100.0), Value::Scalar(17.0)],
+                    vec![
+                        Value::Scalar(17.0),
+                        Value::Scalar(100.0),
+                        Value::Scalar(17.0),
+                    ],
                 )
                 .expect("interp1 next extrap v"),
             ),
@@ -52777,14 +55794,24 @@ mod tests {
             panic!("expected matrix result for interp1 next extrap");
         };
         assert_eq!(
-            next_extrap.get(0, 0).as_scalar().expect("next extrap first"),
+            next_extrap
+                .get(0, 0)
+                .as_scalar()
+                .expect("next extrap first"),
             100.0
         );
         assert_eq!(
-            next_extrap.get(0, 1).as_scalar().expect("next extrap second"),
+            next_extrap
+                .get(0, 1)
+                .as_scalar()
+                .expect("next extrap second"),
             17.0
         );
-        assert!(next_extrap.get(0, 2).as_scalar().expect("next extrap third").is_nan());
+        assert!(next_extrap
+            .get(0, 2)
+            .as_scalar()
+            .expect("next extrap third")
+            .is_nan());
     }
 
     #[test]
@@ -52806,7 +55833,9 @@ mod tests {
         assert_eq!(
             builtin_deconv(
                 &[
-                    Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("empty row dividend pair")),
+                    Value::Matrix(
+                        MatrixValue::new(1, 0, Vec::new()).expect("empty row dividend pair")
+                    ),
                     Value::Matrix(
                         MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
                             .expect("row divisor pair"),
@@ -52817,7 +55846,9 @@ mod tests {
             .expect("empty dividend two outputs"),
             vec![
                 Value::Scalar(0.0),
-                Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("empty dividend remainder")),
+                Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("empty dividend remainder")
+                ),
             ]
         );
     }
@@ -53124,31 +56155,16 @@ mod tests {
             .expect("3d gradient"),
             vec![
                 Value::Matrix(
-                    MatrixValue::with_dimensions(
-                        2,
-                        4,
-                        vec![2, 2, 2],
-                        vec![Value::Scalar(1.0); 8],
-                    )
-                    .expect("cube gx"),
+                    MatrixValue::with_dimensions(2, 4, vec![2, 2, 2], vec![Value::Scalar(1.0); 8],)
+                        .expect("cube gx"),
                 ),
                 Value::Matrix(
-                    MatrixValue::with_dimensions(
-                        2,
-                        4,
-                        vec![2, 2, 2],
-                        vec![Value::Scalar(2.0); 8],
-                    )
-                    .expect("cube gy"),
+                    MatrixValue::with_dimensions(2, 4, vec![2, 2, 2], vec![Value::Scalar(2.0); 8],)
+                        .expect("cube gy"),
                 ),
                 Value::Matrix(
-                    MatrixValue::with_dimensions(
-                        2,
-                        4,
-                        vec![2, 2, 2],
-                        vec![Value::Scalar(4.0); 8],
-                    )
-                    .expect("cube gz"),
+                    MatrixValue::with_dimensions(2, 4, vec![2, 2, 2], vec![Value::Scalar(4.0); 8],)
+                        .expect("cube gz"),
                 ),
             ]
         );
@@ -53182,31 +56198,16 @@ mod tests {
             .expect("3d spaced gradient"),
             vec![
                 Value::Matrix(
-                    MatrixValue::with_dimensions(
-                        2,
-                        4,
-                        vec![2, 2, 2],
-                        vec![Value::Scalar(0.5); 8],
-                    )
-                    .expect("cube dx"),
+                    MatrixValue::with_dimensions(2, 4, vec![2, 2, 2], vec![Value::Scalar(0.5); 8],)
+                        .expect("cube dx"),
                 ),
                 Value::Matrix(
-                    MatrixValue::with_dimensions(
-                        2,
-                        4,
-                        vec![2, 2, 2],
-                        vec![Value::Scalar(2.0); 8],
-                    )
-                    .expect("cube dy"),
+                    MatrixValue::with_dimensions(2, 4, vec![2, 2, 2], vec![Value::Scalar(2.0); 8],)
+                        .expect("cube dy"),
                 ),
                 Value::Matrix(
-                    MatrixValue::with_dimensions(
-                        2,
-                        4,
-                        vec![2, 2, 2],
-                        vec![Value::Scalar(1.0); 8],
-                    )
-                    .expect("cube dz"),
+                    MatrixValue::with_dimensions(2, 4, vec![2, 2, 2], vec![Value::Scalar(1.0); 8],)
+                        .expect("cube dz"),
                 ),
             ]
         );
@@ -53596,11 +56597,17 @@ mod tests {
         );
         assert_eq!(
             builtin_divergence(&[
-                Value::Matrix(MatrixValue::new(3, 0, Vec::new()).expect("empty-column divergence u")),
-                Value::Matrix(MatrixValue::new(3, 0, Vec::new()).expect("empty-column divergence v")),
+                Value::Matrix(
+                    MatrixValue::new(3, 0, Vec::new()).expect("empty-column divergence u")
+                ),
+                Value::Matrix(
+                    MatrixValue::new(3, 0, Vec::new()).expect("empty-column divergence v")
+                ),
             ])
             .expect("empty-column divergence"),
-            Value::Matrix(MatrixValue::new(3, 0, Vec::new()).expect("empty-column divergence result"))
+            Value::Matrix(
+                MatrixValue::new(3, 0, Vec::new()).expect("empty-column divergence result")
+            )
         );
     }
 
@@ -54475,11 +57482,7 @@ mod tests {
                 MatrixValue::new(
                     3,
                     1,
-                    vec![
-                        Value::Scalar(2.0),
-                        Value::Scalar(0.0),
-                        Value::Scalar(2.0),
-                    ],
+                    vec![Value::Scalar(2.0), Value::Scalar(0.0), Value::Scalar(2.0),],
                 )
                 .expect("length result"),
             )
@@ -54521,11 +57524,7 @@ mod tests {
                 MatrixValue::new(
                     3,
                     1,
-                    vec![
-                        Value::Scalar(1.0),
-                        Value::Scalar(0.0),
-                        Value::Scalar(2.0),
-                    ],
+                    vec![Value::Scalar(1.0), Value::Scalar(0.0), Value::Scalar(2.0),],
                 )
                 .expect("nnz result"),
             )
@@ -54569,11 +57568,7 @@ mod tests {
                 MatrixValue::new(
                     3,
                     1,
-                    vec![
-                        Value::Scalar(7.0),
-                        Value::Scalar(4.0),
-                        Value::Scalar(4.0),
-                    ],
+                    vec![Value::Scalar(7.0), Value::Scalar(4.0), Value::Scalar(4.0),],
                 )
                 .expect("median result"),
             )
@@ -54621,11 +57616,7 @@ mod tests {
                 MatrixValue::new(
                     3,
                     1,
-                    vec![
-                        Value::Scalar(5.0),
-                        Value::Scalar(7.0),
-                        Value::Scalar(4.0),
-                    ],
+                    vec![Value::Scalar(5.0), Value::Scalar(7.0), Value::Scalar(4.0),],
                 )
                 .expect("mode result"),
             )
@@ -54748,19 +57739,22 @@ mod tests {
             ]
         );
         assert_eq!(
-            builtin_unique(&[Value::Matrix(
-                MatrixValue::new(
-                    1,
-                    4,
-                    vec![
-                        Value::Scalar(9.0),
-                        Value::Scalar(2.0),
-                        Value::Scalar(9.0),
-                        Value::Scalar(5.0),
-                    ],
-                )
-                .expect("row vector"),
-            )], 3)
+            builtin_unique(
+                &[Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        4,
+                        vec![
+                            Value::Scalar(9.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(9.0),
+                            Value::Scalar(5.0),
+                        ],
+                    )
+                    .expect("row vector"),
+                )],
+                3
+            )
             .expect("unique row outputs"),
             vec![
                 Value::Matrix(
@@ -54849,22 +57843,20 @@ mod tests {
         );
         assert_eq!(
             builtin_unique(
-                &[
-                    Value::Cell(
-                        CellValue::new(
-                            1,
-                            5,
-                            vec![
-                                Value::CharArray("one".to_string()),
-                                Value::CharArray("two".to_string()),
-                                Value::CharArray("twenty-two".to_string()),
-                                Value::CharArray("One".to_string()),
-                                Value::CharArray("two".to_string()),
-                            ],
-                        )
-                        .expect("cell text"),
-                    ),
-                ],
+                &[Value::Cell(
+                    CellValue::new(
+                        1,
+                        5,
+                        vec![
+                            Value::CharArray("one".to_string()),
+                            Value::CharArray("two".to_string()),
+                            Value::CharArray("twenty-two".to_string()),
+                            Value::CharArray("One".to_string()),
+                            Value::CharArray("two".to_string()),
+                        ],
+                    )
+                    .expect("cell text"),
+                ),],
                 1,
             )
             .expect("unique cell text"),
@@ -55104,4 +58096,3 @@ mod tests {
         );
     }
 }
-

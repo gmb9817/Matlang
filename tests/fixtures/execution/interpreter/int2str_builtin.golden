@@ -1,0 +1,8 @@
+workspace
+  a = '43'
+  b = '-3'
+  c = '1'
+  d = '0'
+  e = '1 20 -3'
+  f = ''
+  g = 'NaN Inf -Inf'

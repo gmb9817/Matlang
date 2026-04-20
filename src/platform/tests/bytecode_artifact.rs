@@ -12,10 +12,11 @@ use matlab_frontend::{
 use matlab_ir::lower_to_hir;
 use matlab_optimizer::optimize_module;
 use matlab_platform::{
-    attach_bundle_module_id, collect_bytecode_dependency_paths, decode_bytecode_bundle,
-    decode_bytecode_module, encode_bytecode_bundle, encode_bytecode_module, read_bytecode_artifact,
-    rewrite_bytecode_bundle_targets, write_bytecode_artifact, write_bytecode_bundle,
-    BytecodeBundle, PackagedBytecodeModule,
+    attach_bundle_module_id, collect_bytecode_dependency_paths,
+    collect_bytecode_dependency_paths_with_context, decode_bytecode_bundle, decode_bytecode_module,
+    encode_bytecode_bundle, encode_bytecode_module, read_bytecode_artifact,
+    rewrite_bytecode_bundle_targets, write_bytecode_artifact, write_bytecode_bundle, BytecodeBundle,
+    PackagedBytecodeModule,
 };
 use matlab_resolver::ResolverContext;
 use matlab_semantics::analyze_compilation_unit_with_context;
@@ -217,6 +218,56 @@ fn collects_resolved_dependency_paths_from_external_fixture() {
     assert_eq!(paths.len(), 2);
     assert!(paths.iter().any(|path| path.ends_with("helper.m")));
     assert!(paths.iter().any(|path| path.ends_with("+pkg\\helper.m")));
+}
+
+#[test]
+fn collects_literal_str2func_dependency_paths_with_context() {
+    let workspace = temp_test_dir("str2func-bytecode-deps");
+    let package_dir = workspace.join("+pkg");
+    let class_dir = workspace.join("@Counter");
+    fs::create_dir_all(&package_dir).expect("create package dir");
+    fs::create_dir_all(&class_dir).expect("create class dir");
+
+    let helper_path = workspace.join("helper.m");
+    let package_helper_path = package_dir.join("helper.m");
+    let class_path = class_dir.join("Counter.m");
+    let main_path = workspace.join("main.m");
+
+    fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
+        .expect("write helper");
+    fs::write(&package_helper_path, "function y = helper(x)\ny = x + 2;\nend\n")
+        .expect("write package helper");
+    fs::write(
+        &class_path,
+        "classdef Counter < handle\n\
+         properties\n\
+         value = 0;\n\
+         end\n\
+         methods\n\
+         function obj = Counter(value)\n\
+         obj.value = value;\n\
+         end\n\
+         end\n\
+         end\n",
+    )
+    .expect("write folder class");
+    fs::write(
+        &main_path,
+        "a = str2func('helper');\n\
+         b = str2func('pkg.helper');\n\
+         c = str2func('Counter');\n",
+    )
+    .expect("write main");
+
+    let module = compile_source_path(&main_path);
+    let paths = collect_bytecode_dependency_paths_with_context(&module, &main_path);
+
+    assert_eq!(paths.len(), 3);
+    assert!(paths.contains(&helper_path));
+    assert!(paths.contains(&package_helper_path));
+    assert!(paths.contains(&class_path));
+
+    let _ = fs::remove_dir_all(workspace);
 }
 
 #[test]

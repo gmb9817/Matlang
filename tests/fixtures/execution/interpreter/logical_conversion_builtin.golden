@@ -1,0 +1,10 @@
+workspace
+  a = false
+  b = true
+  c = [false, true ; true, false]
+  d = true
+  e = [true, false ; true, false]
+  f = [true, true]
+  g = []
+  h = true
+  i = false

@@ -1,0 +1,9 @@
+a = logical(0);
+b = logical(2);
+c = logical([0 1; -3 0]);
+d = logical(1i);
+e = logical([1i 0; 2-3i 0]);
+f = logical('ab');
+g = logical([]);
+h = logical(true);
+i = logical(false);

@@ -2,9 +2,10 @@ use std::{fs, path::PathBuf};
 
 use matlab_codegen::emit_bytecode;
 use matlab_execution::{
-    execute_function_file_bytecode, execute_function_file_bytecode_bundle,
-    execute_function_file_bytecode_module, execute_script_bytecode, execute_script_bytecode_bundle,
-    execute_script_bytecode_module, render_execution_result,
+    execute_function_file_bytecode_bundle, execute_function_file_bytecode_module,
+    execute_function_file_bytecode_with_identity, execute_script_bytecode_bundle,
+    execute_script_bytecode_module, execute_script_bytecode_with_identity,
+    render_execution_result,
 };
 use matlab_frontend::{
     ast::CompilationUnitKind,
@@ -14,7 +15,7 @@ use matlab_frontend::{
 use matlab_ir::lower_to_hir;
 use matlab_optimizer::optimize_module;
 use matlab_platform::{
-    collect_bytecode_dependency_paths, decode_bytecode_module, encode_bytecode_module,
+    collect_bytecode_dependency_paths_with_context, decode_bytecode_module, encode_bytecode_module,
     rewrite_bytecode_bundle_targets, BytecodeBundle, PackagedBytecodeModule,
 };
 use matlab_resolver::ResolverContext;
@@ -42,7 +43,7 @@ fn assert_fixture(name: &str, mode: ParseMode, args: &[Value]) {
     let unit = parsed.unit.expect("compilation unit");
     let analysis = analyze_compilation_unit_with_context(
         &unit,
-        &ResolverContext::from_source_file(source_path),
+        &ResolverContext::from_source_file(source_path.clone()),
     );
     assert!(
         !analysis.has_errors(),
@@ -52,8 +53,19 @@ fn assert_fixture(name: &str, mode: ParseMode, args: &[Value]) {
 
     let hir = lower_to_hir(&unit, &analysis);
     let result = match unit.kind {
-        CompilationUnitKind::Script => execute_script_bytecode(&hir),
-        CompilationUnitKind::FunctionFile => execute_function_file_bytecode(&hir, args),
+        CompilationUnitKind::Script => {
+            execute_script_bytecode_with_identity(
+                &hir,
+                "<root>".to_string(),
+                Some(source_path.clone()),
+            )
+        }
+        CompilationUnitKind::FunctionFile => execute_function_file_bytecode_with_identity(
+            &hir,
+            args,
+            "<root>".to_string(),
+            Some(source_path.clone()),
+        ),
         CompilationUnitKind::ClassFile => {
             panic!("class-file fixtures are not executable through the bytecode golden harness")
         }
@@ -133,7 +145,7 @@ fn assert_bundle_fixture(name: &str, mode: ParseMode, args: &[Value]) {
     let hir = lower_to_hir(&unit, &analysis);
     let optimized = optimize_module(&hir);
     let bytecode = emit_bytecode(&optimized.module);
-    let compiled_dependencies = collect_bytecode_dependency_paths(&bytecode)
+    let compiled_dependencies = collect_bytecode_dependency_paths_with_context(&bytecode, &source_path)
         .into_iter()
         .enumerate()
         .map(|(index, path)| {
@@ -565,6 +577,11 @@ fn builtin_nd_shape_helpers_fixture_matches_golden() {
 }
 
 #[test]
+fn builtin_nd_reduction_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_nd_reduction_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
 fn builtin_repetition_helpers_fixture_matches_golden() {
     assert_fixture("builtin_repetition_helpers", ParseMode::Script, &[]);
 }
@@ -605,6 +622,16 @@ fn builtin_quantile_fixture_matches_golden() {
 }
 
 #[test]
+fn builtin_quantile_nd_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_quantile_nd_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
+fn builtin_quantile_vecdim_nd_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_quantile_vecdim_nd_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
 fn builtin_spread_fixture_matches_golden() {
     assert_fixture("builtin_spread", ParseMode::Script, &[]);
 }
@@ -612,6 +639,76 @@ fn builtin_spread_fixture_matches_golden() {
 #[test]
 fn builtin_zscore_fixture_matches_golden() {
     assert_fixture("builtin_zscore", ParseMode::Script, &[]);
+}
+
+#[test]
+fn builtin_zscore_nd_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_zscore_nd_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
+fn builtin_spread_nd_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_spread_nd_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
+fn builtin_bounds_nd_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_bounds_nd_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
+fn builtin_sort_nd_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_sort_nd_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
+fn builtin_vecdim_shape_promotion_helpers_fixture_matches_golden() {
+    assert_fixture("builtin_vecdim_shape_promotion_helpers", ParseMode::Script, &[]);
+}
+
+#[test]
+fn logical_conversion_builtin_fixture_matches_golden() {
+    assert_fixture("logical_conversion_builtin", ParseMode::Script, &[]);
+}
+
+#[test]
+fn double_conversion_builtin_fixture_matches_golden() {
+    assert_fixture("double_conversion_builtin", ParseMode::Script, &[]);
+}
+
+#[test]
+fn str2double_builtin_fixture_matches_golden() {
+    assert_fixture("str2double_builtin", ParseMode::Script, &[]);
+}
+
+#[test]
+fn mat2str_builtin_fixture_matches_golden() {
+    assert_fixture("mat2str_builtin", ParseMode::Script, &[]);
+}
+
+#[test]
+fn int2str_builtin_fixture_matches_golden() {
+    assert_fixture("int2str_builtin", ParseMode::Script, &[]);
+}
+
+#[test]
+fn num2str_builtin_fixture_matches_golden() {
+    assert_fixture("num2str_builtin", ParseMode::Script, &[]);
+}
+
+#[test]
+fn num2str_formatted_builtin_fixture_matches_golden() {
+    assert_fixture("num2str_formatted_builtin", ParseMode::Script, &[]);
+}
+
+#[test]
+fn base_text_to_double_builtin_fixture_matches_golden() {
+    assert_fixture("base_text_to_double_builtin", ParseMode::Script, &[]);
+}
+
+#[test]
+fn str2num_builtin_fixture_matches_golden() {
+    assert_fixture("str2num_builtin", ParseMode::Script, &[]);
 }
 
 #[test]
@@ -652,6 +749,36 @@ fn text_literals_and_builtins_fixture_matches_golden() {
 #[test]
 fn command_form_text_fixture_matches_golden() {
     assert_fixture("command_form_text", ParseMode::Script, &[]);
+}
+
+#[test]
+fn command_form_workspace_builtins_fixture_matches_golden() {
+    assert_fixture("command_form_workspace_builtins", ParseMode::Script, &[]);
+}
+
+#[test]
+fn function_handle_text_builtin_fixture_matches_golden() {
+    assert_fixture("function_handle_text_builtin", ParseMode::Script, &[]);
+}
+
+#[test]
+fn call_argument_nd_selectors_fixture_matches_golden() {
+    assert_fixture("call_argument_nd_selectors", ParseMode::Script, &[]);
+}
+
+#[test]
+fn call_argument_object_selector_fixture_matches_golden() {
+    assert_fixture("call_argument_object_selector", ParseMode::Script, &[]);
+}
+
+#[test]
+fn call_argument_struct_selector_fixture_matches_golden() {
+    assert_fixture("call_argument_struct_selector", ParseMode::Script, &[]);
+}
+
+#[test]
+fn find_nd_linearization_fixture_matches_golden() {
+    assert_fixture("find_nd_linearization", ParseMode::Script, &[]);
 }
 
 #[test]

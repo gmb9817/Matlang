@@ -1,0 +1,3 @@
+workspace
+  out = {'x'}
+  s = [struct{x=10}, struct{x=20}, struct{x=30}]

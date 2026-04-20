@@ -1,0 +1,4 @@
+workspace
+  fh = @sum
+  obj = CallSelectorPoint with properties {x=2}
+  obj_out = 2

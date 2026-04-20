@@ -1,0 +1,21 @@
+m = reshape(1:4, [2 2]);
+n = [1 3; 1 4];
+l_any = [true false; false true];
+l_all = [true true; false true];
+
+sum4 = sum(m, [4]);
+sum14 = sum(m, [1 4]);
+prod34 = prod(m, [3 4]);
+mean14 = mean(m, [1 4]);
+median4 = median(m, [4]);
+mode14 = mode(n, [1 4]);
+var4 = var(m, 0, [4]);
+std14 = std(m, 0, [1 4]);
+any34 = any(l_any, [3 4]);
+all14 = all(l_all, [1 4]);
+[max4, max4_idx] = max(m, [], [4]);
+[min14, min14_idx] = min(m, [], [1 4]);
+size_all14 = size(all14);
+size_max4 = size(max4);
+size_sum14 = size(sum14);
+size_sum4 = size(sum4);

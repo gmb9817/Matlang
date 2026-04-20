@@ -1,0 +1,16 @@
+a = hex2dec("3FF");
+b = hex2dec(["3FF" "7A" "E"]);
+c = hex2dec({'FF'; '0x10'; '0xFFs8'});
+d = hex2dec("0xFFu8");
+e = bin2dec("10111");
+f = bin2dec(["1111111111" "1111010" "1110"]);
+g = bin2dec({'111'; '0b111'; '0b11111111s8'});
+h = hex2dec({'F', '10'});
+i = base2dec("ZZ", 36);
+j = base2dec(["10" "11"], 2);
+k = base2dec({'A', '1F'; '10', '0'}, 16);
+l = dec2hex([15 16 255]);
+m = dec2hex(255, 4);
+n = dec2bin([5; 7], 4);
+o = dec2base([10 35], 36, 2);
+p = dec2base(0, 2, 3);

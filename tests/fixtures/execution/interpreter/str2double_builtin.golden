@@ -1,0 +1,12 @@
+workspace
+  a = 12.5
+  b = 3.25
+  c = [1, NaN ; inf, -2.5]
+  d = [1 + 2i, -3i ; NaN, 0.001]
+  e = NaN
+  f = -45
+  g = [1i, -1i ; 2i, 1 - 2i]
+  h = 1 + 2i
+  i = 1 - 1i
+  j = 2000 + 0.04i
+  k = NaN

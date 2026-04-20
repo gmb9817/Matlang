@@ -9,8 +9,9 @@ use std::{
 
 use matlab_codegen::{
     BackendKind, BytecodeClass, BytecodeExternalMethod, BytecodeFunction, BytecodeInstruction,
-    BytecodeModule,
+    BytecodeModule, TempId,
 };
+use matlab_resolver::{resolve_callable, ResolvedCallable, ResolverContext};
 
 pub const CRATE_NAME: &str = "matlab-platform";
 pub const BYTECODE_ARTIFACT_MAGIC: &str = "MATC-BYTECODE";
@@ -483,6 +484,116 @@ pub fn collect_bytecode_dependency_paths(module: &BytecodeModule) -> Vec<PathBuf
         }
     }
     paths.into_iter().collect()
+}
+
+pub fn collect_bytecode_dependency_paths_with_context(
+    module: &BytecodeModule,
+    source_path: &Path,
+) -> Vec<PathBuf> {
+    let mut paths = collect_bytecode_dependency_paths(module)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for path in collect_literal_str2func_dependency_paths(module, source_path) {
+        paths.insert(path);
+    }
+    paths.into_iter().collect()
+}
+
+fn collect_literal_str2func_dependency_paths(
+    module: &BytecodeModule,
+    source_path: &Path,
+) -> Vec<PathBuf> {
+    let context =
+        ResolverContext::from_source_file(source_path.to_path_buf()).with_env_search_roots("MATC_PATH");
+    let mut paths = BTreeSet::new();
+
+    for function in &module.functions {
+        let mut text_temps = HashMap::<TempId, String>::new();
+        for instruction in &function.instructions {
+            match instruction {
+                BytecodeInstruction::LoadConst { dst, value } => {
+                    if let Some(text) = parse_text_constant(value) {
+                        text_temps.insert(*dst, text);
+                    }
+                }
+                BytecodeInstruction::Call { target, args, .. }
+                    if target_display_name(target).eq_ignore_ascii_case("str2func") =>
+                {
+                    let Some(name) = resolve_str2func_literal_name_arg(&text_temps, args) else {
+                        continue;
+                    };
+                    let Some(resolved) = resolve_callable(&name, &context) else {
+                        continue;
+                    };
+                    match resolved {
+                        ResolvedCallable::Function(resolved) => {
+                            paths.insert(resolved.path);
+                        }
+                        ResolvedCallable::Class(resolved) => {
+                            paths.insert(resolved.path);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    paths.into_iter().collect()
+}
+
+fn target_display_name(target: &str) -> &str {
+    target.split(" [").next().unwrap_or(target)
+}
+
+fn resolve_str2func_literal_name_arg(
+    text_temps: &HashMap<TempId, String>,
+    args: &[String],
+) -> Option<String> {
+    let [arg] = args else {
+        return None;
+    };
+    let temp = parse_temp_ref(arg)?;
+    let raw = text_temps.get(&temp)?.trim();
+    let normalized = raw.strip_prefix('@').unwrap_or(raw).trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
+fn parse_temp_ref(value: &str) -> Option<TempId> {
+    value.strip_prefix('t')?.parse::<TempId>().ok()
+}
+
+fn parse_text_constant(value: &str) -> Option<String> {
+    if let Some(inner) = value
+        .strip_prefix("char(")
+        .and_then(|text| text.strip_suffix(')'))
+    {
+        return decode_delimited_literal(inner, '\'');
+    }
+    if let Some(inner) = value
+        .strip_prefix("string(")
+        .and_then(|text| text.strip_suffix(')'))
+    {
+        return decode_delimited_literal(inner, '"');
+    }
+    None
+}
+
+fn decode_delimited_literal(lexeme: &str, delimiter: char) -> Option<String> {
+    let inner = lexeme
+        .strip_prefix(delimiter)
+        .and_then(|text| text.strip_suffix(delimiter))?;
+    let mut out = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == delimiter && chars.peek() == Some(&delimiter) {
+            out.push(delimiter);
+            chars.next();
+        } else {
+            out.push(ch);
+        }
+    }
+    Some(out)
 }
 
 fn parse_bundle_module_id(value: &str) -> Option<String> {

@@ -1,0 +1,11 @@
+workspace
+  a = '5'
+  b = '[1 2;3 4]'
+  c = '1+2i'
+  d = '[1+2i 0;-3i 4]'
+  e = 'true'
+  f = '[true false;false true]'
+  g = '[]'
+  h = '3.142'
+  i = '[0.333 0.667]'
+  j = '[NaN Inf -Inf]'

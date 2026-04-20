@@ -1428,16 +1428,24 @@ impl<'a> FunctionEmitter<'a> {
             },
             HirExpression::MatrixLiteral(rows) => self.encode_index_literal("matrix", rows),
             HirExpression::CellLiteral(rows) => self.encode_index_literal("cell", rows),
-            HirExpression::Call { target, args } => format!(
-                "call({},{})",
-                self.encode_index_call_target(target),
-                self.encode_index_call_args(args).join(",")
-            ),
-            HirExpression::CellIndex { target, indices } => format!(
-                "cellindex({},{})",
-                self.encode_index_expression_part(target),
-                self.encode_index_call_args(indices).join(",")
-            ),
+            HirExpression::Call { target, args } => {
+                let target = self.encode_index_call_target(target);
+                let args = self.encode_index_call_args(args);
+                if args.is_empty() {
+                    format!("call({target})")
+                } else {
+                    format!("call({target},{})", args.join(","))
+                }
+            }
+            HirExpression::CellIndex { target, indices } => {
+                let target = self.encode_index_expression_part(target);
+                let args = self.encode_index_call_args(indices);
+                if args.is_empty() {
+                    format!("cellindex({target})")
+                } else {
+                    format!("cellindex({target},{})", args.join(","))
+                }
+            }
             HirExpression::FieldAccess { target, field } => format!(
                 "field({},{field})",
                 self.encode_index_expression_part(target)
@@ -1640,6 +1648,9 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
             | "load"
             | "who"
             | "whos"
+            | "what"
+            | "help"
+            | "lookfor"
             | "tic"
             | "toc"
             | "clear"

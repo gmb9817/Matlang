@@ -1,0 +1,11 @@
+a = reshape(1:8, [2 2 2]);
+i13 = iqr(a, [1 3]);
+i123 = iqr(a, [1 2 3]);
+r13 = range(a, [1 3]);
+r123 = range(a, [1 2 3]);
+[z13, mu13, sigma13] = zscore(a, 0, [1 3]);
+[z123, mu123, sigma123] = zscore(a, 0, [1 2 3]);
+m = reshape(1:4, [2 2]);
+[i4, quart4] = iqr(m, [4]);
+r4 = range(m, [4]);
+[z4, mu4, sigma4] = zscore(m, 0, [4]);

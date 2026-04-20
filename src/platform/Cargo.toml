@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 matlab-codegen = { path = "../codegen" }
+matlab-resolver = { path = "../resolver" }
 
 [dev-dependencies]
 matlab-frontend = { path = "../frontend" }

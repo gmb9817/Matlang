@@ -20,9 +20,10 @@ use matlab_codegen::{
     summarize_bytecode, verify_bytecode, BytecodeModule,
 };
 use matlab_execution::{
-    execute_function_file, execute_function_file_bytecode_bundle,
-    execute_function_file_bytecode_module, execute_script, execute_script_bytecode_bundle,
-    execute_script_bytecode_module, render_execution_result, render_matlab_execution_result,
+    execute_function_file_bytecode_bundle, execute_function_file_bytecode_module,
+    execute_function_file_with_identity, execute_script_bytecode_bundle,
+    execute_script_bytecode_module, execute_script_with_identity, render_execution_result,
+    render_matlab_execution_result,
 };
 use matlab_frontend::{
     ast::CompilationUnitKind,
@@ -37,9 +38,9 @@ use matlab_interop::{
 use matlab_ir::{lower_to_hir, testing::render_hir};
 use matlab_optimizer::{optimize_module, render_optimization_summary, OptimizationSummary};
 use matlab_platform::{
-    collect_bytecode_dependency_paths, encode_bytecode_module, read_bytecode_artifact, read_bytecode_bundle,
-    render_bundle_summary, rewrite_bytecode_bundle_targets, write_bytecode_artifact,
-    write_bytecode_bundle, BytecodeBundle, PackagedBytecodeModule,
+    collect_bytecode_dependency_paths_with_context, encode_bytecode_module, read_bytecode_artifact,
+    read_bytecode_bundle, render_bundle_summary, rewrite_bytecode_bundle_targets,
+    write_bytecode_artifact, write_bytecode_bundle, BytecodeBundle, PackagedBytecodeModule,
 };
 use matlab_resolver::ResolverContext;
 use matlab_runtime::{render_workspace, Value, Workspace};
@@ -427,9 +428,11 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                                 .to_string(),
                         );
                     }
-                    execute_script(&hir)
+                    execute_script_with_identity(&hir, path.to_string(), None)
                 }
-                CompilationUnitKind::FunctionFile => execute_function_file(&hir, &runtime_args),
+                CompilationUnitKind::FunctionFile => {
+                    execute_function_file_with_identity(&hir, &runtime_args, path.to_string(), None)
+                }
                 CompilationUnitKind::ClassFile => {
                     return Err("`matc run` does not execute class definition files directly".to_string())
                 }
@@ -480,9 +483,11 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                                 .to_string(),
                         );
                     }
-                    execute_script(&hir)
+                    execute_script_with_identity(&hir, path.to_string(), None)
                 }
-                CompilationUnitKind::FunctionFile => execute_function_file(&hir, &runtime_args),
+                CompilationUnitKind::FunctionFile => {
+                    execute_function_file_with_identity(&hir, &runtime_args, path.to_string(), None)
+                }
                 CompilationUnitKind::ClassFile => {
                     return Err(
                         "`matc run-workspace` does not execute class definition files directly"
@@ -690,7 +695,7 @@ fn build_bytecode_bundle(path: &Path) -> Result<(CompiledBytecodeUnit, BytecodeB
     let root = compile_bytecode_file(path)?;
     let mut seen = std::collections::BTreeSet::new();
     seen.insert(path.display().to_string());
-    let mut pending = collect_bytecode_dependency_paths(&root.bytecode);
+    let mut pending = collect_bytecode_dependency_paths_with_context(&root.bytecode, path);
     let mut compiled_dependencies = Vec::new();
 
     while let Some(next_path) = pending.pop() {
@@ -700,7 +705,7 @@ fn build_bytecode_bundle(path: &Path) -> Result<(CompiledBytecodeUnit, BytecodeB
         }
 
         let compiled = compile_bytecode_file(&next_path)?;
-        for dependency in collect_bytecode_dependency_paths(&compiled.bytecode) {
+        for dependency in collect_bytecode_dependency_paths_with_context(&compiled.bytecode, &next_path) {
             let dependency_key = dependency.display().to_string();
             if !seen.contains(&dependency_key) {
                 pending.push(dependency);
@@ -866,9 +871,16 @@ fn execute_input_workspace(
                                 .to_string(),
                         );
                     }
-                    execute_script(&hir)
+                    execute_script_with_identity(&hir, path.display().to_string(), None)
                 }
-                CompilationUnitKind::FunctionFile => execute_function_file(&hir, runtime_args),
+                CompilationUnitKind::FunctionFile => {
+                    execute_function_file_with_identity(
+                        &hir,
+                        runtime_args,
+                        path.display().to_string(),
+                        None,
+                    )
+                }
                 CompilationUnitKind::ClassFile => {
                     return Err(
                         "`matc export-workspace` does not execute class definition files directly"
