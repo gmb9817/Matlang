@@ -318,7 +318,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                 &exported.workspace,
                 &snapshot_bundle_modules,
             )
-                .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?;
             let byte_count = fs::metadata(snapshot_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
@@ -434,7 +434,9 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                     execute_function_file_with_identity(&hir, &runtime_args, path.to_string(), None)
                 }
                 CompilationUnitKind::ClassFile => {
-                    return Err("`matc run` does not execute class definition files directly".to_string())
+                    return Err(
+                        "`matc run` does not execute class definition files directly".to_string(),
+                    )
                 }
             }
             .map_err(|error| format!("execution failed for `{path}`: {error}"))?;
@@ -445,7 +447,9 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                 CompilationUnitKind::FunctionFile => {
                     print!("{}", render_execution_result(&result));
                 }
-                CompilationUnitKind::ClassFile => unreachable!("class-file execution returns early"),
+                CompilationUnitKind::ClassFile => {
+                    unreachable!("class-file execution returns early")
+                }
             }
             maybe_surface_figures(&result, Path::new(path), live_figures.as_ref());
             Ok(0)
@@ -705,7 +709,9 @@ fn build_bytecode_bundle(path: &Path) -> Result<(CompiledBytecodeUnit, BytecodeB
         }
 
         let compiled = compile_bytecode_file(&next_path)?;
-        for dependency in collect_bytecode_dependency_paths_with_context(&compiled.bytecode, &next_path) {
+        for dependency in
+            collect_bytecode_dependency_paths_with_context(&compiled.bytecode, &next_path)
+        {
             let dependency_key = dependency.display().to_string();
             if !seen.contains(&dependency_key) {
                 pending.push(dependency);

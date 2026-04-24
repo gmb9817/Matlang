@@ -164,7 +164,10 @@ pub fn encode_bytecode_module(module: &BytecodeModule) -> String {
             class.package.clone().unwrap_or_default(),
             class.superclass_name.clone().unwrap_or_default(),
             class.superclass_path.clone().unwrap_or_default(),
-            class.superclass_bundle_module_id.clone().unwrap_or_default(),
+            class
+                .superclass_bundle_module_id
+                .clone()
+                .unwrap_or_default(),
             class.inherits_handle.to_string(),
             class.source_path.clone().unwrap_or_default(),
             class.default_initializer.clone().unwrap_or_default(),
@@ -503,8 +506,8 @@ fn collect_literal_str2func_dependency_paths(
     module: &BytecodeModule,
     source_path: &Path,
 ) -> Vec<PathBuf> {
-    let context =
-        ResolverContext::from_source_file(source_path.to_path_buf()).with_env_search_roots("MATC_PATH");
+    let context = ResolverContext::from_source_file(source_path.to_path_buf())
+        .with_env_search_roots("MATC_PATH");
     let mut paths = BTreeSet::new();
 
     for function in &module.functions {
@@ -969,8 +972,11 @@ fn parse_class(fields: Vec<String>, line_number: usize) -> Result<BytecodeClass,
         )));
     }
     let property_names = fields[property_start..property_end].to_vec();
-    let private_property_count =
-        parse_usize(&fields[property_end], "class private property count", line_number)?;
+    let private_property_count = parse_usize(
+        &fields[property_end],
+        "class private property count",
+        line_number,
+    )?;
     let private_property_start = property_end + 1;
     let private_property_end = private_property_start + private_property_count;
     if fields.len() < private_property_end + 1 {
@@ -1035,8 +1041,7 @@ fn parse_class(fields: Vec<String>, line_number: usize) -> Result<BytecodeClass,
             "line {line_number}: CLASS record is missing external method count"
         )));
     }
-    let private_static_inline_methods =
-        fields[private_static_start..private_static_end].to_vec();
+    let private_static_inline_methods = fields[private_static_start..private_static_end].to_vec();
     let external_count = parse_usize(
         &fields[private_static_end],
         "class external method count",

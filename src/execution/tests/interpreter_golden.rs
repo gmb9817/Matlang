@@ -47,14 +47,12 @@ fn assert_fixture(name: &str, mode: ParseMode, args: &[Value]) {
         CompilationUnitKind::Script => {
             execute_script_with_identity(&hir, "<root>".to_string(), Some(source_path.clone()))
         }
-        CompilationUnitKind::FunctionFile => {
-            execute_function_file_with_identity(
-                &hir,
-                args,
-                "<root>".to_string(),
-                Some(source_path.clone()),
-            )
-        }
+        CompilationUnitKind::FunctionFile => execute_function_file_with_identity(
+            &hir,
+            args,
+            "<root>".to_string(),
+            Some(source_path.clone()),
+        ),
         CompilationUnitKind::ClassFile => {
             panic!("class-file fixtures are not executable through the golden harness")
         }
@@ -563,7 +561,11 @@ fn builtin_sort_nd_helpers_fixture_matches_golden() {
 
 #[test]
 fn builtin_vecdim_shape_promotion_helpers_fixture_matches_golden() {
-    assert_fixture("builtin_vecdim_shape_promotion_helpers", ParseMode::Script, &[]);
+    assert_fixture(
+        "builtin_vecdim_shape_promotion_helpers",
+        ParseMode::Script,
+        &[],
+    );
 }
 
 #[test]
@@ -654,6 +656,11 @@ fn command_form_text_fixture_matches_golden() {
 #[test]
 fn command_form_workspace_builtins_fixture_matches_golden() {
     assert_fixture("command_form_workspace_builtins", ParseMode::Script, &[]);
+}
+
+#[test]
+fn command_form_filesystem_fixture_matches_golden() {
+    assert_fixture("command_form_filesystem", ParseMode::Script, &[]);
 }
 
 #[test]

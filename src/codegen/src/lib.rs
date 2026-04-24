@@ -449,7 +449,11 @@ pub fn render_bytecode(module: &BytecodeModule) -> String {
 impl ModuleEmitter {
     fn emit_module(&mut self, module: &HirModule) -> String {
         for class in &module.classes {
-            let initializer = if class.properties.iter().any(|property| property.default.is_some()) {
+            let initializer = if class
+                .properties
+                .iter()
+                .any(|property| property.default.is_some())
+            {
                 Some(self.emit_class_initializer(class))
             } else {
                 None
@@ -716,9 +720,7 @@ impl<'a> FunctionEmitter<'a> {
                 value,
                 list_assignment,
                 ..
-            } => {
-                self.lower_assignment(targets, value, *list_assignment)
-            }
+            } => self.lower_assignment(targets, value, *list_assignment),
             HirStatement::Expression { expression, .. } => {
                 if let HirExpression::Call { target, args } = expression {
                     if is_statement_builtin_call_with_args(target, args.len()) {
@@ -895,12 +897,10 @@ impl<'a> FunctionEmitter<'a> {
             }
         } else if matches!(targets.first(), Some(HirAssignmentTarget::Field { .. }))
             && (list_assignment
-                || target_expression_requires_field_list_assignment(
-                    match targets.first() {
-                        Some(HirAssignmentTarget::Field { target, .. }) => target,
-                        _ => unreachable!("guard restricted to field target"),
-                    },
-                ))
+                || target_expression_requires_field_list_assignment(match targets.first() {
+                    Some(HirAssignmentTarget::Field { target, .. }) => target,
+                    _ => unreachable!("guard restricted to field target"),
+                }))
         {
             match value {
                 HirExpression::Call {
@@ -1640,6 +1640,8 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
         name,
         "disp"
             | "display"
+            | "fclose"
+            | "frewind"
             | "fprintf"
             | "drawnow"
             | "clc"
@@ -1648,9 +1650,33 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
             | "load"
             | "who"
             | "whos"
+            | "savepath"
+            | "path2rc"
+            | "pathtool"
+            | "type"
+            | "mkdir"
+            | "rmdir"
+            | "copyfile"
+            | "movefile"
+            | "fileattrib"
+            | "path"
+            | "addpath"
+            | "rmpath"
+            | "restoredefaultpath"
+            | "rehash"
+            | "pwd"
+            | "cd"
+            | "dir"
+            | "ls"
             | "what"
             | "help"
+            | "doc"
             | "lookfor"
+            | "methods"
+            | "properties"
+            | "superclasses"
+            | "events"
+            | "ver"
             | "tic"
             | "toc"
             | "clear"
@@ -1765,6 +1791,7 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
                 | "ylim"
                 | "zlim"
         ))
+        || (name == "license" && arg_count > 0)
 }
 
 fn expression_supports_list_expansion(expression: &HirExpression) -> bool {
@@ -1782,7 +1809,9 @@ fn expression_supports_list_expansion(expression: &HirExpression) -> bool {
 
 fn target_expression_requires_field_list_assignment(expression: &HirExpression) -> bool {
     match expression {
-        HirExpression::FieldAccess { target, .. } => target_expression_requires_field_list_assignment(target),
+        HirExpression::FieldAccess { target, .. } => {
+            target_expression_requires_field_list_assignment(target)
+        }
         HirExpression::Call { .. } | HirExpression::CellIndex { .. } => true,
         _ => false,
     }

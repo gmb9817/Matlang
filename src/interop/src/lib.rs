@@ -4,17 +4,16 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
-    fmt,
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     rc::Rc,
     str::Chars,
 };
 
 use matlab_runtime::{
-    CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue,
-    ObjectClassMetadata, ObjectInstance, ObjectMethodTarget, ObjectStorage, ObjectStorageKind,
-    ObjectValue, RuntimeError, StructValue, Value, Workspace, observe_handle_object_id,
+    observe_handle_object_id, CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue,
+    MatrixValue, ObjectClassMetadata, ObjectInstance, ObjectMethodTarget, ObjectStorage,
+    ObjectStorageKind, ObjectValue, RuntimeError, StructValue, Value, Workspace,
 };
 
 pub const CRATE_NAME: &str = "matlab-interop";
@@ -22,8 +21,7 @@ pub const WORKSPACE_SNAPSHOT_MAGIC: &str = "MATC-WORKSPACE";
 pub const WORKSPACE_SNAPSHOT_VERSION: &str = "2";
 
 #[derive(Default)]
-struct HandleAliasEncodeContext {
-}
+struct HandleAliasEncodeContext {}
 
 impl HandleAliasEncodeContext {
     fn handle_id_for_object(&mut self, object: &ObjectValue) -> Option<String> {
@@ -173,9 +171,9 @@ pub fn decode_workspace_snapshot_with_modules(
             }
             _ => {
                 return Err(InteropError::Parse(format!(
-                    "line {}: expected `VAR <name> <value>` or `BUNDLE <id> <path> <module>` record",
-                    line_index + 1
-                )))
+                "line {}: expected `VAR <name> <value>` or `BUNDLE <id> <path> <module>` record",
+                line_index + 1
+            )))
             }
         }
     }
@@ -214,7 +212,9 @@ pub fn read_workspace_snapshot(path: &Path) -> Result<Workspace, InteropError> {
     Ok(read_workspace_snapshot_with_modules(path)?.workspace)
 }
 
-pub fn read_workspace_snapshot_with_modules(path: &Path) -> Result<WorkspaceSnapshotData, InteropError> {
+pub fn read_workspace_snapshot_with_modules(
+    path: &Path,
+) -> Result<WorkspaceSnapshotData, InteropError> {
     let source = fs::read_to_string(path).map_err(|error| {
         InteropError::Io(format!(
             "failed to read workspace snapshot `{}`: {error}",
@@ -233,6 +233,8 @@ const MI_UINT16: u32 = 4;
 const MI_INT32: u32 = 5;
 const MI_UINT32: u32 = 6;
 const MI_DOUBLE: u32 = 9;
+const MI_INT64: u32 = 12;
+const MI_UINT64: u32 = 13;
 const MI_MATRIX: u32 = 14;
 
 const MX_CELL_CLASS: u32 = 1;
@@ -241,6 +243,8 @@ const MX_OBJECT_CLASS: u32 = 3;
 const MX_CHAR_CLASS: u32 = 4;
 const MX_DOUBLE_CLASS: u32 = 6;
 const MX_UINT8_CLASS: u32 = 9;
+const MX_INT64_CLASS: u32 = 14;
+const MX_UINT64_CLASS: u32 = 15;
 
 const ARRAY_FLAG_LOGICAL: u32 = 1 << 9;
 const ARRAY_FLAG_COMPLEX: u32 = 1 << 11;
@@ -355,6 +359,18 @@ fn encode_mat_matrix_payload_with_context(
             write_name(&mut out, name);
             write_f64_values(&mut out, &[*number]);
         }
+        Value::Int64(number) => {
+            write_array_flags(&mut out, MX_INT64_CLASS, 0);
+            write_dimensions(&mut out, &[1, 1]);
+            write_name(&mut out, name);
+            write_i64_values(&mut out, &[*number]);
+        }
+        Value::UInt64(number) => {
+            write_array_flags(&mut out, MX_UINT64_CLASS, 0);
+            write_dimensions(&mut out, &[1, 1]);
+            write_name(&mut out, name);
+            write_u64_values(&mut out, &[*number]);
+        }
         Value::Complex(number) => {
             write_array_flags(&mut out, MX_DOUBLE_CLASS, ARRAY_FLAG_COMPLEX);
             write_dimensions(&mut out, &[1, 1]);
@@ -374,13 +390,9 @@ fn encode_mat_matrix_payload_with_context(
             write_name(&mut out, name);
             write_u16_values(&mut out, &text.encode_utf16().collect::<Vec<_>>());
         }
-        Value::String(text) => encode_mat_string_object(
-            &mut out,
-            name,
-            std::slice::from_ref(text),
-            &[1, 1],
-            context,
-        )?,
+        Value::String(text) => {
+            encode_mat_string_object(&mut out, name, std::slice::from_ref(text), &[1, 1], context)?
+        }
         Value::Matrix(matrix) => encode_mat_matrix_value(&mut out, name, matrix, context)?,
         Value::Cell(cell) => encode_mat_cell_value(&mut out, name, cell, context)?,
         Value::Struct(struct_value) => {
@@ -463,13 +475,50 @@ fn encode_mat_matrix_value(
     let has_complex = column_major
         .iter()
         .any(|value| matches!(value, Value::Complex(_)));
-    write_array_flags(
-        out,
-        MX_DOUBLE_CLASS,
-        if has_complex { ARRAY_FLAG_COMPLEX } else { 0 },
-    );
+    let all_int64 = column_major
+        .iter()
+        .all(|value| matches!(value, Value::Int64(_)));
+    let all_uint64 = column_major
+        .iter()
+        .all(|value| matches!(value, Value::UInt64(_)));
+    let class = if all_int64 {
+        MX_INT64_CLASS
+    } else if all_uint64 {
+        MX_UINT64_CLASS
+    } else {
+        MX_DOUBLE_CLASS
+    };
+    write_array_flags(out, class, if has_complex { ARRAY_FLAG_COMPLEX } else { 0 });
     write_dimensions(out, &matrix.dims);
     write_name(out, name);
+    if all_int64 {
+        let values = column_major
+            .into_iter()
+            .map(|value| match value {
+                Value::Int64(number) => Ok(number),
+                other => Err(InteropError::Unsupported(format!(
+                    "MAT-file encoding currently supports homogeneous int64 matrices, found matrix element {}",
+                    other.kind_name()
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        write_i64_values(out, &values);
+        return Ok(());
+    }
+    if all_uint64 {
+        let values = column_major
+            .into_iter()
+            .map(|value| match value {
+                Value::UInt64(number) => Ok(number),
+                other => Err(InteropError::Unsupported(format!(
+                    "MAT-file encoding currently supports homogeneous uint64 matrices, found matrix element {}",
+                    other.kind_name()
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        write_u64_values(out, &values);
+        return Ok(());
+    }
     let mut real = Vec::with_capacity(column_major.len());
     let mut imag = Vec::with_capacity(column_major.len());
     for value in column_major {
@@ -531,7 +580,13 @@ fn encode_mat_struct_scalar(
     struct_value: &StructValue,
     context: &mut HandleAliasEncodeContext,
 ) -> Result<(), InteropError> {
-    encode_mat_struct_array(out, name, &[1, 1], &[Value::Struct(struct_value.clone())], context)
+    encode_mat_struct_array(
+        out,
+        name,
+        &[1, 1],
+        &[Value::Struct(struct_value.clone())],
+        context,
+    )
 }
 
 fn encode_mat_function_handle_object(
@@ -577,50 +632,60 @@ fn encode_mat_function_handle_object(
     write_tagged_element(out, MI_INT8, &field_names_payload);
 
     let empty_receiver = Value::Matrix(
-        MatrixValue::new(0, 0, Vec::new())
-            .expect("empty matrix value should be constructible"),
+        MatrixValue::new(0, 0, Vec::new()).expect("empty matrix value should be constructible"),
     );
-    let (target_kind, target_value, class_name, package, method_name, receiver) = match &handle.target {
-        FunctionHandleTarget::Named(name) => (
-            "named",
-            name.clone(),
-            String::new(),
-            String::new(),
-            String::new(),
-            empty_receiver,
-        ),
-        FunctionHandleTarget::ResolvedPath(path) => (
-            "path",
-            path.display().to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            empty_receiver,
-        ),
-        FunctionHandleTarget::BundleModule(module_id) => (
-            "bundle",
-            module_id.clone(),
-            String::new(),
-            String::new(),
-            String::new(),
-            empty_receiver,
-        ),
-        FunctionHandleTarget::BoundMethod {
-            class_name,
-            package,
-            method_name,
-            receiver,
-        } => (
-            "bound",
-            String::new(),
-            class_name.clone(),
-            package.clone().unwrap_or_default(),
-            method_name.clone(),
-            receiver.as_ref().clone(),
-        ),
-    };
-    write_mat_matrix_element_with_context(out, "", &Value::CharArray(handle.display_name.clone()), context)?;
-    write_mat_matrix_element_with_context(out, "", &Value::CharArray(target_kind.to_string()), context)?;
+    let (target_kind, target_value, class_name, package, method_name, receiver) =
+        match &handle.target {
+            FunctionHandleTarget::Named(name) => (
+                "named",
+                name.clone(),
+                String::new(),
+                String::new(),
+                String::new(),
+                empty_receiver,
+            ),
+            FunctionHandleTarget::ResolvedPath(path) => (
+                "path",
+                path.display().to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                empty_receiver,
+            ),
+            FunctionHandleTarget::BundleModule(module_id) => (
+                "bundle",
+                module_id.clone(),
+                String::new(),
+                String::new(),
+                String::new(),
+                empty_receiver,
+            ),
+            FunctionHandleTarget::BoundMethod {
+                class_name,
+                package,
+                method_name,
+                receiver,
+            } => (
+                "bound",
+                String::new(),
+                class_name.clone(),
+                package.clone().unwrap_or_default(),
+                method_name.clone(),
+                receiver.as_ref().clone(),
+            ),
+        };
+    write_mat_matrix_element_with_context(
+        out,
+        "",
+        &Value::CharArray(handle.display_name.clone()),
+        context,
+    )?;
+    write_mat_matrix_element_with_context(
+        out,
+        "",
+        &Value::CharArray(target_kind.to_string()),
+        context,
+    )?;
     write_mat_matrix_element_with_context(out, "", &Value::CharArray(target_value), context)?;
     write_mat_matrix_element_with_context(out, "", &Value::CharArray(class_name), context)?;
     write_mat_matrix_element_with_context(out, "", &Value::CharArray(package), context)?;
@@ -776,8 +841,12 @@ fn encode_mat_object_array(
         .map(Value::String)
         .collect::<Vec<_>>();
     let private_static_inline_methods = Value::Cell(
-        CellValue::new(1, private_static_inline_methods.len(), private_static_inline_methods)
-            .map_err(|error| InteropError::Unsupported(error.to_string()))?,
+        CellValue::new(
+            1,
+            private_static_inline_methods.len(),
+            private_static_inline_methods,
+        )
+        .map_err(|error| InteropError::Unsupported(error.to_string()))?,
     );
     let mut external_fields = BTreeMap::new();
     for (method, target) in &class.external_methods {
@@ -796,13 +865,38 @@ fn encode_mat_object_array(
         };
         let properties = object.properties();
         let handle_id = context.handle_id_for_object(&object).unwrap_or_default();
-        write_mat_matrix_element_with_context(out, "", &Value::CharArray(package.clone()), context)?;
-        write_mat_matrix_element_with_context(out, "", &Value::CharArray(superclass.clone()), context)?;
+        write_mat_matrix_element_with_context(
+            out,
+            "",
+            &Value::CharArray(package.clone()),
+            context,
+        )?;
+        write_mat_matrix_element_with_context(
+            out,
+            "",
+            &Value::CharArray(superclass.clone()),
+            context,
+        )?;
         write_mat_matrix_element_with_context(out, "", &ancestors, context)?;
-        write_mat_matrix_element_with_context(out, "", &Value::CharArray(storage.clone()), context)?;
+        write_mat_matrix_element_with_context(
+            out,
+            "",
+            &Value::CharArray(storage.clone()),
+            context,
+        )?;
         write_mat_matrix_element_with_context(out, "", &Value::CharArray(source.clone()), context)?;
-        write_mat_matrix_element_with_context(out, "", &Value::CharArray(module_target.clone()), context)?;
-        write_mat_matrix_element_with_context(out, "", &Value::CharArray(constructor.clone()), context)?;
+        write_mat_matrix_element_with_context(
+            out,
+            "",
+            &Value::CharArray(module_target.clone()),
+            context,
+        )?;
+        write_mat_matrix_element_with_context(
+            out,
+            "",
+            &Value::CharArray(constructor.clone()),
+            context,
+        )?;
         write_mat_matrix_element_with_context(out, "", &inline_methods, context)?;
         write_mat_matrix_element_with_context(out, "", &private_properties, context)?;
         write_mat_matrix_element_with_context(out, "", &private_property_owners, context)?;
@@ -968,6 +1062,8 @@ fn decode_mat_matrix_payload_with_context(
 
     let value = match class {
         MX_DOUBLE_CLASS => decode_mat_double_array(&mut reader, &dims, rows, cols, complex)?,
+        MX_INT64_CLASS => decode_mat_i64_array(&mut reader, &dims, rows, cols)?,
+        MX_UINT64_CLASS => decode_mat_u64_array(&mut reader, &dims, rows, cols)?,
         MX_CHAR_CLASS => decode_mat_char_array(&mut reader, &dims)?,
         MX_CELL_CLASS => decode_mat_cell_array(&mut reader, &dims, rows, cols, context)?,
         MX_STRUCT_CLASS => decode_mat_struct_array(&mut reader, &dims, context)?,
@@ -1020,6 +1116,98 @@ fn decode_mat_double_array(
     }
     if count == 1 {
         return Ok(values.into_iter().next().unwrap_or(Value::Scalar(0.0)));
+    }
+    MatrixValue::with_dimensions(rows, cols, dims.to_vec(), values)
+        .map(Value::Matrix)
+        .map_err(|error| InteropError::Parse(error.to_string()))
+}
+
+fn decode_i64_payload(payload: &[u8]) -> Result<Vec<i64>, InteropError> {
+    if payload.len() % 8 != 0 {
+        return Err(InteropError::Parse(
+            "MAT-file int64 payload length is not a multiple of 8".to_string(),
+        ));
+    }
+    Ok(payload
+        .chunks_exact(8)
+        .map(|chunk| {
+            i64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        })
+        .collect())
+}
+
+fn decode_u64_payload(payload: &[u8]) -> Result<Vec<u64>, InteropError> {
+    if payload.len() % 8 != 0 {
+        return Err(InteropError::Parse(
+            "MAT-file uint64 payload length is not a multiple of 8".to_string(),
+        ));
+    }
+    Ok(payload
+        .chunks_exact(8)
+        .map(|chunk| {
+            u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        })
+        .collect())
+}
+
+fn decode_mat_i64_array(
+    reader: &mut ByteReader<'_>,
+    dims: &[usize],
+    rows: usize,
+    cols: usize,
+) -> Result<Value, InteropError> {
+    let (_, payload) = reader.read_tagged_element()?;
+    let raw = decode_i64_payload(&payload)?;
+    let count = dims.iter().product::<usize>();
+    if raw.len() != count {
+        return Err(InteropError::Parse(format!(
+            "MAT-file int64 payload length {} does not match dimensions {:?}",
+            raw.len(),
+            dims
+        )));
+    }
+    let mut values = vec![Value::Int64(0); count];
+    for linear in 0..count {
+        let index = column_major_multi_index(linear, dims);
+        let row_major = row_major_linear_index(&index, dims);
+        values[row_major] = Value::Int64(raw[linear]);
+    }
+    if count == 1 {
+        return Ok(values.into_iter().next().unwrap_or(Value::Int64(0)));
+    }
+    MatrixValue::with_dimensions(rows, cols, dims.to_vec(), values)
+        .map(Value::Matrix)
+        .map_err(|error| InteropError::Parse(error.to_string()))
+}
+
+fn decode_mat_u64_array(
+    reader: &mut ByteReader<'_>,
+    dims: &[usize],
+    rows: usize,
+    cols: usize,
+) -> Result<Value, InteropError> {
+    let (_, payload) = reader.read_tagged_element()?;
+    let raw = decode_u64_payload(&payload)?;
+    let count = dims.iter().product::<usize>();
+    if raw.len() != count {
+        return Err(InteropError::Parse(format!(
+            "MAT-file uint64 payload length {} does not match dimensions {:?}",
+            raw.len(),
+            dims
+        )));
+    }
+    let mut values = vec![Value::UInt64(0); count];
+    for linear in 0..count {
+        let index = column_major_multi_index(linear, dims);
+        let row_major = row_major_linear_index(&index, dims);
+        values[row_major] = Value::UInt64(raw[linear]);
+    }
+    if count == 1 {
+        return Ok(values.into_iter().next().unwrap_or(Value::UInt64(0)));
     }
     MatrixValue::with_dimensions(rows, cols, dims.to_vec(), values)
         .map(Value::Matrix)
@@ -1476,10 +1664,7 @@ fn decode_mat_generic_object(
         };
         let properties = StructValue::with_field_order(property_fields, property_order);
         values[row_major] = Value::Object(decode_object_with_alias_context(
-            class,
-            properties,
-            handle_id,
-            context,
+            class, properties, handle_id, context,
         ));
     }
 
@@ -1492,17 +1677,17 @@ fn decode_mat_generic_object(
                     superclass_name: None,
                     ancestor_class_names: BTreeSet::new(),
                     storage_kind: ObjectStorageKind::Value,
-                source_path: None,
-                module_target: None,
-                property_order: Vec::new(),
-                private_properties: BTreeSet::new(),
-                private_property_owners: BTreeMap::new(),
-                inline_methods: BTreeSet::new(),
-                private_inline_methods: BTreeSet::new(),
-                private_instance_method_owners: BTreeMap::new(),
-                private_static_inline_methods: BTreeSet::new(),
-                external_methods: BTreeMap::new(),
-                constructor: None,
+                    source_path: None,
+                    module_target: None,
+                    property_order: Vec::new(),
+                    private_properties: BTreeSet::new(),
+                    private_property_owners: BTreeMap::new(),
+                    inline_methods: BTreeSet::new(),
+                    private_inline_methods: BTreeSet::new(),
+                    private_instance_method_owners: BTreeMap::new(),
+                    private_static_inline_methods: BTreeSet::new(),
+                    external_methods: BTreeMap::new(),
+                    constructor: None,
                 },
                 StructValue::default(),
             ))
@@ -1595,6 +1780,22 @@ fn write_u16_values(out: &mut Vec<u8>, values: &[u16]) {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     write_tagged_element(out, MI_UINT16, &payload);
+}
+
+fn write_i64_values(out: &mut Vec<u8>, values: &[i64]) {
+    let mut payload = Vec::new();
+    for &value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    write_tagged_element(out, MI_INT64, &payload);
+}
+
+fn write_u64_values(out: &mut Vec<u8>, values: &[u64]) {
+    let mut payload = Vec::new();
+    for &value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    write_tagged_element(out, MI_UINT64, &payload);
 }
 
 fn write_tagged_element(out: &mut Vec<u8>, data_type: u32, payload: &[u8]) {
@@ -1843,6 +2044,8 @@ fn encode_value_with_context(
 ) -> Result<String, InteropError> {
     match value {
         Value::Scalar(number) => Ok(format!("S({number})")),
+        Value::Int64(number) => Ok(format!("I({number})")),
+        Value::UInt64(number) => Ok(format!("U({number})")),
         Value::Complex(number) => Ok(format!("X({},{})", number.real, number.imag)),
         Value::Logical(flag) => Ok(format!("L({})", if *flag { "true" } else { "false" })),
         Value::CharArray(text) => Ok(format!("Q(char,{})", encode_string(text))),
@@ -1876,7 +2079,8 @@ fn encode_value_with_context(
                 CellValue::new(1, ancestors.len(), ancestors)
                     .map_err(|error| InteropError::Unsupported(error.to_string()))?,
             );
-            let properties = encode_value_with_context(&Value::Struct(object.properties()), context)?;
+            let properties =
+                encode_value_with_context(&Value::Struct(object.properties()), context)?;
             let inline_methods = object
                 .class
                 .inline_methods
@@ -1919,12 +2123,18 @@ fn encode_value_with_context(
                 .map(|name| encode_string(name))
                 .collect::<Vec<_>>()
                 .join(",");
-        let handle_id = context.handle_id_for_object(&object).unwrap_or_default();
+            let handle_id = context.handle_id_for_object(&object).unwrap_or_default();
             let external_methods = object
                 .class
                 .external_methods
                 .iter()
-                .map(|(name, target)| format!("{}=>{}", encode_string(name), encode_string(&encode_object_method_target(target))))
+                .map(|(name, target)| {
+                    format!(
+                        "{}=>{}",
+                        encode_string(name),
+                        encode_string(&encode_object_method_target(target))
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             Ok(format!(
@@ -2060,7 +2270,11 @@ struct Parser<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> Parser<'a, 'ctx> {
-    fn new(source: &'a str, line_number: usize, handle_aliases: &'ctx mut HandleAliasDecodeContext) -> Self {
+    fn new(
+        source: &'a str,
+        line_number: usize,
+        handle_aliases: &'ctx mut HandleAliasDecodeContext,
+    ) -> Self {
         Self {
             chars: source.chars().peekable(),
             line_number,
@@ -2192,7 +2406,10 @@ impl<'a, 'ctx> Parser<'a, 'ctx> {
         }
         self.expect_char(']')?;
         self.expect_char(')')?;
-        Ok(Value::Struct(StructValue::with_field_order(fields, field_order)))
+        Ok(Value::Struct(StructValue::with_field_order(
+            fields,
+            field_order,
+        )))
     }
 
     fn parse_handle(&mut self) -> Result<Value, InteropError> {
@@ -2301,8 +2518,8 @@ impl<'a, 'ctx> Parser<'a, 'ctx> {
         let Value::Struct(properties) = properties else {
             return Err(self.error("object payload expected struct properties".to_string()));
         };
-        let ancestor_class_names = decode_text_set(&ancestors)
-            .map_err(|error| self.error(error.to_string()))?;
+        let ancestor_class_names =
+            decode_text_set(&ancestors).map_err(|error| self.error(error.to_string()))?;
 
         let storage_kind = match storage.as_str() {
             "handle" => ObjectStorageKind::Handle,
@@ -2492,4 +2709,3 @@ impl<'a, 'ctx> Parser<'a, 'ctx> {
         ))
     }
 }
-

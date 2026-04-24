@@ -91,7 +91,8 @@ fn render_class(class: &HirClass, depth: usize, out: &mut String) {
             depth + 1,
             format!(
                 "properties [{}]",
-                class.properties
+                class
+                    .properties
                     .iter()
                     .map(render_class_property)
                     .collect::<Vec<_>>()
@@ -152,7 +153,8 @@ fn render_class(class: &HirClass, depth: usize, out: &mut String) {
             depth + 1,
             format!(
                 "external_methods [{}]",
-                class.external_methods
+                class
+                    .external_methods
                     .iter()
                     .map(|method| format!("{}={}", method.name, method.path.display()))
                     .collect::<Vec<_>>()

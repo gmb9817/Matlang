@@ -75,7 +75,11 @@ fn render_property_block(block: &ClassPropertyBlock, depth: usize, out: &mut Str
 
 fn render_property(property: &ClassPropertyDef, depth: usize, out: &mut String) {
     let line = match &property.default {
-        Some(default) => format!("property {} = {}", property.name.name, render_expression(default)),
+        Some(default) => format!(
+            "property {} = {}",
+            property.name.name,
+            render_expression(default)
+        ),
         None => format!("property {}", property.name.name),
     };
     push_line(out, depth, line);
@@ -87,9 +91,7 @@ fn render_method_block(block: &ClassMethodBlock, depth: usize, out: &mut String)
             "methods (Static, Access=private)".to_string()
         }
         (true, crate::ast::ClassMemberAccess::Public) => "methods (Static)".to_string(),
-        (false, crate::ast::ClassMemberAccess::Private) => {
-            "methods (Access=private)".to_string()
-        }
+        (false, crate::ast::ClassMemberAccess::Private) => "methods (Access=private)".to_string(),
         (false, crate::ast::ClassMemberAccess::Public) => "methods".to_string(),
     };
     push_line(out, depth, header);

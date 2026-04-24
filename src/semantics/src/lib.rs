@@ -10,8 +10,8 @@ pub mod workspace;
 use std::collections::HashMap;
 
 pub use binder::{
-    analyze_compilation_unit, analyze_compilation_unit_with_source_context,
-    builtin_function_names, is_builtin_function_name, AnalysisResult,
+    analyze_compilation_unit, analyze_compilation_unit_with_source_context, builtin_function_names,
+    is_builtin_function_name, AnalysisResult,
 };
 use matlab_frontend::{
     ast::{CompilationUnit, Expression, ExpressionKind, FunctionHandleTarget, IndexArgument},
@@ -114,13 +114,15 @@ fn validate_class_property_default_expression(
                 resolved,
                 diagnostics,
             ),
-            FunctionHandleTarget::Expression(expression) => validate_class_property_default_expression(
-                expression,
-                property_name,
-                references,
-                resolved,
-                diagnostics,
-            ),
+            FunctionHandleTarget::Expression(expression) => {
+                validate_class_property_default_expression(
+                    expression,
+                    property_name,
+                    references,
+                    resolved,
+                    diagnostics,
+                )
+            }
         },
         ExpressionKind::Unary { rhs, .. } => validate_class_property_default_expression(
             rhs,
@@ -323,9 +325,13 @@ mod tests {
         );
 
         assert!(analysis.has_errors(), "{:?}", analysis.diagnostics);
-        assert!(analysis.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "SEM010" && diagnostic.message.contains("property `left`")
-        }), "{:?}", analysis.diagnostics);
+        assert!(
+            analysis.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "SEM010" && diagnostic.message.contains("property `left`")
+            }),
+            "{:?}",
+            analysis.diagnostics
+        );
     }
 
     #[test]

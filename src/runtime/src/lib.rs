@@ -1,13 +1,13 @@
 //! Runtime crate for executable MATLAB semantics.
 
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     path::PathBuf,
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub const CRATE_NAME: &str = "matlab-runtime";
@@ -25,6 +25,8 @@ pub struct ComplexValue {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Scalar(f64),
+    Int64(i64),
+    UInt64(u64),
     Complex(ComplexValue),
     Logical(bool),
     CharArray(String),
@@ -177,14 +179,11 @@ impl ObjectClassMetadata {
     }
 
     pub fn private_property_owner(&self, name: &str) -> Option<String> {
-        self.private_property_owners
-            .get(name)
-            .cloned()
-            .or_else(|| {
-                self.private_properties
-                    .contains(name)
-                    .then(|| self.qualified_name())
-            })
+        self.private_property_owners.get(name).cloned().or_else(|| {
+            self.private_properties
+                .contains(name)
+                .then(|| self.qualified_name())
+        })
     }
 
     pub fn private_instance_method_owner(&self, name: &str) -> Option<String> {
@@ -394,6 +393,8 @@ impl Value {
     pub fn as_scalar(&self) -> Result<f64, RuntimeError> {
         match self {
             Self::Scalar(value) => Ok(*value),
+            Self::Int64(value) => Ok(*value as f64),
+            Self::UInt64(value) => Ok(*value as f64),
             Self::Logical(value) => Ok(if *value { 1.0 } else { 0.0 }),
             Self::Matrix(matrix) if matrix.rows == 1 && matrix.cols == 1 => {
                 matrix.elements[0].as_scalar()
@@ -412,6 +413,8 @@ impl Value {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::Scalar(_) => "scalar",
+            Self::Int64(_) => "int64",
+            Self::UInt64(_) => "uint64",
             Self::Complex(_) => "complex",
             Self::Logical(_) => "logical",
             Self::CharArray(_) => "char",
@@ -504,7 +507,7 @@ impl MatrixValue {
 
         for element in self.elements() {
             match element {
-                Value::Scalar(_) => {}
+                Value::Scalar(_) | Value::Int64(_) | Value::UInt64(_) => {}
                 Value::Logical(_) => {
                     return if self
                         .elements()
@@ -632,7 +635,10 @@ impl CellValue {
 impl StructValue {
     pub fn from_fields(fields: BTreeMap<String, Value>) -> Self {
         let field_order = fields.keys().cloned().collect();
-        Self { fields, field_order }
+        Self {
+            fields,
+            field_order,
+        }
     }
 
     pub fn with_field_order(fields: BTreeMap<String, Value>, field_order: Vec<String>) -> Self {
@@ -725,7 +731,9 @@ impl ObjectValue {
     pub fn property_value(&self, name: &str) -> Option<Value> {
         match &self.storage {
             ObjectStorage::Value(instance) => instance.properties.fields.get(name).cloned(),
-            ObjectStorage::Handle { shared, .. } => shared.borrow().properties.fields.get(name).cloned(),
+            ObjectStorage::Handle { shared, .. } => {
+                shared.borrow().properties.fields.get(name).cloned()
+            }
         }
     }
 
@@ -811,7 +819,11 @@ mod tests {
         let logical = MatrixValue::new(
             1,
             3,
-            vec![Value::Logical(true), Value::Logical(false), Value::Logical(true)],
+            vec![
+                Value::Logical(true),
+                Value::Logical(false),
+                Value::Logical(true),
+            ],
         )
         .expect("logical matrix");
         assert_eq!(logical.storage_class(), ArrayStorageClass::Logical);
@@ -833,7 +845,10 @@ mod tests {
         let strings = MatrixValue::new(
             1,
             2,
-            vec![Value::String("a".to_string()), Value::String("b".to_string())],
+            vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+            ],
         )
         .expect("string matrix");
         assert_eq!(strings.storage_class(), ArrayStorageClass::String);
@@ -873,15 +888,15 @@ mod tests {
 
     #[test]
     fn matrix_and_cell_accessors_expose_shape_and_storage_views() {
-        let mut matrix = MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
-            .expect("matrix");
+        let mut matrix =
+            MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)]).expect("matrix");
         assert_eq!(matrix.dims(), &[1, 2]);
         assert_eq!(matrix.element_count(), 2);
         matrix.elements_mut()[1] = Value::Scalar(4.0);
         assert_eq!(matrix.elements()[1], Value::Scalar(4.0));
 
-        let mut cell = CellValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
-            .expect("cell");
+        let mut cell =
+            CellValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)]).expect("cell");
         assert_eq!(cell.dims(), &[1, 2]);
         assert_eq!(cell.element_count(), 2);
         cell.elements_mut()[0] = Value::String("x".to_string());
@@ -896,7 +911,10 @@ mod tests {
         ]);
         let mut struct_value =
             StructValue::with_field_order(fields, vec!["b".to_string(), "a".to_string()]);
-        assert_eq!(struct_value.field_names(), &["b".to_string(), "a".to_string()]);
+        assert_eq!(
+            struct_value.field_names(),
+            &["b".to_string(), "a".to_string()]
+        );
         assert_eq!(
             struct_value
                 .ordered_entries()
@@ -952,6 +970,8 @@ pub fn render_workspace(workspace: &Workspace) -> String {
 pub fn render_value(value: &Value) -> String {
     match value {
         Value::Scalar(number) => render_number(*number),
+        Value::Int64(number) => number.to_string(),
+        Value::UInt64(number) => number.to_string(),
         Value::Complex(number) => render_complex(number),
         Value::Logical(flag) => {
             if *flag {
@@ -1048,6 +1068,9 @@ fn render_matrix_inline(matrix: &MatrixValue, tail_index: Option<&[usize]>) -> S
     if rows == 0 || cols == 0 {
         return "[]".to_string();
     }
+    if let Some(rendered) = render_char_matrix_inline(matrix, tail_index) {
+        return rendered;
+    }
     let rows = (0..rows)
         .map(|row| {
             (0..cols)
@@ -1065,6 +1088,59 @@ fn render_matrix_inline(matrix: &MatrixValue, tail_index: Option<&[usize]>) -> S
         .collect::<Vec<_>>()
         .join(" ; ");
     format!("[{rows}]")
+}
+
+fn render_char_matrix_inline(matrix: &MatrixValue, tail_index: Option<&[usize]>) -> Option<String> {
+    if !matrix_is_char_matrix(matrix) {
+        return None;
+    }
+
+    let rows = matrix.dims.first().copied().unwrap_or(matrix.rows);
+    let cols = matrix.dims.get(1).copied().unwrap_or(matrix.cols);
+    let row_texts = (0..rows)
+        .map(|row| {
+            (0..cols)
+                .map(|col| {
+                    let mut index = vec![row, col];
+                    if let Some(tail_index) = tail_index {
+                        index.extend_from_slice(tail_index);
+                    }
+                    let linear = row_major_linear_index(&index, &matrix.dims);
+                    single_char_text_value(&matrix.elements[linear])
+                        .expect("char matrix render guard ensures single-character elements")
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    Some(if row_texts.len() == 1 {
+        render_quoted_text(&row_texts[0], '\'')
+    } else {
+        format!(
+            "[{}]",
+            row_texts
+                .into_iter()
+                .map(|row| render_quoted_text(&row, '\''))
+                .collect::<Vec<_>>()
+                .join(" ; ")
+        )
+    })
+}
+
+fn matrix_is_char_matrix(matrix: &MatrixValue) -> bool {
+    !matrix.elements().is_empty()
+        && matrix
+            .iter()
+            .all(|value| single_char_text_value(value).is_some())
+}
+
+fn single_char_text_value(value: &Value) -> Option<char> {
+    let Value::CharArray(text) = value else {
+        return None;
+    };
+    let mut chars = text.chars();
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
 }
 
 fn render_cell_inline(cell: &CellValue, tail_index: Option<&[usize]>) -> String {

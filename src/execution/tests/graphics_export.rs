@@ -3026,7 +3026,9 @@ fn histogram2_pdf_normalization_exports_normalized_tile_colors() {
         "missing maximum-density histogram2 tile color in SVG: {svg}"
     );
     assert!(
-        svg.contains("fill=\"rgb(8,133,187)\" fill-opacity=\"0.82\" stroke=\"#666666\" stroke-width=\"0.8\""),
+        svg.contains(
+            "fill=\"rgb(8,133,187)\" fill-opacity=\"0.82\" stroke=\"#666666\" stroke-width=\"0.8\""
+        ),
         "missing intermediate-density histogram2 tile color in SVG: {svg}"
     );
 

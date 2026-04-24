@@ -1,5 +1,8 @@
 workspace
   a = 2
+  aa = ['ac' ; 'bd']
+  ab = ['a' ; 'b' ; 'c' ; 'd']
+  ac = 'abcd'
   b = 2
   c = 1
   d = [2, 1, 2]

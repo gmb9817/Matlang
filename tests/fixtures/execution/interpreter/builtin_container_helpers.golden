@@ -1,5 +1,14 @@
 workspace
   c = {1, 2 ; 3, 4}
+  ca = ['ac' ; 'bd']
+  cb = ['ab' ; 'cd']
+  cc(:,:,1) = ['a' ; 'b']
+  cc(:,:,2) = ['c' ; 'd']
+  cd = [2, 1, 2]
+  char_cell = ['ab' ; 'cd']
+  char_mat = {'ac' ; 'bd'}
+  char_num = {'a', 'b'}
+  char_num_dim = {'ab'}
   d = [1, 2 ; 3, 4]
   d0 = {}
   d1 = {[], [], [] ; [], [], []}

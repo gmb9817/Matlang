@@ -70,6 +70,15 @@ workspace
   cf = [1, 0 ; 0, 1]
   cg = [1 + 1i, 2 ; 0, 1]
   ch = [0, 1 ; 1, 0]
+  char_herm = true
+  char_is_lower = true
+  char_is_upper = true
+  char_sym = true
+  char_sym_false = false
+  char_tril_codes = [0, 0 ; 98, 0]
+  char_tril_ischar = true
+  char_triu_codes = [97, 99 ; 0, 100]
+  char_triu_ischar = true
   ci = [1, 0 ; 0.5, 1]
   cj = [4, 1 ; 0, 2.5]
   ck = [1.414213562373, 0 ; 0, 1.414213562373]

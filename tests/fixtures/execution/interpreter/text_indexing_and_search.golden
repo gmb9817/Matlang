@@ -5,7 +5,7 @@ workspace
   ac = {[1], [3]}
   b = 'lph'
   c = 'aa'
-  d = 'alpha'
+  d = ['a' ; 'l' ; 'p' ; 'h' ; 'a']
   q = 'aYZ'
   s = 'aZpha'
   t = 'xyz'

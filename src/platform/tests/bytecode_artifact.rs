@@ -15,8 +15,8 @@ use matlab_platform::{
     attach_bundle_module_id, collect_bytecode_dependency_paths,
     collect_bytecode_dependency_paths_with_context, decode_bytecode_bundle, decode_bytecode_module,
     encode_bytecode_bundle, encode_bytecode_module, read_bytecode_artifact,
-    rewrite_bytecode_bundle_targets, write_bytecode_artifact, write_bytecode_bundle, BytecodeBundle,
-    PackagedBytecodeModule,
+    rewrite_bytecode_bundle_targets, write_bytecode_artifact, write_bytecode_bundle,
+    BytecodeBundle, PackagedBytecodeModule,
 };
 use matlab_resolver::ResolverContext;
 use matlab_semantics::analyze_compilation_unit_with_context;
@@ -130,9 +130,13 @@ fn class_module_artifact_roundtrip_preserves_class_metadata() {
     assert!(class.inherits_handle);
     assert_eq!(class.private_property_names, vec!["secret".to_string()]);
     assert_eq!(class.private_inline_methods, Vec::<String>::new());
-    assert_eq!(class.private_static_inline_methods, vec!["code".to_string()]);
+    assert_eq!(
+        class.private_static_inline_methods,
+        vec!["code".to_string()]
+    );
     assert!(decoded.functions.iter().any(|function| {
-        function.role == "class_initializer" && function.owner_class_name.as_deref() == Some("pkg.Point")
+        function.role == "class_initializer"
+            && function.owner_class_name.as_deref() == Some("pkg.Point")
     }));
 
     let _ = fs::remove_dir_all(workspace);
@@ -233,10 +237,12 @@ fn collects_literal_str2func_dependency_paths_with_context() {
     let class_path = class_dir.join("Counter.m");
     let main_path = workspace.join("main.m");
 
-    fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
-        .expect("write helper");
-    fs::write(&package_helper_path, "function y = helper(x)\ny = x + 2;\nend\n")
-        .expect("write package helper");
+    fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n").expect("write helper");
+    fs::write(
+        &package_helper_path,
+        "function y = helper(x)\ny = x + 2;\nend\n",
+    )
+    .expect("write package helper");
     fs::write(
         &class_path,
         "classdef Counter < handle\n\
@@ -335,7 +341,10 @@ fn rewrite_bundle_targets_adds_superclass_bundle_id_for_class_modules() {
     let path_map = std::collections::HashMap::from([(base_path.clone(), "dep0".to_string())]);
     let rewritten = rewrite_bytecode_bundle_targets(&child_module, &path_map);
     let class = rewritten.classes.first().expect("child class metadata");
-    assert_eq!(class.superclass_path.as_deref(), Some(base_path.to_string_lossy().as_ref()));
+    assert_eq!(
+        class.superclass_path.as_deref(),
+        Some(base_path.to_string_lossy().as_ref())
+    );
     assert_eq!(class.superclass_bundle_module_id.as_deref(), Some("dep0"));
 
     let _ = fs::remove_dir_all(workspace);

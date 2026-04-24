@@ -4,8 +4,7 @@ use matlab_codegen::emit_bytecode;
 use matlab_execution::{
     execute_function_file_bytecode_bundle, execute_function_file_bytecode_module,
     execute_function_file_bytecode_with_identity, execute_script_bytecode_bundle,
-    execute_script_bytecode_module, execute_script_bytecode_with_identity,
-    render_execution_result,
+    execute_script_bytecode_module, execute_script_bytecode_with_identity, render_execution_result,
 };
 use matlab_frontend::{
     ast::CompilationUnitKind,
@@ -53,13 +52,11 @@ fn assert_fixture(name: &str, mode: ParseMode, args: &[Value]) {
 
     let hir = lower_to_hir(&unit, &analysis);
     let result = match unit.kind {
-        CompilationUnitKind::Script => {
-            execute_script_bytecode_with_identity(
-                &hir,
-                "<root>".to_string(),
-                Some(source_path.clone()),
-            )
-        }
+        CompilationUnitKind::Script => execute_script_bytecode_with_identity(
+            &hir,
+            "<root>".to_string(),
+            Some(source_path.clone()),
+        ),
         CompilationUnitKind::FunctionFile => execute_function_file_bytecode_with_identity(
             &hir,
             args,
@@ -145,36 +142,37 @@ fn assert_bundle_fixture(name: &str, mode: ParseMode, args: &[Value]) {
     let hir = lower_to_hir(&unit, &analysis);
     let optimized = optimize_module(&hir);
     let bytecode = emit_bytecode(&optimized.module);
-    let compiled_dependencies = collect_bytecode_dependency_paths_with_context(&bytecode, &source_path)
-        .into_iter()
-        .enumerate()
-        .map(|(index, path)| {
-            let source = fs::read_to_string(&path).expect("dependency source");
-            let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
-            assert!(
-                !parsed.has_errors(),
-                "unexpected dependency parse diagnostics: {:?}",
-                parsed.diagnostics
-            );
-            let unit = parsed.unit.expect("dependency compilation unit");
-            let analysis = analyze_compilation_unit_with_context(
-                &unit,
-                &ResolverContext::from_source_file(path.clone()),
-            );
-            assert!(
-                !analysis.has_errors(),
-                "unexpected dependency semantic diagnostics: {:?}",
-                analysis.diagnostics
-            );
-            let hir = lower_to_hir(&unit, &analysis);
-            let optimized = optimize_module(&hir);
-            (
-                path,
-                format!("dep{index}"),
-                emit_bytecode(&optimized.module),
-            )
-        })
-        .collect::<Vec<_>>();
+    let compiled_dependencies =
+        collect_bytecode_dependency_paths_with_context(&bytecode, &source_path)
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let source = fs::read_to_string(&path).expect("dependency source");
+                let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
+                assert!(
+                    !parsed.has_errors(),
+                    "unexpected dependency parse diagnostics: {:?}",
+                    parsed.diagnostics
+                );
+                let unit = parsed.unit.expect("dependency compilation unit");
+                let analysis = analyze_compilation_unit_with_context(
+                    &unit,
+                    &ResolverContext::from_source_file(path.clone()),
+                );
+                assert!(
+                    !analysis.has_errors(),
+                    "unexpected dependency semantic diagnostics: {:?}",
+                    analysis.diagnostics
+                );
+                let hir = lower_to_hir(&unit, &analysis);
+                let optimized = optimize_module(&hir);
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
+            })
+            .collect::<Vec<_>>();
     let path_to_module_id = compiled_dependencies
         .iter()
         .map(|(path, module_id, _)| (path.clone(), module_id.clone()))
@@ -663,7 +661,11 @@ fn builtin_sort_nd_helpers_fixture_matches_golden() {
 
 #[test]
 fn builtin_vecdim_shape_promotion_helpers_fixture_matches_golden() {
-    assert_fixture("builtin_vecdim_shape_promotion_helpers", ParseMode::Script, &[]);
+    assert_fixture(
+        "builtin_vecdim_shape_promotion_helpers",
+        ParseMode::Script,
+        &[],
+    );
 }
 
 #[test]
@@ -754,6 +756,11 @@ fn command_form_text_fixture_matches_golden() {
 #[test]
 fn command_form_workspace_builtins_fixture_matches_golden() {
     assert_fixture("command_form_workspace_builtins", ParseMode::Script, &[]);
+}
+
+#[test]
+fn command_form_filesystem_fixture_matches_golden() {
+    assert_fixture("command_form_filesystem", ParseMode::Script, &[]);
 }
 
 #[test]

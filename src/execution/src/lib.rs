@@ -6,9 +6,13 @@ mod graphics;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
+    io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -25,7 +29,7 @@ use graphics::{
     invoke_graphics_builtin_outputs, rendered_figures, select_current_figure_handle, GraphicsState,
 };
 use matlab_codegen::BytecodeModule;
-use matlab_frontend::ast::CompilationUnitKind;
+use matlab_frontend::ast::{ClassMemberAccess, CompilationUnitKind};
 use matlab_frontend::{
     parser::{parse_source, ParseMode},
     source::SourceFileId,
@@ -51,10 +55,11 @@ use matlab_runtime::{
     RuntimeError, RuntimeStackFrame, StructValue, Value, Workspace,
 };
 use matlab_semantics::{
-    analyze_compilation_unit_with_context,
-    builtin_function_names, is_builtin_function_name,
+    analyze_compilation_unit_with_context, builtin_function_names, is_builtin_function_name,
     symbols::{BindingId, BindingStorage, FinalReferenceResolution, ReferenceResolution},
 };
+
+static RUNTIME_TEMP_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 use matlab_stdlib::{
     format_text_builtin as format_stdlib_text,
     invoke_builtin_outputs as invoke_stdlib_builtin_outputs,
@@ -230,6 +235,552 @@ struct SelectorPlan {
     target_extent: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeFilePermission {
+    Read,
+    Write,
+    Append,
+    ReadWrite,
+    WriteRead,
+    AppendRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryMachineFormat {
+    Native,
+    LittleEndian,
+    BigEndian,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryPrimitiveType {
+    UInt8,
+    Int8,
+    UInt16,
+    Int16,
+    UInt32,
+    Int32,
+    UInt64,
+    Int64,
+    Single,
+    Double,
+    Char,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryReadOutputKind {
+    Numeric,
+    Int64,
+    UInt64,
+    Char,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BinaryReadPrecision {
+    repeat: usize,
+    source: BinaryPrimitiveType,
+    output: BinaryReadOutputKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BinaryWritePrecision {
+    source: BinaryPrimitiveType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FopenOperation {
+    Open {
+        filename: String,
+        permission: RuntimeFilePermission,
+        permission_text: String,
+        text_mode: bool,
+        auto_flush: bool,
+        machinefmt: BinaryMachineFormat,
+        encoding: String,
+    },
+    Query {
+        file_id: i32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryReadSize {
+    ToEnd,
+    Count(usize),
+    Matrix { rows: usize, cols: Option<usize> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanfConversionKind {
+    SignedInteger,
+    AutoInteger,
+    UnsignedInteger,
+    OctalInteger,
+    HexInteger,
+    Float,
+    Character,
+    String,
+    ScanSet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanfCharSetItem {
+    Single(char),
+    Range(char, char),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanfCharSet {
+    inverted: bool,
+    items: Vec<ScanfCharSetItem>,
+}
+
+impl ScanfCharSet {
+    fn contains(&self, ch: char) -> bool {
+        let matched = self.items.iter().any(|item| match item {
+            ScanfCharSetItem::Single(item) => *item == ch,
+            ScanfCharSetItem::Range(start, end) => (*start..=*end).contains(&ch),
+        });
+        if self.inverted {
+            !matched
+        } else {
+            matched
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanfConversion {
+    kind: ScanfConversionKind,
+    suppress: bool,
+    width: Option<usize>,
+    scan_set: Option<ScanfCharSet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanfDirective {
+    Whitespace,
+    Literal(String),
+    Conversion(ScanfConversion),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanfOutputMode {
+    Numeric,
+    Text,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ScanfMatch {
+    consumed_bytes: usize,
+    consumed_chars: usize,
+    numeric_output: Vec<f64>,
+    text_output: String,
+    output_units: usize,
+}
+
+impl RuntimeFilePermission {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Append => "append",
+            Self::ReadWrite => "read/write",
+            Self::WriteRead => "write/read",
+            Self::AppendRead => "append/read",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RuntimeOpenFile {
+    Reader(BufReader<fs::File>),
+    Writer(fs::File),
+    ReadWriter(fs::File),
+}
+
+#[derive(Debug)]
+struct RuntimeFileHandle {
+    path: PathBuf,
+    query_filename: String,
+    permission: RuntimeFilePermission,
+    permission_text: String,
+    text_mode: bool,
+    auto_flush: bool,
+    machinefmt: BinaryMachineFormat,
+    encoding: String,
+    stream: RuntimeOpenFile,
+    eof_indicator: bool,
+    last_error_message: String,
+    last_error_number: i32,
+}
+
+impl RuntimeFileHandle {
+    fn normalize_text_mode_line(line: &str) -> String {
+        if cfg!(windows) {
+            line.replace("\r\n", "\n")
+        } else {
+            line.to_string()
+        }
+    }
+
+    fn encode_text_mode_output(text: &str) -> String {
+        if !cfg!(windows) {
+            return text.to_string();
+        }
+        let mut encoded = String::with_capacity(text.len() + 8);
+        let mut previous_was_cr = false;
+        for ch in text.chars() {
+            if ch == '\n' && !previous_was_cr {
+                encoded.push('\r');
+            }
+            encoded.push(ch);
+            previous_was_cr = ch == '\r';
+        }
+        encoded
+    }
+
+    fn read_line_stream<R: Read>(
+        stream: &mut R,
+        keep_newline: bool,
+        text_mode: bool,
+    ) -> Result<Option<String>, std::io::Error> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 1];
+        loop {
+            match stream.read(&mut chunk)? {
+                0 if bytes.is_empty() => return Ok(None),
+                0 => break,
+                _ => {
+                    bytes.push(chunk[0]);
+                    if chunk[0] == b'\n' {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut line = String::from_utf8_lossy(&bytes).into_owned();
+        if text_mode {
+            line = Self::normalize_text_mode_line(&line);
+        }
+        if !keep_newline {
+            if line.ends_with('\n') {
+                line.pop();
+            }
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        Ok(Some(line))
+    }
+
+    fn clear_error(&mut self) {
+        self.last_error_message.clear();
+        self.last_error_number = 0;
+    }
+
+    fn set_error(&mut self, message: impl Into<String>, number: i32) {
+        self.last_error_message = message.into();
+        self.last_error_number = number;
+    }
+
+    fn error_state(&self) -> (String, i32) {
+        (self.last_error_message.clone(), self.last_error_number)
+    }
+
+    fn current_position(&mut self, builtin_name: &str) -> Result<u64, RuntimeError> {
+        let path = self.path.display().to_string();
+        match &mut self.stream {
+            RuntimeOpenFile::Reader(reader) => reader.stream_position().map_err(|error| {
+                self.set_error(error.to_string(), -1);
+                RuntimeError::Unsupported(format!(
+                    "{builtin_name} failed while querying `{path}`: {error}"
+                ))
+            }),
+            RuntimeOpenFile::Writer(writer) => writer.stream_position().map_err(|error| {
+                self.set_error(error.to_string(), -1);
+                RuntimeError::Unsupported(format!(
+                    "{builtin_name} failed while querying `{path}`: {error}"
+                ))
+            }),
+            RuntimeOpenFile::ReadWriter(stream) => stream.stream_position().map_err(|error| {
+                self.set_error(error.to_string(), -1);
+                RuntimeError::Unsupported(format!(
+                    "{builtin_name} failed while querying `{path}`: {error}"
+                ))
+            }),
+        }
+    }
+
+    fn file_length(&mut self, builtin_name: &str) -> Result<u64, RuntimeError> {
+        fs::metadata(&self.path)
+            .map(|metadata| metadata.len())
+            .map_err(|error| {
+                self.set_error(error.to_string(), -1);
+                RuntimeError::Unsupported(format!(
+                    "{builtin_name} failed while querying `{}`: {error}",
+                    self.path.display()
+                ))
+            })
+    }
+
+    fn set_position(&mut self, builtin_name: &str, position: u64) -> Result<(), RuntimeError> {
+        let path = self.path.display().to_string();
+        let result = match &mut self.stream {
+            RuntimeOpenFile::Reader(reader) => reader.seek(SeekFrom::Start(position)),
+            RuntimeOpenFile::Writer(writer) => writer.seek(SeekFrom::Start(position)),
+            RuntimeOpenFile::ReadWriter(stream) => stream.seek(SeekFrom::Start(position)),
+        };
+        result
+            .map(|_| {
+                self.eof_indicator = false;
+                self.clear_error();
+            })
+            .map_err(|error| {
+                self.set_error(error.to_string(), -1);
+                RuntimeError::Unsupported(format!(
+                    "{builtin_name} failed while seeking `{path}`: {error}"
+                ))
+            })
+    }
+
+    fn query_ftell(&mut self) -> f64 {
+        match self.current_position("ftell") {
+            Ok(position) => position as f64,
+            Err(_) => -1.0,
+        }
+    }
+
+    fn query_feof(&self) -> f64 {
+        if self.eof_indicator {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    fn seek_offset(
+        &mut self,
+        offset: i64,
+        origin: RuntimeFileSeekOrigin,
+        builtin_name: &str,
+    ) -> f64 {
+        let base = match origin {
+            RuntimeFileSeekOrigin::Beginning => 0i64,
+            RuntimeFileSeekOrigin::Current => match self.current_position(builtin_name) {
+                Ok(position) => position as i64,
+                Err(_) => return -1.0,
+            },
+            RuntimeFileSeekOrigin::End => match self.file_length(builtin_name) {
+                Ok(length) => length as i64,
+                Err(_) => return -1.0,
+            },
+        };
+        let Some(target) = base.checked_add(offset) else {
+            self.set_error("Offset is bad - before beginning-of-file.", -1);
+            return -1.0;
+        };
+        if target < 0 {
+            self.set_error("Offset is bad - before beginning-of-file.", -1);
+            return -1.0;
+        }
+        match self.set_position(builtin_name, target as u64) {
+            Ok(()) => 0.0,
+            Err(_) => -1.0,
+        }
+    }
+
+    fn seek_relative(&mut self, builtin_name: &str, offset: i64) -> Result<bool, RuntimeError> {
+        let path = self.path.display().to_string();
+        let result = match &mut self.stream {
+            RuntimeOpenFile::Reader(reader) => reader.seek(SeekFrom::Current(offset)),
+            RuntimeOpenFile::Writer(writer) => writer.seek(SeekFrom::Current(offset)),
+            RuntimeOpenFile::ReadWriter(stream) => stream.seek(SeekFrom::Current(offset)),
+        };
+        match result {
+            Ok(_) => {
+                self.eof_indicator = false;
+                self.clear_error();
+                Ok(true)
+            }
+            Err(error) => {
+                self.set_error(error.to_string(), -1);
+                let _ = builtin_name;
+                let _ = path;
+                Ok(false)
+            }
+        }
+    }
+
+    fn read_binary_chunk(
+        &mut self,
+        builtin_name: &str,
+        bytes: &mut [u8],
+    ) -> Result<bool, RuntimeError> {
+        let path = self.path.display().to_string();
+        let result = match &mut self.stream {
+            RuntimeOpenFile::Reader(reader) => reader.read_exact(bytes),
+            RuntimeOpenFile::ReadWriter(stream) => stream.read_exact(bytes),
+            RuntimeOpenFile::Writer(_) => {
+                return Err(RuntimeError::TypeError(format!(
+                    "{builtin_name} currently expects a file opened for reading, found `{path}` opened with {} access",
+                    self.permission.as_str()
+                )))
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.eof_indicator = false;
+                self.clear_error();
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                self.eof_indicator = true;
+                self.clear_error();
+                Ok(false)
+            }
+            Err(error) => {
+                self.eof_indicator = false;
+                self.set_error(error.to_string(), -1);
+                Ok(false)
+            }
+        }
+    }
+
+    fn write_binary_chunk(
+        &mut self,
+        builtin_name: &str,
+        bytes: &[u8],
+    ) -> Result<bool, RuntimeError> {
+        let path = self.path.display().to_string();
+        let result = match &mut self.stream {
+            RuntimeOpenFile::Writer(writer) => writer.write_all(bytes).and_then(|_| {
+                if self.auto_flush {
+                    writer.flush()
+                } else {
+                    Ok(())
+                }
+            }),
+            RuntimeOpenFile::ReadWriter(stream) => stream.write_all(bytes).and_then(|_| {
+                if self.auto_flush {
+                    stream.flush()
+                } else {
+                    Ok(())
+                }
+            }),
+            RuntimeOpenFile::Reader(_) => {
+                return Err(RuntimeError::TypeError(format!(
+                    "{builtin_name} currently expects a file opened for writing, found `{path}` opened with {} access",
+                    self.permission.as_str()
+                )))
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.eof_indicator = false;
+                self.clear_error();
+                Ok(true)
+            }
+            Err(error) => {
+                self.eof_indicator = false;
+                self.set_error(error.to_string(), -1);
+                Ok(false)
+            }
+        }
+    }
+
+    fn read_line(
+        &mut self,
+        builtin_name: &str,
+        keep_newline: bool,
+    ) -> Result<Option<String>, RuntimeError> {
+        let path = self.path.display().to_string();
+        let line = match &mut self.stream {
+            RuntimeOpenFile::Reader(reader) => Self::read_line_stream(reader, keep_newline, self.text_mode),
+            RuntimeOpenFile::ReadWriter(stream) => {
+                Self::read_line_stream(stream, keep_newline, self.text_mode)
+            }
+            RuntimeOpenFile::Writer(_) => {
+                return Err(RuntimeError::TypeError(format!(
+                    "{builtin_name} currently expects a file opened for reading, found `{path}` opened with {} access",
+                    self.permission.as_str()
+                )))
+            }
+        };
+        match line {
+            Ok(None) => {
+                self.eof_indicator = true;
+                self.clear_error();
+                Ok(None)
+            }
+            Ok(Some(line)) => {
+                self.eof_indicator = false;
+                self.clear_error();
+                Ok(Some(line))
+            }
+            Err(error) => {
+                self.set_error(error.to_string(), -1);
+                Err(RuntimeError::Unsupported(format!(
+                    "{builtin_name} failed while reading `{path}`: {error}"
+                )))
+            }
+        }
+    }
+
+    fn write_text(&mut self, builtin_name: &str, text: &str) -> Result<(), RuntimeError> {
+        let path = self.path.display().to_string();
+        let rendered = if self.text_mode {
+            Self::encode_text_mode_output(text)
+        } else {
+            text.to_string()
+        };
+        match &mut self.stream {
+            RuntimeOpenFile::Writer(writer) => writer
+                .write_all(rendered.as_bytes())
+                .and_then(|_| {
+                    if self.auto_flush {
+                        writer.flush()
+                    } else {
+                        Ok(())
+                    }
+                })
+                .map(|_| {
+                    self.eof_indicator = false;
+                    self.clear_error();
+                })
+                .map_err(|error| {
+                    self.set_error(error.to_string(), -1);
+                    RuntimeError::Unsupported(format!(
+                        "{builtin_name} failed while writing `{path}`: {error}"
+                    ))
+                }),
+            RuntimeOpenFile::ReadWriter(stream) => stream
+                .write_all(rendered.as_bytes())
+                .and_then(|_| {
+                    if self.auto_flush {
+                        stream.flush()
+                    } else {
+                        Ok(())
+                    }
+                })
+                .map(|_| {
+                    self.eof_indicator = false;
+                    self.clear_error();
+                })
+                .map_err(|error| {
+                    self.set_error(error.to_string(), -1);
+                    RuntimeError::Unsupported(format!(
+                        "{builtin_name} failed while writing `{path}`: {error}"
+                    ))
+                }),
+            RuntimeOpenFile::Reader(_) => Err(RuntimeError::TypeError(format!(
+                "{builtin_name} currently expects a file opened for writing, found `{path}` opened with {} access",
+                self.permission.as_str()
+            ))),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Frame<'a> {
     cells: HashMap<BindingId, Cell>,
@@ -244,6 +795,13 @@ struct Frame<'a> {
 struct SharedRuntimeState {
     globals: HashMap<String, Cell>,
     persistents: HashMap<PersistentKey, Cell>,
+    current_directory: Option<PathBuf>,
+    open_files: HashMap<i32, RuntimeFileHandle>,
+    next_file_id: i32,
+    default_user_path_root: Option<PathBuf>,
+    user_path_root: Option<PathBuf>,
+    default_search_path_roots: Vec<PathBuf>,
+    search_path_roots: Vec<PathBuf>,
     bundled_modules: HashMap<PathBuf, BytecodeModule>,
     bundled_modules_by_id: HashMap<String, BytecodeModule>,
     bundled_module_source_paths: HashMap<String, String>,
@@ -255,6 +813,8 @@ struct SharedRuntimeState {
     pause_enabled: bool,
     warnings_enabled: bool,
     warning_overrides: HashMap<String, bool>,
+    checked_out_licenses: BTreeSet<String>,
+    license_test_overrides: HashMap<String, bool>,
     display_format: DisplayFormatState,
     graphics: GraphicsState,
     pending_host_close_events: BTreeSet<u32>,
@@ -267,9 +827,22 @@ struct SharedRuntimeState {
 
 impl Default for SharedRuntimeState {
     fn default() -> Self {
+        let default_user_path_root = default_runtime_user_path();
+        let default_search_path_roots = matlab_resolver::search_roots_from_env("MATC_PATH");
+        let search_path_roots = search_path_roots_with_user_path(
+            default_user_path_root.as_ref(),
+            &default_search_path_roots,
+        );
         Self {
             globals: HashMap::new(),
             persistents: HashMap::new(),
+            current_directory: None,
+            open_files: HashMap::new(),
+            next_file_id: 3,
+            default_user_path_root: default_user_path_root.clone(),
+            user_path_root: default_user_path_root,
+            default_search_path_roots,
+            search_path_roots,
             bundled_modules: HashMap::new(),
             bundled_modules_by_id: HashMap::new(),
             bundled_module_source_paths: HashMap::new(),
@@ -281,6 +854,8 @@ impl Default for SharedRuntimeState {
             pause_enabled: true,
             warnings_enabled: true,
             warning_overrides: HashMap::new(),
+            checked_out_licenses: BTreeSet::from(["matlab".to_string()]),
+            license_test_overrides: HashMap::new(),
             display_format: DisplayFormatState::default(),
             graphics: GraphicsState::default(),
             pending_host_close_events: BTreeSet::new(),
@@ -514,9 +1089,10 @@ fn record_loaded_hir_module_state(
         }
     }
     for class in &module.classes {
-        state
-            .loaded_classes
-            .insert(qualified_object_class_name(&class.name, class.package.as_deref()));
+        state.loaded_classes.insert(qualified_object_class_name(
+            &class.name,
+            class.package.as_deref(),
+        ));
     }
 }
 
@@ -531,9 +1107,10 @@ fn record_loaded_bytecode_module(
         }
     }
     for class in &module.classes {
-        state
-            .loaded_classes
-            .insert(qualified_object_class_name(&class.name, class.package.as_deref()));
+        state.loaded_classes.insert(qualified_object_class_name(
+            &class.name,
+            class.package.as_deref(),
+        ));
     }
 }
 
@@ -594,7 +1171,9 @@ fn package_segments_from_path(path: &Path) -> String {
 
 fn value_contains_bundle_backed_modules(value: &Value, state: &SharedRuntimeState) -> bool {
     match value {
-        Value::FunctionHandle(handle) => function_handle_target_is_bundle_backed(&handle.target, state),
+        Value::FunctionHandle(handle) => {
+            function_handle_target_is_bundle_backed(&handle.target, state)
+        }
         Value::Object(object) => {
             object
                 .class
@@ -785,7 +1364,9 @@ fn value_has_object_method(value: &Value, method_name: &str) -> bool {
 
 fn field_resolves_to_object_method(value: &Value, field: &str) -> bool {
     match value {
-        Value::Object(object) => object.property_value(field).is_none() && object_has_method(object, field),
+        Value::Object(object) => {
+            object.property_value(field).is_none() && object_has_method(object, field)
+        }
         Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
             let Value::Object(first_object) = &matrix.elements[0] else {
                 unreachable!("matrix_is_object_array checked every element");
@@ -819,11 +1400,13 @@ fn private_property_access_allowed(class: &ObjectClassMetadata, property: &str) 
 }
 
 fn private_instance_method_access_allowed(class: &ObjectClassMetadata, method: &str) -> bool {
-    class.private_instance_method_owner(method).is_none_or(|owner| {
-        current_class_access_context()
-            .as_deref()
-            .is_some_and(|current| current.eq_ignore_ascii_case(&owner))
-    })
+    class
+        .private_instance_method_owner(method)
+        .is_none_or(|owner| {
+            current_class_access_context()
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(&owner))
+        })
 }
 
 fn private_static_method_access_allowed(
@@ -838,7 +1421,10 @@ fn private_static_method_access_allowed(
 }
 
 fn class_has_static_method(class: &matlab_ir::HirClass, method_name: &str) -> bool {
-    class.static_inline_methods.iter().any(|name| name == method_name)
+    class
+        .static_inline_methods
+        .iter()
+        .any(|name| name == method_name)
 }
 
 fn private_property_owner_name(class: &ObjectClassMetadata, property: &str) -> String {
@@ -863,9 +1449,128 @@ fn source_path_from_module_identity(module_identity: &str) -> Option<PathBuf> {
     (!module_identity.starts_with('<')).then(|| PathBuf::from(module_identity))
 }
 
-fn resolve_named_callable_path_from_source_path(source_path: &Path, name: &str) -> Option<PathBuf> {
-    let context =
-        ResolverContext::from_source_file(source_path.to_path_buf()).with_env_search_roots("MATC_PATH");
+fn normalize_runtime_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
+}
+
+fn default_runtime_current_directory(resolution_source_path: Option<&Path>) -> PathBuf {
+    normalize_runtime_path(
+        resolution_source_path
+            .and_then(|path| path.parent())
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .or_else(|| env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from(".")),
+    )
+}
+
+fn default_runtime_user_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = env::var_os("USERPROFILE").map(PathBuf::from).or_else(|| {
+        let drive = env::var_os("HOMEDRIVE")?;
+        let path = env::var_os("HOMEPATH")?;
+        let mut home = PathBuf::from(drive);
+        home.push(path);
+        Some(home)
+    });
+    #[cfg(not(windows))]
+    let home = env::var_os("HOME").map(PathBuf::from);
+
+    home.map(|home| normalize_runtime_path(home.join("Documents").join("MATLAB")))
+}
+
+fn runtime_matlab_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn runtime_toolbox_root() -> PathBuf {
+    runtime_matlab_root().join("toolbox")
+}
+
+const MATLAB_VERSION_TEXT: &str = "26.1.0.3125691 (R2026a) Prerelease Update 2";
+const MATLAB_VERSION_NUMBER: &str = "26.1";
+const MATLAB_RELEASE_NAME: &str = "(R2026a)";
+const MATLAB_RELEASE_VALUE: &str = "2026a";
+const MATLAB_VERSION_DESCRIPTION: &str = "Prerelease Update 2";
+const MATLAB_VERSION_DATE: &str = "January 2, 2026";
+const MATLAB_JAVA_VERSION: &str =
+    "Java 1.8.0_202-b08 with Oracle Corporation Java HotSpot(TM) 64-Bit Server VM mixed mode";
+const MATLAB_LICENSE_ID: &str = "123456";
+
+fn runtime_current_directory(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+) -> PathBuf {
+    let mut state = shared_state.borrow_mut();
+    if let Some(current_directory) = state.current_directory.clone() {
+        return current_directory;
+    }
+    let current_directory = default_runtime_current_directory(resolution_source_path);
+    state.current_directory = Some(current_directory.clone());
+    current_directory
+}
+
+fn set_runtime_current_directory(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    current_directory: PathBuf,
+) {
+    shared_state.borrow_mut().current_directory = Some(current_directory);
+}
+
+fn runtime_search_path_roots(shared_state: &Rc<RefCell<SharedRuntimeState>>) -> Vec<PathBuf> {
+    shared_state.borrow().search_path_roots.clone()
+}
+
+fn current_runtime_user_path(shared_state: &Rc<RefCell<SharedRuntimeState>>) -> Option<PathBuf> {
+    shared_state.borrow().user_path_root.clone()
+}
+
+fn default_runtime_user_path_root(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+) -> Option<PathBuf> {
+    shared_state.borrow().default_user_path_root.clone()
+}
+
+fn default_runtime_search_path_roots(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+) -> Vec<PathBuf> {
+    shared_state.borrow().default_search_path_roots.clone()
+}
+
+fn set_runtime_search_path_roots(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    search_path_roots: Vec<PathBuf>,
+) {
+    shared_state.borrow_mut().search_path_roots = search_path_roots;
+}
+
+fn set_runtime_user_path(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    user_path_root: Option<PathBuf>,
+) {
+    shared_state.borrow_mut().user_path_root = user_path_root;
+}
+
+fn resolve_named_callable_path(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    name: &str,
+) -> Option<PathBuf> {
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
     match resolve_callable(name, &context)? {
         ResolvedCallable::Function(resolved) => Some(resolved.path),
         ResolvedCallable::Class(resolved) => Some(resolved.path),
@@ -880,9 +1585,12 @@ fn is_missing_static_method_error(error: &RuntimeError, method_name: &str) -> bo
     )
 }
 
-fn resolve_superclass_path(source_path: &Path, superclass_name: &str) -> Result<PathBuf, RuntimeError> {
-    let context =
-        ResolverContext::from_source_file(source_path.to_path_buf()).with_env_search_roots("MATC_PATH");
+fn resolve_superclass_path(
+    source_path: &Path,
+    superclass_name: &str,
+) -> Result<PathBuf, RuntimeError> {
+    let context = ResolverContext::from_source_file(source_path.to_path_buf())
+        .with_env_search_roots("MATC_PATH");
     resolve_class_definition(superclass_name, &context)
         .map(|resolved| resolved.path)
         .ok_or_else(|| {
@@ -1101,6 +1809,8 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
         name,
         "disp"
             | "display"
+            | "fclose"
+            | "frewind"
             | "fprintf"
             | "drawnow"
             | "clc"
@@ -1109,9 +1819,33 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
             | "load"
             | "who"
             | "whos"
+            | "type"
+            | "savepath"
+            | "path2rc"
+            | "pathtool"
+            | "mkdir"
+            | "rmdir"
+            | "copyfile"
+            | "movefile"
+            | "fileattrib"
+            | "path"
+            | "addpath"
+            | "rmpath"
+            | "restoredefaultpath"
+            | "rehash"
+            | "pwd"
+            | "cd"
+            | "dir"
+            | "ls"
             | "what"
             | "help"
+            | "doc"
             | "lookfor"
+            | "methods"
+            | "properties"
+            | "superclasses"
+            | "events"
+            | "ver"
             | "tic"
             | "toc"
             | "clear"
@@ -1226,6 +1960,7 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
                 | "ylim"
                 | "zlim"
         ))
+        || (name == "license" && arg_count > 0)
 }
 
 pub(crate) fn runtime_error_value(
@@ -1238,10 +1973,19 @@ pub(crate) fn runtime_error_value(
 fn invoke_runtime_builtin_outputs(
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
     frame: Option<&Frame<'_>>,
+    resolution_source_path: Option<&Path>,
     name: &str,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
+    if name == "delete" && all_args_are_text(args) {
+        return invoke_delete_file_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+        );
+    }
     let graphics_result = {
         let mut state = shared_state.borrow_mut();
         invoke_graphics_builtin_outputs(&mut state.graphics, name, args, output_arity)
@@ -1257,7 +2001,11 @@ fn invoke_runtime_builtin_outputs(
         "disp" | "display" => {
             invoke_display_builtin_outputs(shared_state, name, args, output_arity)
         }
+        "im2col" => execute_im2col_builtin_outputs(args, output_arity),
+        "col2im" => execute_col2im_builtin_outputs(args, output_arity),
         "inmem" => invoke_inmem_builtin_outputs(shared_state, args, output_arity),
+        "isprop" => invoke_isprop_builtin_outputs(args, output_arity),
+        "ismethod" => invoke_ismethod_builtin_outputs(shared_state, None, args, output_arity),
         "lookfor" => invoke_lookfor_builtin_outputs(shared_state, None, args, output_arity),
         "filemarker" => {
             if !args.is_empty() {
@@ -1272,12 +2020,154 @@ fn invoke_runtime_builtin_outputs(
                 Ok(vec![Value::CharArray(">".to_string())])
             }
         }
+        "fopen" => {
+            invoke_fopen_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "openedFiles" => invoke_opened_files_builtin_outputs(shared_state, args, output_arity),
+        "fclose" => invoke_fclose_builtin_outputs(shared_state, args, output_arity),
+        "feof" => invoke_feof_builtin_outputs(shared_state, args, output_arity),
+        "ferror" => invoke_ferror_builtin_outputs(shared_state, args, output_arity),
+        "fread" => invoke_fread_builtin_outputs(shared_state, args, output_arity),
+        "fscanf" => invoke_fscanf_builtin_outputs(shared_state, args, output_arity),
+        "frewind" => invoke_frewind_builtin_outputs(shared_state, args, output_arity),
+        "fseek" => invoke_fseek_builtin_outputs(shared_state, args, output_arity),
+        "ftell" => invoke_ftell_builtin_outputs(shared_state, args, output_arity),
+        "fgetl" => invoke_fgetl_builtin_outputs(shared_state, args, output_arity),
+        "fgets" => invoke_fgets_builtin_outputs(shared_state, args, output_arity),
+        "fwrite" => invoke_fwrite_builtin_outputs(shared_state, args, output_arity),
+        "sscanf" => invoke_sscanf_builtin_outputs(args, output_arity),
         "fprintf" => invoke_fprintf_builtin_outputs(shared_state, args, output_arity),
         "drawnow" => invoke_drawnow_builtin_outputs(shared_state, args, output_arity),
         "clc" => invoke_clc_builtin_outputs(shared_state, args, output_arity),
         "format" => invoke_format_builtin_outputs(shared_state, args, output_arity),
-        "who" => invoke_who_builtin_outputs(frame, shared_state, args, output_arity),
-        "whos" => invoke_whos_builtin_outputs(frame, shared_state, args, output_arity),
+        "who" => invoke_who_builtin_outputs(
+            frame,
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+        ),
+        "whos" => invoke_whos_builtin_outputs(
+            frame,
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+        ),
+        "fileread" => invoke_fileread_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+        ),
+        "type" => {
+            invoke_type_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "isfile" => {
+            invoke_isfile_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "isdir" => {
+            invoke_isdir_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "isfolder" => invoke_isfolder_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+        ),
+        "pathdef" => {
+            invoke_pathdef_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "pathsep" => invoke_pathsep_builtin_outputs(args, output_arity),
+        "filesep" => invoke_filesep_builtin_outputs(args, output_arity),
+        "mkdir" => {
+            invoke_mkdir_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "rmdir" => {
+            invoke_rmdir_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "copyfile" => invoke_copyfile_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+        ),
+        "movefile" => invoke_movefile_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+        ),
+        "fileattrib" => invoke_fileattrib_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+        ),
+        "pathtool" => invoke_pathtool_builtin_outputs(shared_state, args, output_arity),
+        "matlabroot" => invoke_matlabroot_builtin_outputs(args, output_arity),
+        "toolboxdir" => invoke_toolboxdir_builtin_outputs(args, output_arity),
+        "computer" => invoke_computer_builtin_outputs(args, output_arity),
+        "tempdir" => invoke_tempdir_builtin_outputs(args, output_arity),
+        "tempname" => invoke_tempname_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+        ),
+        "version" => invoke_version_builtin_outputs(shared_state, args, output_arity),
+        "ver" => invoke_ver_builtin_outputs(shared_state, args, output_arity),
+        "verLessThan" => invoke_ver_less_than_builtin_outputs(args, output_arity),
+        "license" => invoke_license_builtin_outputs(shared_state, args, output_arity),
+        "userpath" => invoke_userpath_builtin_outputs(shared_state, args, output_arity),
+        "savepath" => invoke_savepath_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+            "savepath",
+        ),
+        "path2rc" => invoke_savepath_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+            "path2rc",
+        ),
+        "path" => {
+            invoke_path_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "addpath" => {
+            invoke_addpath_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "rmpath" => {
+            invoke_rmpath_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "restoredefaultpath" => {
+            invoke_restoredefaultpath_builtin_outputs(shared_state, args, output_arity)
+        }
+        "rehash" => invoke_rehash_builtin_outputs(args, output_arity),
+        "genpath" => {
+            invoke_genpath_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "pwd" => {
+            invoke_pwd_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+        }
+        "cd" => invoke_cd_builtin_outputs(shared_state, resolution_source_path, args, output_arity),
+        "dir" => invoke_dir_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+            false,
+        ),
+        "ls" => invoke_dir_builtin_outputs(
+            shared_state,
+            resolution_source_path,
+            args,
+            output_arity,
+            true,
+        ),
         "tic" => invoke_tic_builtin_outputs(shared_state, args, output_arity),
         "toc" => invoke_toc_builtin_outputs(shared_state, args, output_arity),
         "pause" => invoke_pause_builtin_outputs(shared_state, args, output_arity),
@@ -1285,6 +2175,20 @@ fn invoke_runtime_builtin_outputs(
         "lastwarn" => invoke_lastwarn_builtin_outputs(shared_state, args, output_arity),
         "str2num" => invoke_str2num_builtin_outputs(args, output_arity),
         _ => invoke_stdlib_builtin_outputs(name, args, output_arity),
+    }
+}
+
+fn runtime_builtin_can_fallback(error: &RuntimeError, name: &str) -> bool {
+    match error {
+        RuntimeError::Unsupported(message) => {
+            message == &format!("builtin `{name}` is not implemented yet")
+                || message == &format!("{name} builtin is unavailable")
+                || message
+                    == &format!(
+                        "workspace builtin `{name}` is not implemented in the current interpreter"
+                    )
+        }
+        _ => false,
     }
 }
 
@@ -1365,10 +2269,29 @@ struct LookforMatch {
     lines: Vec<String>,
 }
 
-fn resolution_context_with_env(resolution_source_path: Option<&Path>) -> ResolverContext {
-    resolution_source_path
-        .map(|path| ResolverContext::from_source_file(path.to_path_buf()).with_env_search_roots("MATC_PATH"))
-        .unwrap_or_else(|| ResolverContext::new(None, matlab_resolver::search_roots_from_env("MATC_PATH")))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MethodEntry {
+    name: String,
+    owner: String,
+    constructor: bool,
+}
+
+fn resolution_context_with_env(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+) -> ResolverContext {
+    let current_directory = runtime_current_directory(shared_state, resolution_source_path);
+    let mut context = ResolverContext::new(
+        resolution_source_path.map(Path::to_path_buf),
+        runtime_search_path_roots(shared_state),
+    );
+    if context
+        .source_dir()
+        .is_none_or(|source_dir| source_dir != current_directory.as_path())
+    {
+        context.search_roots.insert(0, current_directory);
+    }
+    context
 }
 
 fn parse_which_args(args: &[Value]) -> Result<(String, WhichMode), RuntimeError> {
@@ -1433,12 +2356,1508 @@ fn parse_inmem_args(args: &[Value]) -> Result<bool, RuntimeError> {
     }
 }
 
+fn parse_pwd_args(args: &[Value]) -> Result<(), RuntimeError> {
+    match args {
+        [] => Ok(()),
+        _ => Err(RuntimeError::Unsupported(
+            "pwd currently supports no input arguments".to_string(),
+        )),
+    }
+}
+
+fn parse_cd_args(args: &[Value]) -> Result<Option<String>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [path] => {
+            let text = text_value(path)?.trim().to_string();
+            if text.is_empty() {
+                Err(RuntimeError::TypeError(
+                    "cd currently expects a nonempty folder path".to_string(),
+                ))
+            } else {
+                Ok(Some(text))
+            }
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "cd currently supports `cd`, `cd path`, or `old = cd(path)`".to_string(),
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchPathPosition {
+    Begin,
+    End,
+}
+
+fn parse_path_args(args: &[Value]) -> Result<PathBuiltinSpec, RuntimeError> {
+    match args {
+        [] => Ok(PathBuiltinSpec::Display),
+        [newpath] => Ok(PathBuiltinSpec::Replace(text_value(newpath)?.to_string())),
+        [first, second] => Ok(PathBuiltinSpec::AddRelativeToExisting {
+            first: text_value(first)?.to_string(),
+            second: text_value(second)?.to_string(),
+        }),
+        _ => Err(RuntimeError::Unsupported(
+            "path currently supports `path`, `path(newpath)`, `path(oldpath,newfolder)`, or `path(newfolder,oldpath)`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_addpath_args(args: &[Value]) -> Result<(Vec<String>, SearchPathPosition), RuntimeError> {
+    let Some((last, folders)) = args.split_last() else {
+        return Err(RuntimeError::Unsupported(
+            "addpath currently expects one or more folder names".to_string(),
+        ));
+    };
+    let last_text = text_value(last)?.to_string();
+    let (position, folder_values) = match last_text.to_ascii_lowercase().as_str() {
+        "-begin" => (SearchPathPosition::Begin, folders),
+        "-end" => (SearchPathPosition::End, folders),
+        _ => (SearchPathPosition::Begin, args),
+    };
+    if folder_values.is_empty() {
+        return Err(RuntimeError::Unsupported(
+            "addpath currently expects one or more folder names".to_string(),
+        ));
+    }
+    Ok((
+        folder_values
+            .iter()
+            .map(text_value)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+        position,
+    ))
+}
+
+fn parse_rmpath_args(args: &[Value], builtin_name: &str) -> Result<Vec<String>, RuntimeError> {
+    if args.is_empty() {
+        return Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently expects one or more folder names"
+        )));
+    }
+    args.iter()
+        .map(text_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|values| values.into_iter().map(ToOwned::to_owned).collect())
+}
+
+fn parse_rehash_args(args: &[Value]) -> Result<Option<String>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [mode] => {
+            let mode = text_value(mode)?.to_ascii_lowercase();
+            match mode.as_str() {
+                "path" | "toolbox" | "toolboxcache" => Ok(Some(mode)),
+                _ => Err(RuntimeError::Unsupported(
+                    "rehash currently supports `rehash`, `rehash path`, `rehash toolbox`, or `rehash toolboxcache`"
+                        .to_string(),
+                )),
+            }
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "rehash currently supports `rehash`, `rehash path`, `rehash toolbox`, or `rehash toolboxcache`"
+                .to_string(),
+        )),
+    }
+}
+
+enum UserPathCommand {
+    Query,
+    Set(PathBuf),
+    Reset,
+    Clear,
+}
+
+fn parse_userpath_args(args: &[Value]) -> Result<UserPathCommand, RuntimeError> {
+    match args {
+        [] => Ok(UserPathCommand::Query),
+        [value] => {
+            let text = text_value(value)?.trim();
+            if text.eq_ignore_ascii_case("reset") {
+                Ok(UserPathCommand::Reset)
+            } else if text.eq_ignore_ascii_case("clear") {
+                Ok(UserPathCommand::Clear)
+            } else if text.is_empty() {
+                Err(RuntimeError::TypeError(
+                    "userpath currently expects a nonempty absolute folder path".to_string(),
+                ))
+            } else {
+                let path = PathBuf::from(text);
+                if !path.is_absolute() {
+                    return Err(RuntimeError::TypeError(
+                        "userpath currently expects an absolute folder path".to_string(),
+                    ));
+                }
+                Ok(UserPathCommand::Set(normalize_runtime_path(path)))
+            }
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "userpath currently supports `userpath`, `userpath(path)`, `userpath('reset')`, or `userpath('clear')`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_savepath_args(args: &[Value], builtin_name: &str) -> Result<Option<String>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [path] => Ok(Some(text_value(path)?.to_string())),
+        _ => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports `{builtin_name}` or `{builtin_name}(path)`"
+        ))),
+    }
+}
+
+fn parse_zero_arg_builtin_args(args: &[Value], builtin_name: &str) -> Result<(), RuntimeError> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports no input arguments"
+        )))
+    }
+}
+
+fn parse_toolboxdir_args(args: &[Value]) -> Result<String, RuntimeError> {
+    match args {
+        [name] => {
+            let name = text_value(name)?.trim().to_string();
+            if name.is_empty() {
+                Err(RuntimeError::TypeError(
+                    "toolboxdir currently expects a nonempty toolbox name".to_string(),
+                ))
+            } else {
+                Ok(name)
+            }
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "toolboxdir currently supports exactly one toolbox name input".to_string(),
+        )),
+    }
+}
+
+fn parse_mkdir_args(args: &[Value]) -> Result<(String, Option<String>), RuntimeError> {
+    match args {
+        [folder] => Ok((text_value(folder)?.trim().to_string(), None)),
+        [parent, folder] => Ok((
+            text_value(parent)?.trim().to_string(),
+            Some(text_value(folder)?.trim().to_string()),
+        )),
+        _ => Err(RuntimeError::Unsupported(
+            "mkdir currently supports `mkdir(folderName)` or `mkdir(parentFolder, folderName)`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_rmdir_args(args: &[Value]) -> Result<(String, bool), RuntimeError> {
+    match args {
+        [folder] => Ok((text_value(folder)?.trim().to_string(), false)),
+        [folder, option] if text_value(option)?.eq_ignore_ascii_case("s") => {
+            Ok((text_value(folder)?.trim().to_string(), true))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "rmdir currently supports `rmdir(folderName)` or `rmdir(folderName, 's')`".to_string(),
+        )),
+    }
+}
+
+fn parse_copy_move_args(
+    args: &[Value],
+    builtin_name: &str,
+) -> Result<(Vec<String>, Option<String>, bool), RuntimeError> {
+    match args {
+        [source] => Ok((collect_text_path_values(source, builtin_name)?, None, false)),
+        [source, destination] => Ok((
+            collect_text_path_values(source, builtin_name)?,
+            Some(text_value(destination)?.trim().to_string()),
+            false,
+        )),
+        [source, destination, force] if text_value(force)?.eq_ignore_ascii_case("f") => Ok((
+            collect_text_path_values(source, builtin_name)?,
+            Some(text_value(destination)?.trim().to_string()),
+            true,
+        )),
+        _ => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports `{builtin_name}(source)`, `{builtin_name}(source, destination)`, or `{builtin_name}(source, destination, 'f')`"
+        ))),
+    }
+}
+
+fn parse_path_query_arg<'a>(
+    args: &'a [Value],
+    builtin_name: &str,
+) -> Result<&'a Value, RuntimeError> {
+    match args {
+        [value] => Ok(value),
+        _ => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports exactly one input argument"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum FileAttribMode {
+    Get {
+        filename: Option<String>,
+    },
+    Set {
+        filename: String,
+        write_enabled: bool,
+        recursive: bool,
+    },
+}
+
+fn parse_fileattrib_args(args: &[Value]) -> Result<FileAttribMode, RuntimeError> {
+    let parse_users = |value: &Value| -> Result<(), RuntimeError> {
+        let text = text_value(value)?.trim().to_ascii_lowercase();
+        match text.as_str() {
+            "" | "a" | "g" | "o" | "u" => Ok(()),
+            _ => Err(RuntimeError::Unsupported(
+                "fileattrib currently supports users `''`, `a`, `g`, `o`, or `u` only".to_string(),
+            )),
+        }
+    };
+
+    let parse_recursive = |value: &Value| -> Result<bool, RuntimeError> {
+        let text = text_value(value)?.trim();
+        if text.eq_ignore_ascii_case("s") {
+            Ok(true)
+        } else {
+            Err(RuntimeError::Unsupported(
+                "fileattrib currently supports recursive flag `s` only".to_string(),
+            ))
+        }
+    };
+
+    let parse_write_attribs = |value: &Value| -> Result<bool, RuntimeError> {
+        let text = text_value(value)?;
+        let mut write_enabled = None;
+        for token in text.split_whitespace() {
+            let mut chars = token.chars();
+            let sign = chars.next().ok_or_else(|| {
+                RuntimeError::Unsupported(
+                    "fileattrib currently expects attribute tokens like `+w` or `-w`".to_string(),
+                )
+            })?;
+            let attr = chars.next().ok_or_else(|| {
+                RuntimeError::Unsupported(
+                    "fileattrib currently expects attribute tokens like `+w` or `-w`".to_string(),
+                )
+            })?;
+            if chars.next().is_some() {
+                return Err(RuntimeError::Unsupported(
+                    "fileattrib currently expects attribute tokens like `+w` or `-w`".to_string(),
+                ));
+            }
+            match (sign, attr.to_ascii_lowercase()) {
+                ('+', 'w') => write_enabled = Some(true),
+                ('-', 'w') => write_enabled = Some(false),
+                _ => {
+                    return Err(RuntimeError::Unsupported(
+                        "fileattrib setter currently supports only `+w` and `-w`".to_string(),
+                    ))
+                }
+            }
+        }
+        write_enabled.ok_or_else(|| {
+            RuntimeError::Unsupported(
+                "fileattrib setter currently supports only `+w` and `-w`".to_string(),
+            )
+        })
+    };
+
+    match args {
+        [] => Ok(FileAttribMode::Get { filename: None }),
+        [filename] => Ok(FileAttribMode::Get {
+            filename: Some(text_value(filename)?.trim().to_string()),
+        }),
+        [filename, attribs] => Ok(FileAttribMode::Set {
+            filename: text_value(filename)?.trim().to_string(),
+            write_enabled: parse_write_attribs(attribs)?,
+            recursive: false,
+        }),
+        [filename, attribs, third] => {
+            let recursive = if text_value(third)?.trim().eq_ignore_ascii_case("s") {
+                true
+            } else {
+                parse_users(third)?;
+                false
+            };
+            Ok(FileAttribMode::Set {
+                filename: text_value(filename)?.trim().to_string(),
+                write_enabled: parse_write_attribs(attribs)?,
+                recursive,
+            })
+        }
+        [filename, attribs, users, recursive] => {
+            parse_users(users)?;
+            Ok(FileAttribMode::Set {
+                filename: text_value(filename)?.trim().to_string(),
+                write_enabled: parse_write_attribs(attribs)?,
+                recursive: parse_recursive(recursive)?,
+            })
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "fileattrib currently supports getter forms or setter forms `fileattrib(filename, attribs, ...)`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_version_args(args: &[Value]) -> Result<Option<String>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [option] => {
+            let option = text_value(option)?.to_ascii_lowercase();
+            match option.as_str() {
+                "-date" | "-description" | "-release" | "-java" => Ok(Some(option)),
+                _ => Err(RuntimeError::Unsupported(
+                    "version currently supports `version`, `version('-date')`, `version('-description')`, `version('-release')`, or `version('-java')`"
+                        .to_string(),
+                )),
+            }
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "version currently supports `version`, `version('-date')`, `version('-description')`, `version('-release')`, or `version('-java')`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_ver_args(args: &[Value]) -> Result<Option<String>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [product] => {
+            let product = text_value(product)?.trim().to_string();
+            if product.eq_ignore_ascii_case("-support") {
+                return Err(RuntimeError::Unsupported(
+                    "ver currently does not support `-support`".to_string(),
+                ));
+            }
+            if product.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "ver currently expects a nonempty product name".to_string(),
+                ));
+            }
+            Ok(Some(product))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "ver currently supports `ver` or `ver(product)`".to_string(),
+        )),
+    }
+}
+
+fn parse_ver_less_than_args(args: &[Value]) -> Result<(String, String), RuntimeError> {
+    match args {
+        [toolbox, version] => {
+            let toolbox = text_value(toolbox)?.trim().to_string();
+            let version = text_value(version)?.trim().to_string();
+            if toolbox.is_empty() || version.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "verLessThan currently expects nonempty toolbox and version strings"
+                        .to_string(),
+                ));
+            }
+            Ok((toolbox, version))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "verLessThan currently supports exactly two string arguments".to_string(),
+        )),
+    }
+}
+
+fn parse_computer_args(args: &[Value]) -> Result<bool, RuntimeError> {
+    match args {
+        [] => Ok(false),
+        [value] if text_value(value)?.eq_ignore_ascii_case("arch") => Ok(true),
+        _ => Err(RuntimeError::Unsupported(
+            "computer currently supports `computer` or `computer('arch')`".to_string(),
+        )),
+    }
+}
+
+fn parse_tempname_args(args: &[Value]) -> Result<Option<String>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [folder] => Ok(Some(text_value(folder)?.trim().to_string())),
+        _ => Err(RuntimeError::Unsupported(
+            "tempname currently supports `tempname` or `tempname(folderName)`".to_string(),
+        )),
+    }
+}
+
+enum FcloseTarget {
+    FileId(i32),
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FreadSpec {
+    size: BinaryReadSize,
+    precision: BinaryReadPrecision,
+    skip: usize,
+    machinefmt: BinaryMachineFormat,
+    machinefmt_explicit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FwriteSpec {
+    precision: BinaryWritePrecision,
+    skip: usize,
+    machinefmt: BinaryMachineFormat,
+    machinefmt_explicit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeFileSeekOrigin {
+    Beginning,
+    Current,
+    End,
+}
+
+fn parse_runtime_file_permission(value: &str) -> Result<RuntimeFilePermission, RuntimeError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "fopen currently expects a nonempty permission string".to_string(),
+        ));
+    }
+    let raw = trimmed.chars().collect::<Vec<_>>();
+    let text_mode = raw.iter().any(|ch| *ch == 't' || *ch == 'T');
+    let binary_mode = raw.iter().any(|ch| *ch == 'b' || *ch == 'B');
+    if text_mode && binary_mode {
+        return Err(RuntimeError::Unsupported(
+            "fopen currently does not allow permission strings containing both `t` and `b`"
+                .to_string(),
+        ));
+    }
+    let normalized = trimmed
+        .chars()
+        .filter(|ch| !matches!(ch, 't' | 'T' | 'b' | 'B'))
+        .collect::<String>();
+    let auto_flush = !normalized.starts_with('W') && !normalized.starts_with('A');
+    let lowered = normalized.to_ascii_lowercase();
+    let permission = match lowered.as_str() {
+        "r" => RuntimeFilePermission::Read,
+        "w" => RuntimeFilePermission::Write,
+        "a" => RuntimeFilePermission::Append,
+        "r+" => RuntimeFilePermission::ReadWrite,
+        "w+" => RuntimeFilePermission::WriteRead,
+        "a+" => RuntimeFilePermission::AppendRead,
+        _ => return Err(RuntimeError::Unsupported(
+            "fopen currently supports `r`, `w`, `a`, `r+`, `w+`, `a+`, `W`, and `A` permissions"
+                .to_string(),
+        )),
+    };
+    if !auto_flush
+        && !matches!(
+            permission,
+            RuntimeFilePermission::Write | RuntimeFilePermission::Append
+        )
+    {
+        return Err(RuntimeError::Unsupported(
+            "fopen currently supports `W` and `A` only for write-only or append-only permissions"
+                .to_string(),
+        ));
+    }
+    Ok(permission)
+}
+
+fn parse_runtime_file_permission_spec(
+    value: &str,
+) -> Result<(RuntimeFilePermission, String, bool, bool), RuntimeError> {
+    let trimmed = value.trim();
+    let raw = trimmed.chars().collect::<Vec<_>>();
+    let text_mode = raw.iter().any(|ch| *ch == 't' || *ch == 'T');
+    let binary_mode = raw.iter().any(|ch| *ch == 'b' || *ch == 'B');
+    if text_mode && binary_mode {
+        return Err(RuntimeError::Unsupported(
+            "fopen currently does not allow permission strings containing both `t` and `b`"
+                .to_string(),
+        ));
+    }
+    let normalized = trimmed
+        .chars()
+        .filter(|ch| !matches!(ch, 't' | 'T' | 'b' | 'B'))
+        .collect::<String>();
+    let auto_flush = !normalized.starts_with('W') && !normalized.starts_with('A');
+    let permission = parse_runtime_file_permission(trimmed)?;
+    let permission_text = runtime_permission_text(permission, text_mode, auto_flush);
+    Ok((permission, permission_text, text_mode, auto_flush))
+}
+
+fn parse_runtime_file_id(value: &Value, builtin_name: &str) -> Result<i32, RuntimeError> {
+    let file_id = finite_scalar_value(value, builtin_name)?;
+    if file_id < 0.0 || file_id.fract() != 0.0 || file_id > i32::MAX as f64 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects a nonnegative integer file identifier"
+        )));
+    }
+    Ok(file_id as i32)
+}
+
+fn default_runtime_file_encoding(permission: RuntimeFilePermission) -> String {
+    match permission {
+        RuntimeFilePermission::Read => "UTF-8".to_string(),
+        RuntimeFilePermission::Write
+        | RuntimeFilePermission::Append
+        | RuntimeFilePermission::ReadWrite
+        | RuntimeFilePermission::WriteRead
+        | RuntimeFilePermission::AppendRead => "UTF-8".to_string(),
+    }
+}
+
+fn runtime_permission_text(
+    permission: RuntimeFilePermission,
+    text_mode: bool,
+    auto_flush: bool,
+) -> String {
+    match permission {
+        RuntimeFilePermission::Read => format!("r{}", if text_mode { "t" } else { "b" }),
+        RuntimeFilePermission::Write => format!(
+            "{}{}",
+            if auto_flush { "w" } else { "W" },
+            if text_mode { "t" } else { "b" }
+        ),
+        RuntimeFilePermission::Append => format!(
+            "{}{}",
+            if auto_flush { "a" } else { "A" },
+            if text_mode { "t" } else { "b" }
+        ),
+        RuntimeFilePermission::ReadWrite => format!("r+{}", if text_mode { "t" } else { "b" }),
+        RuntimeFilePermission::WriteRead => format!("w+{}", if text_mode { "t" } else { "b" }),
+        RuntimeFilePermission::AppendRead => format!("a+{}", if text_mode { "t" } else { "b" }),
+    }
+}
+
+fn parse_fopen_args(args: &[Value]) -> Result<FopenOperation, RuntimeError> {
+    match args {
+        [value] => match value {
+            Value::Scalar(_) => Ok(FopenOperation::Query {
+                file_id: parse_runtime_file_id(value, "fopen")?,
+            }),
+            _ => {
+                let filename = text_value(value)?.trim().to_string();
+                Ok(FopenOperation::Open {
+                    filename,
+                    permission: RuntimeFilePermission::Read,
+                    permission_text: runtime_permission_text(RuntimeFilePermission::Read, false, true),
+                    text_mode: false,
+                    auto_flush: true,
+                    machinefmt: BinaryMachineFormat::Native,
+                    encoding: default_runtime_file_encoding(RuntimeFilePermission::Read),
+                })
+            }
+        },
+        [filename, permission] => {
+            let (permission, permission_text, text_mode, auto_flush) =
+                parse_runtime_file_permission_spec(text_value(permission)?)?;
+            Ok(FopenOperation::Open {
+                filename: text_value(filename)?.trim().to_string(),
+                permission,
+                permission_text,
+                text_mode,
+                auto_flush,
+                machinefmt: BinaryMachineFormat::Native,
+                encoding: default_runtime_file_encoding(permission),
+            })
+        }
+        [filename, permission, machinefmt] => {
+            let (permission, permission_text, text_mode, auto_flush) =
+                parse_runtime_file_permission_spec(text_value(permission)?)?;
+            Ok(FopenOperation::Open {
+                filename: text_value(filename)?.trim().to_string(),
+                permission,
+                permission_text,
+                text_mode,
+                auto_flush,
+                machinefmt: parse_binary_machinefmt(text_value(machinefmt)?, "fopen")?,
+                encoding: default_runtime_file_encoding(permission),
+            })
+        }
+        [filename, permission, machinefmt, encoding] => {
+            let (permission, permission_text, text_mode, auto_flush) =
+                parse_runtime_file_permission_spec(text_value(permission)?)?;
+            let encoding = text_value(encoding)?.trim().to_string();
+            if encoding.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "fopen currently expects a nonempty encoding name".to_string(),
+                ));
+            }
+            Ok(FopenOperation::Open {
+                filename: text_value(filename)?.trim().to_string(),
+                permission,
+                permission_text,
+                text_mode,
+                auto_flush,
+                machinefmt: parse_binary_machinefmt(text_value(machinefmt)?, "fopen")?,
+                encoding,
+            })
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "fopen currently supports file open forms up to `fopen(filename, permission, machinefmt, encoding)` and query form `fopen(fileID)`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_fclose_args(args: &[Value]) -> Result<FcloseTarget, RuntimeError> {
+    match args {
+        [value] => match value {
+            Value::CharArray(text) | Value::String(text)
+                if text.trim().eq_ignore_ascii_case("all") =>
+            {
+                Ok(FcloseTarget::All)
+            }
+            _ => Ok(FcloseTarget::FileId(parse_runtime_file_id(
+                value, "fclose",
+            )?)),
+        },
+        _ => Err(RuntimeError::Unsupported(
+            "fclose currently supports `fclose(fileID)` or `fclose('all')`".to_string(),
+        )),
+    }
+}
+
+fn machinefmt_query_text(machinefmt: BinaryMachineFormat) -> &'static str {
+    match machinefmt {
+        BinaryMachineFormat::Native => "native",
+        BinaryMachineFormat::LittleEndian => "ieee-le",
+        BinaryMachineFormat::BigEndian => "ieee-be",
+    }
+}
+
+fn standard_stream_query_metadata(file_id: i32) -> Option<(String, String, String, String)> {
+    match file_id {
+        0 => Some((
+            "stdin".to_string(),
+            "rb".to_string(),
+            "native".to_string(),
+            "UTF-8".to_string(),
+        )),
+        1 => Some((
+            "stdout".to_string(),
+            "wb".to_string(),
+            "native".to_string(),
+            "UTF-8".to_string(),
+        )),
+        2 => Some((
+            "stderr".to_string(),
+            "wb".to_string(),
+            "native".to_string(),
+            "UTF-8".to_string(),
+        )),
+        _ => None,
+    }
+}
+
+fn parse_runtime_file_read_args(args: &[Value], builtin_name: &str) -> Result<i32, RuntimeError> {
+    let [file_id] = args else {
+        return Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports exactly one file identifier input"
+        )));
+    };
+    parse_runtime_file_id(file_id, builtin_name)
+}
+
+fn parse_runtime_integer_scalar(
+    value: &Value,
+    builtin_name: &str,
+    role: &str,
+) -> Result<i64, RuntimeError> {
+    let number = finite_scalar_value(value, builtin_name)?;
+    if number.fract() != 0.0 || number < i64::MIN as f64 || number > i64::MAX as f64 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects {role} to be an integer scalar"
+        )));
+    }
+    Ok(number as i64)
+}
+
+fn parse_fseek_origin(value: &Value) -> Result<RuntimeFileSeekOrigin, RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => {
+            match text.trim().to_ascii_lowercase().as_str() {
+                "bof" => Ok(RuntimeFileSeekOrigin::Beginning),
+                "cof" => Ok(RuntimeFileSeekOrigin::Current),
+                "eof" => Ok(RuntimeFileSeekOrigin::End),
+                _ => Err(RuntimeError::Unsupported(
+                    "fseek currently supports origin values `bof`, `cof`, `eof`, `-1`, `0`, or `1`"
+                        .to_string(),
+                )),
+            }
+        }
+        Value::Scalar(_) => match parse_runtime_integer_scalar(value, "fseek", "origin")? {
+            -1 => Ok(RuntimeFileSeekOrigin::Beginning),
+            0 => Ok(RuntimeFileSeekOrigin::Current),
+            1 => Ok(RuntimeFileSeekOrigin::End),
+            _ => Err(RuntimeError::Unsupported(
+                "fseek currently supports origin values `bof`, `cof`, `eof`, `-1`, `0`, or `1`"
+                    .to_string(),
+            )),
+        },
+        other => Err(RuntimeError::TypeError(format!(
+            "fseek currently expects origin to be text or a numeric scalar, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn parse_fseek_args(args: &[Value]) -> Result<(i32, i64, RuntimeFileSeekOrigin), RuntimeError> {
+    let [file_id, offset, origin] = args else {
+        return Err(RuntimeError::Unsupported(
+            "fseek currently supports exactly three inputs: `fseek(fileID, offset, origin)`"
+                .to_string(),
+        ));
+    };
+    Ok((
+        parse_runtime_file_id(file_id, "fseek")?,
+        parse_runtime_integer_scalar(offset, "fseek", "offset")?,
+        parse_fseek_origin(origin)?,
+    ))
+}
+
+fn parse_ferror_args(args: &[Value]) -> Result<(i32, bool), RuntimeError> {
+    match args {
+        [file_id] => Ok((parse_runtime_file_id(file_id, "ferror")?, false)),
+        [file_id, clear] if text_value(clear)?.trim().eq_ignore_ascii_case("clear") => {
+            Ok((parse_runtime_file_id(file_id, "ferror")?, true))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "ferror currently supports `ferror(fileID)` or `ferror(fileID, 'clear')`".to_string(),
+        )),
+    }
+}
+
+fn parse_scanf_format(format: &str) -> Result<Vec<ScanfDirective>, RuntimeError> {
+    let mut directives = Vec::new();
+    let mut literal = String::new();
+    let mut chars = format.chars().peekable();
+
+    let flush_literal = |directives: &mut Vec<ScanfDirective>, literal: &mut String| {
+        if !literal.is_empty() {
+            directives.push(ScanfDirective::Literal(std::mem::take(literal)));
+        }
+    };
+
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            if chars.peek() == Some(&'%') {
+                chars.next();
+                literal.push('%');
+                continue;
+            }
+
+            flush_literal(&mut directives, &mut literal);
+            let suppress = if chars.peek() == Some(&'*') {
+                chars.next();
+                true
+            } else {
+                false
+            };
+
+            let mut width_text = String::new();
+            while chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+                width_text.push(chars.next().expect("digit peeked"));
+            }
+            let width = if width_text.is_empty() {
+                None
+            } else {
+                let width = width_text.parse::<usize>().map_err(|_| {
+                    RuntimeError::TypeError("fscanf width must be a positive integer".to_string())
+                })?;
+                if width == 0 {
+                    return Err(RuntimeError::TypeError(
+                        "fscanf width must be positive".to_string(),
+                    ));
+                }
+                Some(width)
+            };
+
+            let long_modifier = if chars.peek() == Some(&'l') {
+                chars.next();
+                true
+            } else {
+                false
+            };
+            let specifier = chars.next().ok_or_else(|| {
+                RuntimeError::TypeError(
+                    "fscanf format string ends with an incomplete conversion".to_string(),
+                )
+            })?;
+            let (kind, scan_set) = match specifier {
+                'd' => (ScanfConversionKind::SignedInteger, None),
+                'i' => (ScanfConversionKind::AutoInteger, None),
+                'u' => (ScanfConversionKind::UnsignedInteger, None),
+                'o' => (ScanfConversionKind::OctalInteger, None),
+                'x' | 'X' => (ScanfConversionKind::HexInteger, None),
+                'f' | 'e' | 'E' | 'g' | 'G' => (ScanfConversionKind::Float, None),
+                'c' => (ScanfConversionKind::Character, None),
+                's' => (ScanfConversionKind::String, None),
+                '[' => (ScanfConversionKind::ScanSet, Some(parse_scanf_scanset(&mut chars)?)),
+                _ => {
+                    return Err(RuntimeError::Unsupported(format!(
+                        "fscanf currently supports `%d`, `%i`, `%u`, `%o`, `%x`, `%f`, `%e`, `%g`, `%c`, `%s`, `%[...]`, and `%%` conversions"
+                    )))
+                }
+            };
+            if long_modifier
+                && !matches!(
+                    kind,
+                    ScanfConversionKind::SignedInteger
+                        | ScanfConversionKind::AutoInteger
+                        | ScanfConversionKind::UnsignedInteger
+                        | ScanfConversionKind::OctalInteger
+                        | ScanfConversionKind::HexInteger
+                )
+            {
+                return Err(RuntimeError::Unsupported(
+                    "fscanf currently supports the `l` length modifier only for `%d`, `%i`, `%u`, `%o`, and `%x`"
+                        .to_string(),
+                ));
+            }
+            directives.push(ScanfDirective::Conversion(ScanfConversion {
+                kind,
+                suppress,
+                width,
+                scan_set,
+            }));
+        } else if ch.is_whitespace() {
+            flush_literal(&mut directives, &mut literal);
+            while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                chars.next();
+            }
+            directives.push(ScanfDirective::Whitespace);
+        } else {
+            literal.push(ch);
+        }
+    }
+
+    flush_literal(&mut directives, &mut literal);
+    Ok(directives)
+}
+
+fn parse_scanf_scanset<I>(chars: &mut std::iter::Peekable<I>) -> Result<ScanfCharSet, RuntimeError>
+where
+    I: Iterator<Item = char>,
+{
+    let inverted = if chars.peek() == Some(&'^') {
+        chars.next();
+        true
+    } else {
+        false
+    };
+    let mut raw = Vec::new();
+    let mut closed = false;
+    if chars.peek() == Some(&']') {
+        raw.push(chars.next().expect("peeked ]"));
+    }
+    while let Some(ch) = chars.next() {
+        if ch == ']' {
+            closed = true;
+            break;
+        }
+        raw.push(ch);
+    }
+    if !closed {
+        return Err(RuntimeError::TypeError(
+            "fscanf `%[...]` conversion is missing a closing `]`".to_string(),
+        ));
+    }
+    if raw.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "fscanf `%[...]` conversion requires a nonempty scanset".to_string(),
+        ));
+    }
+
+    let mut items = Vec::new();
+    let mut index = 0usize;
+    while index < raw.len() {
+        let current = raw[index];
+        if index + 2 < raw.len() && raw[index + 1] == '-' && raw[index + 2] != ']' {
+            let start = current;
+            let end = raw[index + 2];
+            if start <= end {
+                items.push(ScanfCharSetItem::Range(start, end));
+            } else {
+                items.push(ScanfCharSetItem::Single(start));
+                items.push(ScanfCharSetItem::Single('-'));
+                items.push(ScanfCharSetItem::Single(end));
+            }
+            index += 3;
+        } else {
+            items.push(ScanfCharSetItem::Single(current));
+            index += 1;
+        }
+    }
+    if items.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "fscanf `%[...]` conversion requires a nonempty scanset".to_string(),
+        ));
+    }
+    Ok(ScanfCharSet { inverted, items })
+}
+
+fn scanf_output_mode(directives: &[ScanfDirective]) -> Result<ScanfOutputMode, RuntimeError> {
+    let mut saw_numeric = false;
+    let mut saw_unsuppressed = false;
+    for directive in directives {
+        let ScanfDirective::Conversion(conversion) = directive else {
+            continue;
+        };
+        match conversion.kind {
+            ScanfConversionKind::SignedInteger
+            | ScanfConversionKind::AutoInteger
+            | ScanfConversionKind::UnsignedInteger
+            | ScanfConversionKind::OctalInteger
+            | ScanfConversionKind::HexInteger
+            | ScanfConversionKind::Float => saw_numeric = true,
+            ScanfConversionKind::Character
+            | ScanfConversionKind::String
+            | ScanfConversionKind::ScanSet => {}
+        }
+        if !conversion.suppress {
+            saw_unsuppressed = true;
+        }
+    }
+    if !saw_unsuppressed {
+        return Err(RuntimeError::Unsupported(
+            "fscanf currently expects at least one nonsuppressed conversion in the format string"
+                .to_string(),
+        ));
+    }
+    Ok(if saw_numeric {
+        ScanfOutputMode::Numeric
+    } else {
+        ScanfOutputMode::Text
+    })
+}
+
+fn parse_fscanf_size(value: &Value) -> Result<BinaryReadSize, RuntimeError> {
+    match value {
+        Value::Scalar(number) => {
+            if number.is_infinite() && *number > 0.0 {
+                Ok(BinaryReadSize::ToEnd)
+            } else {
+                Ok(BinaryReadSize::Count(parse_positive_size_usize(
+                    *number, "fscanf", "size",
+                )?))
+            }
+        }
+        Value::Matrix(matrix) => {
+            let dims = matrix.scalar_elements()?;
+            if dims.len() != 2 {
+                return Err(RuntimeError::Unsupported(
+                    "fscanf currently expects sizeA to be Inf, a positive integer, or a two-element size vector"
+                        .to_string(),
+                ));
+            }
+            let rows = parse_positive_size_usize(dims[0], "fscanf", "row count")?;
+            let cols = if dims[1].is_infinite() && dims[1] > 0.0 {
+                None
+            } else {
+                Some(parse_positive_size_usize(
+                    dims[1],
+                    "fscanf",
+                    "column count",
+                )?)
+            };
+            Ok(BinaryReadSize::Matrix { rows, cols })
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "fscanf currently expects sizeA to be numeric, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn parse_fscanf_args(args: &[Value]) -> Result<(i32, String, BinaryReadSize), RuntimeError> {
+    match args {
+        [file_id, format] => Ok((
+            parse_runtime_file_id(file_id, "fscanf")?,
+            text_value(format)?.to_string(),
+            BinaryReadSize::ToEnd,
+        )),
+        [file_id, format, size] => Ok((
+            parse_runtime_file_id(file_id, "fscanf")?,
+            text_value(format)?.to_string(),
+            parse_fscanf_size(size)?,
+        )),
+        _ => Err(RuntimeError::Unsupported(
+            "fscanf currently supports `fscanf(fileID, formatSpec)` or `fscanf(fileID, formatSpec, sizeA)`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_sscanf_args(args: &[Value]) -> Result<(String, String, BinaryReadSize), RuntimeError> {
+    match args {
+        [input, format] => Ok((
+            text_value(input)?.to_string(),
+            text_value(format)?.to_string(),
+            BinaryReadSize::ToEnd,
+        )),
+        [input, format, size] => Ok((
+            text_value(input)?.to_string(),
+            text_value(format)?.to_string(),
+            parse_fscanf_size(size)?,
+        )),
+        _ => Err(RuntimeError::Unsupported(
+            "sscanf currently supports `sscanf(str, formatSpec)` or `sscanf(str, formatSpec, sizeA)`"
+                .to_string(),
+        )),
+    }
+}
+
+fn looks_like_binary_machinefmt(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "n" | "native"
+            | "b"
+            | "ieee-be"
+            | "l"
+            | "ieee-le"
+            | "s"
+            | "ieee-be.l64"
+            | "a"
+            | "ieee-le.l64"
+    )
+}
+
+fn parse_binary_machinefmt(
+    value: &str,
+    builtin_name: &str,
+) -> Result<BinaryMachineFormat, RuntimeError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "n" | "native" => Ok(BinaryMachineFormat::Native),
+        "b" | "ieee-be" | "s" | "ieee-be.l64" => Ok(BinaryMachineFormat::BigEndian),
+        "l" | "ieee-le" | "a" | "ieee-le.l64" => Ok(BinaryMachineFormat::LittleEndian),
+        _ => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports machine formats `native`, `ieee-be`, and `ieee-le`"
+        ))),
+    }
+}
+
+fn parse_binary_primitive_type(
+    value: &str,
+    builtin_name: &str,
+) -> Result<BinaryPrimitiveType, RuntimeError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "uint" | "uint32" | "ulong" => Ok(BinaryPrimitiveType::UInt32),
+        "uint8" | "uchar" | "unsigned char" => Ok(BinaryPrimitiveType::UInt8),
+        "uint16" | "ushort" => Ok(BinaryPrimitiveType::UInt16),
+        "uint64" => Ok(BinaryPrimitiveType::UInt64),
+        "int" | "int32" | "long" | "integer*4" => Ok(BinaryPrimitiveType::Int32),
+        "int8" | "schar" | "signed char" | "integer*1" => Ok(BinaryPrimitiveType::Int8),
+        "int16" | "short" | "integer*2" => Ok(BinaryPrimitiveType::Int16),
+        "int64" | "integer*8" => Ok(BinaryPrimitiveType::Int64),
+        "single" | "float" | "float32" | "real*4" => Ok(BinaryPrimitiveType::Single),
+        "double" | "float64" | "real*8" => Ok(BinaryPrimitiveType::Double),
+        "char" | "char*1" => Ok(BinaryPrimitiveType::Char),
+        _ => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports uint/int 8/16/32/64, single, double, and char precisions"
+        ))),
+    }
+}
+
+fn parse_binary_read_output(value: &str) -> Result<BinaryReadOutputKind, RuntimeError> {
+    Ok(match parse_binary_primitive_type(value, "fread")? {
+        BinaryPrimitiveType::Char => BinaryReadOutputKind::Char,
+        BinaryPrimitiveType::Int64 => BinaryReadOutputKind::Int64,
+        BinaryPrimitiveType::UInt64 => BinaryReadOutputKind::UInt64,
+        _ => BinaryReadOutputKind::Numeric,
+    })
+}
+
+fn parse_binary_read_precision(value: &str) -> Result<BinaryReadPrecision, RuntimeError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "fread currently expects a nonempty precision string".to_string(),
+        ));
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    let mut repeat = 1usize;
+    let mut body = normalized.as_str();
+    if let Some(star_index) = body.find('*') {
+        let prefix = &body[..star_index];
+        if !prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit()) {
+            repeat = prefix.parse::<usize>().map_err(|_| {
+                RuntimeError::TypeError("fread repeat count must be a positive integer".to_string())
+            })?;
+            if repeat == 0 {
+                return Err(RuntimeError::TypeError(
+                    "fread repeat count must be positive".to_string(),
+                ));
+            }
+            body = &body[(star_index + 1)..];
+        }
+    }
+
+    let (source_text, output) = if let Some(rest) = body.strip_prefix('*') {
+        (rest, parse_binary_read_output(rest)?)
+    } else if let Some((source, output)) = body.split_once("=>") {
+        (source, parse_binary_read_output(output)?)
+    } else {
+        (body, BinaryReadOutputKind::Numeric)
+    };
+
+    Ok(BinaryReadPrecision {
+        repeat,
+        source: parse_binary_primitive_type(source_text, "fread")?,
+        output,
+    })
+}
+
+fn parse_binary_write_precision(value: &str) -> Result<BinaryWritePrecision, RuntimeError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "fwrite currently expects a nonempty precision string".to_string(),
+        ));
+    }
+    if trimmed.contains("=>") || trimmed.starts_with('*') {
+        return Err(RuntimeError::Unsupported(
+            "fwrite currently expects a single precision type without output conversion"
+                .to_string(),
+        ));
+    }
+    Ok(BinaryWritePrecision {
+        source: parse_binary_primitive_type(trimmed, "fwrite")?,
+    })
+}
+
+fn parse_positive_size_usize(
+    value: f64,
+    builtin_name: &str,
+    role: &str,
+) -> Result<usize, RuntimeError> {
+    if !value.is_finite() || value < 1.0 || value.fract() != 0.0 || value > usize::MAX as f64 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects {role} to be a positive integer"
+        )));
+    }
+    Ok(value as usize)
+}
+
+fn parse_fread_size(value: &Value) -> Result<BinaryReadSize, RuntimeError> {
+    match value {
+        Value::Scalar(number) => {
+            if number.is_infinite() && *number > 0.0 {
+                Ok(BinaryReadSize::ToEnd)
+            } else {
+                Ok(BinaryReadSize::Count(parse_positive_size_usize(
+                    *number, "fread", "size",
+                )?))
+            }
+        }
+        Value::Matrix(matrix) => {
+            let dims = matrix.scalar_elements()?;
+            if dims.len() != 2 {
+                return Err(RuntimeError::Unsupported(
+                    "fread currently expects sizeA to be Inf, a positive integer, or a two-element size vector"
+                        .to_string(),
+                ));
+            }
+            let rows = parse_positive_size_usize(dims[0], "fread", "row count")?;
+            let cols = if dims[1].is_infinite() && dims[1] > 0.0 {
+                None
+            } else {
+                Some(parse_positive_size_usize(dims[1], "fread", "column count")?)
+            };
+            Ok(BinaryReadSize::Matrix { rows, cols })
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "fread currently expects sizeA to be numeric, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn parse_nonnegative_binary_skip(value: &Value, builtin_name: &str) -> Result<usize, RuntimeError> {
+    let skip = parse_runtime_integer_scalar(value, builtin_name, "skip")?;
+    if skip < 0 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects skip to be a nonnegative integer scalar"
+        )));
+    }
+    Ok(skip as usize)
+}
+
+fn parse_fread_args(args: &[Value]) -> Result<(i32, FreadSpec), RuntimeError> {
+    let [file_id, rest @ ..] = args else {
+        return Err(RuntimeError::Unsupported(
+            "fread currently expects at least a file identifier".to_string(),
+        ));
+    };
+    let file_id = parse_runtime_file_id(file_id, "fread")?;
+    let mut spec = FreadSpec {
+        size: BinaryReadSize::ToEnd,
+        precision: BinaryReadPrecision {
+            repeat: 1,
+            source: BinaryPrimitiveType::UInt8,
+            output: BinaryReadOutputKind::Numeric,
+        },
+        skip: 0,
+        machinefmt: BinaryMachineFormat::Native,
+        machinefmt_explicit: false,
+    };
+
+    match rest {
+        [] => {}
+        [arg] => {
+            if let Ok(text) = text_value(arg) {
+                if looks_like_binary_machinefmt(text) {
+                    spec.machinefmt = parse_binary_machinefmt(text, "fread")?;
+                    spec.machinefmt_explicit = true;
+                } else {
+                    spec.precision = parse_binary_read_precision(text)?;
+                }
+            } else {
+                spec.size = parse_fread_size(arg)?;
+            }
+        }
+        [first, second] => {
+            if let Ok(text) = text_value(first) {
+                spec.precision = parse_binary_read_precision(text)?;
+                if let Ok(text) = text_value(second) {
+                    spec.machinefmt = parse_binary_machinefmt(text, "fread")?;
+                    spec.machinefmt_explicit = true;
+                } else {
+                    spec.skip = parse_nonnegative_binary_skip(second, "fread")?;
+                }
+            } else {
+                spec.size = parse_fread_size(first)?;
+                let text = text_value(second)?;
+                if looks_like_binary_machinefmt(text) {
+                    spec.machinefmt = parse_binary_machinefmt(text, "fread")?;
+                    spec.machinefmt_explicit = true;
+                } else {
+                    spec.precision = parse_binary_read_precision(text)?;
+                }
+            }
+        }
+        [first, second, third] => {
+            if let Ok(text) = text_value(first) {
+                spec.precision = parse_binary_read_precision(text)?;
+                spec.skip = parse_nonnegative_binary_skip(second, "fread")?;
+                spec.machinefmt = parse_binary_machinefmt(text_value(third)?, "fread")?;
+                spec.machinefmt_explicit = true;
+            } else {
+                spec.size = parse_fread_size(first)?;
+                spec.precision = parse_binary_read_precision(text_value(second)?)?;
+                if let Ok(text) = text_value(third) {
+                    spec.machinefmt = parse_binary_machinefmt(text, "fread")?;
+                    spec.machinefmt_explicit = true;
+                } else {
+                    spec.skip = parse_nonnegative_binary_skip(third, "fread")?;
+                }
+            }
+        }
+        [first, second, third, fourth] => {
+            spec.size = parse_fread_size(first)?;
+            spec.precision = parse_binary_read_precision(text_value(second)?)?;
+            spec.skip = parse_nonnegative_binary_skip(third, "fread")?;
+            spec.machinefmt = parse_binary_machinefmt(text_value(fourth)?, "fread")?;
+            spec.machinefmt_explicit = true;
+        }
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "fread currently supports MATLAB forms up to `fread(fileID, sizeA, precision, skip, machinefmt)`"
+                    .to_string(),
+            ))
+        }
+    }
+
+    Ok((file_id, spec))
+}
+
+fn parse_fwrite_args(args: &[Value]) -> Result<(i32, &Value, FwriteSpec), RuntimeError> {
+    let [file_id, value, rest @ ..] = args else {
+        return Err(RuntimeError::Unsupported(
+            "fwrite currently expects a file identifier and data value".to_string(),
+        ));
+    };
+    let file_id = parse_runtime_file_id(file_id, "fwrite")?;
+    let mut spec = FwriteSpec {
+        precision: BinaryWritePrecision {
+            source: BinaryPrimitiveType::UInt8,
+        },
+        skip: 0,
+        machinefmt: BinaryMachineFormat::Native,
+        machinefmt_explicit: false,
+    };
+
+    match rest {
+        [] => {}
+        [precision] => {
+            spec.precision = parse_binary_write_precision(text_value(precision)?)?;
+        }
+        [precision, skip_or_machinefmt] => {
+            spec.precision = parse_binary_write_precision(text_value(precision)?)?;
+            if let Ok(text) = text_value(skip_or_machinefmt) {
+                spec.machinefmt = parse_binary_machinefmt(text, "fwrite")?;
+                spec.machinefmt_explicit = true;
+            } else {
+                spec.skip = parse_nonnegative_binary_skip(skip_or_machinefmt, "fwrite")?;
+            }
+        }
+        [precision, skip, machinefmt] => {
+            spec.precision = parse_binary_write_precision(text_value(precision)?)?;
+            spec.skip = parse_nonnegative_binary_skip(skip, "fwrite")?;
+            spec.machinefmt = parse_binary_machinefmt(text_value(machinefmt)?, "fwrite")?;
+            spec.machinefmt_explicit = true;
+        }
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "fwrite currently supports MATLAB forms up to `fwrite(fileID, A, precision, skip, machinefmt)`"
+                    .to_string(),
+            ))
+        }
+    }
+
+    Ok((file_id, value, spec))
+}
+
+enum LicenseCommand {
+    Query,
+    InUse(Option<String>),
+    Test {
+        feature: String,
+        toggle: Option<bool>,
+    },
+    Checkout {
+        feature: String,
+    },
+}
+
+fn parse_license_args(args: &[Value]) -> Result<LicenseCommand, RuntimeError> {
+    match args {
+        [] => Ok(LicenseCommand::Query),
+        [mode] if text_value(mode)?.eq_ignore_ascii_case("inuse") => Ok(LicenseCommand::InUse(None)),
+        [mode, feature] if text_value(mode)?.eq_ignore_ascii_case("inuse") => Ok(LicenseCommand::InUse(
+            Some(text_value(feature)?.trim().to_string()),
+        )),
+        [mode, feature] if text_value(mode)?.eq_ignore_ascii_case("test") => Ok(LicenseCommand::Test {
+            feature: text_value(feature)?.trim().to_string(),
+            toggle: None,
+        }),
+        [mode, feature, toggle] if text_value(mode)?.eq_ignore_ascii_case("test") => {
+            let toggle = match text_value(toggle)?.to_ascii_lowercase().as_str() {
+                "enable" => true,
+                "disable" => false,
+                _ => {
+                    return Err(RuntimeError::Unsupported(
+                        "license('test',feature,toggle) currently supports toggle values `enable` or `disable`"
+                            .to_string(),
+                    ))
+                }
+            };
+            Ok(LicenseCommand::Test {
+                feature: text_value(feature)?.trim().to_string(),
+                toggle: Some(toggle),
+            })
+        }
+        [mode, feature] if text_value(mode)?.eq_ignore_ascii_case("checkout") => Ok(
+            LicenseCommand::Checkout {
+                feature: text_value(feature)?.trim().to_string(),
+            },
+        ),
+        _ => Err(RuntimeError::Unsupported(
+            "license currently supports `license`, `license('inuse')`, `license('inuse',feature)`, `license('test',feature)`, `license('test',feature,toggle)`, or `license('checkout',feature)`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_dir_args(args: &[Value], builtin_name: &str) -> Result<Option<String>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [path] => Ok(Some(text_value(path)?.to_string())),
+        _ => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports `{builtin_name}` or `{builtin_name}(path)`"
+        ))),
+    }
+}
+
 fn parse_help_args(args: &[Value]) -> Result<Option<&Value>, RuntimeError> {
     match args {
         [] => Ok(None),
         [value] => Ok(Some(value)),
         _ => Err(RuntimeError::Unsupported(
             "help currently supports `help` or `help(name)`".to_string(),
+        )),
+    }
+}
+
+fn parse_doc_args(args: &[Value]) -> Result<Option<&Value>, RuntimeError> {
+    match args {
+        [] => Ok(None),
+        [value] => Ok(Some(value)),
+        _ => Err(RuntimeError::Unsupported(
+            "doc currently supports `doc` or `doc(name)`".to_string(),
+        )),
+    }
+}
+
+fn parse_methods_args(args: &[Value]) -> Result<(&Value, bool), RuntimeError> {
+    match args {
+        [value] => Ok((value, false)),
+        [value, flag] if text_value(flag)?.eq_ignore_ascii_case("-full") => Ok((value, true)),
+        _ => Err(RuntimeError::Unsupported(
+            "methods currently supports `methods(target)` or `methods(target, '-full')`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_properties_args(args: &[Value]) -> Result<&Value, RuntimeError> {
+    match args {
+        [value] => Ok(value),
+        _ => Err(RuntimeError::Unsupported(
+            "properties currently supports exactly one class name or object input".to_string(),
+        )),
+    }
+}
+
+fn parse_superclasses_args(args: &[Value]) -> Result<&Value, RuntimeError> {
+    match args {
+        [value] => Ok(value),
+        _ => Err(RuntimeError::Unsupported(
+            "superclasses currently supports exactly one class name or object input".to_string(),
+        )),
+    }
+}
+
+fn parse_events_args(args: &[Value]) -> Result<&Value, RuntimeError> {
+    match args {
+        [value] => Ok(value),
+        _ => Err(RuntimeError::Unsupported(
+            "events currently supports exactly one class name or object input".to_string(),
+        )),
+    }
+}
+
+fn parse_isprop_args(args: &[Value]) -> Result<(&Value, &Value), RuntimeError> {
+    match args {
+        [value, property] => Ok((value, property)),
+        _ => Err(RuntimeError::Unsupported(
+            "isprop currently supports exactly two arguments".to_string(),
+        )),
+    }
+}
+
+fn parse_ismethod_args(args: &[Value]) -> Result<(&Value, &Value), RuntimeError> {
+    match args {
+        [value, method] => Ok((value, method)),
+        _ => Err(RuntimeError::Unsupported(
+            "ismethod currently supports exactly two arguments".to_string(),
         )),
     }
 }
@@ -1455,7 +3874,14 @@ fn parse_lookfor_args(args: &[Value]) -> Result<(String, bool), RuntimeError> {
     }
 }
 
+enum PathBuiltinSpec {
+    Display,
+    Replace(String),
+    AddRelativeToExisting { first: String, second: String },
+}
+
 fn which_value_result(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     frame: Option<&Frame<'_>>,
     visible_function_names: Option<&[String]>,
     resolution_source_path: Option<&Path>,
@@ -1471,7 +3897,11 @@ fn which_value_result(
 
     if !matches!(&mode, WhichMode::In(_)) {
         if let Some(frame) = frame {
-            if frame.visible_workspace_names().iter().any(|candidate| candidate == trimmed) {
+            if frame
+                .visible_workspace_names()
+                .iter()
+                .any(|candidate| candidate == trimmed)
+            {
                 return which_output_value(vec!["variable".to_string()], &mode);
             }
         }
@@ -1482,14 +3912,15 @@ fn which_value_result(
 
     match &mode {
         WhichMode::In(context_name) => {
-            let Some(context_path) = resolve_which_context_path(resolution_source_path, context_name)
+            let Some(context_path) =
+                resolve_which_context_path(shared_state, resolution_source_path, context_name)
             else {
                 return which_output_value(Vec::new(), &mode);
             };
             for marker in collect_within_file_matches_for_name(&context_path, trimmed) {
                 push_unique_which_match(&mut matches, &mut seen, marker);
             }
-            let context = resolution_context_with_env(Some(&context_path));
+            let context = resolution_context_with_env(shared_state, Some(&context_path));
             for matched in resolve_all_callables(trimmed, &context) {
                 push_unique_which_match(
                     &mut matches,
@@ -1510,7 +3941,7 @@ fn which_value_result(
                 }
                 push_unique_which_match(&mut matches, &mut seen, marker);
             }
-            let context = resolution_context_with_env(resolution_source_path);
+            let context = resolution_context_with_env(shared_state, resolution_source_path);
 
             if matches!(&mode, WhichMode::First) {
                 let first = resolve_callable(trimmed, &context)
@@ -1534,6 +3965,7 @@ fn which_value_result(
 }
 
 fn exist_value_result(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     frame: Option<&Frame<'_>>,
     visible_function_names: Option<&[String]>,
     resolution_source_path: Option<&Path>,
@@ -1548,8 +3980,12 @@ fn exist_value_result(
     }
 
     if matches!(search_type, ExistSearchType::Default | ExistSearchType::Var)
-        && frame
-            .is_some_and(|frame| frame.visible_workspace_names().iter().any(|candidate| candidate == trimmed))
+        && frame.is_some_and(|frame| {
+            frame
+                .visible_workspace_names()
+                .iter()
+                .any(|candidate| candidate == trimmed)
+        })
     {
         return Ok(Value::Scalar(1.0));
     }
@@ -1557,7 +3993,7 @@ fn exist_value_result(
         return Ok(Value::Scalar(0.0));
     }
 
-    let context = resolution_context_with_env(resolution_source_path);
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
     let local_exists = current_visible_function_exists(frame, visible_function_names, trimmed);
     let direct_file_exists = existing_lookup_path(trimmed, &context, false).is_some();
     let folder_exists = existing_lookup_path(trimmed, &context, true).is_some();
@@ -1575,7 +4011,10 @@ fn exist_value_result(
                     Some(ResolvedCallable::Class(_)) => Some(8.0),
                     None => None,
                 };
-                if folder_exists && !builtin_exists && (direct_file_exists || resolved_code.is_some()) {
+                if folder_exists
+                    && !builtin_exists
+                    && (direct_file_exists || resolved_code.is_some())
+                {
                     7.0
                 } else if let Some(code) = resolved_code {
                     code
@@ -1639,7 +4078,8 @@ fn invoke_what_builtin_outputs(
     }
 
     let folder_name = parse_what_args(args)?;
-    let infos = collect_what_folder_infos(resolution_source_path, folder_name.as_deref())?;
+    let infos =
+        collect_what_folder_infos(shared_state, resolution_source_path, folder_name.as_deref())?;
     if output_arity == 0 {
         push_text_displayed_output(shared_state, render_what_infos(&infos), false);
         Ok(Vec::new())
@@ -1669,6 +4109,2892 @@ fn invoke_inmem_builtin_outputs(
     Ok(outputs)
 }
 
+fn invoke_path_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "path currently supports at most one output".to_string(),
+        ));
+    }
+    let spec = parse_path_args(args)?;
+    let display_only = matches!(&spec, PathBuiltinSpec::Display);
+    let old_path = runtime_search_path_string(shared_state)?;
+    let rendered = match spec {
+        PathBuiltinSpec::Display => old_path.clone(),
+        PathBuiltinSpec::Replace(newpath) => {
+            let new_paths = parse_search_path_text(
+                shared_state,
+                resolution_source_path,
+                &newpath,
+                "path",
+                true,
+            )?;
+            set_runtime_search_path_roots(shared_state, new_paths);
+            runtime_search_path_string(shared_state)?
+        }
+        PathBuiltinSpec::AddRelativeToExisting { first, second } => {
+            let current = old_path.clone();
+            let (folder_text, position) = if first == current {
+                (second, SearchPathPosition::End)
+            } else if second == current {
+                (first, SearchPathPosition::Begin)
+            } else {
+                return Err(RuntimeError::Unsupported(
+                    "path with two arguments currently expects one argument to be the current path string"
+                        .to_string(),
+                ));
+            };
+            let folders = parse_search_path_text(
+                shared_state,
+                resolution_source_path,
+                &folder_text,
+                "path",
+                true,
+            )?;
+            let updated = search_path_roots_with_updates(
+                &runtime_search_path_roots(shared_state),
+                &folders,
+                position,
+            );
+            set_runtime_search_path_roots(shared_state, updated);
+            runtime_search_path_string(shared_state)?
+        }
+    };
+    if output_arity == 0 {
+        if display_only {
+            push_text_displayed_output(
+                shared_state,
+                render_search_path_display(&runtime_search_path_roots(shared_state)),
+                true,
+            );
+        }
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::CharArray(rendered)])
+    }
+}
+
+fn invoke_matlabroot_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if !args.is_empty() {
+        return Err(RuntimeError::Unsupported(
+            "matlabroot currently supports no input arguments".to_string(),
+        ));
+    }
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "matlabroot currently supports at most one output".to_string(),
+        ));
+    }
+    let root = runtime_matlab_root().display().to_string();
+    if output_arity == 0 {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::CharArray(root)])
+    }
+}
+
+fn invoke_toolboxdir_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "toolboxdir currently supports at most one output".to_string(),
+        ));
+    }
+    let name = parse_toolboxdir_args(args)?;
+    let toolbox_root = normalize_runtime_path(runtime_toolbox_root().join(&name));
+    if !(toolbox_root.is_dir() || matches!(name.as_str(), "matlab" | "local")) {
+        return Err(RuntimeError::MissingVariable(format!(
+            "toolboxdir could not locate toolbox `{name}`"
+        )));
+    }
+    Ok(vec![Value::CharArray(toolbox_root.display().to_string())])
+}
+
+fn invoke_computer_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    let arch_only = parse_computer_args(args)?;
+    if arch_only {
+        if output_arity > 1 {
+            return Err(RuntimeError::Unsupported(
+                "computer('arch') currently supports at most one output".to_string(),
+            ));
+        }
+        return Ok(vec![Value::CharArray(computer_arch_text().to_string())]);
+    }
+
+    let output_arity = output_arity.max(1);
+    if output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "computer currently supports at most three outputs".to_string(),
+        ));
+    }
+    let mut outputs = vec![
+        Value::CharArray(computer_type_text().to_string()),
+        Value::Scalar(((1u64 << 48) - 1) as f64),
+        Value::CharArray("L".to_string()),
+    ];
+    outputs.truncate(output_arity);
+    Ok(outputs)
+}
+
+fn invoke_tempdir_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    parse_zero_arg_builtin_args(args, "tempdir")?;
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "tempdir currently supports at most one output".to_string(),
+        ));
+    }
+    Ok(vec![Value::CharArray(tempdir_text())])
+}
+
+fn invoke_tempname_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "tempname currently supports at most one output".to_string(),
+        ));
+    }
+    let folder = parse_tempname_args(args)?;
+    let base_dir = match folder.as_deref().filter(|folder| !folder.is_empty()) {
+        None => tempdir_root(),
+        Some(folder) => {
+            let folder_path = if Path::new(folder).is_absolute() {
+                PathBuf::from(folder)
+            } else {
+                runtime_current_directory(shared_state, resolution_source_path).join(folder)
+            };
+            normalize_runtime_path(folder_path)
+        }
+    };
+    Ok(vec![Value::CharArray(
+        tempname_path(&base_dir).display().to_string(),
+    )])
+}
+
+fn version_info_for_option(option: Option<&str>) -> &str {
+    match option {
+        None => MATLAB_VERSION_TEXT,
+        Some("-date") => MATLAB_VERSION_DATE,
+        Some("-description") => MATLAB_VERSION_DESCRIPTION,
+        Some("-release") => MATLAB_RELEASE_VALUE,
+        Some("-java") => MATLAB_JAVA_VERSION,
+        Some(other) => unreachable!("unsupported version option `{other}`"),
+    }
+}
+
+fn invoke_version_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    let option = parse_version_args(args)?;
+    if option.is_some() {
+        if output_arity > 1 {
+            return Err(RuntimeError::Unsupported(
+                "version(option) currently supports at most one output".to_string(),
+            ));
+        }
+        let text = version_info_for_option(option.as_deref()).to_string();
+        if output_arity == 0 {
+            push_text_displayed_output(shared_state, text, true);
+            Ok(Vec::new())
+        } else {
+            Ok(vec![Value::CharArray(text)])
+        }
+    } else {
+        let output_arity = output_arity.max(1);
+        if output_arity > 2 {
+            return Err(RuntimeError::Unsupported(
+                "version currently supports at most two outputs".to_string(),
+            ));
+        }
+        let mut outputs = vec![
+            Value::CharArray(MATLAB_VERSION_TEXT.to_string()),
+            Value::CharArray(MATLAB_VERSION_DATE.to_string()),
+        ];
+        outputs.truncate(output_arity);
+        Ok(outputs)
+    }
+}
+
+fn invoke_fileread_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "fileread currently supports at most one output".to_string(),
+        ));
+    }
+    let [filename] = args else {
+        return Err(RuntimeError::Unsupported(
+            "fileread currently supports exactly one filename input".to_string(),
+        ));
+    };
+    let path = resolve_runtime_existing_file_path(
+        shared_state,
+        resolution_source_path,
+        text_value(filename)?,
+        &[],
+    )
+    .ok_or_else(|| {
+        RuntimeError::MissingVariable(format!(
+            "file `{}` is not available",
+            text_value(filename).unwrap_or_default()
+        ))
+    })?;
+    let text =
+        fs::read_to_string(&path).map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    Ok(vec![Value::CharArray(text)])
+}
+
+fn fopen_outputs(file_id: i32, message: String, output_arity: usize) -> Vec<Value> {
+    let mut outputs = vec![Value::Scalar(file_id as f64), Value::CharArray(message)];
+    outputs.truncate(output_arity.max(1));
+    outputs
+}
+
+fn effective_binary_machinefmt(machinefmt: BinaryMachineFormat) -> BinaryMachineFormat {
+    match machinefmt {
+        BinaryMachineFormat::Native => {
+            if cfg!(target_endian = "little") {
+                BinaryMachineFormat::LittleEndian
+            } else {
+                BinaryMachineFormat::BigEndian
+            }
+        }
+        other => other,
+    }
+}
+
+fn binary_primitive_byte_width(primitive: BinaryPrimitiveType) -> usize {
+    match primitive {
+        BinaryPrimitiveType::UInt8 | BinaryPrimitiveType::Int8 | BinaryPrimitiveType::Char => 1,
+        BinaryPrimitiveType::UInt16 | BinaryPrimitiveType::Int16 => 2,
+        BinaryPrimitiveType::UInt32 | BinaryPrimitiveType::Int32 | BinaryPrimitiveType::Single => 4,
+        BinaryPrimitiveType::UInt64 | BinaryPrimitiveType::Int64 | BinaryPrimitiveType::Double => 8,
+    }
+}
+
+fn saturating_unsigned_from_f64(value: f64, max: u64) -> u64 {
+    if !value.is_finite() {
+        0
+    } else if value <= 0.0 {
+        0
+    } else if value >= max as f64 {
+        max
+    } else {
+        value.trunc() as u64
+    }
+}
+
+fn saturating_signed_from_f64(value: f64, min: i64, max: i64) -> i64 {
+    if !value.is_finite() {
+        0
+    } else if value <= min as f64 {
+        min
+    } else if value >= max as f64 {
+        max
+    } else {
+        value.trunc() as i64
+    }
+}
+
+fn char_from_f64_code(value: f64) -> char {
+    let code = if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= char::MAX as u32 as f64 {
+        char::MAX as u32
+    } else {
+        value.trunc() as u32
+    };
+    char::from_u32(code).unwrap_or('\0')
+}
+
+fn encode_binary_scalar(
+    value: f64,
+    primitive: BinaryPrimitiveType,
+    machinefmt: BinaryMachineFormat,
+) -> Vec<u8> {
+    let machinefmt = effective_binary_machinefmt(machinefmt);
+    match primitive {
+        BinaryPrimitiveType::UInt8 | BinaryPrimitiveType::Char => {
+            vec![saturating_unsigned_from_f64(value, u8::MAX as u64) as u8]
+        }
+        BinaryPrimitiveType::Int8 => {
+            vec![saturating_signed_from_f64(value, i8::MIN as i64, i8::MAX as i64) as i8 as u8]
+        }
+        BinaryPrimitiveType::UInt16 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => {
+                (saturating_unsigned_from_f64(value, u16::MAX as u64) as u16)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            BinaryMachineFormat::BigEndian => (saturating_unsigned_from_f64(value, u16::MAX as u64)
+                as u16)
+                .to_be_bytes()
+                .to_vec(),
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Int16 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => {
+                (saturating_signed_from_f64(value, i16::MIN as i64, i16::MAX as i64) as i16)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            BinaryMachineFormat::BigEndian => {
+                (saturating_signed_from_f64(value, i16::MIN as i64, i16::MAX as i64) as i16)
+                    .to_be_bytes()
+                    .to_vec()
+            }
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::UInt32 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => {
+                (saturating_unsigned_from_f64(value, u32::MAX as u64) as u32)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            BinaryMachineFormat::BigEndian => (saturating_unsigned_from_f64(value, u32::MAX as u64)
+                as u32)
+                .to_be_bytes()
+                .to_vec(),
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Int32 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => {
+                (saturating_signed_from_f64(value, i32::MIN as i64, i32::MAX as i64) as i32)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            BinaryMachineFormat::BigEndian => {
+                (saturating_signed_from_f64(value, i32::MIN as i64, i32::MAX as i64) as i32)
+                    .to_be_bytes()
+                    .to_vec()
+            }
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::UInt64 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => saturating_unsigned_from_f64(value, u64::MAX)
+                .to_le_bytes()
+                .to_vec(),
+            BinaryMachineFormat::BigEndian => saturating_unsigned_from_f64(value, u64::MAX)
+                .to_be_bytes()
+                .to_vec(),
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Int64 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => {
+                saturating_signed_from_f64(value, i64::MIN, i64::MAX)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            BinaryMachineFormat::BigEndian => saturating_signed_from_f64(value, i64::MIN, i64::MAX)
+                .to_be_bytes()
+                .to_vec(),
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Single => match machinefmt {
+            BinaryMachineFormat::LittleEndian => (value as f32).to_le_bytes().to_vec(),
+            BinaryMachineFormat::BigEndian => (value as f32).to_be_bytes().to_vec(),
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Double => match machinefmt {
+            BinaryMachineFormat::LittleEndian => value.to_le_bytes().to_vec(),
+            BinaryMachineFormat::BigEndian => value.to_be_bytes().to_vec(),
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+    }
+}
+
+fn decode_binary_scalar(
+    bytes: &[u8],
+    primitive: BinaryPrimitiveType,
+    machinefmt: BinaryMachineFormat,
+) -> f64 {
+    let machinefmt = effective_binary_machinefmt(machinefmt);
+    match primitive {
+        BinaryPrimitiveType::UInt8 | BinaryPrimitiveType::Char => bytes[0] as f64,
+        BinaryPrimitiveType::Int8 => (bytes[0] as i8) as f64,
+        BinaryPrimitiveType::UInt16 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => u16::from_le_bytes([bytes[0], bytes[1]]) as f64,
+            BinaryMachineFormat::BigEndian => u16::from_be_bytes([bytes[0], bytes[1]]) as f64,
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Int16 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => i16::from_le_bytes([bytes[0], bytes[1]]) as f64,
+            BinaryMachineFormat::BigEndian => i16::from_be_bytes([bytes[0], bytes[1]]) as f64,
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::UInt32 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => {
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
+            }
+            BinaryMachineFormat::BigEndian => {
+                u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
+            }
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Int32 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => {
+                i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
+            }
+            BinaryMachineFormat::BigEndian => {
+                i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
+            }
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::UInt64 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]) as f64,
+            BinaryMachineFormat::BigEndian => u64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]) as f64,
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Int64 => match machinefmt {
+            BinaryMachineFormat::LittleEndian => i64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]) as f64,
+            BinaryMachineFormat::BigEndian => i64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]) as f64,
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Single => match machinefmt {
+            BinaryMachineFormat::LittleEndian => {
+                f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
+            }
+            BinaryMachineFormat::BigEndian => {
+                f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
+            }
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+        BinaryPrimitiveType::Double => match machinefmt {
+            BinaryMachineFormat::LittleEndian => f64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]),
+            BinaryMachineFormat::BigEndian => f64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]),
+            BinaryMachineFormat::Native => unreachable!("native machine format normalized"),
+        },
+    }
+}
+
+fn flatten_fwrite_scalar_values(value: &Value) -> Result<Vec<f64>, RuntimeError> {
+    match value {
+        Value::Scalar(number) => Ok(vec![*number]),
+        Value::Int64(number) => Ok(vec![*number as f64]),
+        Value::UInt64(number) => Ok(vec![*number as f64]),
+        Value::Logical(flag) => Ok(vec![if *flag { 1.0 } else { 0.0 }]),
+        Value::CharArray(text) | Value::String(text) => Ok(text.bytes().map(|byte| byte as f64).collect()),
+        Value::Matrix(matrix) if matrix_is_char_matrix(matrix) => linearized_matrix_elements(matrix)?
+            .into_iter()
+            .map(|element| {
+                single_char_text_value(&element)
+                    .map(|ch| ch as u32 as f64)
+                    .ok_or_else(|| {
+                        RuntimeError::TypeError(
+                            "fwrite currently expects char matrices to contain single-character elements"
+                                .to_string(),
+                        )
+                    })
+            })
+            .collect(),
+        Value::Matrix(matrix) => linearized_matrix_elements(matrix)?
+            .into_iter()
+            .map(|element| element.as_scalar())
+            .collect(),
+        other => Err(RuntimeError::TypeError(format!(
+            "fwrite currently expects numeric, logical, or text inputs, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn fread_requested_element_limit(size: BinaryReadSize) -> Option<usize> {
+    match size {
+        BinaryReadSize::ToEnd => None,
+        BinaryReadSize::Count(count) => Some(count),
+        BinaryReadSize::Matrix {
+            rows,
+            cols: Some(cols),
+        } => Some(rows.saturating_mul(cols)),
+        BinaryReadSize::Matrix { cols: None, .. } => None,
+    }
+}
+
+fn fread_typed_output_value(
+    values: Vec<Value>,
+    size: BinaryReadSize,
+) -> Result<Value, RuntimeError> {
+    if values.is_empty() {
+        return Ok(Value::Matrix(MatrixValue::new(0, 0, Vec::new())?));
+    }
+    match size {
+        BinaryReadSize::ToEnd | BinaryReadSize::Count(_) => {
+            Ok(Value::Matrix(MatrixValue::new(values.len(), 1, values)?))
+        }
+        BinaryReadSize::Matrix { rows, .. } => {
+            let actual_rows = rows.min(values.len());
+            let cols = values.len().div_ceil(actual_rows);
+            let mut elements = vec![values[0].clone(); values.len()];
+            for (index, value) in values.into_iter().enumerate() {
+                let row = index % actual_rows;
+                let col = index / actual_rows;
+                elements[row * cols + col] = value;
+            }
+            Ok(Value::Matrix(MatrixValue::new(
+                actual_rows,
+                cols,
+                elements,
+            )?))
+        }
+    }
+}
+
+fn char_output_value(text: String, size: BinaryReadSize) -> Result<Value, RuntimeError> {
+    match size {
+        BinaryReadSize::Matrix { rows, .. } => {
+            if text.is_empty() {
+                return Ok(Value::Matrix(MatrixValue::new(0, 0, Vec::new())?));
+            }
+            let chars = text.chars().collect::<Vec<_>>();
+            let actual_rows = rows.min(chars.len());
+            let cols = chars.len().div_ceil(actual_rows);
+            let mut elements = vec![' '; chars.len()];
+            for (index, ch) in chars.into_iter().enumerate() {
+                let row = index % actual_rows;
+                let col = index / actual_rows;
+                elements[row * cols + col] = ch;
+            }
+            char_value_from_dimensions(actual_rows, cols, vec![actual_rows, cols], elements)
+        }
+        BinaryReadSize::ToEnd | BinaryReadSize::Count(_) => Ok(Value::CharArray(text)),
+    }
+}
+
+fn fread_from_handle(
+    handle: &mut RuntimeFileHandle,
+    spec: FreadSpec,
+) -> Result<(Value, usize), RuntimeError> {
+    let machinefmt = if spec.machinefmt_explicit {
+        spec.machinefmt
+    } else {
+        handle.machinefmt
+    };
+    let primitive_width = binary_primitive_byte_width(spec.precision.source);
+    let limit = fread_requested_element_limit(spec.size);
+    let mut output_values = Vec::new();
+    let mut text = String::new();
+    let mut count = 0usize;
+
+    'outer: loop {
+        if limit.is_some_and(|limit| count >= limit) {
+            break;
+        }
+        let block_len = spec
+            .precision
+            .repeat
+            .min(limit.map(|limit| limit - count).unwrap_or(usize::MAX));
+        if block_len == 0 {
+            break;
+        }
+        let mut read_in_block = 0usize;
+        for _ in 0..block_len {
+            let mut bytes = vec![0u8; primitive_width];
+            if !handle.read_binary_chunk("fread", &mut bytes)? {
+                break 'outer;
+            }
+            let numeric = decode_binary_scalar(&bytes, spec.precision.source, machinefmt);
+            match spec.precision.output {
+                BinaryReadOutputKind::Numeric => output_values.push(Value::Scalar(numeric)),
+                BinaryReadOutputKind::Int64 => output_values.push(Value::Int64(numeric as i64)),
+                BinaryReadOutputKind::UInt64 => output_values.push(Value::UInt64(numeric as u64)),
+                BinaryReadOutputKind::Char => text.push(char_from_f64_code(numeric)),
+            }
+            count += 1;
+            read_in_block += 1;
+        }
+        if read_in_block == 0 {
+            break;
+        }
+        if spec.skip > 0 && !limit.is_some_and(|limit| count >= limit) {
+            if !handle.seek_relative("fread", spec.skip as i64)? {
+                break;
+            }
+        }
+    }
+
+    let value = match spec.precision.output {
+        BinaryReadOutputKind::Numeric
+        | BinaryReadOutputKind::Int64
+        | BinaryReadOutputKind::UInt64 => fread_typed_output_value(output_values, spec.size)?,
+        BinaryReadOutputKind::Char => char_output_value(text, spec.size)?,
+    };
+    Ok((value, count))
+}
+
+fn fwrite_to_handle(
+    handle: &mut RuntimeFileHandle,
+    value: &Value,
+    spec: FwriteSpec,
+) -> Result<usize, RuntimeError> {
+    let machinefmt = if spec.machinefmt_explicit {
+        spec.machinefmt
+    } else {
+        handle.machinefmt
+    };
+    let values = flatten_fwrite_scalar_values(value)?;
+    let total_len = values.len();
+    let mut count = 0usize;
+    for (index, value) in values.into_iter().enumerate() {
+        let bytes = encode_binary_scalar(value, spec.precision.source, machinefmt);
+        if !handle.write_binary_chunk("fwrite", &bytes)? {
+            break;
+        }
+        count += 1;
+        if spec.skip > 0
+            && index + 1 < total_len
+            && !handle.seek_relative("fwrite", spec.skip as i64)?
+        {
+            break;
+        }
+    }
+    Ok(count)
+}
+
+fn scanf_output_limit(size: BinaryReadSize) -> Option<usize> {
+    match size {
+        BinaryReadSize::ToEnd => None,
+        BinaryReadSize::Count(count) => Some(count),
+        BinaryReadSize::Matrix {
+            rows,
+            cols: Some(cols),
+        } => Some(rows.saturating_mul(cols)),
+        BinaryReadSize::Matrix { cols: None, .. } => None,
+    }
+}
+
+fn consume_scanf_whitespace(input: &str, start: usize) -> (usize, usize) {
+    let mut consumed_bytes = 0usize;
+    let mut consumed_chars = 0usize;
+    for ch in input[start..].chars() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        consumed_bytes += ch.len_utf8();
+        consumed_chars += 1;
+    }
+    (consumed_bytes, consumed_chars)
+}
+
+fn scanf_limited_slice<'a>(text: &'a str, width: Option<usize>) -> &'a str {
+    match width {
+        None => text,
+        Some(width) => {
+            if width == 0 {
+                return "";
+            }
+            let mut end = text.len();
+            let mut count = 0usize;
+            for (index, ch) in text.char_indices() {
+                count += 1;
+                if count > width {
+                    end = index;
+                    break;
+                }
+                end = index + ch.len_utf8();
+            }
+            &text[..end]
+        }
+    }
+}
+
+fn scan_signed_integer_prefix(text: &str, allow_base_prefix: bool) -> usize {
+    let mut offset = 0usize;
+    let mut chars = text[offset..].chars();
+    if let Some(sign) = chars.next() {
+        if sign == '+' || sign == '-' {
+            offset += sign.len_utf8();
+        }
+    }
+    let rest = &text[offset..];
+    if allow_base_prefix && (rest.starts_with("0x") || rest.starts_with("0X")) {
+        let mut digit_bytes = 0usize;
+        for ch in rest[2..].chars() {
+            if ch.is_ascii_hexdigit() {
+                digit_bytes += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        return if digit_bytes == 0 {
+            0
+        } else {
+            offset + 2 + digit_bytes
+        };
+    }
+    let mut digit_bytes = 0usize;
+    for ch in rest.chars() {
+        if ch.is_ascii_digit() {
+            digit_bytes += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if digit_bytes == 0 {
+        0
+    } else {
+        offset + digit_bytes
+    }
+}
+
+fn scan_unsigned_integer_prefix(text: &str) -> usize {
+    let mut digit_bytes = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            digit_bytes += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    digit_bytes
+}
+
+fn scan_radix_integer_prefix(text: &str, radix: u32, allow_hex_prefix: bool) -> usize {
+    let mut offset = 0usize;
+    let mut chars = text[offset..].chars();
+    if let Some(sign) = chars.next() {
+        if sign == '+' || sign == '-' {
+            offset += sign.len_utf8();
+        }
+    }
+    let rest = &text[offset..];
+    let prefix_len = if allow_hex_prefix && (rest.starts_with("0x") || rest.starts_with("0X")) {
+        2
+    } else {
+        0
+    };
+    let mut digit_bytes = 0usize;
+    for ch in rest[prefix_len..].chars() {
+        if ch.is_digit(radix) {
+            digit_bytes += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if digit_bytes == 0 {
+        0
+    } else {
+        offset + prefix_len + digit_bytes
+    }
+}
+
+fn scan_float_prefix(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    if let Some(sign) = bytes.get(index) {
+        if *sign == b'+' || *sign == b'-' {
+            index += 1;
+        }
+    }
+
+    let int_start = index;
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+        index += 1;
+    }
+    let mut saw_digits = index > int_start;
+
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let frac_start = index;
+        while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+            index += 1;
+        }
+        saw_digits |= index > frac_start;
+    }
+
+    if !saw_digits {
+        return 0;
+    }
+
+    let exponent_start = index;
+    if bytes
+        .get(index)
+        .is_some_and(|byte| *byte == b'e' || *byte == b'E')
+    {
+        index += 1;
+        if bytes
+            .get(index)
+            .is_some_and(|byte| *byte == b'+' || *byte == b'-')
+        {
+            index += 1;
+        }
+        let digit_start = index;
+        while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+            index += 1;
+        }
+        if index == digit_start {
+            return exponent_start;
+        }
+    }
+
+    index
+}
+
+fn parse_scanf_numeric_value(kind: ScanfConversionKind, token: &str) -> Option<f64> {
+    match kind {
+        ScanfConversionKind::SignedInteger => token.parse::<i64>().ok().map(|value| value as f64),
+        ScanfConversionKind::UnsignedInteger => token.parse::<u64>().ok().map(|value| value as f64),
+        ScanfConversionKind::AutoInteger => {
+            let trimmed = token.trim();
+            let (sign, body) = match trimmed.as_bytes().first() {
+                Some(b'+') => (1i64, &trimmed[1..]),
+                Some(b'-') => (-1i64, &trimmed[1..]),
+                _ => (1i64, trimmed),
+            };
+            if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+                i64::from_str_radix(hex, 16)
+                    .ok()
+                    .map(|value| (sign * value) as f64)
+            } else {
+                trimmed.parse::<i64>().ok().map(|value| value as f64)
+            }
+        }
+        ScanfConversionKind::OctalInteger => {
+            let trimmed = token.trim();
+            let (sign, body) = match trimmed.as_bytes().first() {
+                Some(b'+') => (1i64, &trimmed[1..]),
+                Some(b'-') => (-1i64, &trimmed[1..]),
+                _ => (1i64, trimmed),
+            };
+            i64::from_str_radix(body, 8)
+                .ok()
+                .map(|value| (sign * value) as f64)
+        }
+        ScanfConversionKind::HexInteger => {
+            let trimmed = token.trim();
+            let (sign, body) = match trimmed.as_bytes().first() {
+                Some(b'+') => (1i64, &trimmed[1..]),
+                Some(b'-') => (-1i64, &trimmed[1..]),
+                _ => (1i64, trimmed),
+            };
+            let body = body
+                .strip_prefix("0x")
+                .or_else(|| body.strip_prefix("0X"))
+                .unwrap_or(body);
+            i64::from_str_radix(body, 16)
+                .ok()
+                .map(|value| (sign * value) as f64)
+        }
+        ScanfConversionKind::Float => token.parse::<f64>().ok(),
+        ScanfConversionKind::Character
+        | ScanfConversionKind::String
+        | ScanfConversionKind::ScanSet => None,
+    }
+}
+
+fn parse_scanf_conversion(
+    input: &str,
+    start: usize,
+    conversion: ScanfConversion,
+    output_mode: ScanfOutputMode,
+    remaining_capacity: Option<usize>,
+) -> Option<ScanfMatch> {
+    if remaining_capacity == Some(0) {
+        return None;
+    }
+    let width = match conversion.kind {
+        ScanfConversionKind::Character => {
+            let base = conversion.width.unwrap_or(1);
+            Some(remaining_capacity.map_or(base, |remaining| base.min(remaining)))
+        }
+        ScanfConversionKind::String => match (conversion.width, remaining_capacity) {
+            (Some(width), Some(remaining)) => Some(width.min(remaining)),
+            (Some(width), None) => Some(width),
+            (None, Some(remaining)) => Some(remaining),
+            (None, None) => None,
+        },
+        ScanfConversionKind::ScanSet => match (conversion.width, remaining_capacity) {
+            (Some(width), Some(remaining)) => Some(width.min(remaining)),
+            (Some(width), None) => Some(width),
+            (None, Some(remaining)) => Some(remaining),
+            (None, None) => None,
+        },
+        _ => conversion.width,
+    };
+
+    let limited = scanf_limited_slice(&input[start..], width);
+    let (token, token_bytes, token_chars, numeric_output, text_output, output_units) =
+        match conversion.kind {
+            ScanfConversionKind::Character => {
+                if limited.is_empty() {
+                    return None;
+                }
+                let token = limited.to_string();
+                let output_units = token.chars().count();
+                let numeric_output =
+                    if conversion.suppress || matches!(output_mode, ScanfOutputMode::Text) {
+                        Vec::new()
+                    } else {
+                        token.chars().map(|ch| ch as u32 as f64).collect()
+                    };
+                let text_output =
+                    if conversion.suppress || matches!(output_mode, ScanfOutputMode::Numeric) {
+                        String::new()
+                    } else {
+                        token.clone()
+                    };
+                (
+                    token,
+                    limited.len(),
+                    output_units,
+                    numeric_output,
+                    text_output,
+                    output_units,
+                )
+            }
+            ScanfConversionKind::String => {
+                let mut bytes = 0usize;
+                let mut chars = 0usize;
+                for ch in limited.chars() {
+                    if ch.is_whitespace() {
+                        break;
+                    }
+                    bytes += ch.len_utf8();
+                    chars += 1;
+                }
+                if bytes == 0 {
+                    return None;
+                }
+                let token = limited[..bytes].to_string();
+                let numeric_output =
+                    if conversion.suppress || matches!(output_mode, ScanfOutputMode::Text) {
+                        Vec::new()
+                    } else {
+                        token.chars().map(|ch| ch as u32 as f64).collect()
+                    };
+                let text_output =
+                    if conversion.suppress || matches!(output_mode, ScanfOutputMode::Numeric) {
+                        String::new()
+                    } else {
+                        token.clone()
+                    };
+                (token, bytes, chars, numeric_output, text_output, chars)
+            }
+            ScanfConversionKind::ScanSet => {
+                let scan_set = conversion
+                    .scan_set
+                    .as_ref()
+                    .expect("scanset conversion has set");
+                let mut bytes = 0usize;
+                let mut chars = 0usize;
+                for ch in limited.chars() {
+                    if !scan_set.contains(ch) {
+                        break;
+                    }
+                    bytes += ch.len_utf8();
+                    chars += 1;
+                }
+                if bytes == 0 {
+                    return None;
+                }
+                let token = limited[..bytes].to_string();
+                let numeric_output =
+                    if conversion.suppress || matches!(output_mode, ScanfOutputMode::Text) {
+                        Vec::new()
+                    } else {
+                        token.chars().map(|ch| ch as u32 as f64).collect()
+                    };
+                let text_output =
+                    if conversion.suppress || matches!(output_mode, ScanfOutputMode::Numeric) {
+                        String::new()
+                    } else {
+                        token.clone()
+                    };
+                (token, bytes, chars, numeric_output, text_output, chars)
+            }
+            ScanfConversionKind::SignedInteger
+            | ScanfConversionKind::AutoInteger
+            | ScanfConversionKind::UnsignedInteger
+            | ScanfConversionKind::OctalInteger
+            | ScanfConversionKind::HexInteger => {
+                let token_bytes = match conversion.kind {
+                    ScanfConversionKind::SignedInteger => {
+                        scan_signed_integer_prefix(limited, false)
+                    }
+                    ScanfConversionKind::AutoInteger => scan_signed_integer_prefix(limited, true),
+                    ScanfConversionKind::UnsignedInteger => scan_unsigned_integer_prefix(limited),
+                    ScanfConversionKind::OctalInteger => {
+                        scan_radix_integer_prefix(limited, 8, false)
+                    }
+                    ScanfConversionKind::HexInteger => scan_radix_integer_prefix(limited, 16, true),
+                    _ => unreachable!("integer branch matched"),
+                };
+                if token_bytes == 0 {
+                    return None;
+                }
+                let token = limited[..token_bytes].to_string();
+                let token_chars = token.chars().count();
+                let value = parse_scanf_numeric_value(conversion.kind, &token)?;
+                (
+                    token,
+                    token_bytes,
+                    token_chars,
+                    if conversion.suppress {
+                        Vec::new()
+                    } else {
+                        vec![value]
+                    },
+                    String::new(),
+                    1,
+                )
+            }
+            ScanfConversionKind::Float => {
+                let token_bytes = scan_float_prefix(limited);
+                if token_bytes == 0 {
+                    return None;
+                }
+                let token = limited[..token_bytes].to_string();
+                let token_chars = token.chars().count();
+                let value = parse_scanf_numeric_value(conversion.kind, &token)?;
+                (
+                    token,
+                    token_bytes,
+                    token_chars,
+                    if conversion.suppress {
+                        Vec::new()
+                    } else {
+                        vec![value]
+                    },
+                    String::new(),
+                    1,
+                )
+            }
+        };
+
+    let _ = token;
+    Some(ScanfMatch {
+        consumed_bytes: token_bytes,
+        consumed_chars: token_chars,
+        numeric_output,
+        text_output,
+        output_units: if conversion.suppress { 0 } else { output_units },
+    })
+}
+
+fn execute_fscanf_format(
+    input: &str,
+    directives: &[ScanfDirective],
+    size: BinaryReadSize,
+) -> Result<(Value, usize, usize), RuntimeError> {
+    let output_mode = scanf_output_mode(directives)?;
+    let limit = scanf_output_limit(size);
+    let mut offset = 0usize;
+    let mut count_chars = 0usize;
+    let mut produced_units = 0usize;
+    let mut numeric_values = Vec::new();
+    let mut text_output = String::new();
+
+    'outer: loop {
+        if limit.is_some_and(|limit| produced_units >= limit) {
+            break;
+        }
+        let cycle_start = offset;
+        let mut cycle_progress = false;
+
+        for directive in directives {
+            match directive {
+                ScanfDirective::Whitespace => {
+                    let (space_bytes, space_chars) = consume_scanf_whitespace(input, offset);
+                    if space_bytes > 0 {
+                        cycle_progress = true;
+                    }
+                    offset += space_bytes;
+                    count_chars += space_chars;
+                }
+                ScanfDirective::Literal(literal) => {
+                    if input[offset..].starts_with(literal) {
+                        offset += literal.len();
+                        count_chars += literal.chars().count();
+                        cycle_progress = true;
+                    } else {
+                        break 'outer;
+                    }
+                }
+                ScanfDirective::Conversion(conversion) => {
+                    if !matches!(
+                        conversion.kind,
+                        ScanfConversionKind::Character | ScanfConversionKind::ScanSet
+                    ) {
+                        let (space_bytes, space_chars) = consume_scanf_whitespace(input, offset);
+                        if space_bytes > 0 {
+                            cycle_progress = true;
+                        }
+                        offset += space_bytes;
+                        count_chars += space_chars;
+                    }
+                    let remaining = limit.map(|limit| limit - produced_units);
+                    let Some(parsed) = parse_scanf_conversion(
+                        input,
+                        offset,
+                        conversion.clone(),
+                        output_mode,
+                        remaining,
+                    ) else {
+                        break 'outer;
+                    };
+                    if parsed.consumed_bytes > 0 {
+                        cycle_progress = true;
+                    }
+                    offset += parsed.consumed_bytes;
+                    count_chars += parsed.consumed_chars;
+                    produced_units += parsed.output_units;
+                    numeric_values.extend(parsed.numeric_output);
+                    text_output.push_str(&parsed.text_output);
+                    if limit.is_some_and(|limit| produced_units >= limit) {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        if !cycle_progress || offset == cycle_start {
+            break;
+        }
+    }
+
+    let value = match output_mode {
+        ScanfOutputMode::Numeric => fread_typed_output_value(
+            numeric_values.into_iter().map(Value::Scalar).collect(),
+            size,
+        )?,
+        ScanfOutputMode::Text => char_output_value(text_output, size)?,
+    };
+    Ok((value, count_chars, offset))
+}
+
+fn open_runtime_file_handle(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    filename: &str,
+    permission: RuntimeFilePermission,
+    permission_text: &str,
+    text_mode: bool,
+    auto_flush: bool,
+    machinefmt: BinaryMachineFormat,
+    encoding: &str,
+) -> Result<RuntimeFileHandle, std::io::Error> {
+    let path = match permission {
+        RuntimeFilePermission::Read | RuntimeFilePermission::ReadWrite => {
+            resolve_runtime_existing_file_path(shared_state, resolution_source_path, filename, &[])
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("file `{filename}` is not available"),
+                    )
+                })?
+        }
+        RuntimeFilePermission::Write
+        | RuntimeFilePermission::Append
+        | RuntimeFilePermission::WriteRead
+        | RuntimeFilePermission::AppendRead => {
+            resolve_runtime_path_text(shared_state, resolution_source_path, filename)
+        }
+    };
+
+    let stream = match permission {
+        RuntimeFilePermission::Read => {
+            RuntimeOpenFile::Reader(BufReader::new(fs::File::open(&path)?))
+        }
+        RuntimeFilePermission::Write => RuntimeOpenFile::Writer(
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)?,
+        ),
+        RuntimeFilePermission::Append => RuntimeOpenFile::Writer(
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?,
+        ),
+        RuntimeFilePermission::ReadWrite => {
+            RuntimeOpenFile::ReadWriter(fs::OpenOptions::new().read(true).write(true).open(&path)?)
+        }
+        RuntimeFilePermission::WriteRead => RuntimeOpenFile::ReadWriter(
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)?,
+        ),
+        RuntimeFilePermission::AppendRead => RuntimeOpenFile::ReadWriter(
+            fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&path)?,
+        ),
+    };
+    let query_filename = if matches!(
+        permission,
+        RuntimeFilePermission::Read | RuntimeFilePermission::ReadWrite
+    ) {
+        path.display().to_string()
+    } else {
+        filename.to_string()
+    };
+
+    Ok(RuntimeFileHandle {
+        path,
+        query_filename,
+        permission,
+        permission_text: permission_text.to_string(),
+        text_mode,
+        auto_flush,
+        machinefmt,
+        encoding: encoding.to_string(),
+        stream,
+        eof_indicator: false,
+        last_error_message: String::new(),
+        last_error_number: 0,
+    })
+}
+
+fn invoke_fopen_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 4 {
+        return Err(RuntimeError::Unsupported(
+            "fopen currently supports at most four outputs".to_string(),
+        ));
+    }
+    match parse_fopen_args(args)? {
+        FopenOperation::Query { file_id } => {
+            let state = shared_state.borrow();
+            let mut outputs = if let Some(handle) = state.open_files.get(&file_id) {
+                vec![
+                    Value::CharArray(handle.query_filename.clone()),
+                    Value::CharArray(handle.permission_text.clone()),
+                    Value::CharArray(machinefmt_query_text(handle.machinefmt).to_string()),
+                    Value::CharArray(handle.encoding.clone()),
+                ]
+            } else if let Some((filename, permission, machinefmt, encoding)) =
+                standard_stream_query_metadata(file_id)
+            {
+                vec![
+                    Value::CharArray(filename),
+                    Value::CharArray(permission),
+                    Value::CharArray(machinefmt),
+                    Value::CharArray(encoding),
+                ]
+            } else {
+                vec![
+                    Value::CharArray(String::new()),
+                    Value::CharArray(String::new()),
+                    Value::CharArray(String::new()),
+                    Value::CharArray(String::new()),
+                ]
+            };
+            outputs.truncate(output_arity.max(1));
+            Ok(outputs)
+        }
+        FopenOperation::Open {
+            filename,
+            permission,
+            permission_text,
+            text_mode,
+            auto_flush,
+            machinefmt,
+            encoding,
+        } => {
+            if output_arity > 2 {
+                return Err(RuntimeError::Unsupported(
+                    "fopen open forms currently support at most two outputs".to_string(),
+                ));
+            }
+            if filename.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "fopen currently expects a nonempty filename".to_string(),
+                ));
+            }
+            match open_runtime_file_handle(
+                shared_state,
+                resolution_source_path,
+                &filename,
+                permission,
+                &permission_text,
+                text_mode,
+                auto_flush,
+                machinefmt,
+                &encoding,
+            ) {
+                Ok(handle) => {
+                    let mut state = shared_state.borrow_mut();
+                    let file_id = state.next_file_id;
+                    state.next_file_id += 1;
+                    state.open_files.insert(file_id, handle);
+                    Ok(fopen_outputs(file_id, String::new(), output_arity))
+                }
+                Err(error) => Ok(fopen_outputs(-1, error.to_string(), output_arity)),
+            }
+        }
+    }
+}
+
+fn invoke_fclose_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "fclose currently supports at most one output".to_string(),
+        ));
+    }
+    let status = {
+        let mut state = shared_state.borrow_mut();
+        match parse_fclose_args(args)? {
+            FcloseTarget::All => {
+                state.open_files.clear();
+                0.0
+            }
+            FcloseTarget::FileId(file_id) => {
+                if state.open_files.remove(&file_id).is_some() {
+                    0.0
+                } else {
+                    -1.0
+                }
+            }
+        }
+    };
+    if output_arity == 0 {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::Scalar(status)])
+    }
+}
+
+fn invoke_opened_files_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if !args.is_empty() {
+        return Err(RuntimeError::Unsupported(
+            "openedFiles currently supports no input arguments".to_string(),
+        ));
+    }
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "openedFiles currently supports at most one output".to_string(),
+        ));
+    }
+    let mut file_ids = shared_state
+        .borrow()
+        .open_files
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    file_ids.sort_unstable();
+    let value = Value::Matrix(MatrixValue::new(
+        1,
+        file_ids.len(),
+        file_ids
+            .into_iter()
+            .map(|file_id| Value::Scalar(file_id as f64))
+            .collect(),
+    )?);
+    Ok(vec![value])
+}
+
+fn invoke_feof_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "feof currently supports at most one output".to_string(),
+        ));
+    }
+    let file_id = parse_runtime_file_read_args(args, "feof")?;
+    let status = {
+        let state = shared_state.borrow();
+        let handle = state.open_files.get(&file_id).ok_or_else(|| {
+            RuntimeError::TypeError(
+                "feof currently expects a valid open file identifier".to_string(),
+            )
+        })?;
+        handle.query_feof()
+    };
+    Ok(vec![Value::Scalar(status)])
+}
+
+fn invoke_ferror_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 2 {
+        return Err(RuntimeError::Unsupported(
+            "ferror currently supports at most two outputs".to_string(),
+        ));
+    }
+    let (file_id, clear) = parse_ferror_args(args)?;
+    let outputs = {
+        let mut state = shared_state.borrow_mut();
+        if let Some(handle) = state.open_files.get_mut(&file_id) {
+            let (message, number) = handle.error_state();
+            if clear {
+                handle.clear_error();
+            }
+            vec![Value::CharArray(message), Value::Scalar(number as f64)]
+        } else if standard_stream_query_metadata(file_id).is_some() {
+            vec![Value::CharArray(String::new()), Value::Scalar(0.0)]
+        } else {
+            return Err(RuntimeError::TypeError(
+                "ferror currently expects a valid open file identifier".to_string(),
+            ));
+        }
+    };
+    let mut outputs = outputs;
+    outputs.truncate(output_arity.max(1));
+    Ok(outputs)
+}
+
+fn invoke_fread_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 2 {
+        return Err(RuntimeError::Unsupported(
+            "fread currently supports at most two outputs".to_string(),
+        ));
+    }
+    let (file_id, spec) = parse_fread_args(args)?;
+    let (value, count) = {
+        let mut state = shared_state.borrow_mut();
+        let handle = state.open_files.get_mut(&file_id).ok_or_else(|| {
+            RuntimeError::TypeError(
+                "fread currently expects a valid open file identifier".to_string(),
+            )
+        })?;
+        fread_from_handle(handle, spec)?
+    };
+    let mut outputs = vec![value, Value::Scalar(count as f64)];
+    outputs.truncate(output_arity.max(1));
+    Ok(outputs)
+}
+
+fn invoke_fscanf_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 2 {
+        return Err(RuntimeError::Unsupported(
+            "fscanf currently supports at most two outputs".to_string(),
+        ));
+    }
+    let (file_id, format, size) = parse_fscanf_args(args)?;
+    let directives = parse_scanf_format(&format)?;
+    let (value, count, consumed_bytes) = {
+        let mut state = shared_state.borrow_mut();
+        let handle = state.open_files.get_mut(&file_id).ok_or_else(|| {
+            RuntimeError::TypeError(
+                "fscanf currently expects a valid open file identifier".to_string(),
+            )
+        })?;
+        let start = handle.current_position("fscanf")?;
+        let bytes = fs::read(&handle.path).map_err(|error| {
+            handle.set_error(error.to_string(), -1);
+            RuntimeError::Unsupported(format!(
+                "fscanf failed while reading `{}`: {error}",
+                handle.path.display()
+            ))
+        })?;
+        let remaining = if start as usize <= bytes.len() {
+            &bytes[start as usize..]
+        } else {
+            &[]
+        };
+        let input = std::str::from_utf8(remaining).map_err(|error| {
+            handle.set_error(error.to_string(), -1);
+            RuntimeError::Unsupported(format!(
+                "fscanf currently expects UTF-8 text input in `{}`: {error}",
+                handle.path.display()
+            ))
+        })?;
+        let (value, count, consumed_bytes) = execute_fscanf_format(input, &directives, size)?;
+        handle.set_position("fscanf", start + consumed_bytes as u64)?;
+        handle.eof_indicator = start as usize + consumed_bytes >= bytes.len();
+        handle.clear_error();
+        (value, count, consumed_bytes)
+    };
+    let _ = consumed_bytes;
+    let mut outputs = vec![value, Value::Scalar(count as f64)];
+    outputs.truncate(output_arity.max(1));
+    Ok(outputs)
+}
+
+fn invoke_sscanf_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 4 {
+        return Err(RuntimeError::Unsupported(
+            "sscanf currently supports at most four outputs".to_string(),
+        ));
+    }
+    let (input, format, size) = parse_sscanf_args(args)?;
+    let directives = parse_scanf_format(&format)?;
+    let limit = scanf_output_limit(size);
+    let (value, _char_count, consumed_bytes) = execute_fscanf_format(&input, &directives, size)?;
+    let element_count = match &value {
+        Value::CharArray(text) | Value::String(text) => text.chars().count(),
+        Value::Matrix(matrix) => matrix.element_count(),
+        Value::Logical(_)
+        | Value::Scalar(_)
+        | Value::Int64(_)
+        | Value::UInt64(_)
+        | Value::Complex(_) => 1,
+        Value::Cell(cell) => cell.element_count(),
+        Value::Struct(_) | Value::Object(_) | Value::FunctionHandle(_) => 1,
+    };
+    let remaining = &input[consumed_bytes..];
+    let errmsg = if limit.is_some_and(|limit| element_count >= limit)
+        || remaining.is_empty()
+        || remaining.chars().all(char::is_whitespace)
+    {
+        String::new()
+    } else {
+        "Input file or string does not contain specified format.".to_string()
+    };
+    let nextindex = input[..consumed_bytes].chars().count() + 1;
+
+    let mut outputs = vec![
+        value,
+        Value::Scalar(element_count as f64),
+        Value::CharArray(errmsg),
+        Value::Scalar(nextindex as f64),
+    ];
+    outputs.truncate(output_arity.max(1));
+    Ok(outputs)
+}
+
+fn invoke_frewind_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 0 {
+        return Err(RuntimeError::Unsupported(
+            "frewind currently does not return outputs".to_string(),
+        ));
+    }
+    let file_id = parse_runtime_file_read_args(args, "frewind")?;
+    let mut state = shared_state.borrow_mut();
+    let handle = state.open_files.get_mut(&file_id).ok_or_else(|| {
+        RuntimeError::TypeError(
+            "frewind currently expects a valid open file identifier".to_string(),
+        )
+    })?;
+    let _ = handle.seek_offset(0, RuntimeFileSeekOrigin::Beginning, "frewind");
+    Ok(Vec::new())
+}
+
+fn invoke_fseek_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "fseek currently supports at most one output".to_string(),
+        ));
+    }
+    let (file_id, offset, origin) = parse_fseek_args(args)?;
+    let status = {
+        let mut state = shared_state.borrow_mut();
+        let handle = state.open_files.get_mut(&file_id).ok_or_else(|| {
+            RuntimeError::TypeError(
+                "fseek currently expects a valid open file identifier".to_string(),
+            )
+        })?;
+        handle.seek_offset(offset, origin, "fseek")
+    };
+    Ok(vec![Value::Scalar(status)])
+}
+
+fn invoke_ftell_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "ftell currently supports at most one output".to_string(),
+        ));
+    }
+    let file_id = parse_runtime_file_read_args(args, "ftell")?;
+    let position = {
+        let mut state = shared_state.borrow_mut();
+        let handle = state.open_files.get_mut(&file_id).ok_or_else(|| {
+            RuntimeError::TypeError(
+                "ftell currently expects a valid open file identifier".to_string(),
+            )
+        })?;
+        handle.query_ftell()
+    };
+    Ok(vec![Value::Scalar(position)])
+}
+
+fn invoke_fwrite_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "fwrite currently supports at most one output".to_string(),
+        ));
+    }
+    let (file_id, value, spec) = parse_fwrite_args(args)?;
+    let count = {
+        let mut state = shared_state.borrow_mut();
+        let handle = state.open_files.get_mut(&file_id).ok_or_else(|| {
+            RuntimeError::TypeError(
+                "fwrite currently expects a valid open file identifier".to_string(),
+            )
+        })?;
+        fwrite_to_handle(handle, value, spec)?
+    };
+    Ok(vec![Value::Scalar(count as f64)])
+}
+
+fn invoke_runtime_file_line_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+    builtin_name: &str,
+    keep_newline: bool,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports at most one output"
+        )));
+    }
+    let file_id = parse_runtime_file_read_args(args, builtin_name)?;
+    let line = {
+        let mut state = shared_state.borrow_mut();
+        let handle = state.open_files.get_mut(&file_id).ok_or_else(|| {
+            RuntimeError::TypeError(format!(
+                "{builtin_name} currently expects a valid open file identifier"
+            ))
+        })?;
+        handle.read_line(builtin_name, keep_newline)?
+    };
+    Ok(vec![match line {
+        Some(text) => Value::CharArray(text),
+        None => Value::Scalar(-1.0),
+    }])
+}
+
+fn invoke_fgetl_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    invoke_runtime_file_line_builtin_outputs(shared_state, args, output_arity, "fgetl", false)
+}
+
+fn invoke_fgets_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    invoke_runtime_file_line_builtin_outputs(shared_state, args, output_arity, "fgets", true)
+}
+
+fn invoke_type_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 0 {
+        return Err(RuntimeError::Unsupported(
+            "type currently does not return outputs".to_string(),
+        ));
+    }
+    let [filename] = args else {
+        return Err(RuntimeError::Unsupported(
+            "type currently supports exactly one filename input".to_string(),
+        ));
+    };
+    let filename_text = text_value(filename)?;
+    let path = resolve_runtime_existing_file_path(
+        shared_state,
+        resolution_source_path,
+        filename_text,
+        &["mlx", "mlapp", "m"],
+    )
+    .ok_or_else(|| {
+        RuntimeError::MissingVariable(format!("file `{filename_text}` is not available"))
+    })?;
+    let text =
+        fs::read_to_string(&path).map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    push_text_displayed_output(shared_state, text, true);
+    Ok(Vec::new())
+}
+
+fn ver_product_struct_value(product: InstalledProductInfo) -> Value {
+    Value::Struct(StructValue::with_field_order(
+        BTreeMap::from([
+            ("Name".to_string(), Value::CharArray(product.name)),
+            ("Version".to_string(), Value::CharArray(product.version)),
+            ("Release".to_string(), Value::CharArray(product.release)),
+            ("Date".to_string(), Value::CharArray(product.date)),
+        ]),
+        vec![
+            "Name".to_string(),
+            "Version".to_string(),
+            "Release".to_string(),
+            "Date".to_string(),
+        ],
+    ))
+}
+
+fn ver_product_value(products: Vec<InstalledProductInfo>) -> Result<Value, RuntimeError> {
+    match products.len() {
+        0 => Ok(Value::Matrix(MatrixValue::new(0, 0, Vec::new())?)),
+        1 => Ok(ver_product_struct_value(
+            products.into_iter().next().expect("single product"),
+        )),
+        count => Ok(Value::Matrix(MatrixValue::new(
+            1,
+            count,
+            products.into_iter().map(ver_product_struct_value).collect(),
+        )?)),
+    }
+}
+
+fn render_ver_text(products: &[InstalledProductInfo]) -> String {
+    let mut out = format!(
+        "MATLAB Version: {MATLAB_VERSION_TEXT}\nMATLAB License Number: {MATLAB_LICENSE_ID}\nOperating System: {}\nJava Version: {MATLAB_JAVA_VERSION}\n\n",
+        if cfg!(windows) {
+            "Windows 64-bit"
+        } else if cfg!(target_os = "linux") {
+            "Linux 64-bit"
+        } else {
+            "macOS 64-bit"
+        }
+    );
+    for product in products {
+        out.push_str(&format!(
+            "{} Version {} {}\n",
+            product.name, product.version, product.release
+        ));
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn invoke_ver_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "ver currently supports at most one output".to_string(),
+        ));
+    }
+    let products = match parse_ver_args(args)? {
+        None => installed_products(),
+        Some(product) => installed_product_info(&product).into_iter().collect(),
+    };
+    if output_arity == 0 {
+        push_text_displayed_output(shared_state, render_ver_text(&products), true);
+        Ok(Vec::new())
+    } else {
+        Ok(vec![ver_product_value(products)?])
+    }
+}
+
+fn invoke_ver_less_than_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "verLessThan currently supports at most one output".to_string(),
+        ));
+    }
+    let (toolbox, requested_version) = parse_ver_less_than_args(args)?;
+    let current = installed_product_info(&toolbox).ok_or_else(|| {
+        RuntimeError::MissingVariable(format!("verLessThan could not locate toolbox `{toolbox}`"))
+    })?;
+    Ok(vec![logical_value(version_is_less_than(
+        &current.version,
+        &requested_version,
+    ))])
+}
+
+fn license_struct_value(feature: &str) -> Value {
+    Value::Struct(StructValue::with_field_order(
+        BTreeMap::from([
+            ("feature".to_string(), Value::CharArray(feature.to_string())),
+            ("user".to_string(), Value::CharArray(String::new())),
+        ]),
+        vec!["feature".to_string(), "user".to_string()],
+    ))
+}
+
+fn empty_license_struct_value() -> Value {
+    license_struct_value("")
+}
+
+fn license_features_value(features: &[String]) -> Result<Value, RuntimeError> {
+    match features.len() {
+        0 => Ok(empty_license_struct_value()),
+        1 => Ok(license_struct_value(&features[0])),
+        count => Ok(Value::Matrix(MatrixValue::new(
+            1,
+            count,
+            features
+                .iter()
+                .map(|feature| license_struct_value(feature))
+                .collect(),
+        )?)),
+    }
+}
+
+fn invoke_license_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    let command = parse_license_args(args)?;
+    match command {
+        LicenseCommand::Query => {
+            if output_arity > 1 {
+                return Err(RuntimeError::Unsupported(
+                    "license currently supports at most one output".to_string(),
+                ));
+            }
+            Ok(vec![Value::CharArray(MATLAB_LICENSE_ID.to_string())])
+        }
+        LicenseCommand::InUse(feature) => {
+            if output_arity > 1 {
+                return Err(RuntimeError::Unsupported(
+                    "license('inuse',...) currently supports at most one output".to_string(),
+                ));
+            }
+            let mut features = checked_out_license_features(shared_state);
+            features.sort();
+            if let Some(feature) = feature {
+                let normalized = feature.to_ascii_lowercase();
+                let value = if features
+                    .iter()
+                    .any(|entry| entry.eq_ignore_ascii_case(&normalized))
+                {
+                    license_features_value(&[normalized])?
+                } else {
+                    empty_license_struct_value()
+                };
+                if output_arity == 0 {
+                    let feature_text = match &value {
+                        Value::Struct(struct_value) => struct_value
+                            .fields
+                            .get("feature")
+                            .and_then(|value| match value {
+                                Value::CharArray(text) => Some(text.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    if !feature_text.is_empty() {
+                        push_text_displayed_output(shared_state, feature_text, true);
+                    }
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![value])
+                }
+            } else if output_arity == 0 {
+                push_text_displayed_output(shared_state, features.join("\n"), true);
+                Ok(Vec::new())
+            } else {
+                Ok(vec![license_features_value(&features)?])
+            }
+        }
+        LicenseCommand::Test { feature, toggle } => {
+            if output_arity > 1 {
+                return Err(RuntimeError::Unsupported(
+                    "license('test',...) currently supports at most one output".to_string(),
+                ));
+            }
+            let feature_name =
+                installed_feature_name(&feature).unwrap_or_else(|| feature.to_ascii_lowercase());
+            if let Some(toggle) = toggle {
+                set_license_enabled(shared_state, &feature_name, toggle);
+            }
+            let exists = installed_feature_name(&feature).is_some()
+                && license_is_enabled(shared_state, &feature_name);
+            Ok(vec![logical_value(exists)])
+        }
+        LicenseCommand::Checkout { feature } => {
+            if output_arity > 2 {
+                return Err(RuntimeError::Unsupported(
+                    "license('checkout',...) currently supports at most two outputs".to_string(),
+                ));
+            }
+            if let Some(feature_name) = installed_feature_name(&feature) {
+                if license_is_enabled(shared_state, &feature_name) {
+                    checkout_license_feature(shared_state, &feature_name);
+                    let mut outputs = vec![logical_value(true), Value::CharArray(String::new())];
+                    outputs.truncate(output_arity.max(1));
+                    Ok(outputs)
+                } else {
+                    let errmsg = format!("Cannot find a license for {}.", feature_name);
+                    let mut outputs = vec![logical_value(false), Value::CharArray(errmsg)];
+                    outputs.truncate(output_arity.max(1));
+                    Ok(outputs)
+                }
+            } else {
+                let errmsg = format!("Cannot find a license for {}.", feature);
+                let mut outputs = vec![logical_value(false), Value::CharArray(errmsg)];
+                outputs.truncate(output_arity.max(1));
+                Ok(outputs)
+            }
+        }
+    }
+}
+
+fn invoke_userpath_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "userpath currently supports at most one output".to_string(),
+        ));
+    }
+    match parse_userpath_args(args)? {
+        UserPathCommand::Query => {}
+        UserPathCommand::Set(path) => {
+            fs::create_dir_all(&path)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            replace_runtime_user_path(shared_state, Some(path));
+        }
+        UserPathCommand::Reset => {
+            let default_user_path_root = default_runtime_user_path_root(shared_state);
+            if let Some(path) = default_user_path_root.as_ref() {
+                fs::create_dir_all(path)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            }
+            replace_runtime_user_path(shared_state, default_user_path_root);
+        }
+        UserPathCommand::Clear => {
+            replace_runtime_user_path(shared_state, None);
+        }
+    }
+    if output_arity == 0 {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::CharArray(render_runtime_user_path(
+            shared_state,
+        ))])
+    }
+}
+
+fn resolve_savepath_target(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    target: Option<&str>,
+) -> PathBuf {
+    if let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) {
+        let mut path = if Path::new(target).is_absolute() {
+            PathBuf::from(target)
+        } else {
+            runtime_current_directory(shared_state, resolution_source_path).join(target)
+        };
+        if path.extension().is_none() {
+            path.push("pathdef.m");
+        }
+        return normalize_runtime_path(path);
+    }
+
+    let current_directory = runtime_current_directory(shared_state, resolution_source_path);
+    let current_candidate = current_directory.join("pathdef.m");
+    if current_candidate.is_file() {
+        return normalize_runtime_path(current_candidate);
+    }
+    for root in runtime_search_path_roots(shared_state) {
+        let candidate = root.join("pathdef.m");
+        if candidate.is_file() {
+            return normalize_runtime_path(candidate);
+        }
+    }
+    if let Some(user_path_root) = current_runtime_user_path(shared_state) {
+        return normalize_runtime_path(user_path_root.join("pathdef.m"));
+    }
+    normalize_runtime_path(current_directory.join("pathdef.m"))
+}
+
+fn render_pathdef_source(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+) -> Result<String, RuntimeError> {
+    let path_text = runtime_search_path_string(shared_state)?.replace('\'', "''");
+    Ok(format!(
+        "function p = pathdef\n%PATHDEF Search path defaults.\np = '{path_text}';\nend\n"
+    ))
+}
+
+fn parse_pathdef_source(source: &str) -> Option<String> {
+    source.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let body = trimmed.strip_prefix("p = '")?.strip_suffix("';")?;
+        Some(body.replace("''", "'"))
+    })
+}
+
+fn saved_pathdef_text(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+) -> Result<String, RuntimeError> {
+    let target = resolve_savepath_target(shared_state, resolution_source_path, None);
+    if target.is_file() {
+        let source = fs::read_to_string(&target)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        if let Some(path_text) = parse_pathdef_source(&source) {
+            return Ok(path_text);
+        }
+    }
+    render_search_path_string(&search_path_roots_with_user_path(
+        current_runtime_user_path(shared_state).as_ref(),
+        &default_runtime_search_path_roots(shared_state),
+    ))
+}
+
+fn invoke_savepath_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+    builtin_name: &str,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports at most one output"
+        )));
+    }
+    let target = resolve_savepath_target(
+        shared_state,
+        resolution_source_path,
+        parse_savepath_args(args, builtin_name)?.as_deref(),
+    );
+    let result = (|| -> Result<(), RuntimeError> {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        }
+        fs::write(&target, render_pathdef_source(shared_state)?)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))
+    })();
+    match result {
+        Ok(()) => {
+            if output_arity == 0 {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![Value::Scalar(0.0)])
+            }
+        }
+        Err(error) => {
+            if output_arity == 0 {
+                Err(error)
+            } else {
+                Ok(vec![Value::Scalar(1.0)])
+            }
+        }
+    }
+}
+
+fn invoke_pathdef_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    parse_zero_arg_builtin_args(args, "pathdef")?;
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "pathdef currently supports at most one output".to_string(),
+        ));
+    }
+    Ok(vec![Value::CharArray(saved_pathdef_text(
+        shared_state,
+        resolution_source_path,
+    )?)])
+}
+
+fn invoke_pathsep_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    parse_zero_arg_builtin_args(args, "pathsep")?;
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "pathsep currently supports at most one output".to_string(),
+        ));
+    }
+    #[cfg(windows)]
+    let separator = ";";
+    #[cfg(not(windows))]
+    let separator = ":";
+    Ok(vec![Value::CharArray(separator.to_string())])
+}
+
+fn invoke_filesep_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    parse_zero_arg_builtin_args(args, "filesep")?;
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "filesep currently supports at most one output".to_string(),
+        ));
+    }
+    Ok(vec![Value::CharArray(
+        std::path::MAIN_SEPARATOR.to_string(),
+    )])
+}
+
+fn invoke_pathtool_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    parse_zero_arg_builtin_args(args, "pathtool")?;
+    if output_arity > 0 {
+        return Err(RuntimeError::Unsupported(
+            "pathtool currently does not return outputs".to_string(),
+        ));
+    }
+    push_text_displayed_output(
+        shared_state,
+        render_search_path_display(&runtime_search_path_roots(shared_state)),
+        true,
+    );
+    Ok(Vec::new())
+}
+
+fn invoke_mkdir_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "mkdir currently supports at most three outputs".to_string(),
+        ));
+    }
+    let (parent_or_folder, folder_name) = parse_mkdir_args(args)?;
+    let target = if let Some(folder_name) = folder_name {
+        resolve_runtime_path_text(shared_state, resolution_source_path, &parent_or_folder)
+            .join(folder_name)
+    } else {
+        resolve_runtime_path_text(shared_state, resolution_source_path, &parent_or_folder)
+    };
+    let target = normalize_runtime_path(target);
+    if target.as_os_str().is_empty() {
+        return Err(RuntimeError::TypeError(
+            "mkdir currently expects a nonempty folder path".to_string(),
+        ));
+    }
+    if target.is_dir() {
+        if output_arity == 0 {
+            return Ok(Vec::new());
+        }
+        return Ok(file_operation_outputs(
+            true,
+            "Directory already exists.",
+            "MATLAB:MKDIR:DirectoryExists",
+            output_arity,
+        ));
+    }
+    match fs::create_dir_all(&target) {
+        Ok(()) => {
+            if output_arity == 0 {
+                Ok(Vec::new())
+            } else {
+                Ok(file_operation_outputs(true, "", "", output_arity))
+            }
+        }
+        Err(error) => {
+            if output_arity == 0 {
+                Err(RuntimeError::Unsupported(error.to_string()))
+            } else {
+                Ok(file_operation_outputs(
+                    false,
+                    &error.to_string(),
+                    "MATLAB:MKDIR:OSError",
+                    output_arity,
+                ))
+            }
+        }
+    }
+}
+
+fn invoke_rmdir_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "rmdir currently supports at most three outputs".to_string(),
+        ));
+    }
+    let (folder_name, recursive) = parse_rmdir_args(args)?;
+    let target = resolve_runtime_path_text(shared_state, resolution_source_path, &folder_name);
+    let remove = if recursive {
+        fs::remove_dir_all(&target)
+    } else {
+        fs::remove_dir(&target)
+    };
+    match remove {
+        Ok(()) => {
+            if output_arity == 0 {
+                Ok(Vec::new())
+            } else {
+                Ok(file_operation_outputs(true, "", "", output_arity))
+            }
+        }
+        Err(error) => {
+            if output_arity == 0 {
+                Err(RuntimeError::Unsupported(error.to_string()))
+            } else {
+                Ok(file_operation_outputs(
+                    false,
+                    &error.to_string(),
+                    "MATLAB:RMDIR:DirectoryNotRemoved",
+                    output_arity,
+                ))
+            }
+        }
+    }
+}
+
+fn invoke_copyfile_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "copyfile currently supports at most three outputs".to_string(),
+        ));
+    }
+    let (source_specs, destination, force) = parse_copy_move_args(args, "copyfile")?;
+    let wildcard_mode = source_specs
+        .iter()
+        .any(|source| path_text_has_wildcards(source));
+    let mut sources = Vec::new();
+    for source in source_specs {
+        sources.extend(resolve_runtime_source_paths(
+            shared_state,
+            resolution_source_path,
+            &source,
+        )?);
+    }
+    let destination = resolve_runtime_destination_path(
+        shared_state,
+        resolution_source_path,
+        destination.as_deref(),
+    );
+    match copy_source_to_destination(&sources, &destination, force, wildcard_mode) {
+        Ok(()) => {
+            if output_arity == 0 {
+                Ok(Vec::new())
+            } else {
+                Ok(file_operation_outputs(true, "", "", output_arity))
+            }
+        }
+        Err(error) => {
+            if output_arity == 0 {
+                Err(RuntimeError::Unsupported(error.to_string()))
+            } else {
+                Ok(file_operation_outputs(
+                    false,
+                    &error.to_string(),
+                    "MATLAB:COPYFILE:OSError",
+                    output_arity,
+                ))
+            }
+        }
+    }
+}
+
+fn invoke_movefile_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "movefile currently supports at most three outputs".to_string(),
+        ));
+    }
+    let (source_specs, destination, force) = parse_copy_move_args(args, "movefile")?;
+    let wildcard_mode = source_specs
+        .iter()
+        .any(|source| path_text_has_wildcards(source));
+    let mut sources = Vec::new();
+    for source in source_specs {
+        sources.extend(resolve_runtime_source_paths(
+            shared_state,
+            resolution_source_path,
+            &source,
+        )?);
+    }
+    let destination = resolve_runtime_destination_path(
+        shared_state,
+        resolution_source_path,
+        destination.as_deref(),
+    );
+    match move_source_to_destination(&sources, &destination, force, wildcard_mode) {
+        Ok(()) => {
+            if output_arity == 0 {
+                Ok(Vec::new())
+            } else {
+                Ok(file_operation_outputs(true, "", "", output_arity))
+            }
+        }
+        Err(error) => {
+            if output_arity == 0 {
+                Err(RuntimeError::Unsupported(error.to_string()))
+            } else {
+                Ok(file_operation_outputs(
+                    false,
+                    &error.to_string(),
+                    "MATLAB:MOVEFILE:OSError",
+                    output_arity,
+                ))
+            }
+        }
+    }
+}
+
+fn invoke_fileattrib_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    match parse_fileattrib_args(args)? {
+        FileAttribMode::Get { filename } => {
+            if output_arity > 2 {
+                return Err(RuntimeError::Unsupported(
+                    "fileattrib getter currently supports at most two outputs".to_string(),
+                ));
+            }
+            let entries =
+                match fileattrib_entries(shared_state, resolution_source_path, filename.as_deref())
+                {
+                    Ok(entries) => entries,
+                    Err(RuntimeError::MissingVariable(_)) => Vec::new(),
+                    Err(error) => return Err(error),
+                };
+            let values = match entries.len() {
+                0 => Value::Matrix(MatrixValue::new(0, 0, Vec::new())?),
+                1 => entries.into_iter().next().expect("single fileattrib entry"),
+                count => Value::Matrix(MatrixValue::new(1, count, entries)?),
+            };
+            let status =
+                !matches!(&values, Value::Matrix(matrix) if matrix.rows == 0 && matrix.cols == 0);
+            if output_arity == 0 {
+                push_text_displayed_output(shared_state, render_value(&values), true);
+                Ok(Vec::new())
+            } else if output_arity == 1 {
+                Ok(vec![logical_value(status)])
+            } else {
+                Ok(vec![logical_value(status), values])
+            }
+        }
+        FileAttribMode::Set {
+            filename,
+            write_enabled,
+            recursive,
+        } => {
+            if output_arity > 3 {
+                return Err(RuntimeError::Unsupported(
+                    "fileattrib setter currently supports at most three outputs".to_string(),
+                ));
+            }
+            let sources =
+                match resolve_runtime_source_paths(shared_state, resolution_source_path, &filename)
+                {
+                    Ok(sources) => sources,
+                    Err(error) => {
+                        if output_arity == 0 {
+                            return Err(error);
+                        }
+                        return Ok(file_operation_outputs(
+                            false,
+                            &error.to_string(),
+                            "MATLAB:FILEATTRIB:FileNotFound",
+                            output_arity,
+                        ));
+                    }
+                };
+            let result = (|| -> Result<(), RuntimeError> {
+                for source in &sources {
+                    apply_fileattrib_write_recursive(source, write_enabled, recursive)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    if output_arity == 0 {
+                        Ok(Vec::new())
+                    } else {
+                        Ok(file_operation_outputs(true, "", "", output_arity))
+                    }
+                }
+                Err(error) => {
+                    if output_arity == 0 {
+                        Err(error)
+                    } else {
+                        Ok(file_operation_outputs(
+                            false,
+                            &error.to_string(),
+                            "MATLAB:FILEATTRIB:OSError",
+                            output_arity,
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn invoke_delete_file_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 0 {
+        return Err(RuntimeError::Unsupported(
+            "delete currently does not return outputs for file deletion".to_string(),
+        ));
+    }
+    for arg in args {
+        for path_text in collect_text_path_values(arg, "delete")? {
+            let sources =
+                resolve_runtime_source_paths(shared_state, resolution_source_path, &path_text)?;
+            for source in sources {
+                if source.is_dir() {
+                    return Err(RuntimeError::TypeError(format!(
+                        "delete currently expects file paths for filesystem deletion, found directory `{}`",
+                        source.display()
+                    )));
+                }
+                fs::remove_file(&source)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn invoke_isfolder_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "isfolder currently supports at most one output".to_string(),
+        ));
+    }
+    let value = parse_path_query_arg(args, "isfolder")?;
+    Ok(vec![path_state_query_value(
+        shared_state,
+        resolution_source_path,
+        value,
+        Path::is_dir,
+        "isfolder",
+    )?])
+}
+
+fn invoke_isdir_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    invoke_isfolder_builtin_outputs(shared_state, resolution_source_path, args, output_arity)
+}
+
+fn invoke_isfile_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "isfile currently supports at most one output".to_string(),
+        ));
+    }
+    let value = parse_path_query_arg(args, "isfile")?;
+    Ok(vec![path_state_query_value(
+        shared_state,
+        resolution_source_path,
+        value,
+        Path::is_file,
+        "isfile",
+    )?])
+}
+
+fn path_state_query_value(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    value: &Value,
+    predicate: fn(&Path) -> bool,
+    builtin_name: &str,
+) -> Result<Value, RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => {
+            let resolved = resolve_runtime_path_text(shared_state, resolution_source_path, text);
+            Ok(logical_value(predicate(&resolved)))
+        }
+        Value::Matrix(matrix) if value_is_text_path_operand(value) => {
+            let values = matrix
+                .elements()
+                .iter()
+                .map(|element| {
+                    let resolved =
+                        resolve_runtime_path_text(shared_state, resolution_source_path, text_value(element).expect("text matrix checked"));
+                    logical_value(predicate(&resolved))
+                })
+                .collect::<Vec<_>>();
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                matrix.rows,
+                matrix.cols,
+                matrix.dims.clone(),
+                values,
+            )?))
+        }
+        Value::Cell(cell) => {
+            let values = collect_text_path_values(value, builtin_name)?
+                .into_iter()
+                .map(|text| logical_value(predicate(&resolve_runtime_path_text(
+                    shared_state,
+                    resolution_source_path,
+                    &text,
+                ))))
+                .collect::<Vec<_>>();
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                cell.rows,
+                cell.cols,
+                cell.dims.clone(),
+                values,
+            )?))
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects a char, string, text array, or cell array of text, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn invoke_addpath_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "addpath currently supports at most one output".to_string(),
+        ));
+    }
+    let old_path = runtime_search_path_string(shared_state)?;
+    let (folders, position) = parse_addpath_args(args)?;
+    let resolved = folders
+        .into_iter()
+        .map(|folder| {
+            parse_search_path_text(
+                shared_state,
+                resolution_source_path,
+                &folder,
+                "addpath",
+                true,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let updated = search_path_roots_with_updates(
+        &runtime_search_path_roots(shared_state),
+        &resolved,
+        position,
+    );
+    set_runtime_search_path_roots(shared_state, updated);
+    if output_arity == 0 {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::CharArray(old_path)])
+    }
+}
+
+fn invoke_rmpath_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "rmpath currently supports at most one output".to_string(),
+        ));
+    }
+    let old_path = runtime_search_path_string(shared_state)?;
+    let folders = parse_rmpath_args(args, "rmpath")?;
+    let resolved = folders
+        .into_iter()
+        .map(|folder| {
+            parse_search_path_text(
+                shared_state,
+                resolution_source_path,
+                &folder,
+                "rmpath",
+                false,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let updated =
+        search_path_roots_without_paths(&runtime_search_path_roots(shared_state), &resolved);
+    set_runtime_search_path_roots(shared_state, updated);
+    if output_arity == 0 {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::CharArray(old_path)])
+    }
+}
+
+fn invoke_restoredefaultpath_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if !args.is_empty() {
+        return Err(RuntimeError::Unsupported(
+            "restoredefaultpath currently supports no input arguments".to_string(),
+        ));
+    }
+    if output_arity > 0 {
+        return Err(RuntimeError::Unsupported(
+            "restoredefaultpath currently does not return outputs".to_string(),
+        ));
+    }
+    set_runtime_search_path_roots(
+        shared_state,
+        search_path_roots_with_user_path(
+            current_runtime_user_path(shared_state).as_ref(),
+            &default_runtime_search_path_roots(shared_state),
+        ),
+    );
+    Ok(Vec::new())
+}
+
+fn invoke_rehash_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 0 {
+        return Err(RuntimeError::Unsupported(
+            "rehash currently does not return outputs".to_string(),
+        ));
+    }
+    let _ = parse_rehash_args(args)?;
+    Ok(Vec::new())
+}
+
+fn invoke_genpath_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "genpath currently supports at most one output".to_string(),
+        ));
+    }
+    let [folder] = args else {
+        return Err(RuntimeError::Unsupported(
+            "genpath currently supports exactly one folder input".to_string(),
+        ));
+    };
+    let folder_text = text_value(folder)?;
+    let roots = parse_search_path_text(
+        shared_state,
+        resolution_source_path,
+        folder_text,
+        "genpath",
+        true,
+    )?;
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in roots {
+        collect_genpath_entries(&root, &mut seen, &mut entries)?;
+    }
+    let rendered = render_search_path_string(&entries)?;
+    let _ = output_arity;
+    Ok(vec![Value::CharArray(rendered)])
+}
+
+fn invoke_pwd_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "pwd currently supports at most one output".to_string(),
+        ));
+    }
+    parse_pwd_args(args)?;
+    let path = runtime_current_directory(shared_state, resolution_source_path);
+    let rendered = path.display().to_string();
+    if output_arity == 0 {
+        push_text_displayed_output(shared_state, rendered, true);
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::CharArray(rendered)])
+    }
+}
+
+fn invoke_cd_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "cd currently supports at most one output".to_string(),
+        ));
+    }
+    let target = parse_cd_args(args)?;
+    let previous = runtime_current_directory(shared_state, resolution_source_path);
+    if let Some(target) = target {
+        let resolved = resolve_cd_target(&previous, &target)?;
+        set_runtime_current_directory(shared_state, resolved);
+        if output_arity == 0 {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![Value::CharArray(previous.display().to_string())])
+        }
+    } else {
+        let rendered = previous.display().to_string();
+        if output_arity == 0 {
+            push_text_displayed_output(shared_state, rendered, true);
+            Ok(Vec::new())
+        } else {
+            Ok(vec![Value::CharArray(rendered)])
+        }
+    }
+}
+
+fn invoke_dir_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+    ls_mode: bool,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(format!(
+            "{} currently supports at most one output",
+            if ls_mode { "ls" } else { "dir" }
+        )));
+    }
+    let builtin_name = if ls_mode { "ls" } else { "dir" };
+    let target = parse_dir_args(args, builtin_name)?;
+    let entries =
+        collect_directory_entries(shared_state, resolution_source_path, target.as_deref())?;
+    if output_arity == 0 {
+        let text = if ls_mode {
+            render_ls_entries(&entries)
+        } else {
+            render_dir_entries(&entries)
+        };
+        push_text_displayed_output(shared_state, text, true);
+        Ok(Vec::new())
+    } else if ls_mode {
+        Ok(vec![Value::CharArray(
+            entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )])
+    } else {
+        Ok(vec![directory_entries_value(&entries)?])
+    }
+}
+
 fn invoke_help_builtin_outputs(
     frame: Option<&Frame<'_>>,
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
@@ -1684,7 +7010,7 @@ fn invoke_help_builtin_outputs(
 
     let text = match parse_help_args(args)? {
         None => "Type `help name` for help on a specific function, class, or folder.".to_string(),
-        Some(value) => help_text_for_value(frame, resolution_source_path, value)?,
+        Some(value) => help_text_for_value(shared_state, frame, resolution_source_path, value)?,
     };
 
     if output_arity == 0 {
@@ -1693,6 +7019,228 @@ fn invoke_help_builtin_outputs(
     } else {
         Ok(vec![Value::CharArray(text)])
     }
+}
+
+fn invoke_doc_builtin_outputs(
+    frame: Option<&Frame<'_>>,
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 0 {
+        return Err(RuntimeError::Unsupported(
+            "doc currently does not return outputs".to_string(),
+        ));
+    }
+    let text = match parse_doc_args(args)? {
+        None => "MATLAB documentation is available at https://www.mathworks.com/help/matlab/."
+            .to_string(),
+        Some(value) => doc_text_for_value(shared_state, frame, resolution_source_path, value)?,
+    };
+    push_text_displayed_output(shared_state, text, true);
+    Ok(Vec::new())
+}
+
+fn invoke_methods_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "methods currently supports at most one output".to_string(),
+        ));
+    }
+    let (target, full) = parse_methods_args(args)?;
+    let entries = methods_entries_for_value(shared_state, resolution_source_path, target)?;
+    let rendered = render_methods_entries(&entries, full);
+    if output_arity == 0 {
+        push_text_displayed_output(shared_state, rendered.join("\n"), true);
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::Cell(
+            CellValue::new(
+                rendered.len(),
+                1,
+                rendered.into_iter().map(Value::CharArray).collect(),
+            )
+            .expect("methods cell"),
+        )])
+    }
+}
+
+fn invoke_properties_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "properties currently supports at most one output".to_string(),
+        ));
+    }
+    let target = parse_properties_args(args)?;
+    let (class_name, properties) =
+        properties_for_value(shared_state, resolution_source_path, target)?;
+    if output_arity == 0 {
+        let mut text = format!("Properties for class {}:\n", class_name);
+        if properties.is_empty() {
+            text.push_str("    (none)");
+        } else {
+            text.push('\n');
+            for property in &properties {
+                text.push_str("    ");
+                text.push_str(property);
+                text.push('\n');
+            }
+            text.pop();
+        }
+        push_text_displayed_output(shared_state, text, true);
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::Cell(
+            CellValue::new(
+                properties.len(),
+                1,
+                properties.into_iter().map(Value::CharArray).collect(),
+            )
+            .expect("properties cell"),
+        )])
+    }
+}
+
+fn invoke_superclasses_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "superclasses currently supports at most one output".to_string(),
+        ));
+    }
+    let target = parse_superclasses_args(args)?;
+    let (class_name, superclasses) =
+        superclasses_for_value(shared_state, resolution_source_path, target)?;
+    if output_arity == 0 {
+        let mut text = format!("Superclasses for class {}:\n", class_name);
+        if superclasses.is_empty() {
+            text.push_str("    (none)");
+        } else {
+            text.push('\n');
+            for superclass in &superclasses {
+                text.push_str("    ");
+                text.push_str(superclass);
+                text.push('\n');
+            }
+            text.pop();
+        }
+        push_text_displayed_output(shared_state, text, true);
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Value::Cell(
+            CellValue::new(
+                superclasses.len(),
+                1,
+                superclasses.into_iter().map(Value::CharArray).collect(),
+            )
+            .expect("superclasses cell"),
+        )])
+    }
+}
+
+fn invoke_events_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "events currently supports at most one output".to_string(),
+        ));
+    }
+    let target = parse_events_args(args)?;
+    let (class_name, events) = events_for_value(shared_state, resolution_source_path, target)?;
+    if output_arity == 0 {
+        let mut text = format!("Events for class {}:\n", class_name);
+        if events.is_empty() {
+            text.push_str("    (none)");
+        } else {
+            text.push('\n');
+            for event_name in &events {
+                text.push_str("    ");
+                text.push_str(event_name);
+                text.push('\n');
+            }
+            text.pop();
+        }
+        push_text_displayed_output(shared_state, text, true);
+        Ok(Vec::new())
+    } else {
+        let values = events.into_iter().map(Value::CharArray).collect::<Vec<_>>();
+        Ok(vec![Value::Cell(if values.is_empty() {
+            CellValue::new(0, 0, values).expect("empty events cell")
+        } else {
+            CellValue::new(values.len(), 1, values).expect("events cell")
+        })])
+    }
+}
+
+fn invoke_isprop_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "isprop currently supports at most one output".to_string(),
+        ));
+    }
+    let (value, property_name) = parse_isprop_args(args)?;
+    let property_name = match property_name {
+        Value::CharArray(text) | Value::String(text) => text.trim(),
+        _ => return Ok(vec![logical_value(false)]),
+    };
+    if property_name.is_empty() {
+        return Ok(vec![logical_value(false)]);
+    }
+    Ok(vec![property_defined_value(value, property_name)?])
+}
+
+fn invoke_ismethod_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "ismethod currently supports at most one output".to_string(),
+        ));
+    }
+    let (value, method_name) = parse_ismethod_args(args)?;
+    let method_name = text_value(method_name)?.trim();
+    if method_name.is_empty() {
+        return Ok(vec![logical_value(false)]);
+    }
+    let value = match value {
+        Value::Object(_) => value,
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => value,
+        other => {
+            return Err(RuntimeError::TypeError(format!(
+                "ismethod currently expects an object input, found {}",
+                other.kind_name()
+            )))
+        }
+    };
+    let methods = methods_entries_for_value(shared_state, resolution_source_path, value)?;
+    Ok(vec![logical_value(methods.iter().any(|entry| {
+        entry.name.eq_ignore_ascii_case(method_name)
+    }))])
 }
 
 fn invoke_lookfor_builtin_outputs(
@@ -1708,6 +7256,7 @@ fn invoke_lookfor_builtin_outputs(
     }
     let (keyword, search_all) = parse_lookfor_args(args)?;
     let rendered = render_lookfor_matches(&collect_lookfor_matches(
+        shared_state,
         resolution_source_path,
         &keyword,
         search_all,
@@ -1723,11 +7272,13 @@ fn current_visible_within_file_match(
     name: &str,
 ) -> Option<String> {
     let path = resolution_source_path?;
-    let visible_names = visible_function_names.map(|names| names.to_vec()).unwrap_or_else(|| {
-        frame
-            .map(|frame| frame.visible_functions.keys().cloned().collect())
-            .unwrap_or_default()
-    });
+    let visible_names = visible_function_names
+        .map(|names| names.to_vec())
+        .unwrap_or_else(|| {
+            frame
+                .map(|frame| frame.visible_functions.keys().cloned().collect())
+                .unwrap_or_default()
+        });
     if visible_names.is_empty() {
         return None;
     }
@@ -1751,9 +7302,9 @@ fn current_visible_function_exists(
 ) -> bool {
     visible_function_names
         .map(|names| {
-            names.iter().any(|candidate| {
-                base_scoped_function_name(candidate).eq_ignore_ascii_case(name)
-            })
+            names
+                .iter()
+                .any(|candidate| base_scoped_function_name(candidate).eq_ignore_ascii_case(name))
         })
         .or_else(|| {
             frame.map(|frame| {
@@ -1766,6 +7317,7 @@ fn current_visible_function_exists(
 }
 
 fn help_text_for_value(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     frame: Option<&Frame<'_>>,
     resolution_source_path: Option<&Path>,
     value: &Value,
@@ -1778,11 +7330,17 @@ fn help_text_for_value(
                     "help currently expects a nonempty function, class, or folder name".to_string(),
                 ));
             }
-            if let Some(text) = help_text_for_name(frame, resolution_source_path, trimmed)? {
+            if let Some(text) =
+                help_text_for_name(shared_state, frame, resolution_source_path, trimmed)?
+            {
                 Ok(text)
             } else if let Some(frame) = frame {
                 if let Ok(variable) = frame.read_reference(None, trimmed) {
-                    help_text_for_class_name(resolution_source_path, &matlab_class_name(&variable))
+                    help_text_for_class_name(
+                        shared_state,
+                        resolution_source_path,
+                        &matlab_class_name(&variable),
+                    )
                 } else {
                     Ok(format!("No help found for '{}'.", trimmed))
                 }
@@ -1790,11 +7348,586 @@ fn help_text_for_value(
                 Ok(format!("No help found for '{}'.", trimmed))
             }
         }
-        other => help_text_for_class_name(resolution_source_path, &matlab_class_name(other)),
+        other => help_text_for_class_name(
+            shared_state,
+            resolution_source_path,
+            &matlab_class_name(other),
+        ),
     }
 }
 
+fn doc_text_for_value(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    frame: Option<&Frame<'_>>,
+    resolution_source_path: Option<&Path>,
+    value: &Value,
+) -> Result<String, RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "doc currently expects a nonempty function, class, or folder name".to_string(),
+                ));
+            }
+
+            let docs_url = doc_url_for_name(trimmed);
+            if is_builtin_function_name(trimmed) {
+                return Ok(format!("Documentation for {trimmed}:\n{docs_url}"));
+            }
+
+            if let Some(text) =
+                help_text_for_name(shared_state, frame, resolution_source_path, trimmed)?
+            {
+                return Ok(format!("Documentation for {trimmed}:\n\n{text}"));
+            }
+
+            if let Some(frame) = frame {
+                if let Ok(variable) = frame.read_reference(None, trimmed) {
+                    let class_name = matlab_class_name(&variable);
+                    let class_help = help_text_for_class_name(
+                        shared_state,
+                        resolution_source_path,
+                        &class_name,
+                    )?;
+                    return Ok(format!("Documentation for {class_name}:\n\n{class_help}"));
+                }
+            }
+
+            Ok(format!(
+                "No local documentation found for '{trimmed}'.\nSearch the documentation: {}",
+                doc_search_url(trimmed)
+            ))
+        }
+        other => {
+            let class_name = matlab_class_name(other);
+            let class_help =
+                help_text_for_class_name(shared_state, resolution_source_path, &class_name)?;
+            Ok(format!("Documentation for {class_name}:\n\n{class_help}"))
+        }
+    }
+}
+
+fn methods_entries_for_value(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    value: &Value,
+) -> Result<Vec<MethodEntry>, RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "methods currently expects a nonempty class name or object".to_string(),
+                ));
+            }
+            methods_entries_for_class_name(shared_state, resolution_source_path, trimmed)
+        }
+        Value::Object(object) => methods_entries_for_object_metadata(&object.class),
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            let Some(class) = object_array_class_metadata(matrix) else {
+                return Ok(Vec::new());
+            };
+            methods_entries_for_object_metadata(&class)
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "methods currently expects a class name or object input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn properties_for_value(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    value: &Value,
+) -> Result<(String, Vec<String>), RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "properties currently expects a nonempty class name or object".to_string(),
+                ));
+            }
+            properties_for_class_name(shared_state, resolution_source_path, trimmed)
+        }
+        Value::Object(object) => Ok((
+            object.class.qualified_name(),
+            public_property_names_from_metadata(&object.class),
+        )),
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            let Some(class) = object_array_class_metadata(matrix) else {
+                return Ok((String::new(), Vec::new()));
+            };
+            Ok((
+                class.qualified_name(),
+                public_property_names_from_metadata(&class),
+            ))
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "properties currently expects a class name or object input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn superclasses_for_value(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    value: &Value,
+) -> Result<(String, Vec<String>), RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "superclasses currently expects a nonempty class name or object".to_string(),
+                ));
+            }
+            superclasses_for_class_name(shared_state, resolution_source_path, trimmed)
+        }
+        Value::Object(object) => Ok((
+            object.class.qualified_name(),
+            superclasses_from_object_metadata(&object.class)?,
+        )),
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            let Some(class) = object_array_class_metadata(matrix) else {
+                return Ok((String::new(), Vec::new()));
+            };
+            Ok((
+                class.qualified_name(),
+                superclasses_from_object_metadata(&class)?,
+            ))
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "superclasses currently expects a class name or object input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn events_for_value(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    value: &Value,
+) -> Result<(String, Vec<String>), RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(RuntimeError::TypeError(
+                    "events currently expects a nonempty class name or object".to_string(),
+                ));
+            }
+            events_for_class_name(shared_state, resolution_source_path, trimmed)
+        }
+        Value::Object(object) => Ok((
+            object.class.qualified_name(),
+            events_from_object_metadata(&object.class),
+        )),
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            let Some(class) = object_array_class_metadata(matrix) else {
+                return Ok((String::new(), Vec::new()));
+            };
+            Ok((class.qualified_name(), events_from_object_metadata(&class)))
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "events currently expects a class name or object input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn properties_for_class_name(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    class_name: &str,
+) -> Result<(String, Vec<String>), RuntimeError> {
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
+    let Some(class_def) = resolve_class_definition(class_name, &context) else {
+        return Err(RuntimeError::MissingVariable(format!(
+            "class `{class_name}` is not defined"
+        )));
+    };
+    let loaded = load_class_module_from_path(&class_def.path)?;
+    Ok((
+        qualified_object_class_name(&loaded.class.name, loaded.class.package.as_deref()),
+        property_names_from_loaded_class(&loaded),
+    ))
+}
+
+fn superclasses_for_class_name(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    class_name: &str,
+) -> Result<(String, Vec<String>), RuntimeError> {
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
+    let Some(class_def) = resolve_class_definition(class_name, &context) else {
+        return Err(RuntimeError::MissingVariable(format!(
+            "class `{class_name}` is not defined"
+        )));
+    };
+    let loaded = load_class_module_from_path(&class_def.path)?;
+    Ok((
+        qualified_object_class_name(&loaded.class.name, loaded.class.package.as_deref()),
+        superclasses_from_loaded_class(&loaded)?,
+    ))
+}
+
+fn events_for_class_name(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    class_name: &str,
+) -> Result<(String, Vec<String>), RuntimeError> {
+    if class_name.eq_ignore_ascii_case("handle") {
+        return Ok((
+            "handle".to_string(),
+            vec!["ObjectBeingDestroyed".to_string()],
+        ));
+    }
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
+    let Some(class_def) = resolve_class_definition(class_name, &context) else {
+        return Err(RuntimeError::MissingVariable(format!(
+            "class `{class_name}` is not defined"
+        )));
+    };
+    let loaded = load_class_module_from_path(&class_def.path)?;
+    Ok((
+        qualified_object_class_name(&loaded.class.name, loaded.class.package.as_deref()),
+        events_from_loaded_class(&loaded),
+    ))
+}
+
+fn property_names_from_loaded_class(loaded: &LoadedClassModule) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = BTreeSet::new();
+    if let Some(superclass_path) = loaded.class.superclass_path.as_ref() {
+        if let Ok(loaded_super) = load_class_module_from_path(superclass_path) {
+            for name in property_names_from_loaded_class(&loaded_super) {
+                push_property_name(&mut names, &mut seen, name);
+            }
+        }
+    }
+    for property in &loaded.class.properties {
+        if property.access != ClassMemberAccess::Private {
+            push_property_name(&mut names, &mut seen, property.name.clone());
+        }
+    }
+    names
+}
+
+fn superclasses_from_loaded_class(loaded: &LoadedClassModule) -> Result<Vec<String>, RuntimeError> {
+    let mut names = Vec::new();
+    if let Some(superclass_name) = &loaded.class.superclass_name {
+        if superclass_name.eq_ignore_ascii_case("handle") {
+            names.push("handle".to_string());
+        } else if let Some(superclass_path) = loaded.class.superclass_path.as_ref() {
+            let loaded_super = load_class_module_from_path(superclass_path)?;
+            let qualified_super = qualified_object_class_name(
+                &loaded_super.class.name,
+                loaded_super.class.package.as_deref(),
+            );
+            names.push(qualified_super);
+            names.extend(superclasses_from_loaded_class(&loaded_super)?);
+        } else {
+            names.push(superclass_name.clone());
+        }
+    }
+    Ok(names)
+}
+
+fn events_from_loaded_class(loaded: &LoadedClassModule) -> Vec<String> {
+    if loaded.class.inherits_handle {
+        vec!["ObjectBeingDestroyed".to_string()]
+    } else if let Some(superclass_name) = &loaded.class.superclass_name {
+        if superclass_name.eq_ignore_ascii_case("handle") {
+            vec!["ObjectBeingDestroyed".to_string()]
+        } else if let Some(superclass_path) = loaded.class.superclass_path.as_ref() {
+            load_class_module_from_path(superclass_path)
+                .map(|loaded_super| events_from_loaded_class(&loaded_super))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    }
+}
+
+fn public_property_names_from_metadata(class: &ObjectClassMetadata) -> Vec<String> {
+    class
+        .property_order
+        .iter()
+        .filter(|name| class.private_property_owner(name).is_none())
+        .cloned()
+        .collect()
+}
+
+fn events_from_object_metadata(class: &ObjectClassMetadata) -> Vec<String> {
+    if class.storage_kind == ObjectStorageKind::Handle {
+        vec!["ObjectBeingDestroyed".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn superclasses_from_object_metadata(
+    class: &ObjectClassMetadata,
+) -> Result<Vec<String>, RuntimeError> {
+    if let Some(path) = class.source_path.as_ref().filter(|path| path.exists()) {
+        let loaded = load_class_module_from_path(path)?;
+        return superclasses_from_loaded_class(&loaded);
+    }
+
+    let mut names = Vec::new();
+    if let Some(superclass_name) = &class.superclass_name {
+        if superclass_name.eq_ignore_ascii_case("handle") {
+            names.push("handle".to_string());
+        } else {
+            names.push(superclass_name.clone());
+        }
+    }
+    let mut ancestors = class
+        .ancestor_class_names
+        .iter()
+        .filter(|name| {
+            !names
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    ancestors.sort_by_cached_key(|name| name.to_ascii_lowercase());
+    names.extend(ancestors);
+    if class.storage_kind == ObjectStorageKind::Handle
+        && !names.iter().any(|name| name.eq_ignore_ascii_case("handle"))
+    {
+        names.push("handle".to_string());
+    }
+    Ok(names)
+}
+
+fn push_property_name(names: &mut Vec<String>, seen: &mut BTreeSet<String>, name: String) {
+    if seen.insert(name.to_ascii_lowercase()) {
+        names.push(name);
+    }
+}
+
+fn property_defined_value(value: &Value, property_name: &str) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Object(object) => Ok(logical_value(
+            object.property_value(property_name).is_some(),
+        )),
+        Value::Matrix(matrix) if matrix_is_object_array(matrix) => {
+            let defined = matrix
+                .elements()
+                .iter()
+                .map(|element| match element {
+                    Value::Object(object) => {
+                        logical_value(object.property_value(property_name).is_some())
+                    }
+                    _ => unreachable!("matrix_is_object_array checked every element"),
+                })
+                .collect::<Vec<_>>();
+            if matrix.element_count() == 1 {
+                Ok(defined.into_iter().next().expect("scalar logical"))
+            } else {
+                Ok(Value::Matrix(MatrixValue::with_dimensions(
+                    matrix.rows,
+                    matrix.cols,
+                    matrix.dims().to_vec(),
+                    defined,
+                )?))
+            }
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "isprop currently expects an object input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn methods_entries_for_class_name(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    class_name: &str,
+) -> Result<Vec<MethodEntry>, RuntimeError> {
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
+    let Some(class_def) = resolve_class_definition(class_name, &context) else {
+        return Err(RuntimeError::MissingVariable(format!(
+            "class `{class_name}` is not defined"
+        )));
+    };
+    let loaded = load_class_module_from_path(&class_def.path)?;
+    Ok(method_entries_from_loaded_class(&loaded))
+}
+
+fn methods_entries_for_object_metadata(
+    class: &ObjectClassMetadata,
+) -> Result<Vec<MethodEntry>, RuntimeError> {
+    if let Some(path) = class.source_path.as_ref().filter(|path| path.exists()) {
+        let loaded = load_class_module_from_path(path)?;
+        return Ok(method_entries_from_loaded_class(&loaded));
+    }
+
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    let owner = class.qualified_name();
+    push_method_entry(
+        &mut entries,
+        &mut seen,
+        MethodEntry {
+            name: class.class_name.clone(),
+            owner: owner.clone(),
+            constructor: true,
+        },
+    );
+    for name in &class.inline_methods {
+        if class.private_inline_methods.contains(name) {
+            continue;
+        }
+        push_method_entry(
+            &mut entries,
+            &mut seen,
+            MethodEntry {
+                name: name.clone(),
+                owner: owner.clone(),
+                constructor: false,
+            },
+        );
+    }
+    for name in class.external_methods.keys() {
+        if class.private_instance_method_owner(name).is_some() {
+            continue;
+        }
+        push_method_entry(
+            &mut entries,
+            &mut seen,
+            MethodEntry {
+                name: name.clone(),
+                owner: owner.clone(),
+                constructor: false,
+            },
+        );
+    }
+    sort_method_entries(&mut entries);
+    Ok(entries)
+}
+
+fn method_entries_from_loaded_class(loaded: &LoadedClassModule) -> Vec<MethodEntry> {
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_loaded_class_method_entries(&loaded.class, &mut entries, &mut seen);
+    if let Some(superclass_path) = loaded.class.superclass_path.as_ref() {
+        if let Ok(loaded_super) = load_class_module_from_path(superclass_path) {
+            for entry in method_entries_from_loaded_class(&loaded_super) {
+                push_method_entry(&mut entries, &mut seen, entry);
+            }
+        }
+    }
+    sort_method_entries(&mut entries);
+    entries
+}
+
+fn collect_loaded_class_method_entries(
+    class: &matlab_ir::HirClass,
+    entries: &mut Vec<MethodEntry>,
+    seen: &mut BTreeSet<String>,
+) {
+    let owner = qualified_object_class_name(&class.name, class.package.as_deref());
+    push_method_entry(
+        entries,
+        seen,
+        MethodEntry {
+            name: class.name.clone(),
+            owner: owner.clone(),
+            constructor: true,
+        },
+    );
+    for name in &class.inline_methods {
+        if class
+            .private_inline_methods
+            .iter()
+            .any(|private| private == name)
+        {
+            continue;
+        }
+        push_method_entry(
+            entries,
+            seen,
+            MethodEntry {
+                name: name.clone(),
+                owner: owner.clone(),
+                constructor: false,
+            },
+        );
+    }
+    for name in &class.static_inline_methods {
+        if class
+            .private_static_inline_methods
+            .iter()
+            .any(|private| private == name)
+        {
+            continue;
+        }
+        push_method_entry(
+            entries,
+            seen,
+            MethodEntry {
+                name: name.clone(),
+                owner: owner.clone(),
+                constructor: false,
+            },
+        );
+    }
+    for method in &class.external_methods {
+        push_method_entry(
+            entries,
+            seen,
+            MethodEntry {
+                name: method.name.clone(),
+                owner: owner.clone(),
+                constructor: false,
+            },
+        );
+    }
+}
+
+fn push_method_entry(
+    entries: &mut Vec<MethodEntry>,
+    seen: &mut BTreeSet<String>,
+    entry: MethodEntry,
+) {
+    let key = entry.name.to_ascii_lowercase();
+    if seen.insert(key) {
+        entries.push(entry);
+    }
+}
+
+fn sort_method_entries(entries: &mut [MethodEntry]) {
+    entries.sort_by_cached_key(|entry| entry.name.to_ascii_lowercase());
+}
+
+fn render_methods_entries(entries: &[MethodEntry], full: bool) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            if full {
+                if entry.constructor {
+                    format!("{} (constructor)", entry.owner)
+                } else {
+                    format!("{}.{}", entry.owner, entry.name)
+                }
+            } else {
+                entry.name.clone()
+            }
+        })
+        .collect()
+}
+
 fn help_text_for_name(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     _frame: Option<&Frame<'_>>,
     resolution_source_path: Option<&Path>,
     name: &str,
@@ -1805,32 +7938,56 @@ fn help_text_for_name(
         }
     }
 
-    let context = resolution_context_with_env(resolution_source_path);
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
     if let Some(resolved) = resolve_callable(name, &context) {
         return help_text_for_resolved_callable(&resolved, name).map(Some);
     }
     if is_builtin_function_name(name) {
         return Ok(Some(format!("{name} is a built-in function.")));
     }
-    if let Some(folder_path) = collect_what_folder_paths(resolution_source_path, Some(name))?
-        .into_iter()
-        .next()
+    if let Some(folder_path) =
+        collect_what_folder_paths(shared_state, resolution_source_path, Some(name))?
+            .into_iter()
+            .next()
     {
         return Ok(Some(help_text_for_folder_path(&folder_path)?));
     }
     Ok(None)
 }
 
+fn doc_url_for_name(name: &str) -> String {
+    format!(
+        "https://www.mathworks.com/help/matlab/ref/{}.html",
+        doc_url_slug(name)
+    )
+}
+
+fn doc_search_url(name: &str) -> String {
+    format!(
+        "https://www.mathworks.com/help/search.html?qdoc={}",
+        name.replace(' ', "+")
+    )
+}
+
+fn doc_url_slug(name: &str) -> String {
+    name.to_ascii_lowercase().replace('.', "")
+}
+
 fn help_text_for_class_name(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     resolution_source_path: Option<&Path>,
     class_name: &str,
 ) -> Result<String, RuntimeError> {
-    let context = resolution_context_with_env(resolution_source_path);
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
     if let Some(class_def) = resolve_class_definition(class_name, &context) {
-        return help_text_for_path(&class_def.path)
-            .map(|text| {
-                text.unwrap_or_else(|| format!("{class_name} is a class defined in {}.", class_def.path.display()))
-            });
+        return help_text_for_path(&class_def.path).map(|text| {
+            text.unwrap_or_else(|| {
+                format!(
+                    "{class_name} is a class defined in {}.",
+                    class_def.path.display()
+                )
+            })
+        });
     }
     Ok(format!("{class_name} is a built-in class."))
 }
@@ -1840,17 +7997,24 @@ fn help_text_for_resolved_callable(
     display_name: &str,
 ) -> Result<String, RuntimeError> {
     match resolved {
-        ResolvedCallable::Function(function) => {
-            help_text_for_path(&function.path).map(|text| {
-                text.unwrap_or_else(|| format!("{display_name} is a function defined in {}.", function.path.display()))
+        ResolvedCallable::Function(function) => help_text_for_path(&function.path).map(|text| {
+            text.unwrap_or_else(|| {
+                format!(
+                    "{display_name} is a function defined in {}.",
+                    function.path.display()
+                )
             })
-        }
+        }),
         ResolvedCallable::Class(class_def) => {
             if let Some((_, method_name)) = display_name.rsplit_once('.') {
-                if let Some(method_path) = resolve_class_folder_method(&class_def.path, method_name) {
+                if let Some(method_path) = resolve_class_folder_method(&class_def.path, method_name)
+                {
                     return help_text_for_path(&method_path).map(|text| {
                         text.unwrap_or_else(|| {
-                            format!("{display_name} is a class method defined in {}.", method_path.display())
+                            format!(
+                                "{display_name} is a class method defined in {}.",
+                                method_path.display()
+                            )
                         })
                     });
                 }
@@ -1860,7 +8024,12 @@ fn help_text_for_resolved_callable(
                 return Ok(format!("{display_name} is a class method."));
             }
             help_text_for_path(&class_def.path).map(|text| {
-                text.unwrap_or_else(|| format!("{display_name} is a class defined in {}.", class_def.path.display()))
+                text.unwrap_or_else(|| {
+                    format!(
+                        "{display_name} is a class defined in {}.",
+                        class_def.path.display()
+                    )
+                })
             })
         }
     }
@@ -1905,35 +8074,30 @@ fn help_text_for_folder_path(path: &Path) -> Result<String, RuntimeError> {
 }
 
 fn help_summary_line_for_path(path: &Path) -> Result<Option<String>, RuntimeError> {
-    Ok(help_text_for_path(path)?
-        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()).map(|line| line.trim().to_string())))
+    Ok(help_text_for_path(path)?.and_then(|text| {
+        text.lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+    }))
 }
 
 fn help_text_for_path(path: &Path) -> Result<Option<String>, RuntimeError> {
     let source = fs::read_to_string(path).map_err(|error| {
-        RuntimeError::Unsupported(format!(
-            "help could not read `{}`: {error}",
-            path.display()
-        ))
+        RuntimeError::Unsupported(format!("help could not read `{}`: {error}", path.display()))
     })?;
     Ok(read_primary_help_text_from_source(&source))
 }
 
 fn read_named_help_text_from_path(path: &Path, name: &str) -> Result<Option<String>, RuntimeError> {
     let source = fs::read_to_string(path).map_err(|error| {
-        RuntimeError::Unsupported(format!(
-            "help could not read `{}`: {error}",
-            path.display()
-        ))
+        RuntimeError::Unsupported(format!("help could not read `{}`: {error}", path.display()))
     })?;
     Ok(read_named_help_text_from_source(&source, name))
 }
 
 fn read_primary_help_text_from_source(source: &str) -> Option<String> {
     let lines = source.lines().collect::<Vec<_>>();
-    let first_nonblank = lines
-        .iter()
-        .position(|line| !line.trim().is_empty())?;
+    let first_nonblank = lines.iter().position(|line| !line.trim().is_empty())?;
     let first = lines[first_nonblank].trim_start();
     let start = if first.starts_with("function") || first.starts_with("classdef") {
         first_nonblank + 1
@@ -1957,6 +8121,7 @@ fn read_named_help_text_from_source(source: &str, name: &str) -> Option<String> 
 }
 
 fn collect_lookfor_matches(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     resolution_source_path: Option<&Path>,
     keyword: &str,
     search_all: bool,
@@ -1968,7 +8133,7 @@ fn collect_lookfor_matches(
         ));
     }
 
-    let context = resolution_context_with_env(resolution_source_path);
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
     let mut matches = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -2142,7 +8307,10 @@ fn collect_help_block_from_lines(lines: &[&str], start: usize) -> Option<String>
 
 fn declared_function_name_from_line(line: &str) -> Option<String> {
     let body = line.strip_prefix("function")?.trim_start();
-    let body = body.rsplit_once('=').map(|(_, rhs)| rhs.trim_start()).unwrap_or(body);
+    let body = body
+        .rsplit_once('=')
+        .map(|(_, rhs)| rhs.trim_start())
+        .unwrap_or(body);
     let name = body
         .split(['(', ' ', '\t', ','])
         .next()
@@ -2152,43 +8320,64 @@ fn declared_function_name_from_line(line: &str) -> Option<String> {
 }
 
 fn collect_what_folder_infos(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     resolution_source_path: Option<&Path>,
     folder_name: Option<&str>,
 ) -> Result<Vec<WhatFolderInfo>, RuntimeError> {
-    collect_what_folder_paths(resolution_source_path, folder_name)?
+    collect_what_folder_paths(shared_state, resolution_source_path, folder_name)?
         .into_iter()
         .map(|path| scan_what_folder(&path))
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct DirectoryEntryInfo {
+    name: String,
+    folder: PathBuf,
+    bytes: u64,
+    is_dir: bool,
+    date: String,
+    datenum: f64,
+}
+
 fn collect_what_folder_paths(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     resolution_source_path: Option<&Path>,
     folder_name: Option<&str>,
 ) -> Result<Vec<PathBuf>, RuntimeError> {
-    let context = resolution_context_with_env(resolution_source_path);
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
+    let current_directory = runtime_current_directory(shared_state, resolution_source_path);
     let mut paths = Vec::new();
     let mut seen = BTreeSet::new();
 
-    let push_if_dir = |paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<String>, candidate: PathBuf| {
-        if candidate.is_dir() {
-            let key = candidate.display().to_string();
-            if seen.insert(key) {
-                paths.push(candidate);
+    let push_if_dir =
+        |paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<String>, candidate: PathBuf| {
+            if candidate.is_dir() {
+                let key = candidate.display().to_string();
+                if seen.insert(key) {
+                    paths.push(candidate);
+                }
             }
-        }
-    };
+        };
 
     match folder_name.map(str::trim).filter(|name| !name.is_empty()) {
         None => {
-            if let Some(source_dir) = context.source_dir() {
-                push_if_dir(&mut paths, &mut seen, source_dir.to_path_buf());
-            } else if let Ok(current_dir) = env::current_dir() {
-                push_if_dir(&mut paths, &mut seen, current_dir);
-            }
+            push_if_dir(&mut paths, &mut seen, current_directory.clone());
         }
         Some(folder_name) => {
+            if folder_name_looks_like_path(folder_name) {
+                let resolved = if Path::new(folder_name).is_absolute() {
+                    PathBuf::from(folder_name)
+                } else {
+                    current_directory.join(folder_name)
+                };
+                let resolved =
+                    normalize_runtime_path(fs::canonicalize(&resolved).unwrap_or(resolved));
+                push_if_dir(&mut paths, &mut seen, resolved);
+                return Ok(paths);
+            }
             for variant in what_folder_name_variants(folder_name) {
-                push_if_dir(&mut paths, &mut seen, variant.clone());
+                push_if_dir(&mut paths, &mut seen, current_directory.join(&variant));
                 if let Some(source_dir) = context.source_dir() {
                     push_if_dir(&mut paths, &mut seen, source_dir.join(&variant));
                 }
@@ -2202,17 +8391,971 @@ fn collect_what_folder_paths(
     Ok(paths)
 }
 
+fn folder_name_looks_like_path(folder_name: &str) -> bool {
+    let path = Path::new(folder_name);
+    path.is_absolute()
+        || folder_name.starts_with('.')
+        || folder_name.contains('\\')
+        || folder_name.contains('/')
+}
+
+fn resolve_cd_target(current_directory: &Path, target: &str) -> Result<PathBuf, RuntimeError> {
+    let candidate = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        current_directory.join(target)
+    };
+    if !candidate.exists() {
+        return Err(RuntimeError::MissingVariable(format!(
+            "folder `{}` does not exist",
+            candidate.display()
+        )));
+    }
+    if !candidate.is_dir() {
+        return Err(RuntimeError::TypeError(format!(
+            "cd currently expects a folder path, found `{}`",
+            candidate.display()
+        )));
+    }
+    Ok(normalize_runtime_path(
+        fs::canonicalize(&candidate).unwrap_or(candidate),
+    ))
+}
+
+fn resolve_runtime_path_text(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    text: &str,
+) -> PathBuf {
+    let current_directory = runtime_current_directory(shared_state, resolution_source_path);
+    let path = Path::new(text);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_directory.join(path)
+    };
+    normalize_runtime_path(resolved)
+}
+
+fn file_operation_outputs(
+    status: bool,
+    message: &str,
+    message_id: &str,
+    output_arity: usize,
+) -> Vec<Value> {
+    let mut outputs = vec![
+        logical_value(status),
+        Value::CharArray(message.to_string()),
+        Value::CharArray(message_id.to_string()),
+    ];
+    outputs.truncate(output_arity.max(1));
+    outputs
+}
+
+fn all_args_are_text(args: &[Value]) -> bool {
+    !args.is_empty() && args.iter().all(value_is_text_path_operand)
+}
+
+fn path_text_has_wildcards(text: &str) -> bool {
+    text.contains('*') || text.contains('?')
+}
+
+fn resolve_runtime_source_paths(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    source: &str,
+) -> Result<Vec<PathBuf>, RuntimeError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(RuntimeError::TypeError(
+            "source path must be nonempty".to_string(),
+        ));
+    }
+    let resolved = resolve_runtime_path_text(shared_state, resolution_source_path, trimmed);
+    if path_text_has_wildcards(trimmed) {
+        let parent = resolved
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| runtime_current_directory(shared_state, resolution_source_path));
+        let pattern = resolved
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "*".to_string());
+        let mut matches = fs::read_dir(&parent)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| wildcard_matches(&pattern, &name.to_string_lossy()))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        if matches.is_empty() {
+            return Err(RuntimeError::MissingVariable(format!(
+                "source `{trimmed}` does not exist"
+            )));
+        }
+        Ok(matches.into_iter().map(normalize_runtime_path).collect())
+    } else if resolved.exists() {
+        Ok(vec![resolved])
+    } else {
+        Err(RuntimeError::MissingVariable(format!(
+            "source `{}` does not exist",
+            resolved.display()
+        )))
+    }
+}
+
+fn resolve_runtime_destination_path(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    destination: Option<&str>,
+) -> PathBuf {
+    destination
+        .map(|destination| {
+            resolve_runtime_path_text(shared_state, resolution_source_path, destination)
+        })
+        .unwrap_or_else(|| runtime_current_directory(shared_state, resolution_source_path))
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(destination)?;
+    let mut entries = fs::read_dir(source)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    entries.sort();
+    for entry in entries {
+        let target = destination.join(entry.file_name().unwrap_or_default());
+        if entry.is_dir() {
+            copy_directory_contents(&entry, &target)?;
+        } else {
+            fs::copy(&entry, &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_existing_file_for_overwrite(target: &Path, force: bool) -> Result<bool, std::io::Error> {
+    if !target.exists() {
+        return Ok(false);
+    }
+    let readonly = fs::metadata(target)?.permissions().readonly();
+    if readonly && !force {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Cannot write to destination.",
+        ));
+    }
+    if readonly {
+        let mut permissions = fs::metadata(target)?.permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(target, permissions)?;
+    }
+    fs::remove_file(target)?;
+    Ok(readonly)
+}
+
+fn restore_readonly_if_needed(target: &Path, readonly: bool) -> Result<(), std::io::Error> {
+    if readonly {
+        let mut permissions = fs::metadata(target)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(target, permissions)?;
+    }
+    Ok(())
+}
+
+fn copy_source_to_destination(
+    source_paths: &[PathBuf],
+    destination: &Path,
+    force: bool,
+    wildcard_mode: bool,
+) -> Result<(), std::io::Error> {
+    if source_paths.len() > 1 || wildcard_mode {
+        if destination.exists() && !destination.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "destination exists and is not a directory",
+            ));
+        }
+        fs::create_dir_all(destination)?;
+        for source in source_paths {
+            let target = destination.join(source.file_name().unwrap_or_default());
+            if source.is_dir() {
+                copy_directory_contents(source, &target)?;
+            } else {
+                if target.exists() {
+                    let readonly = remove_existing_file_for_overwrite(&target, force)?;
+                    fs::copy(source, &target)?;
+                    restore_readonly_if_needed(&target, readonly)?;
+                } else {
+                    fs::copy(source, target)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let source = &source_paths[0];
+    if source.is_dir() {
+        if destination.exists() {
+            if !destination.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination exists and is not a directory",
+                ));
+            }
+            copy_directory_contents(source, destination)
+        } else {
+            fs::create_dir_all(destination)?;
+            copy_directory_contents(source, destination)
+        }
+    } else if destination.is_dir() {
+        let target = destination.join(source.file_name().unwrap_or_default());
+        if target.exists() {
+            let readonly = remove_existing_file_for_overwrite(&target, force)?;
+            fs::copy(source, &target)?;
+            restore_readonly_if_needed(&target, readonly)?;
+            Ok(())
+        } else {
+            fs::copy(source, target).map(|_| ())
+        }
+    } else {
+        let mut readonly = false;
+        if destination.exists() {
+            if destination.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination exists and is a directory",
+                ));
+            }
+            readonly = remove_existing_file_for_overwrite(destination, force)?;
+        }
+        if let Some(parent) = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination).map(|_| ())?;
+        restore_readonly_if_needed(destination, readonly)?;
+        Ok(())
+    }
+}
+
+fn move_source_to_destination(
+    source_paths: &[PathBuf],
+    destination: &Path,
+    force: bool,
+    wildcard_mode: bool,
+) -> Result<(), std::io::Error> {
+    if source_paths.len() > 1 || wildcard_mode {
+        if destination.exists() && !destination.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "destination exists and is not a directory",
+            ));
+        }
+        fs::create_dir_all(destination)?;
+        for source in source_paths {
+            let target = destination.join(source.file_name().unwrap_or_default());
+            move_source_to_destination(std::slice::from_ref(source), &target, force, false)?;
+        }
+        return Ok(());
+    }
+
+    let source = &source_paths[0];
+    if source.is_dir() {
+        if destination.exists() {
+            if !destination.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination exists and is not a directory",
+                ));
+            }
+            let mut entries = fs::read_dir(source)?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .collect::<Vec<_>>();
+            entries.sort();
+            for entry in entries {
+                let target = destination.join(entry.file_name().unwrap_or_default());
+                move_source_to_destination(std::slice::from_ref(&entry), &target, force, false)?;
+            }
+            fs::remove_dir(source)
+        } else {
+            fs::rename(source, destination).or_else(|_| {
+                fs::create_dir_all(destination)?;
+                let mut entries = fs::read_dir(source)?
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .collect::<Vec<_>>();
+                entries.sort();
+                for entry in entries {
+                    let target = destination.join(entry.file_name().unwrap_or_default());
+                    move_source_to_destination(
+                        std::slice::from_ref(&entry),
+                        &target,
+                        force,
+                        false,
+                    )?;
+                }
+                fs::remove_dir(source)
+            })
+        }
+    } else {
+        let target = if destination.is_dir() {
+            destination.join(source.file_name().unwrap_or_default())
+        } else {
+            destination.to_path_buf()
+        };
+        let mut readonly = false;
+        if target.exists() {
+            if target.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination exists and is a directory",
+                ));
+            }
+            readonly = remove_existing_file_for_overwrite(&target, force)?;
+        }
+        if let Some(parent) = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(source, &target).or_else(|_| {
+            fs::copy(source, &target)?;
+            fs::remove_file(source)
+        })?;
+        restore_readonly_if_needed(&target, readonly)?;
+        Ok(())
+    }
+}
+
+fn fileattrib_entries(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    filename: Option<&str>,
+) -> Result<Vec<Value>, RuntimeError> {
+    let sources = match filename {
+        None => vec![runtime_current_directory(
+            shared_state,
+            resolution_source_path,
+        )],
+        Some(filename) => {
+            resolve_runtime_source_paths(shared_state, resolution_source_path, filename)?
+        }
+    };
+    let mut entries = Vec::with_capacity(sources.len());
+    for source in sources {
+        let metadata =
+            fs::metadata(&source).map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        let readonly = metadata.permissions().readonly();
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "Name".to_string(),
+            Value::CharArray(source.display().to_string()),
+        );
+        fields.insert("archive".to_string(), Value::Scalar(f64::NAN));
+        fields.insert("system".to_string(), Value::Scalar(f64::NAN));
+        fields.insert(
+            "hidden".to_string(),
+            Value::Scalar(
+                source
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.')) as i32 as f64,
+            ),
+        );
+        fields.insert(
+            "directory".to_string(),
+            Value::Scalar(metadata.is_dir() as i32 as f64),
+        );
+        fields.insert("UserRead".to_string(), Value::Scalar(1.0));
+        fields.insert(
+            "UserWrite".to_string(),
+            Value::Scalar((!readonly) as i32 as f64),
+        );
+        fields.insert("UserExecute".to_string(), Value::Scalar(f64::NAN));
+        fields.insert("GroupRead".to_string(), Value::Scalar(f64::NAN));
+        fields.insert("GroupWrite".to_string(), Value::Scalar(f64::NAN));
+        fields.insert("GroupExecute".to_string(), Value::Scalar(f64::NAN));
+        fields.insert("OtherRead".to_string(), Value::Scalar(f64::NAN));
+        fields.insert("OtherWrite".to_string(), Value::Scalar(f64::NAN));
+        fields.insert("OtherExecute".to_string(), Value::Scalar(f64::NAN));
+        entries.push(Value::Struct(StructValue::with_field_order(
+            fields,
+            vec![
+                "Name".to_string(),
+                "archive".to_string(),
+                "system".to_string(),
+                "hidden".to_string(),
+                "directory".to_string(),
+                "UserRead".to_string(),
+                "UserWrite".to_string(),
+                "UserExecute".to_string(),
+                "GroupRead".to_string(),
+                "GroupWrite".to_string(),
+                "GroupExecute".to_string(),
+                "OtherRead".to_string(),
+                "OtherWrite".to_string(),
+                "OtherExecute".to_string(),
+            ],
+        )));
+    }
+    Ok(entries)
+}
+
+fn apply_fileattrib_write_recursive(
+    path: &Path,
+    write_enabled: bool,
+    recursive: bool,
+) -> Result<(), std::io::Error> {
+    let metadata = fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(!write_enabled);
+    fs::set_permissions(path, permissions)?;
+    if recursive && metadata.is_dir() {
+        let mut entries = fs::read_dir(path)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            apply_fileattrib_write_recursive(&entry, write_enabled, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn search_path_entry_key(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        return path.display().to_string().to_ascii_lowercase();
+    }
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
+fn render_search_path_string(paths: &[PathBuf]) -> Result<String, RuntimeError> {
+    env::join_paths(paths)
+        .map(|joined| joined.to_string_lossy().to_string())
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))
+}
+
+fn render_search_path_display(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        "MATLABPATH".to_string()
+    } else {
+        format!(
+            "MATLABPATH\n{}",
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+}
+
+fn parse_search_path_text(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    text: &str,
+    builtin_name: &str,
+    require_exists: bool,
+) -> Result<Vec<PathBuf>, RuntimeError> {
+    let current_directory = runtime_current_directory(shared_state, resolution_source_path);
+    let raw_paths = env::split_paths(OsStr::new(text)).collect::<Vec<_>>();
+    let raw_paths = if raw_paths.is_empty() && !text.is_empty() {
+        vec![PathBuf::from(text)]
+    } else {
+        raw_paths
+    };
+    let mut resolved = Vec::new();
+    let mut seen = BTreeSet::new();
+    for raw_path in raw_paths {
+        if raw_path.as_os_str().is_empty() {
+            continue;
+        }
+        let path = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            current_directory.join(raw_path)
+        };
+        let path = normalize_runtime_path(fs::canonicalize(&path).unwrap_or(path));
+        if require_exists && !path.is_dir() {
+            return Err(RuntimeError::MissingVariable(format!(
+                "{builtin_name} folder `{}` does not exist",
+                path.display()
+            )));
+        }
+        let key = search_path_entry_key(&path);
+        if seen.insert(key) {
+            resolved.push(path);
+        }
+    }
+    Ok(resolved)
+}
+
+fn search_path_roots_with_updates(
+    current_paths: &[PathBuf],
+    folders: &[PathBuf],
+    position: SearchPathPosition,
+) -> Vec<PathBuf> {
+    let folder_keys = folders
+        .iter()
+        .map(|path| search_path_entry_key(path))
+        .collect::<BTreeSet<_>>();
+    let retained = current_paths
+        .iter()
+        .filter(|path| !folder_keys.contains(&search_path_entry_key(path)))
+        .cloned()
+        .collect::<Vec<_>>();
+    match position {
+        SearchPathPosition::Begin => folders.iter().cloned().chain(retained).collect(),
+        SearchPathPosition::End => retained
+            .into_iter()
+            .chain(folders.iter().cloned())
+            .collect(),
+    }
+}
+
+fn search_path_roots_with_user_path(
+    user_path_root: Option<&PathBuf>,
+    base_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut paths = base_roots.to_vec();
+    if let Some(user_path_root) = user_path_root {
+        paths = search_path_roots_with_updates(
+            &paths,
+            &[user_path_root.clone()],
+            SearchPathPosition::Begin,
+        );
+    }
+    paths
+}
+
+fn search_path_roots_without_paths(current_paths: &[PathBuf], folders: &[PathBuf]) -> Vec<PathBuf> {
+    let folder_keys = folders
+        .iter()
+        .map(|path| search_path_entry_key(path))
+        .collect::<BTreeSet<_>>();
+    current_paths
+        .iter()
+        .filter(|path| !folder_keys.contains(&search_path_entry_key(path)))
+        .cloned()
+        .collect()
+}
+
+fn runtime_search_path_string(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+) -> Result<String, RuntimeError> {
+    render_search_path_string(&runtime_search_path_roots(shared_state))
+}
+
+fn render_runtime_user_path(shared_state: &Rc<RefCell<SharedRuntimeState>>) -> String {
+    current_runtime_user_path(shared_state)
+        .map(|path| path.display().to_string())
+        .unwrap_or_default()
+}
+
+#[derive(Clone)]
+struct InstalledProductInfo {
+    query_name: String,
+    name: String,
+    version: String,
+    release: String,
+    date: String,
+}
+
+fn installed_products() -> Vec<InstalledProductInfo> {
+    vec![InstalledProductInfo {
+        query_name: "matlab".to_string(),
+        name: "MATLAB".to_string(),
+        version: MATLAB_VERSION_NUMBER.to_string(),
+        release: MATLAB_RELEASE_NAME.to_string(),
+        date: MATLAB_VERSION_DATE.to_string(),
+    }]
+}
+
+fn installed_product_info(name: &str) -> Option<InstalledProductInfo> {
+    let normalized = name.trim().to_ascii_lowercase();
+    installed_products().into_iter().find(|product| {
+        product.query_name.eq_ignore_ascii_case(&normalized)
+            || product.name.eq_ignore_ascii_case(&normalized)
+    })
+}
+
+fn installed_feature_name(feature: &str) -> Option<String> {
+    let normalized = feature.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized == "matlab" {
+        return Some("matlab".to_string());
+    }
+    let stripped = normalized.strip_suffix("_toolbox").unwrap_or(&normalized);
+    let candidate = runtime_toolbox_root().join(stripped);
+    if candidate.is_dir() {
+        Some(stripped.to_string())
+    } else {
+        None
+    }
+}
+
+fn version_segments(text: &str) -> Vec<u32> {
+    text.split('.')
+        .map(|segment| segment.trim().parse::<u32>().unwrap_or(0))
+        .collect()
+}
+
+fn version_is_less_than(current: &str, requested: &str) -> bool {
+    let current_segments = version_segments(current);
+    let requested_segments = version_segments(requested);
+    let max_len = current_segments.len().max(requested_segments.len());
+    for index in 0..max_len {
+        let left = current_segments.get(index).copied().unwrap_or(0);
+        let right = requested_segments.get(index).copied().unwrap_or(0);
+        if left != right {
+            return left < right;
+        }
+    }
+    false
+}
+
+fn computer_type_text() -> &'static str {
+    #[cfg(windows)]
+    {
+        "PCWIN64"
+    }
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        "GLNXA64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "MACA64"
+    }
+}
+
+fn computer_arch_text() -> &'static str {
+    #[cfg(windows)]
+    {
+        "win64"
+    }
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        "glnxa64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "maca64"
+    }
+}
+
+fn tempdir_root() -> PathBuf {
+    normalize_runtime_path(env::temp_dir())
+}
+
+fn tempdir_text() -> String {
+    let path = tempdir_root();
+    let separator = std::path::MAIN_SEPARATOR.to_string();
+    let mut text = path.display().to_string();
+    if !text.ends_with(&separator) {
+        text.push(std::path::MAIN_SEPARATOR);
+    }
+    text
+}
+
+fn tempname_path(base_dir: &Path) -> PathBuf {
+    let suffix = RUNTIME_TEMP_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    base_dir.join(format!("tp{:x}{suffix:x}", nanos))
+}
+
+fn license_is_enabled(shared_state: &Rc<RefCell<SharedRuntimeState>>, feature: &str) -> bool {
+    let normalized = feature.to_ascii_lowercase();
+    shared_state
+        .borrow()
+        .license_test_overrides
+        .get(&normalized)
+        .copied()
+        .unwrap_or(true)
+}
+
+fn set_license_enabled(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    feature: &str,
+    enabled: bool,
+) {
+    shared_state
+        .borrow_mut()
+        .license_test_overrides
+        .insert(feature.to_ascii_lowercase(), enabled);
+}
+
+fn checked_out_license_features(shared_state: &Rc<RefCell<SharedRuntimeState>>) -> Vec<String> {
+    shared_state
+        .borrow()
+        .checked_out_licenses
+        .iter()
+        .cloned()
+        .collect()
+}
+
+fn checkout_license_feature(shared_state: &Rc<RefCell<SharedRuntimeState>>, feature: &str) {
+    shared_state
+        .borrow_mut()
+        .checked_out_licenses
+        .insert(feature.to_ascii_lowercase());
+}
+
+fn replace_runtime_user_path(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    user_path_root: Option<PathBuf>,
+) {
+    let mut search_path_roots = runtime_search_path_roots(shared_state);
+    if let Some(previous) = current_runtime_user_path(shared_state) {
+        search_path_roots = search_path_roots_without_paths(&search_path_roots, &[previous]);
+    }
+    if let Some(user_path_root_ref) = user_path_root.as_ref() {
+        search_path_roots = search_path_roots_with_updates(
+            &search_path_roots,
+            std::slice::from_ref(user_path_root_ref),
+            SearchPathPosition::Begin,
+        );
+    }
+    set_runtime_search_path_roots(shared_state, search_path_roots);
+    set_runtime_user_path(shared_state, user_path_root);
+}
+
+fn collect_genpath_entries(
+    dir: &Path,
+    seen: &mut BTreeSet<String>,
+    entries: &mut Vec<PathBuf>,
+) -> Result<(), RuntimeError> {
+    let dir = normalize_runtime_path(fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+    let key = search_path_entry_key(&dir);
+    if !seen.insert(key) {
+        return Ok(());
+    }
+    entries.push(dir.clone());
+    let mut children = fs::read_dir(&dir)
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    children.sort();
+    for child in children {
+        let Some(name) = child.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if genpath_excludes_directory(name) {
+            continue;
+        }
+        collect_genpath_entries(&child, seen, entries)?;
+    }
+    Ok(())
+}
+
+fn genpath_excludes_directory(name: &str) -> bool {
+    name.eq_ignore_ascii_case("private")
+        || name.eq_ignore_ascii_case("resources")
+        || name.starts_with('@')
+        || name.starts_with('+')
+}
+
+fn collect_directory_entries(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    target: Option<&str>,
+) -> Result<Vec<DirectoryEntryInfo>, RuntimeError> {
+    let cwd = runtime_current_directory(shared_state, resolution_source_path);
+    let candidates = resolve_directory_targets(&cwd, target)?;
+    let mut entries = Vec::new();
+    for path in candidates {
+        let metadata =
+            fs::metadata(&path).map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        let parent = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cwd.clone());
+        let modified = metadata.modified().ok();
+        let datenum = modified
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs_f64() / 86_400.0 + 719_529.0)
+            .unwrap_or(f64::NAN);
+        let date = modified
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_default();
+        entries.push(DirectoryEntryInfo {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string()),
+            folder: parent,
+            bytes: metadata.len(),
+            is_dir: metadata.is_dir(),
+            date,
+            datenum,
+        });
+    }
+    entries.sort_by_cached_key(|entry| entry.name.to_ascii_lowercase());
+    Ok(entries)
+}
+
+fn resolve_directory_targets(
+    cwd: &Path,
+    target: Option<&str>,
+) -> Result<Vec<PathBuf>, RuntimeError> {
+    let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+        return directory_contents(cwd);
+    };
+
+    let path = Path::new(target);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    if target.contains('*') || target.contains('?') {
+        let parent = resolved
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cwd.to_path_buf());
+        let pattern = resolved
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "*".to_string());
+        let mut matches = directory_contents(&parent)?
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .map(|name| wildcard_matches(&pattern, &name.to_string_lossy()))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        return Ok(matches);
+    }
+    if resolved.is_dir() {
+        return directory_contents(&resolved);
+    }
+    if resolved.exists() {
+        return Ok(vec![resolved]);
+    }
+    Err(RuntimeError::MissingVariable(format!(
+        "path `{}` does not exist",
+        resolved.display()
+    )))
+}
+
+fn directory_contents(dir: &Path) -> Result<Vec<PathBuf>, RuntimeError> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    entries.sort();
+    Ok(entries)
+}
+
+fn wildcard_matches(pattern: &str, text: &str) -> bool {
+    wildcard_matches_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn wildcard_matches_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    match pattern[0] {
+        b'*' => {
+            wildcard_matches_bytes(&pattern[1..], text)
+                || (!text.is_empty() && wildcard_matches_bytes(pattern, &text[1..]))
+        }
+        b'?' => !text.is_empty() && wildcard_matches_bytes(&pattern[1..], &text[1..]),
+        byte => {
+            !text.is_empty()
+                && byte.eq_ignore_ascii_case(&text[0])
+                && wildcard_matches_bytes(&pattern[1..], &text[1..])
+        }
+    }
+}
+
+fn render_dir_entries(entries: &[DirectoryEntryInfo]) -> String {
+    if entries.is_empty() {
+        return "Directory is empty".to_string();
+    }
+    let mut out = String::new();
+    if let Some(first) = entries.first() {
+        out.push_str(&format!("Directory of {}\n", first.folder.display()));
+    }
+    for entry in entries {
+        let kind = if entry.is_dir { "<DIR>" } else { "" };
+        out.push_str(&format!("{} {} {}\n", entry.date, kind, entry.name));
+    }
+    out
+}
+
+fn render_ls_entries(entries: &[DirectoryEntryInfo]) -> String {
+    entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn directory_entries_value(entries: &[DirectoryEntryInfo]) -> Result<Value, RuntimeError> {
+    let fields = vec![
+        "name".to_string(),
+        "folder".to_string(),
+        "date".to_string(),
+        "bytes".to_string(),
+        "isdir".to_string(),
+        "datenum".to_string(),
+    ];
+    let elements = entries
+        .iter()
+        .map(|entry| {
+            Value::Struct(StructValue::with_field_order(
+                BTreeMap::from([
+                    ("name".to_string(), Value::CharArray(entry.name.clone())),
+                    (
+                        "folder".to_string(),
+                        Value::CharArray(entry.folder.display().to_string()),
+                    ),
+                    ("date".to_string(), Value::CharArray(entry.date.clone())),
+                    ("bytes".to_string(), Value::Scalar(entry.bytes as f64)),
+                    ("isdir".to_string(), Value::Logical(entry.is_dir)),
+                    ("datenum".to_string(), Value::Scalar(entry.datenum)),
+                ]),
+                fields.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    Ok(Value::Matrix(MatrixValue::new(entries.len(), 1, elements)?))
+}
+
 fn what_folder_name_variants(folder_name: &str) -> Vec<PathBuf> {
     let trimmed = folder_name.trim();
     let mut variants = Vec::new();
     let mut seen = BTreeSet::new();
 
-    let push_variant = |variants: &mut Vec<PathBuf>, seen: &mut BTreeSet<String>, value: PathBuf| {
-        let key = value.display().to_string();
-        if seen.insert(key) {
-            variants.push(value);
-        }
-    };
+    let push_variant =
+        |variants: &mut Vec<PathBuf>, seen: &mut BTreeSet<String>, value: PathBuf| {
+            let key = value.display().to_string();
+            if seen.insert(key) {
+                variants.push(value);
+            }
+        };
 
     push_variant(&mut variants, &mut seen, PathBuf::from(trimmed));
 
@@ -2349,11 +9492,7 @@ fn what_infos_value(infos: &[WhatFolderInfo]) -> Result<Value, RuntimeError> {
 }
 
 fn inmem_function_cell_value(state: &SharedRuntimeState, complete_names: bool) -> Value {
-    let mut entries = state
-        .loaded_functions
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut entries = state.loaded_functions.values().cloned().collect::<Vec<_>>();
     entries.sort_by_cached_key(|entry| {
         if complete_names {
             entry.complete_name.to_ascii_lowercase()
@@ -2470,11 +9609,19 @@ fn render_what_infos(infos: &[WhatFolderInfo]) -> String {
         render_what_section(&mut out, "MDL files", &info.path, &info.mdl);
         render_what_section(&mut out, "SLX files", &info.path, &info.slx);
         render_what_section(&mut out, "SFX files", &info.path, &info.sfx);
-        render_what_section(&mut out, "P-code files", &info.path, &strip_extensions(&info.p));
+        render_what_section(
+            &mut out,
+            "P-code files",
+            &info.path,
+            &strip_extensions(&info.p),
+        );
         render_what_section(&mut out, "Classes", &info.path, &info.classes);
         render_what_section(&mut out, "Namespaces", &info.path, &info.packages);
         if out.is_empty() || out.ends_with("\n\n") {
-            out.push_str(&format!("No MATLAB files found in folder {}\n", info.path.display()));
+            out.push_str(&format!(
+                "No MATLAB files found in folder {}\n",
+                info.path.display()
+            ));
         }
     }
     out
@@ -2593,6 +9740,7 @@ fn within_file_marker(path: &Path, chain: &[String]) -> String {
 }
 
 fn resolve_which_context_path(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     resolution_source_path: Option<&Path>,
     context_name: &str,
 ) -> Option<PathBuf> {
@@ -2601,7 +9749,12 @@ fn resolve_which_context_path(
         return None;
     }
 
-    let direct = PathBuf::from(trimmed);
+    let current_directory = runtime_current_directory(shared_state, resolution_source_path);
+    let direct = if Path::new(trimmed).is_absolute() {
+        PathBuf::from(trimmed)
+    } else {
+        current_directory.join(trimmed)
+    };
     if direct.is_file() {
         return Some(direct);
     }
@@ -2627,7 +9780,7 @@ fn resolve_which_context_path(
         }
     }
 
-    let context = resolution_context_with_env(resolution_source_path);
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
     match resolve_callable(trimmed, &context)? {
         ResolvedCallable::Function(function) => Some(function.path),
         ResolvedCallable::Class(class_def) => Some(class_def.path),
@@ -2641,7 +9794,10 @@ fn existing_lookup_path(name: &str, context: &ResolverContext, want_dir: bool) -
     }
 
     let mut candidates = BTreeSet::new();
-    candidates.insert(PathBuf::from(trimmed));
+    let direct = PathBuf::from(trimmed);
+    if direct.is_absolute() {
+        candidates.insert(direct);
+    }
     if let Some(source_dir) = context.source_dir() {
         candidates.insert(source_dir.join(trimmed));
     }
@@ -2665,6 +9821,66 @@ fn rendered_resolved_callable_path(resolved: &ResolvedCallable) -> String {
     }
 }
 
+fn runtime_file_lookup_candidates(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    name: &str,
+) -> Vec<PathBuf> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let context = resolution_context_with_env(shared_state, resolution_source_path);
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    let push_unique =
+        |path: PathBuf, candidates: &mut Vec<PathBuf>, seen: &mut BTreeSet<String>| {
+            let key = search_path_entry_key(&path);
+            if seen.insert(key) {
+                candidates.push(path);
+            }
+        };
+
+    let direct = PathBuf::from(trimmed);
+    if direct.is_absolute() {
+        push_unique(direct, &mut candidates, &mut seen);
+    } else {
+        push_unique(
+            runtime_current_directory(shared_state, resolution_source_path).join(trimmed),
+            &mut candidates,
+            &mut seen,
+        );
+    }
+    for root in context.effective_search_roots() {
+        push_unique(root.join(trimmed), &mut candidates, &mut seen);
+    }
+    candidates
+}
+
+fn resolve_runtime_existing_file_path(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    name: &str,
+    extension_fallbacks: &[&str],
+) -> Option<PathBuf> {
+    for candidate in runtime_file_lookup_candidates(shared_state, resolution_source_path, name) {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if candidate.extension().is_none() {
+            for extension in extension_fallbacks {
+                let fallback = candidate.with_extension(extension.trim_start_matches('.'));
+                if fallback.is_file() {
+                    return Some(fallback);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn push_unique_which_match(matches: &mut Vec<String>, seen: &mut BTreeSet<String>, value: String) {
     if seen.insert(value.clone()) {
         matches.push(value);
@@ -2675,7 +9891,9 @@ fn which_output_value(matches: Vec<String>, mode: &WhichMode) -> Result<Value, R
     match mode {
         WhichMode::All => {
             if matches.is_empty() {
-                Ok(Value::Cell(CellValue::new(0, 0, Vec::new()).expect("empty which cell")))
+                Ok(Value::Cell(
+                    CellValue::new(0, 0, Vec::new()).expect("empty which cell"),
+                ))
             } else {
                 Ok(Value::Cell(
                     CellValue::new(
@@ -2714,13 +9932,19 @@ fn functions_workspace_value_from_pairs(pairs: Vec<(String, Value)>) -> Value {
     if pairs.is_empty() {
         return empty_functions_workspace_value();
     }
-    let field_order = pairs.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
+    let field_order = pairs
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
     let fields = pairs.into_iter().collect::<BTreeMap<_, _>>();
     Value::Cell(
         CellValue::new(
             1,
             1,
-            vec![Value::Struct(StructValue::with_field_order(fields, field_order))],
+            vec![Value::Struct(StructValue::with_field_order(
+                fields,
+                field_order,
+            ))],
         )
         .expect("functions workspace cell"),
     )
@@ -2740,7 +9964,10 @@ fn functions_info_struct_value(
     let mut fields = BTreeMap::from([
         ("function".to_string(), Value::CharArray(function_name)),
         ("type".to_string(), Value::CharArray(type_name.to_string())),
-        ("file".to_string(), Value::CharArray(file.unwrap_or_default())),
+        (
+            "file".to_string(),
+            Value::CharArray(file.unwrap_or_default()),
+        ),
     ]);
     for (name, value) in extras {
         if !field_order.iter().any(|existing| existing == &name) {
@@ -2761,7 +9988,10 @@ fn functions_parentage_value(function_name: &str, file: Option<&str>) -> Value {
         CellValue::new(
             1,
             2,
-            vec![Value::CharArray(function_name.to_string()), Value::CharArray(parent)],
+            vec![
+                Value::CharArray(function_name.to_string()),
+                Value::CharArray(parent),
+            ],
         )
         .expect("functions parentage cell"),
     )
@@ -2794,7 +10024,8 @@ fn parse_scoped_function_handle_name(name: &str) -> Option<(PathBuf, String)> {
 
 fn resolved_path_functions_file(path: &Path, display_name: &str) -> Option<String> {
     if resolved_path_static_method_name(path, display_name).is_some()
-        || path.parent()
+        || path
+            .parent()
             .and_then(|parent| parent.file_name())
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with('@'))
@@ -2815,8 +10046,8 @@ fn resolved_str2func_handle_value(
 ) -> Result<Value, RuntimeError> {
     let name = normalize_str2func_name_arg(args)?;
     if let Some(source_path) = resolution_source_path {
-        let context =
-            ResolverContext::from_source_file(source_path.to_path_buf()).with_env_search_roots("MATC_PATH");
+        let context = ResolverContext::from_source_file(source_path.to_path_buf())
+            .with_env_search_roots("MATC_PATH");
         if let Some(resolved) = resolve_callable(&name, &context) {
             let path = match resolved {
                 ResolvedCallable::Function(resolved) => resolved.path,
@@ -2866,15 +10097,43 @@ struct ElementwiseCallbackOptions {
     error_handler: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+struct NlfilterInput {
+    dims: Vec<usize>,
+    elements: Vec<Value>,
+    padding_value: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColfiltBlockType {
+    Sliding,
+    Distinct,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BlockprocPadMethod {
+    Constant(f64),
+    Replicate,
+    Symmetric,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockprocOptions {
+    border_size: [usize; 2],
+    pad_partial_blocks: bool,
+    pad_method: BlockprocPadMethod,
+    trim_border: bool,
+}
+
 fn arrayfun_callback_value(value: &Value) -> Result<Value, RuntimeError> {
     match value {
         Value::FunctionHandle(_) => Ok(value.clone()),
-        Value::CharArray(text) | Value::String(text) => Ok(Value::FunctionHandle(
-            FunctionHandleValue {
+        Value::CharArray(text) | Value::String(text) => {
+            Ok(Value::FunctionHandle(FunctionHandleValue {
                 display_name: text.clone(),
                 target: FunctionHandleTarget::Named(text.clone()),
-            },
-        )),
+            }))
+        }
         other => Err(RuntimeError::TypeError(format!(
             "arrayfun currently expects a function handle or text function name, found {}",
             other.kind_name()
@@ -2889,8 +10148,7 @@ fn arrayfun_operand_from_value(value: &Value) -> Result<ArrayfunOperand, Runtime
             elements: matrix.elements().to_vec(),
         }),
         Value::Cell(_) => Err(RuntimeError::TypeError(
-            "arrayfun currently does not accept cell array inputs; use cellfun instead"
-                .to_string(),
+            "arrayfun currently does not accept cell array inputs; use cellfun instead".to_string(),
         )),
         other => Ok(ArrayfunOperand {
             dims: vec![1, 1],
@@ -2922,9 +10180,9 @@ fn split_elementwise_callback_options<'a>(
                 Value::Scalar(number) if *number == 1.0 => true,
                 other => {
                     return Err(RuntimeError::TypeError(format!(
-                        "{builtin_name} currently expects UniformOutput to be true or false, found {}",
-                        other.kind_name()
-                    )))
+                    "{builtin_name} currently expects UniformOutput to be true or false, found {}",
+                    other.kind_name()
+                )))
                 }
             };
             input_end -= 2;
@@ -3043,12 +10301,1057 @@ fn parse_cellfun_arguments(
             || !equivalent_dimensions(&operand.dims, &first.dims)
         {
             return Err(RuntimeError::ShapeError(
-                "cellfun currently expects all input cell arrays to have the same size"
-                    .to_string(),
+                "cellfun currently expects all input cell arrays to have the same size".to_string(),
             ));
         }
     }
     Ok((callback, operands, options))
+}
+
+fn parse_nlfilter_arguments(
+    args: &[Value],
+) -> Result<(Value, NlfilterInput, [usize; 2]), RuntimeError> {
+    match args {
+        [input, block_size, callback] => Ok((
+            arrayfun_callback_value(callback)?,
+            nlfilter_input_from_value(input, false)?,
+            nlfilter_block_size(block_size)?,
+        )),
+        [input, mode, block_size, callback]
+            if matches!(mode, Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("indexed")) =>
+        {
+            Ok((
+                arrayfun_callback_value(callback)?,
+                nlfilter_input_from_value(input, true)?,
+                nlfilter_block_size(block_size)?,
+            ))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "nlfilter currently supports `nlfilter(A,[m n],fun)` and `nlfilter(A,'indexed',[m n],fun)`".to_string(),
+        )),
+    }
+}
+
+fn nlfilter_input_from_value(value: &Value, indexed: bool) -> Result<NlfilterInput, RuntimeError> {
+    image_processing_input_from_value(value, indexed, "nlfilter")
+}
+
+fn image_processing_input_from_value(
+    value: &Value,
+    indexed: bool,
+    builtin_name: &str,
+) -> Result<NlfilterInput, RuntimeError> {
+    match value {
+        Value::Scalar(_) | Value::Int64(_) | Value::UInt64(_) | Value::Logical(_) => {
+            let padding_value = nlfilter_padding_value(value, indexed);
+            Ok(NlfilterInput {
+                dims: vec![1, 1],
+                elements: vec![value.clone()],
+                padding_value,
+            })
+        }
+        Value::Matrix(matrix) => {
+            let mut dims = matrix.dims().to_vec();
+            while dims.len() > 2 && dims.last() == Some(&1) {
+                dims.pop();
+            }
+            if dims.len() != 2 {
+                return Err(RuntimeError::ShapeError(format!(
+                    "{builtin_name} currently expects a 2-D numeric or logical array"
+                )));
+            }
+            match matrix.storage_class() {
+                ArrayStorageClass::Numeric | ArrayStorageClass::Logical => {}
+                _ => {
+                    return Err(RuntimeError::TypeError(format!(
+                        "{builtin_name} currently expects numeric or logical input, found {}",
+                        value.kind_name()
+                    )))
+                }
+            }
+            let padding_value = nlfilter_padding_value(
+                matrix.elements().first().unwrap_or(&Value::Scalar(0.0)),
+                indexed,
+            );
+            Ok(NlfilterInput {
+                dims,
+                elements: matrix.elements().to_vec(),
+                padding_value,
+            })
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects numeric or logical input, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn nlfilter_padding_value(prototype: &Value, indexed: bool) -> Value {
+    let numeric = if indexed {
+        match prototype {
+            Value::Logical(_) => 0.0,
+            _ => 1.0,
+        }
+    } else {
+        0.0
+    };
+    match prototype {
+        Value::Logical(_) => Value::Logical(numeric != 0.0),
+        Value::Int64(_) => Value::Int64(numeric as i64),
+        Value::UInt64(_) => Value::UInt64(numeric as u64),
+        _ => Value::Scalar(numeric),
+    }
+}
+
+fn nlfilter_block_size(value: &Value) -> Result<[usize; 2], RuntimeError> {
+    let elements = match value {
+        Value::Matrix(matrix) if matrix.rows == 1 || matrix.cols == 1 => matrix.elements().to_vec(),
+        Value::Matrix(_) => {
+            return Err(RuntimeError::ShapeError(
+                "nlfilter currently expects [m n] to be a two-element vector".to_string(),
+            ))
+        }
+        other => vec![other.clone()],
+    };
+    if elements.len() != 2 {
+        return Err(RuntimeError::ShapeError(
+            "nlfilter currently expects [m n] to be a two-element vector".to_string(),
+        ));
+    }
+    Ok([
+        nlfilter_positive_integer(&elements[0])?,
+        nlfilter_positive_integer(&elements[1])?,
+    ])
+}
+
+fn nlfilter_positive_integer(value: &Value) -> Result<usize, RuntimeError> {
+    match value {
+        Value::Scalar(number) => {
+            if !number.is_finite() || *number < 1.0 || number.fract() != 0.0 {
+                return Err(RuntimeError::TypeError(
+                    "nlfilter currently expects block dimensions to be positive integers"
+                        .to_string(),
+                ));
+            }
+            Ok(*number as usize)
+        }
+        Value::Int64(number) if *number >= 1 => Ok(*number as usize),
+        Value::UInt64(number) if *number >= 1 => Ok(*number as usize),
+        Value::Logical(true) => Ok(1),
+        _ => Err(RuntimeError::TypeError(
+            "nlfilter currently expects block dimensions to be positive integers".to_string(),
+        )),
+    }
+}
+
+fn parse_colfilt_arguments(
+    args: &[Value],
+) -> Result<(Value, NlfilterInput, [usize; 2], ColfiltBlockType), RuntimeError> {
+    let (indexed, remaining) = match args {
+        [input, mode, rest @ ..] if matches!(mode, Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("indexed")) => {
+            (
+                true,
+                std::iter::once(input)
+                    .chain(rest.iter())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        }
+        _ => (false, args.to_vec()),
+    };
+
+    match remaining.as_slice() {
+        [input, block_size, block_type, callback] => Ok((
+            arrayfun_callback_value(callback)?,
+            nlfilter_input_from_value(input, indexed)?,
+            nlfilter_block_size(block_size)?,
+            parse_colfilt_block_type(block_type)?,
+        )),
+        [input, block_size, group_size, block_type, callback] => {
+            let _ = nlfilter_block_size(group_size)?;
+            Ok((
+                arrayfun_callback_value(callback)?,
+                nlfilter_input_from_value(input, indexed)?,
+                nlfilter_block_size(block_size)?,
+                parse_colfilt_block_type(block_type)?,
+            ))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "colfilt currently supports `colfilt(A,[m n],block_type,fun)`, optional `[mblock nblock]`, and optional `'indexed'`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_colfilt_block_type(value: &Value) -> Result<ColfiltBlockType, RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("sliding") => {
+            Ok(ColfiltBlockType::Sliding)
+        }
+        Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("distinct") => {
+            Ok(ColfiltBlockType::Distinct)
+        }
+        _ => Err(RuntimeError::TypeError(
+            "colfilt currently expects block_type to be 'sliding' or 'distinct'".to_string(),
+        )),
+    }
+}
+
+fn parse_im2col_arguments(
+    args: &[Value],
+) -> Result<(NlfilterInput, [usize; 2], ColfiltBlockType), RuntimeError> {
+    match args {
+        [input, block_size] => Ok((
+            image_processing_input_from_value(input, false, "im2col")?,
+            nlfilter_block_size(block_size)?,
+            ColfiltBlockType::Sliding,
+        )),
+        [input, mode, block_size]
+            if matches!(mode, Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("indexed")) =>
+        {
+            Ok((
+                image_processing_input_from_value(input, true, "im2col")?,
+                nlfilter_block_size(block_size)?,
+                ColfiltBlockType::Sliding,
+            ))
+        }
+        [input, mode, block_size, block_type]
+            if matches!(mode, Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("indexed")) =>
+        {
+            Ok((
+                image_processing_input_from_value(input, true, "im2col")?,
+                nlfilter_block_size(block_size)?,
+                parse_colfilt_block_type(block_type)?,
+            ))
+        }
+        [input, block_size, block_type] => Ok((
+            image_processing_input_from_value(input, false, "im2col")?,
+            nlfilter_block_size(block_size)?,
+            parse_colfilt_block_type(block_type)?,
+        )),
+        _ => Err(RuntimeError::Unsupported(
+            "im2col currently supports `im2col(A,[m n])`, `im2col(A,[m n],blockType)`, and optional `'indexed'`"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_col2im_arguments(
+    args: &[Value],
+) -> Result<(NlfilterInput, [usize; 2], [usize; 2], ColfiltBlockType), RuntimeError> {
+    match args {
+        [blocks, block_size, image_size] => Ok((
+            image_processing_input_from_value(blocks, false, "col2im")?,
+            nlfilter_block_size(block_size)?,
+            col2im_image_size(image_size)?,
+            ColfiltBlockType::Sliding,
+        )),
+        [blocks, block_size, image_size, block_type] => Ok((
+            image_processing_input_from_value(blocks, false, "col2im")?,
+            nlfilter_block_size(block_size)?,
+            col2im_image_size(image_size)?,
+            parse_colfilt_block_type(block_type)?,
+        )),
+        _ => Err(RuntimeError::Unsupported(
+            "col2im currently supports `col2im(B,[m n],[M N])` or `col2im(B,[m n],[M N],blockType)`"
+                .to_string(),
+        )),
+    }
+}
+
+fn col2im_image_size(value: &Value) -> Result<[usize; 2], RuntimeError> {
+    let elements = match value {
+        Value::Matrix(matrix) if matrix.rows == 1 || matrix.cols == 1 => matrix.elements().to_vec(),
+        Value::Matrix(_) => {
+            return Err(RuntimeError::ShapeError(
+                "col2im currently expects [M N] to be a two-element vector".to_string(),
+            ))
+        }
+        other => vec![other.clone()],
+    };
+    if elements.len() != 2 {
+        return Err(RuntimeError::ShapeError(
+            "col2im currently expects [M N] to be a two-element vector".to_string(),
+        ));
+    }
+    Ok([
+        nlfilter_positive_integer(&elements[0])?,
+        nlfilter_positive_integer(&elements[1])?,
+    ])
+}
+
+pub(crate) fn execute_im2col_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "im2col currently supports exactly one output".to_string(),
+        ));
+    }
+    let (input, block_size, block_type) = parse_im2col_arguments(args)?;
+    let matrix = match block_type {
+        ColfiltBlockType::Sliding => build_im2col_sliding_matrix(&input, block_size)?,
+        ColfiltBlockType::Distinct => build_colfilt_distinct_temp_matrix(&input, block_size)?,
+    };
+    Ok(vec![Value::Matrix(matrix)])
+}
+
+pub(crate) fn execute_col2im_builtin_outputs(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "col2im currently supports exactly one output".to_string(),
+        ));
+    }
+    let (blocks, block_size, image_size, block_type) = parse_col2im_arguments(args)?;
+    let value = match block_type {
+        ColfiltBlockType::Sliding => build_col2im_sliding_output(&blocks, block_size, image_size)?,
+        ColfiltBlockType::Distinct => {
+            build_col2im_distinct_output(&blocks, block_size, image_size)?
+        }
+    };
+    Ok(vec![value])
+}
+
+fn parse_blockproc_arguments(
+    args: &[Value],
+) -> Result<(Value, NlfilterInput, [usize; 2], BlockprocOptions), RuntimeError> {
+    let [input, block_size, callback, tail @ ..] = args else {
+        return Err(RuntimeError::Unsupported(
+            "blockproc currently supports `blockproc(A,[m n],fun)` plus selected name-value options"
+                .to_string(),
+        ));
+    };
+    let callback = arrayfun_callback_value(callback)?;
+    let input = image_processing_input_from_value(input, false, "blockproc")?;
+    let block_size = nlfilter_block_size(block_size)?;
+    let mut options = BlockprocOptions {
+        border_size: [0, 0],
+        pad_partial_blocks: false,
+        pad_method: BlockprocPadMethod::Constant(0.0),
+        trim_border: true,
+    };
+
+    let mut index = 0usize;
+    while index < tail.len() {
+        let Some(name) = tail.get(index) else {
+            break;
+        };
+        let Some(value) = tail.get(index + 1) else {
+            return Err(RuntimeError::Unsupported(
+                "blockproc currently expects name-value options to appear in pairs".to_string(),
+            ));
+        };
+        let option = match name {
+            Value::CharArray(text) | Value::String(text) => text.as_str(),
+            _ => {
+                return Err(RuntimeError::TypeError(
+                    "blockproc currently expects option names to be char or string values"
+                        .to_string(),
+                ))
+            }
+        };
+
+        if option.eq_ignore_ascii_case("BorderSize") {
+            options.border_size = nonnegative_integer_pair(value, "blockproc", "BorderSize")?;
+        } else if option.eq_ignore_ascii_case("PadPartialBlocks") {
+            options.pad_partial_blocks = bool_option_value(value, "blockproc", "PadPartialBlocks")?;
+        } else if option.eq_ignore_ascii_case("PadMethod") {
+            options.pad_method = parse_blockproc_pad_method(value)?;
+        } else if option.eq_ignore_ascii_case("TrimBorder") {
+            options.trim_border = bool_option_value(value, "blockproc", "TrimBorder")?;
+        } else if option.eq_ignore_ascii_case("UseParallel")
+            || option.eq_ignore_ascii_case("DisplayWaitbar")
+        {
+            let _ = bool_option_value(value, "blockproc", option)?;
+        } else {
+            return Err(RuntimeError::Unsupported(format!(
+                "blockproc currently does not support the `{option}` option"
+            )));
+        }
+        index += 2;
+    }
+
+    Ok((callback, input, block_size, options))
+}
+
+fn nonnegative_integer_pair(
+    value: &Value,
+    builtin_name: &str,
+    label: &str,
+) -> Result<[usize; 2], RuntimeError> {
+    let elements = match value {
+        Value::Matrix(matrix) if matrix.rows == 1 || matrix.cols == 1 => matrix.elements().to_vec(),
+        Value::Matrix(_) => {
+            return Err(RuntimeError::ShapeError(format!(
+                "{builtin_name} currently expects {label} to be a two-element vector"
+            )))
+        }
+        other => vec![other.clone()],
+    };
+    if elements.len() != 2 {
+        return Err(RuntimeError::ShapeError(format!(
+            "{builtin_name} currently expects {label} to be a two-element vector"
+        )));
+    }
+    Ok([
+        nonnegative_integer_option(&elements[0], builtin_name, label)?,
+        nonnegative_integer_option(&elements[1], builtin_name, label)?,
+    ])
+}
+
+fn nonnegative_integer_option(
+    value: &Value,
+    builtin_name: &str,
+    label: &str,
+) -> Result<usize, RuntimeError> {
+    match value {
+        Value::Scalar(number) => {
+            if !number.is_finite() || *number < 0.0 || number.fract() != 0.0 {
+                return Err(RuntimeError::TypeError(format!(
+                    "{builtin_name} currently expects {label} to contain nonnegative integers"
+                )));
+            }
+            Ok(*number as usize)
+        }
+        Value::Int64(number) if *number >= 0 => Ok(*number as usize),
+        Value::UInt64(number) => Ok(*number as usize),
+        Value::Logical(flag) => Ok(usize::from(*flag)),
+        _ => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects {label} to contain nonnegative integers"
+        ))),
+    }
+}
+
+fn bool_option_value(value: &Value, builtin_name: &str, label: &str) -> Result<bool, RuntimeError> {
+    match value {
+        Value::Logical(flag) => Ok(*flag),
+        Value::Scalar(number) if *number == 0.0 => Ok(false),
+        Value::Scalar(number) if *number == 1.0 => Ok(true),
+        _ => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects {label} to be true or false"
+        ))),
+    }
+}
+
+fn parse_blockproc_pad_method(value: &Value) -> Result<BlockprocPadMethod, RuntimeError> {
+    match value {
+        Value::Scalar(_) | Value::Logical(_) => Ok(BlockprocPadMethod::Constant(
+            finite_scalar_value(value, "blockproc")?,
+        )),
+        Value::CharArray(text) | Value::String(text) => match text.to_ascii_lowercase().as_str() {
+            "replicate" => Ok(BlockprocPadMethod::Replicate),
+            "symmetric" => Ok(BlockprocPadMethod::Symmetric),
+            _ => Err(RuntimeError::Unsupported(
+                "blockproc currently supports only numeric, `replicate`, or `symmetric` PadMethod"
+                    .to_string(),
+            )),
+        },
+        _ => Err(RuntimeError::TypeError(
+            "blockproc currently expects PadMethod to be numeric, char, or string".to_string(),
+        )),
+    }
+}
+
+pub(crate) fn execute_blockproc_builtin_outputs<F>(
+    args: &[Value],
+    output_arity: usize,
+    mut invoke_callback: F,
+) -> Result<Vec<Value>, RuntimeError>
+where
+    F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
+{
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "blockproc currently supports exactly one output".to_string(),
+        ));
+    }
+    let (callback, input, block_size, options) = parse_blockproc_arguments(args)?;
+    if input.elements.is_empty() {
+        return Ok(vec![empty_matrix_value()]);
+    }
+
+    let rows = input.dims[0];
+    let cols = input.dims[1];
+    let block_rows = rows.div_ceil(block_size[0]);
+    let block_cols = cols.div_ceil(block_size[1]);
+    let mut output_rows = Vec::with_capacity(block_rows);
+
+    for block_row in 0..block_rows {
+        let mut row_outputs = Vec::with_capacity(block_cols);
+        for block_col in 0..block_cols {
+            let block_struct =
+                blockproc_block_struct_value(&input, block_size, options, block_row, block_col)?;
+            let outputs = invoke_callback(&callback, &[block_struct], 1)?;
+            let Some(value) = outputs.first() else {
+                return Err(RuntimeError::Unsupported(
+                    "blockproc callback did not produce an output".to_string(),
+                ));
+            };
+            if blockproc_value_is_empty(value) {
+                return Ok(vec![empty_matrix_value()]);
+            }
+            row_outputs.push(blockproc_trim_value(
+                value.clone(),
+                options.border_size,
+                options.trim_border,
+            )?);
+        }
+        output_rows.push(concatenate_values("horzcat", &row_outputs)?);
+    }
+
+    Ok(vec![concatenate_values("vertcat", &output_rows)?])
+}
+
+pub(crate) fn execute_colfilt_builtin_outputs<F>(
+    args: &[Value],
+    output_arity: usize,
+    mut invoke_callback: F,
+) -> Result<Vec<Value>, RuntimeError>
+where
+    F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
+{
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "colfilt currently supports exactly one output".to_string(),
+        ));
+    }
+    let (callback, input, block_size, block_type) = parse_colfilt_arguments(args)?;
+    if input.elements.is_empty() {
+        return Ok(vec![build_arrayfun_output(&input.dims, Vec::new(), true)?]);
+    }
+
+    match block_type {
+        ColfiltBlockType::Sliding => {
+            let temp = build_colfilt_sliding_temp_matrix(&input, block_size)?;
+            let outputs = invoke_callback(&callback, &[Value::Matrix(temp)], 1)?;
+            let Some(value) = outputs.first() else {
+                return Err(RuntimeError::Unsupported(
+                    "colfilt callback did not produce an output".to_string(),
+                ));
+            };
+            Ok(vec![colfilt_sliding_output_value(
+                value,
+                &input.dims,
+                input.elements.len(),
+            )?])
+        }
+        ColfiltBlockType::Distinct => {
+            let temp = build_colfilt_distinct_temp_matrix(&input, block_size)?;
+            let temp_cols = temp.cols;
+            let temp_rows = temp.rows;
+            let outputs = invoke_callback(&callback, &[Value::Matrix(temp)], 1)?;
+            let Some(value) = outputs.first() else {
+                return Err(RuntimeError::Unsupported(
+                    "colfilt callback did not produce an output".to_string(),
+                ));
+            };
+            Ok(vec![colfilt_distinct_output_value(
+                value, &input, block_size, temp_rows, temp_cols,
+            )?])
+        }
+    }
+}
+
+fn build_colfilt_sliding_temp_matrix(
+    input: &NlfilterInput,
+    block_size: [usize; 2],
+) -> Result<MatrixValue, RuntimeError> {
+    let rows = input.dims[0];
+    let cols = input.dims[1];
+    let temp_rows = block_size[0] * block_size[1];
+    let temp_cols = rows * cols;
+    let center_row = ((block_size[0] as isize + 1) / 2) - 1;
+    let center_col = ((block_size[1] as isize + 1) / 2) - 1;
+    let mut elements = Vec::with_capacity(temp_rows * temp_cols);
+    for temp_row in 0..temp_rows {
+        let block_index = column_major_multi_index(temp_row, &block_size);
+        for temp_col in 0..temp_cols {
+            let output_index = column_major_multi_index(temp_col, &[rows, cols]);
+            let source_row = output_index[0] as isize + block_index[0] as isize - center_row;
+            let source_col = output_index[1] as isize + block_index[1] as isize - center_col;
+            elements.push(sample_nlfilter_input(input, source_row, source_col));
+        }
+    }
+    MatrixValue::new(temp_rows, temp_cols, elements)
+}
+
+fn build_im2col_sliding_matrix(
+    input: &NlfilterInput,
+    block_size: [usize; 2],
+) -> Result<MatrixValue, RuntimeError> {
+    let rows = input.dims[0];
+    let cols = input.dims[1];
+    let temp_rows = block_size[0] * block_size[1];
+    let out_rows = if rows >= block_size[0] {
+        rows - block_size[0] + 1
+    } else {
+        0
+    };
+    let out_cols = if cols >= block_size[1] {
+        cols - block_size[1] + 1
+    } else {
+        0
+    };
+    let temp_cols = out_rows * out_cols;
+    let mut elements = Vec::with_capacity(temp_rows * temp_cols);
+    for temp_row in 0..temp_rows {
+        let block_index = column_major_multi_index(temp_row, &block_size);
+        for temp_col in 0..temp_cols {
+            let output_index = column_major_multi_index(temp_col, &[out_rows, out_cols]);
+            let source_row = output_index[0] + block_index[0];
+            let source_col = output_index[1] + block_index[1];
+            elements.push(input.elements[source_row * cols + source_col].clone());
+        }
+    }
+    MatrixValue::new(temp_rows, temp_cols, elements)
+}
+
+fn build_colfilt_distinct_temp_matrix(
+    input: &NlfilterInput,
+    block_size: [usize; 2],
+) -> Result<MatrixValue, RuntimeError> {
+    let rows = input.dims[0];
+    let cols = input.dims[1];
+    let block_rows = rows.div_ceil(block_size[0]);
+    let block_cols = cols.div_ceil(block_size[1]);
+    let temp_rows = block_size[0] * block_size[1];
+    let temp_cols = block_rows * block_cols;
+    let mut elements = Vec::with_capacity(temp_rows * temp_cols);
+    for temp_row in 0..temp_rows {
+        let block_index = column_major_multi_index(temp_row, &block_size);
+        for temp_col in 0..temp_cols {
+            let grid_index = column_major_multi_index(temp_col, &[block_rows, block_cols]);
+            let source_row = (grid_index[0] * block_size[0] + block_index[0]) as isize;
+            let source_col = (grid_index[1] * block_size[1] + block_index[1]) as isize;
+            elements.push(sample_nlfilter_input(input, source_row, source_col));
+        }
+    }
+    MatrixValue::new(temp_rows, temp_cols, elements)
+}
+
+fn build_col2im_sliding_output(
+    blocks: &NlfilterInput,
+    block_size: [usize; 2],
+    image_size: [usize; 2],
+) -> Result<Value, RuntimeError> {
+    let out_rows = if image_size[0] >= block_size[0] {
+        image_size[0] - block_size[0] + 1
+    } else {
+        0
+    };
+    let out_cols = if image_size[1] >= block_size[1] {
+        image_size[1] - block_size[1] + 1
+    } else {
+        0
+    };
+    let expected = out_rows * out_cols;
+    let matlab_linear = colfilt_callback_linear_values(
+        &input_value_from_image_processing_input(blocks)?,
+        expected,
+        "col2im",
+    )?;
+    let row_major = reorder_matlab_linear_values_to_row_major(matlab_linear, &[out_rows, out_cols]);
+    Ok(Value::Matrix(MatrixValue::new(
+        out_rows, out_cols, row_major,
+    )?))
+}
+
+fn build_col2im_distinct_output(
+    blocks: &NlfilterInput,
+    block_size: [usize; 2],
+    image_size: [usize; 2],
+) -> Result<Value, RuntimeError> {
+    let expected_rows = block_size[0] * block_size[1];
+    if blocks.dims[0] != expected_rows {
+        return Err(RuntimeError::ShapeError(format!(
+            "col2im currently expects B to have {expected_rows} row(s) for block size {:?}",
+            block_size
+        )));
+    }
+    let block_rows = image_size[0].div_ceil(block_size[0]);
+    let block_cols = image_size[1].div_ceil(block_size[1]);
+    let expected_cols = block_rows * block_cols;
+    if blocks.dims[1] != expected_cols {
+        return Err(RuntimeError::ShapeError(format!(
+            "col2im currently expects B to have {expected_cols} column(s) for image size {:?} and block size {:?}",
+            image_size, block_size
+        )));
+    }
+    let full_rows = block_rows * block_size[0];
+    let full_cols = block_cols * block_size[1];
+    let mut padded = vec![blocks.padding_value.clone(); full_rows * full_cols];
+    for temp_row in 0..expected_rows {
+        let block_index = column_major_multi_index(temp_row, &block_size);
+        for temp_col in 0..expected_cols {
+            let grid_index = column_major_multi_index(temp_col, &[block_rows, block_cols]);
+            let target_row = grid_index[0] * block_size[0] + block_index[0];
+            let target_col = grid_index[1] * block_size[1] + block_index[1];
+            padded[target_row * full_cols + target_col] =
+                blocks.elements[temp_row * expected_cols + temp_col].clone();
+        }
+    }
+    let mut cropped = Vec::with_capacity(image_size[0] * image_size[1]);
+    for row in 0..image_size[0] {
+        for col in 0..image_size[1] {
+            cropped.push(padded[row * full_cols + col].clone());
+        }
+    }
+    Ok(Value::Matrix(MatrixValue::new(
+        image_size[0],
+        image_size[1],
+        cropped,
+    )?))
+}
+
+fn input_value_from_image_processing_input(input: &NlfilterInput) -> Result<Value, RuntimeError> {
+    let (rows, cols) = storage_shape_from_dimensions(&input.dims);
+    Ok(Value::Matrix(MatrixValue::with_dimensions(
+        rows,
+        cols,
+        input.dims.clone(),
+        input.elements.clone(),
+    )?))
+}
+
+fn blockproc_block_struct_value(
+    input: &NlfilterInput,
+    block_size: [usize; 2],
+    options: BlockprocOptions,
+    block_row: usize,
+    block_col: usize,
+) -> Result<Value, RuntimeError> {
+    let row_start = block_row * block_size[0];
+    let col_start = block_col * block_size[1];
+    let actual_rows = input.dims[0].saturating_sub(row_start).min(block_size[0]);
+    let actual_cols = input.dims[1].saturating_sub(col_start).min(block_size[1]);
+    let data_rows = if options.pad_partial_blocks {
+        block_size[0]
+    } else {
+        actual_rows
+    };
+    let data_cols = if options.pad_partial_blocks {
+        block_size[1]
+    } else {
+        actual_cols
+    };
+    let full_rows = data_rows + 2 * options.border_size[0];
+    let full_cols = data_cols + 2 * options.border_size[1];
+    let mut data_elements = Vec::with_capacity(full_rows * full_cols);
+    for local_row in 0..full_rows {
+        for local_col in 0..full_cols {
+            let source_row =
+                row_start as isize + local_row as isize - options.border_size[0] as isize;
+            let source_col =
+                col_start as isize + local_col as isize - options.border_size[1] as isize;
+            data_elements.push(blockproc_sample(
+                input,
+                source_row,
+                source_col,
+                options.pad_method,
+            ));
+        }
+    }
+    let data = if full_rows == 1 && full_cols == 1 {
+        data_elements
+            .into_iter()
+            .next()
+            .expect("single block element")
+    } else {
+        Value::Matrix(MatrixValue::new(full_rows, full_cols, data_elements)?)
+    };
+
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "border".to_string(),
+        numeric_row_vector_value(&[options.border_size[0] as f64, options.border_size[1] as f64])?,
+    );
+    fields.insert(
+        "blockSize".to_string(),
+        numeric_row_vector_value(&[data_rows as f64, data_cols as f64])?,
+    );
+    fields.insert("data".to_string(), data);
+    fields.insert(
+        "imageSize".to_string(),
+        numeric_row_vector_value(&[input.dims[0] as f64, input.dims[1] as f64])?,
+    );
+    fields.insert(
+        "location".to_string(),
+        numeric_row_vector_value(&[(row_start + 1) as f64, (col_start + 1) as f64])?,
+    );
+    Ok(Value::Struct(StructValue::with_field_order(
+        fields,
+        vec![
+            "border".to_string(),
+            "blockSize".to_string(),
+            "data".to_string(),
+            "imageSize".to_string(),
+            "location".to_string(),
+        ],
+    )))
+}
+
+fn blockproc_sample(
+    input: &NlfilterInput,
+    row: isize,
+    col: isize,
+    pad_method: BlockprocPadMethod,
+) -> Value {
+    if row >= 0 && row < input.dims[0] as isize && col >= 0 && col < input.dims[1] as isize {
+        return input.elements[row as usize * input.dims[1] + col as usize].clone();
+    }
+    match pad_method {
+        BlockprocPadMethod::Constant(value) => typed_padding_value(&input.padding_value, value),
+        BlockprocPadMethod::Replicate => {
+            let row = row.clamp(0, input.dims[0] as isize - 1) as usize;
+            let col = col.clamp(0, input.dims[1] as isize - 1) as usize;
+            input.elements[row * input.dims[1] + col].clone()
+        }
+        BlockprocPadMethod::Symmetric => {
+            let row = symmetric_padded_index(row, input.dims[0]);
+            let col = symmetric_padded_index(col, input.dims[1]);
+            input.elements[row * input.dims[1] + col].clone()
+        }
+    }
+}
+
+fn typed_padding_value(prototype: &Value, numeric: f64) -> Value {
+    match prototype {
+        Value::Logical(_) => Value::Logical(numeric != 0.0),
+        Value::Int64(_) => Value::Int64(numeric as i64),
+        Value::UInt64(_) => Value::UInt64(numeric as u64),
+        _ => Value::Scalar(numeric),
+    }
+}
+
+fn symmetric_padded_index(index: isize, len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let mut index = index;
+    let len = len as isize;
+    while index < 0 || index >= len {
+        if index < 0 {
+            index = -index - 1;
+        } else {
+            index = (2 * len) - index - 1;
+        }
+    }
+    index as usize
+}
+
+fn numeric_row_vector_value(values: &[f64]) -> Result<Value, RuntimeError> {
+    Ok(Value::Matrix(MatrixValue::new(
+        1,
+        values.len(),
+        values.iter().copied().map(Value::Scalar).collect(),
+    )?))
+}
+
+fn blockproc_value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::CharArray(text) | Value::String(text) => text.is_empty(),
+        Value::Matrix(matrix) => matrix.rows == 0 || matrix.cols == 0,
+        Value::Cell(cell) => cell.rows == 0 || cell.cols == 0,
+        _ => false,
+    }
+}
+
+fn blockproc_trim_value(
+    value: Value,
+    border_size: [usize; 2],
+    trim_border: bool,
+) -> Result<Value, RuntimeError> {
+    if !trim_border || border_size == [0, 0] {
+        return Ok(value);
+    }
+    let Value::Matrix(matrix) = value else {
+        return Err(RuntimeError::Unsupported(
+            "blockproc currently expects non-scalar callback outputs when using TrimBorder"
+                .to_string(),
+        ));
+    };
+    if matrix.rows < 2 * border_size[0] || matrix.cols < 2 * border_size[1] {
+        return Ok(empty_matrix_value());
+    }
+    let out_rows = matrix.rows - 2 * border_size[0];
+    let out_cols = matrix.cols - 2 * border_size[1];
+    let mut elements = Vec::with_capacity(out_rows * out_cols);
+    for row in border_size[0]..(border_size[0] + out_rows) {
+        for col in border_size[1]..(border_size[1] + out_cols) {
+            elements.push(matrix.elements()[row * matrix.cols + col].clone());
+        }
+    }
+    if out_rows == 1 && out_cols == 1 {
+        Ok(elements.into_iter().next().expect("trimmed scalar"))
+    } else {
+        Ok(Value::Matrix(MatrixValue::new(
+            out_rows, out_cols, elements,
+        )?))
+    }
+}
+
+fn concatenate_values(name: &str, values: &[Value]) -> Result<Value, RuntimeError> {
+    invoke_stdlib_builtin_outputs(name, values, 1)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| RuntimeError::Unsupported(format!("{name} did not produce an output")))
+}
+
+fn sample_nlfilter_input(input: &NlfilterInput, row: isize, col: isize) -> Value {
+    let rows = input.dims[0];
+    let cols = input.dims[1];
+    if row < 0 || row >= rows as isize || col < 0 || col >= cols as isize {
+        input.padding_value.clone()
+    } else {
+        input.elements[row as usize * cols + col as usize].clone()
+    }
+}
+
+fn colfilt_sliding_output_value(
+    value: &Value,
+    input_dims: &[usize],
+    expected_count: usize,
+) -> Result<Value, RuntimeError> {
+    let matlab_linear = colfilt_callback_linear_values(value, expected_count, "colfilt")?;
+    let row_major = reorder_matlab_linear_values_to_row_major(matlab_linear, input_dims);
+    build_arrayfun_output(input_dims, row_major, true)
+}
+
+fn colfilt_distinct_output_value(
+    value: &Value,
+    input: &NlfilterInput,
+    block_size: [usize; 2],
+    temp_rows: usize,
+    temp_cols: usize,
+) -> Result<Value, RuntimeError> {
+    let expected_count = temp_rows * temp_cols;
+    let row_major_temp = colfilt_callback_row_major_matrix_values(
+        value,
+        temp_rows,
+        temp_cols,
+        expected_count,
+        "colfilt",
+    )?;
+    let block_rows = input.dims[0].div_ceil(block_size[0]);
+    let block_cols = input.dims[1].div_ceil(block_size[1]);
+    let output_rows = block_rows * block_size[0];
+    let output_cols = block_cols * block_size[1];
+    let mut output = vec![input.padding_value.clone(); output_rows * output_cols];
+    for temp_row in 0..temp_rows {
+        let block_index = column_major_multi_index(temp_row, &block_size);
+        for temp_col in 0..temp_cols {
+            let grid_index = column_major_multi_index(temp_col, &[block_rows, block_cols]);
+            let target_row = grid_index[0] * block_size[0] + block_index[0];
+            let target_col = grid_index[1] * block_size[1] + block_index[1];
+            output[target_row * output_cols + target_col] =
+                row_major_temp[temp_row * temp_cols + temp_col].clone();
+        }
+    }
+    let dims = vec![output_rows, output_cols];
+    build_arrayfun_output(&dims, output, true)
+}
+
+fn colfilt_callback_linear_values(
+    value: &Value,
+    expected_count: usize,
+    builtin_name: &str,
+) -> Result<Vec<Value>, RuntimeError> {
+    match value {
+        Value::Matrix(matrix) => {
+            if matrix.element_count() != expected_count {
+                return Err(RuntimeError::ShapeError(format!(
+                    "{builtin_name} callback must return {expected_count} value(s)"
+                )));
+            }
+            linearized_matrix_elements(matrix)
+        }
+        other if expected_count == 1 => Ok(vec![other.clone()]),
+        other => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} callback must return a vector with {expected_count} value(s), found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn colfilt_callback_row_major_matrix_values(
+    value: &Value,
+    rows: usize,
+    cols: usize,
+    expected_count: usize,
+    builtin_name: &str,
+) -> Result<Vec<Value>, RuntimeError> {
+    let matlab_linear = colfilt_callback_linear_values(value, expected_count, builtin_name)?;
+    Ok(reorder_matlab_linear_values_to_row_major(
+        matlab_linear,
+        &[rows, cols],
+    ))
+}
+
+pub(crate) fn execute_nlfilter_builtin_outputs<F>(
+    args: &[Value],
+    output_arity: usize,
+    mut invoke_callback: F,
+) -> Result<Vec<Value>, RuntimeError>
+where
+    F: FnMut(&Value, &[Value], usize) -> Result<Vec<Value>, RuntimeError>,
+{
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "nlfilter currently supports exactly one output".to_string(),
+        ));
+    }
+    let (callback, input, block_size) = parse_nlfilter_arguments(args)?;
+    if input.elements.is_empty() {
+        return Ok(vec![build_arrayfun_output(&input.dims, Vec::new(), true)?]);
+    }
+
+    let rows = input.dims[0];
+    let cols = input.dims[1];
+    let center_row = ((block_size[0] as isize + 1) / 2) - 1;
+    let center_col = ((block_size[1] as isize + 1) / 2) - 1;
+    let mut outputs = Vec::with_capacity(input.elements.len());
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let mut block_elements = Vec::with_capacity(block_size[0] * block_size[1]);
+            for block_row in 0..block_size[0] {
+                for block_col in 0..block_size[1] {
+                    let source_row = row as isize + block_row as isize - center_row;
+                    let source_col = col as isize + block_col as isize - center_col;
+                    if source_row < 0
+                        || source_row >= rows as isize
+                        || source_col < 0
+                        || source_col >= cols as isize
+                    {
+                        block_elements.push(input.padding_value.clone());
+                    } else {
+                        block_elements.push(
+                            input.elements[source_row as usize * cols + source_col as usize]
+                                .clone(),
+                        );
+                    }
+                }
+            }
+            let block = Value::Matrix(MatrixValue::new(
+                block_size[0],
+                block_size[1],
+                block_elements,
+            )?);
+            let values = invoke_callback(&callback, &[block], 1)?;
+            let Some(value) = values.first() else {
+                return Err(RuntimeError::Unsupported(
+                    "nlfilter callback did not produce an output".to_string(),
+                ));
+            };
+            outputs.push(normalize_arrayfun_uniform_output(value.clone())?);
+        }
+    }
+
+    Ok(vec![build_arrayfun_output(&input.dims, outputs, true)?])
 }
 
 fn parse_structfun_arguments(
@@ -3095,7 +11398,11 @@ fn normalize_arrayfun_uniform_output(value: Value) -> Result<Value, RuntimeError
     }
 }
 
-fn build_arrayfun_output(dims: &[usize], values: Vec<Value>, uniform_output: bool) -> Result<Value, RuntimeError> {
+fn build_arrayfun_output(
+    dims: &[usize],
+    values: Vec<Value>,
+    uniform_output: bool,
+) -> Result<Value, RuntimeError> {
     let (rows, cols) = storage_shape_from_dimensions(dims);
     if uniform_output {
         if rows == 1 && cols == 1 && values.len() == 1 {
@@ -3127,7 +11434,14 @@ where
 {
     let output_arity = output_arity.max(1);
     let (callback, operands, options) = parse_arrayfun_arguments(args)?;
-    execute_elementwise_callback_outputs(callback, operands, options, output_arity, "arrayfun", invoke_callback)
+    execute_elementwise_callback_outputs(
+        callback,
+        operands,
+        options,
+        output_arity,
+        "arrayfun",
+        invoke_callback,
+    )
 }
 
 pub(crate) fn execute_cellfun_builtin_outputs<F>(
@@ -3140,7 +11454,14 @@ where
 {
     let output_arity = output_arity.max(1);
     let (callback, operands, options) = parse_cellfun_arguments(args)?;
-    execute_elementwise_callback_outputs(callback, operands, options, output_arity, "cellfun", invoke_callback)
+    execute_elementwise_callback_outputs(
+        callback,
+        operands,
+        options,
+        output_arity,
+        "cellfun",
+        invoke_callback,
+    )
 }
 
 pub(crate) fn execute_structfun_builtin_outputs<F>(
@@ -3153,7 +11474,14 @@ where
 {
     let output_arity = output_arity.max(1);
     let (callback, operands, options) = parse_structfun_arguments(args)?;
-    execute_elementwise_callback_outputs(callback, operands, options, output_arity, "structfun", invoke_callback)
+    execute_elementwise_callback_outputs(
+        callback,
+        operands,
+        options,
+        output_arity,
+        "structfun",
+        invoke_callback,
+    )
 }
 
 fn execute_elementwise_callback_outputs<F>(
@@ -3249,37 +11577,56 @@ fn invoke_fprintf_builtin_outputs(
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let (format, values) = match args {
-        [] => {
-            return Err(RuntimeError::Unsupported(
-                "fprintf currently expects at least a format string".to_string(),
-            ))
-        }
-        [format, values @ ..] => (text_value(format)?, values),
-    };
+    enum FprintfTarget {
+        Display,
+        File(i32),
+    }
 
-    let (format, values) = if let Some(first) = args.first() {
-        match first.as_scalar() {
-            Ok(file_id)
-                if (file_id - 1.0).abs() <= f64::EPSILON
-                    || (file_id - 2.0).abs() <= f64::EPSILON =>
-            {
-                let format = text_value(args.get(1).ok_or_else(|| {
-                    RuntimeError::Unsupported(
-                        "fprintf currently expects a format string after the file identifier"
-                            .to_string(),
-                    )
-                })?)?;
-                (format, &args[2..])
-            }
-            _ => (format, values),
-        }
-    } else {
-        (format, values)
+    let Some(first) = args.first() else {
+        return Err(RuntimeError::Unsupported(
+            "fprintf currently expects at least a format string".to_string(),
+        ));
     };
+    let (target, format_index) = match first {
+        Value::Scalar(_) => {
+            let file_id = parse_runtime_file_id(first, "fprintf")?;
+            if file_id == 1 || file_id == 2 {
+                (FprintfTarget::Display, 1)
+            } else if file_id == 0 {
+                return Err(RuntimeError::Unsupported(
+                    "fprintf operation is not implemented for requested file identifier"
+                        .to_string(),
+                ));
+            } else if shared_state.borrow().open_files.contains_key(&file_id) {
+                (FprintfTarget::File(file_id), 1)
+            } else {
+                return Err(RuntimeError::TypeError(
+                    "fprintf currently expects a valid open file identifier".to_string(),
+                ));
+            }
+        }
+        _ => (FprintfTarget::Display, 0),
+    };
+    let format = text_value(args.get(format_index).ok_or_else(|| {
+        RuntimeError::Unsupported(
+            "fprintf currently expects a format string after the file identifier".to_string(),
+        )
+    })?)?;
+    let values = &args[(format_index + 1)..];
 
     let rendered = format_stdlib_text(format, values, "fprintf")?;
-    push_text_displayed_output(shared_state, rendered.clone(), false);
+    match target {
+        FprintfTarget::Display => push_text_displayed_output(shared_state, rendered.clone(), false),
+        FprintfTarget::File(file_id) => {
+            let mut state = shared_state.borrow_mut();
+            let handle = state.open_files.get_mut(&file_id).ok_or_else(|| {
+                RuntimeError::TypeError(
+                    "fprintf currently expects a valid open file identifier".to_string(),
+                )
+            })?;
+            handle.write_text("fprintf", &rendered)?;
+        }
+    }
     match output_arity {
         0 => Ok(Vec::new()),
         1 => Ok(vec![Value::Scalar(rendered.len() as f64)]),
@@ -3354,10 +11701,11 @@ fn invoke_format_builtin_outputs(
 fn invoke_who_builtin_outputs(
     frame: Option<&Frame<'_>>,
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let entries = workspace_entries(frame, args, "who")?;
+    let entries = workspace_entries(frame, shared_state, resolution_source_path, args, "who")?;
     match output_arity {
         0 => {
             let mut out = String::from("Your variables are:\n\n");
@@ -3393,10 +11741,11 @@ fn invoke_who_builtin_outputs(
 fn invoke_whos_builtin_outputs(
     frame: Option<&Frame<'_>>,
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let entries = workspace_entries(frame, args, "whos")?;
+    let entries = workspace_entries(frame, shared_state, resolution_source_path, args, "whos")?;
     match output_arity {
         0 => {
             let mut out = String::from("  Name      Size            Bytes  Class\n");
@@ -3494,6 +11843,7 @@ fn invoke_clearvars_builtin_outputs(
 fn invoke_save_builtin_outputs(
     frame: &mut Frame<'_>,
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
@@ -3502,7 +11852,7 @@ fn invoke_save_builtin_outputs(
             "save currently does not return outputs".to_string(),
         ));
     }
-    let spec = parse_save_spec(args)?;
+    let spec = parse_save_spec(shared_state, resolution_source_path, args)?;
     let workspace = frame.export_workspace()?;
     let selected = if let Some(struct_name) = spec.struct_name {
         let value = workspace.get(&struct_name).cloned().ok_or_else(|| {
@@ -3566,20 +11916,21 @@ fn invoke_save_builtin_outputs(
         filtered
     };
     let (merged, snapshot_bundle_modules) = if spec.append && spec.path.exists() {
-        let (mut existing, mut existing_bundle_modules) = if workspace_snapshot_extension(&spec.path) {
-            let snapshot = read_workspace_snapshot_with_modules(&spec.path)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-            (
-                snapshot.workspace,
-                decode_snapshot_bundle_modules(&snapshot.bundle_modules)?,
-            )
-        } else {
-            (
-                read_mat_file(&spec.path)
-                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
-                Vec::new(),
-            )
-        };
+        let (mut existing, mut existing_bundle_modules) =
+            if workspace_snapshot_extension(&spec.path) {
+                let snapshot = read_workspace_snapshot_with_modules(&spec.path)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                (
+                    snapshot.workspace,
+                    decode_snapshot_bundle_modules(&snapshot.bundle_modules)?,
+                )
+            } else {
+                (
+                    read_mat_file(&spec.path)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                    Vec::new(),
+                )
+            };
         for (name, value) in selected {
             existing.insert(name, value);
         }
@@ -3616,7 +11967,7 @@ fn invoke_save_builtin_outputs(
             &merged,
             &encode_snapshot_bundle_modules(&snapshot_bundle_modules),
         )
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     } else {
         write_mat_file(&spec.path, &merged)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
@@ -3627,14 +11978,18 @@ fn invoke_save_builtin_outputs(
 fn invoke_load_builtin_outputs(
     frame: &mut Frame<'_>,
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let spec = parse_load_arguments(args)?;
+    let spec = parse_load_arguments(shared_state, resolution_source_path, args)?;
     let mut workspace = if workspace_snapshot_extension(&spec.path) {
         let snapshot = read_workspace_snapshot_with_modules(&spec.path)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-        install_bundled_modules(shared_state, &decode_snapshot_bundle_modules(&snapshot.bundle_modules)?);
+        install_bundled_modules(
+            shared_state,
+            &decode_snapshot_bundle_modules(&snapshot.bundle_modules)?,
+        );
         snapshot.workspace
     } else {
         read_mat_file(&spec.path).map_err(|error| RuntimeError::Unsupported(error.to_string()))?
@@ -3783,9 +12138,7 @@ fn str2num_prefers_bracket_wrapper(text: &str) -> bool {
     if text.starts_with('[') {
         return false;
     }
-    text.contains(';')
-        || text.contains(',')
-        || text.split_whitespace().nth(1).is_some()
+    text.contains(';') || text.contains(',') || text.split_whitespace().nth(1).is_some()
 }
 
 fn execute_str2num_source(source: &str) -> Result<Value, RuntimeError> {
@@ -3820,7 +12173,7 @@ fn execute_str2num_source(source: &str) -> Result<Value, RuntimeError> {
 
 fn normalize_str2num_value(value: Value) -> Result<Value, RuntimeError> {
     match value {
-        Value::Scalar(_) | Value::Complex(_) => Ok(value),
+        Value::Scalar(_) | Value::Int64(_) | Value::UInt64(_) | Value::Complex(_) => Ok(value),
         Value::Logical(_) => Ok(invoke_stdlib_builtin_outputs("double", &[value], 1)?
             .into_iter()
             .next()
@@ -4012,10 +12365,12 @@ fn take_displayed_outputs(shared_state: &Rc<RefCell<SharedRuntimeState>>) -> Vec
 
 fn workspace_entries(
     frame: Option<&Frame<'_>>,
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     builtin_name: &str,
 ) -> Result<Vec<(String, Value)>, RuntimeError> {
-    match parse_workspace_query_spec(args, builtin_name)? {
+    match parse_workspace_query_spec(shared_state, resolution_source_path, args, builtin_name)? {
         WorkspaceQuerySpec::Current { names, regexes } => {
             let Some(frame) = frame else {
                 return Err(RuntimeError::Unsupported(format!(
@@ -4082,6 +12437,8 @@ enum WorkspaceQuerySpec {
 }
 
 fn parse_workspace_query_spec(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     builtin_name: &str,
 ) -> Result<WorkspaceQuerySpec, RuntimeError> {
@@ -4092,7 +12449,11 @@ fn parse_workspace_query_spec(
                     "{builtin_name} -file currently expects a filename"
                 )));
             };
-            let path = normalize_workspace_snapshot_path(text_value(path_value)?);
+            let path = resolve_workspace_snapshot_path(
+                shared_state,
+                resolution_source_path,
+                text_value(path_value)?,
+            );
             let (names, regexes) = parse_query_filters(&args[2..], builtin_name)?;
             return Ok(WorkspaceQuerySpec::File {
                 path,
@@ -4143,8 +12504,20 @@ fn matlab_size_text(value: &Value) -> String {
 
 fn matlab_value_dimensions(value: &Value) -> Vec<usize> {
     match value {
-        Value::Scalar(_) | Value::Complex(_) | Value::Logical(_) | Value::String(_) => vec![1, 1],
-        Value::CharArray(text) => vec![1, text.chars().count().max(1)],
+        Value::Scalar(_)
+        | Value::Int64(_)
+        | Value::UInt64(_)
+        | Value::Complex(_)
+        | Value::Logical(_)
+        | Value::String(_) => vec![1, 1],
+        Value::CharArray(text) => {
+            let count = text.chars().count();
+            if count == 0 {
+                vec![0, 0]
+            } else {
+                vec![1, count]
+            }
+        }
         Value::Matrix(matrix) => matrix.dims().to_vec(),
         Value::Cell(cell) => cell.dims().to_vec(),
         Value::Struct(_) | Value::Object(_) | Value::FunctionHandle(_) => vec![1, 1],
@@ -4154,6 +12527,8 @@ fn matlab_value_dimensions(value: &Value) -> Vec<usize> {
 fn matlab_class_name(value: &Value) -> String {
     match value {
         Value::Scalar(_) | Value::Complex(_) => "double".to_string(),
+        Value::Int64(_) => "int64".to_string(),
+        Value::UInt64(_) => "uint64".to_string(),
         Value::Logical(_) => "logical".to_string(),
         Value::CharArray(_) => "char".to_string(),
         Value::String(_) => "string".to_string(),
@@ -4166,6 +12541,10 @@ fn matlab_class_name(value: &Value) -> String {
 }
 
 fn matrix_class_name(matrix: &MatrixValue) -> String {
+    if matrix_is_char_matrix(matrix) {
+        return "char".to_string();
+    }
+
     match matrix.storage_class() {
         ArrayStorageClass::Logical => "logical".to_string(),
         ArrayStorageClass::String => "string".to_string(),
@@ -4174,7 +12553,17 @@ fn matrix_class_name(matrix: &MatrixValue) -> String {
                 return "double".to_string();
             };
             match first {
-                Value::Struct(_) if matrix.iter().all(|value| matches!(value, Value::Struct(_))) => {
+                Value::Int64(_) if matrix.iter().all(|value| matches!(value, Value::Int64(_))) => {
+                    "int64".to_string()
+                }
+                Value::UInt64(_)
+                    if matrix.iter().all(|value| matches!(value, Value::UInt64(_))) =>
+                {
+                    "uint64".to_string()
+                }
+                Value::Struct(_)
+                    if matrix.iter().all(|value| matches!(value, Value::Struct(_))) =>
+                {
                     "struct".to_string()
                 }
                 Value::Object(_) if object_array_class_metadata(matrix).is_some() => {
@@ -4191,6 +12580,7 @@ fn matrix_class_name(matrix: &MatrixValue) -> String {
 fn approximate_value_bytes(value: &Value) -> usize {
     match value {
         Value::Scalar(_) => 8,
+        Value::Int64(_) | Value::UInt64(_) => 8,
         Value::Complex(_) => 16,
         Value::Logical(_) => 1,
         Value::CharArray(text) | Value::String(text) => text.encode_utf16().count() * 2,
@@ -4339,14 +12729,18 @@ struct SaveSpec {
     append: bool,
 }
 
-fn parse_save_spec(args: &[Value]) -> Result<SaveSpec, RuntimeError> {
+fn parse_save_spec(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+) -> Result<SaveSpec, RuntimeError> {
     let Some((filename, names)) = args.split_first() else {
         return Err(RuntimeError::Unsupported(format!(
             "save currently expects a filename"
         )));
     };
     let filename = text_value(filename)?;
-    let path = normalize_workspace_snapshot_path(filename);
+    let path = resolve_workspace_snapshot_path(shared_state, resolution_source_path, filename);
     let mut append = false;
     let mut struct_name = None;
     let mut regexes = Vec::new();
@@ -4419,14 +12813,18 @@ struct DisplayFormatUpdate {
     reset_default: bool,
 }
 
-fn parse_load_arguments(args: &[Value]) -> Result<LoadSpec, RuntimeError> {
+fn parse_load_arguments(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    args: &[Value],
+) -> Result<LoadSpec, RuntimeError> {
     let Some((filename, names)) = args.split_first() else {
         return Err(RuntimeError::Unsupported(
             "load currently expects a filename".to_string(),
         ));
     };
     let filename = text_value(filename)?;
-    let path = normalize_workspace_snapshot_path(filename);
+    let path = resolve_workspace_snapshot_path(shared_state, resolution_source_path, filename);
     let (names, regexes) = parse_query_filters(names, "load")?;
     Ok(LoadSpec {
         path,
@@ -4545,6 +12943,76 @@ fn normalize_workspace_snapshot_path(filename: &str) -> PathBuf {
         path
     } else {
         path.with_extension("mat")
+    }
+}
+
+fn matrix_is_char_matrix(matrix: &MatrixValue) -> bool {
+    !matrix.elements().is_empty()
+        && matrix
+            .iter()
+            .all(|value| single_char_text_value(value).is_some())
+}
+
+fn single_char_text_value(value: &Value) -> Option<char> {
+    let Value::CharArray(text) = value else {
+        return None;
+    };
+    let mut chars = text.chars();
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
+}
+
+fn char_value_from_dimensions(
+    rows: usize,
+    cols: usize,
+    dims: Vec<usize>,
+    chars: Vec<char>,
+) -> Result<Value, RuntimeError> {
+    if chars.is_empty() {
+        return Ok(Value::CharArray(String::new()));
+    }
+
+    if rows == 1 && dims.iter().skip(2).all(|dim| *dim == 1) {
+        return Ok(Value::CharArray(chars.into_iter().collect()));
+    }
+
+    Ok(Value::Matrix(MatrixValue::with_dimensions(
+        rows,
+        cols,
+        dims,
+        chars
+            .into_iter()
+            .map(|ch| Value::CharArray(ch.to_string()))
+            .collect(),
+    )?))
+}
+
+fn char_matrix_chars(matrix: &MatrixValue) -> Result<Vec<char>, RuntimeError> {
+    matrix
+        .elements()
+        .iter()
+        .map(|value| {
+            single_char_text_value(value).ok_or_else(|| {
+                RuntimeError::TypeError(
+                    "char matrices currently expect single-character elements".to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn resolve_workspace_snapshot_path(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
+    filename: &str,
+) -> PathBuf {
+    let path = normalize_workspace_snapshot_path(filename);
+    if path.is_absolute() {
+        normalize_runtime_path(path)
+    } else {
+        normalize_runtime_path(
+            runtime_current_directory(shared_state, resolution_source_path).join(path),
+        )
     }
 }
 
@@ -4988,6 +13456,8 @@ fn fplot_numeric_output_values(
 ) -> Result<Vec<f64>, RuntimeError> {
     match value {
         Value::Scalar(number) => Ok(vec![*number; expected_len]),
+        Value::Int64(number) => Ok(vec![*number as f64; expected_len]),
+        Value::UInt64(number) => Ok(vec![*number as f64; expected_len]),
         Value::Logical(flag) => Ok(vec![if *flag { 1.0 } else { 0.0 }; expected_len]),
         Value::Matrix(matrix) => {
             let values = matrix
@@ -4995,6 +13465,8 @@ fn fplot_numeric_output_values(
                 .iter()
                 .map(|entry| match entry {
                     Value::Scalar(number) => Ok(*number),
+                    Value::Int64(number) => Ok(*number as f64),
+                    Value::UInt64(number) => Ok(*number as f64),
                     Value::Logical(flag) => Ok(if *flag { 1.0 } else { 0.0 }),
                     other => Err(RuntimeError::TypeError(format!(
                         "{builtin_name} currently expects the sampled function output to be numeric/logical, found {}",
@@ -5030,6 +13502,8 @@ fn fsurf_numeric_output_values(
     let expected_len = rows * cols;
     match value {
         Value::Scalar(number) => Ok(vec![*number; expected_len]),
+        Value::Int64(number) => Ok(vec![*number as f64; expected_len]),
+        Value::UInt64(number) => Ok(vec![*number as f64; expected_len]),
         Value::Logical(flag) => Ok(vec![if *flag { 1.0 } else { 0.0 }; expected_len]),
         Value::Matrix(matrix) => {
             let values = matrix
@@ -5037,6 +13511,8 @@ fn fsurf_numeric_output_values(
                 .iter()
                 .map(|entry| match entry {
                     Value::Scalar(number) => Ok(*number),
+                    Value::Int64(number) => Ok(*number as f64),
+                    Value::UInt64(number) => Ok(*number as f64),
                     Value::Logical(flag) => Ok(if *flag { 1.0 } else { 0.0 }),
                     other => Err(RuntimeError::TypeError(format!(
                         "{builtin_name} currently expects the sampled function output to be numeric/logical, found {}",
@@ -5912,6 +14388,8 @@ fn render_value_with_format(value: &Value, format: DisplayFormatState) -> String
 
     match value {
         Value::Scalar(number) => render_number_with_format(*number, format.numeric),
+        Value::Int64(number) => number.to_string(),
+        Value::UInt64(number) => number.to_string(),
         Value::Complex(number) => render_complex_with_format(number, format.numeric),
         Value::Logical(flag) => {
             if *flag {
@@ -5954,6 +14432,9 @@ fn render_matrix_inline_with_format(
 ) -> String {
     let rows = matrix.dims.first().copied().unwrap_or(matrix.rows);
     let cols = matrix.dims.get(1).copied().unwrap_or(matrix.cols);
+    if let Some(rendered) = render_char_matrix_inline_with_format(matrix, tail_index, format) {
+        return rendered;
+    }
     let rows = (0..rows)
         .map(|row| {
             (0..cols)
@@ -5971,6 +14452,51 @@ fn render_matrix_inline_with_format(
         .collect::<Vec<_>>()
         .join(" ; ");
     format!("[{rows}]")
+}
+
+fn render_char_matrix_inline_with_format(
+    matrix: &MatrixValue,
+    tail_index: Option<&[usize]>,
+    _format: DisplayFormatState,
+) -> Option<String> {
+    if !matrix_is_char_matrix(matrix) {
+        return None;
+    }
+
+    let rows = matrix.dims.first().copied().unwrap_or(matrix.rows);
+    let cols = matrix.dims.get(1).copied().unwrap_or(matrix.cols);
+    if rows == 0 || cols == 0 {
+        return Some("[]".to_string());
+    }
+
+    let row_texts = (0..rows)
+        .map(|row| {
+            (0..cols)
+                .map(|col| {
+                    let mut index = vec![row, col];
+                    if let Some(tail_index) = tail_index {
+                        index.extend_from_slice(tail_index);
+                    }
+                    let linear = row_major_linear_index(&index, &matrix.dims);
+                    single_char_text_value(&matrix.elements[linear])
+                        .expect("char matrix render guard ensures single-character elements")
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    Some(if row_texts.len() == 1 {
+        render_quoted_text_with_delimiter(&row_texts[0], '\'')
+    } else {
+        format!(
+            "[{}]",
+            row_texts
+                .into_iter()
+                .map(|row| render_quoted_text_with_delimiter(&row, '\''))
+                .collect::<Vec<_>>()
+                .join(" ; ")
+        )
+    })
 }
 
 fn render_cell_inline_with_format(
@@ -6493,15 +15019,11 @@ impl<'a> Interpreter<'a> {
                                         .captures
                                         .iter()
                                         .filter_map(|capture| {
-                                            closure
-                                                .captured_cells
-                                                .get(&capture.binding_id)
-                                                .map(|cell| {
-                                                    (
-                                                        capture.name.clone(),
-                                                        capture_cell_value(cell),
-                                                    )
-                                                })
+                                            closure.captured_cells.get(&capture.binding_id).map(
+                                                |cell| {
+                                                    (capture.name.clone(), capture_cell_value(cell))
+                                                },
+                                            )
                                         })
                                         .collect(),
                                 ),
@@ -6540,15 +15062,11 @@ impl<'a> Interpreter<'a> {
                                         .captures
                                         .iter()
                                         .filter_map(|capture| {
-                                            closure
-                                                .captured_cells
-                                                .get(&capture.binding_id)
-                                                .map(|cell| {
-                                                    (
-                                                        capture.name.clone(),
-                                                        capture_cell_value(cell),
-                                                    )
-                                                })
+                                            closure.captured_cells.get(&capture.binding_id).map(
+                                                |cell| {
+                                                    (capture.name.clone(), capture_cell_value(cell))
+                                                },
+                                            )
                                         })
                                         .collect(),
                                 ),
@@ -6612,7 +15130,8 @@ impl<'a> Interpreter<'a> {
                             functions_parentage_value(&handle.display_name, file.as_deref()),
                         )],
                     )
-                } else if let Some((path, function_name)) = parse_scoped_function_handle_name(name) {
+                } else if let Some((path, function_name)) = parse_scoped_function_handle_name(name)
+                {
                     let file = path.display().to_string();
                     (
                         function_name.clone(),
@@ -6633,18 +15152,12 @@ impl<'a> Interpreter<'a> {
                 resolved_path_functions_file(path, &handle.display_name),
                 Vec::new(),
             ),
-            FunctionHandleTarget::BundleModule(_) => (
-                handle.display_name.clone(),
-                "simple",
-                None,
-                Vec::new(),
-            ),
-            FunctionHandleTarget::BoundMethod { receiver: _, .. } => (
-                handle.display_name.clone(),
-                "simple",
-                None,
-                Vec::new(),
-            ),
+            FunctionHandleTarget::BundleModule(_) => {
+                (handle.display_name.clone(), "simple", None, Vec::new())
+            }
+            FunctionHandleTarget::BoundMethod { receiver: _, .. } => {
+                (handle.display_name.clone(), "simple", None, Vec::new())
+            }
         };
         Ok(functions_info_struct_value(
             function_name,
@@ -6763,8 +15276,8 @@ impl<'a> Interpreter<'a> {
                 path.display()
             ))
         })?;
-        let context =
-            ResolverContext::from_source_file(path.to_path_buf()).with_env_search_roots("MATC_PATH");
+        let context = ResolverContext::from_source_file(path.to_path_buf())
+            .with_env_search_roots("MATC_PATH");
         let analysis = analyze_compilation_unit_with_context(&unit, &context);
         if analysis.has_errors() {
             return Err(RuntimeError::Unsupported(format!(
@@ -6791,11 +15304,11 @@ impl<'a> Interpreter<'a> {
                 HirItem::Statement(_) | HirItem::Function(_) => None,
             })
             .ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "function `{function_name}` is not available in `{}`",
-                path.display()
-            ))
-        })?;
+                RuntimeError::Unsupported(format!(
+                    "function `{function_name}` is not available in `{}`",
+                    path.display()
+                ))
+            })?;
         let mut interpreter = Interpreter::with_shared_state(
             &hir,
             "<root>".to_string(),
@@ -6830,12 +15343,16 @@ impl<'a> Interpreter<'a> {
 
             let mut frame = Frame::new(visible_functions);
             for capture in &closure.function.captures {
-                let cell = closure.captured_cells.get(&capture.binding_id).cloned().ok_or_else(|| {
-                    RuntimeError::MissingVariable(format!(
-                        "captured binding `{}` is not available when calling `{}`",
-                        capture.name, closure.function.name
-                    ))
-                })?;
+                let cell = closure
+                    .captured_cells
+                    .get(&capture.binding_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        RuntimeError::MissingVariable(format!(
+                            "captured binding `{}` is not available when calling `{}`",
+                            capture.name, closure.function.name
+                        ))
+                    })?;
                 frame.bind_existing(capture.binding_id, &capture.name, cell);
             }
 
@@ -7070,7 +15587,11 @@ impl<'a> Interpreter<'a> {
                 frame.declare_binding(output)?;
             }
             for (name, value) in prebound_outputs {
-                if let Some(binding) = function.outputs.iter().find(|binding| binding.name == *name) {
+                if let Some(binding) = function
+                    .outputs
+                    .iter()
+                    .find(|binding| binding.name == *name)
+                {
                     frame.assign_binding(binding, value.clone())?;
                 }
             }
@@ -7120,10 +15641,7 @@ impl<'a> Interpreter<'a> {
         } else {
             ObjectStorageKind::Value
         };
-        let module_target = class
-            .source_path
-            .clone()
-            .map(ObjectMethodTarget::Path);
+        let module_target = class.source_path.clone().map(ObjectMethodTarget::Path);
         let mut external_methods = BTreeMap::new();
         let mut private_property_owners = BTreeMap::new();
         let mut private_instance_method_owners = BTreeMap::new();
@@ -7183,7 +15701,11 @@ impl<'a> Interpreter<'a> {
             }
             fields.insert(property.name.clone(), value);
         }
-        let inline_methods = class.inline_methods.iter().cloned().collect::<BTreeSet<_>>();
+        let inline_methods = class
+            .inline_methods
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let qualified_class_name =
             qualified_object_class_name(&class.name, class.package.as_deref());
         for property in &class.private_properties {
@@ -7239,12 +15761,14 @@ impl<'a> Interpreter<'a> {
             loaded.source_path.display().to_string(),
         )?;
         if let Some(constructor_name) = &loaded.class.constructor {
-            let constructor = self.find_module_function(&loaded.module, constructor_name).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "constructor `{constructor_name}` is not available in class `{}`",
-                    loaded.class.name
-                ))
-            })?;
+            let constructor = self
+                .find_module_function(&loaded.module, constructor_name)
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "constructor `{constructor_name}` is not available in class `{}`",
+                        loaded.class.name
+                    ))
+                })?;
             let prebound_outputs = constructor
                 .outputs
                 .first()
@@ -7277,12 +15801,14 @@ impl<'a> Interpreter<'a> {
         existing_object: Value,
     ) -> Result<Vec<Value>, RuntimeError> {
         if let Some(constructor_name) = &loaded.class.constructor {
-            let constructor = self.find_module_function(&loaded.module, constructor_name).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "constructor `{constructor_name}` is not available in class `{}`",
-                    loaded.class.name
-                ))
-            })?;
+            let constructor = self
+                .find_module_function(&loaded.module, constructor_name)
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "constructor `{constructor_name}` is not available in class `{}`",
+                        loaded.class.name
+                    ))
+                })?;
             let prebound_outputs = constructor
                 .outputs
                 .first()
@@ -7454,16 +15980,20 @@ impl<'a> Interpreter<'a> {
                     && updated.cols == 1
                     && matches!(updated.elements.first(), Some(Value::Object(_)))
                 {
-                    Ok(updated.elements.into_iter().next().expect("single object element"))
+                    Ok(updated
+                        .elements
+                        .into_iter()
+                        .next()
+                        .expect("single object element"))
                 } else {
                     Ok(Value::Matrix(updated))
                 }
             }
             (IndexAssignmentKind::Paren, Value::Matrix(matrix)) => {
                 if let Some(class) = object_assignment_target_class(&matrix, &value)? {
-                    Ok(Value::Matrix(
-                        self.assign_object_matrix_index(matrix, indices, value, class)?,
-                    ))
+                    Ok(Value::Matrix(self.assign_object_matrix_index(
+                        matrix, indices, value, class,
+                    )?))
                 } else {
                     apply_index_update(
                         Value::Matrix(matrix),
@@ -7519,12 +16049,14 @@ impl<'a> Interpreter<'a> {
                 qualified_class_name
             )));
         }
-        let method = self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "static method `{method_name}` is not available in class `{}`",
-                loaded.class.name
-            ))
-        })?;
+        let method = self
+            .find_module_function(&loaded.module, method_name)
+            .ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "static method `{method_name}` is not available in class `{}`",
+                    loaded.class.name
+                ))
+            })?;
         let mut interpreter = Interpreter::with_shared_state(
             &loaded.module,
             loaded.source_path.display().to_string(),
@@ -7589,12 +16121,14 @@ impl<'a> Interpreter<'a> {
                 })?,
             };
             let loaded = load_class_module_from_path(source_path)?;
-            let method = self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "inline method `{method_name}` is not available in class `{}`",
-                    class.class_name
-                ))
-            })?;
+            let method = self
+                .find_module_function(&loaded.module, method_name)
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "inline method `{method_name}` is not available in class `{}`",
+                        class.class_name
+                    ))
+                })?;
             let mut method_args = Vec::with_capacity(args.len() + 1);
             method_args.push(receiver.clone());
             method_args.extend(args.iter().cloned());
@@ -7683,12 +16217,15 @@ impl<'a> Interpreter<'a> {
         }
         let hir = lower_to_hir(&unit, &analysis);
         let method = if unit.kind == CompilationUnitKind::ClassFile {
-            Some(self.find_module_function(&hir, method_name).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "method `{method_name}` is not available in class module `{}`",
-                    path.display()
-                ))
-            })?)
+            Some(
+                self.find_module_function(&hir, method_name)
+                    .ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "method `{method_name}` is not available in class module `{}`",
+                            path.display()
+                        ))
+                    })?,
+            )
         } else {
             None
         };
@@ -7702,11 +16239,15 @@ impl<'a> Interpreter<'a> {
             self.call_stack.clone(),
         );
         if unit.kind == CompilationUnitKind::ClassFile {
-            interpreter.invoke_function(method.expect("class-file method lookup"), &method_args, None)
+            interpreter.invoke_function(
+                method.expect("class-file method lookup"),
+                &method_args,
+                None,
+            )
         } else {
-            interpreter.invoke_primary_function(&method_args).map(|values| {
-                values.into_iter().map(|(_, value)| value).collect()
-            })
+            interpreter
+                .invoke_primary_function(&method_args)
+                .map(|values| values.into_iter().map(|(_, value)| value).collect())
         }
     }
 
@@ -7790,8 +16331,7 @@ impl<'a> Interpreter<'a> {
         }
         if matches!(
             reference.name.as_str(),
-            "clear" | "clearvars" | "save" | "load" | "who" | "whos" | "tic" | "toc"
-                | "format"
+            "clear" | "clearvars" | "save" | "load" | "who" | "whos" | "tic" | "toc" | "format"
         ) {
             let shared_state = Rc::clone(&self.shared_state);
             self.invoke_workspace_builtin_outputs(
@@ -7825,6 +16365,57 @@ impl<'a> Interpreter<'a> {
             .map(|_| ())?;
             return Ok(());
         }
+        if reference.name == "doc" {
+            invoke_doc_builtin_outputs(
+                Some(frame),
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &evaluated_args,
+                0,
+            )
+            .map(|_| ())?;
+            return Ok(());
+        }
+        if reference.name == "methods" {
+            invoke_methods_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &evaluated_args,
+                0,
+            )
+            .map(|_| ())?;
+            return Ok(());
+        }
+        if reference.name == "properties" {
+            invoke_properties_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &evaluated_args,
+                0,
+            )
+            .map(|_| ())?;
+            return Ok(());
+        }
+        if reference.name == "superclasses" {
+            invoke_superclasses_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &evaluated_args,
+                0,
+            )
+            .map(|_| ())?;
+            return Ok(());
+        }
+        if reference.name == "events" {
+            invoke_events_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &evaluated_args,
+                0,
+            )
+            .map(|_| ())?;
+            return Ok(());
+        }
         if reference.name == "lookfor" {
             invoke_lookfor_builtin_outputs(
                 &self.shared_state,
@@ -7838,6 +16429,7 @@ impl<'a> Interpreter<'a> {
         invoke_runtime_builtin_outputs(
             &self.shared_state,
             Some(frame),
+            self.resolution_source_path.as_deref(),
             &reference.name,
             &evaluated_args,
             0,
@@ -7880,9 +16472,9 @@ impl<'a> Interpreter<'a> {
                         return Err(unsupported_simple_csl_assignment_error(count));
                     }
                 }
-                if self.try_execute_undefined_root_colon_brace_csl_assignment(
-                    frame, targets, value,
-                )? {
+                if self
+                    .try_execute_undefined_root_colon_brace_csl_assignment(frame, targets, value)?
+                {
                     return Ok(None);
                 }
                 if self.try_execute_undefined_cell_receiver_struct_field_brace_csl_assignment(
@@ -7890,9 +16482,9 @@ impl<'a> Interpreter<'a> {
                 )? {
                     return Ok(None);
                 }
-                if self.try_execute_undefined_cell_struct_field_csl_assignment(
-                    frame, targets, value,
-                )? {
+                if self
+                    .try_execute_undefined_cell_struct_field_csl_assignment(frame, targets, value)?
+                {
                     return Ok(None);
                 }
                 if self.try_execute_undefined_struct_field_brace_csl_assignment(
@@ -7917,12 +16509,8 @@ impl<'a> Interpreter<'a> {
                 )? {
                     return Ok(None);
                 }
-                let values = self.evaluate_assignment_values(
-                    frame,
-                    targets,
-                    value,
-                    *list_assignment,
-                )?;
+                let values =
+                    self.evaluate_assignment_values(frame, targets, value, *list_assignment)?;
                 if !display_suppressed && targets.len() == 1 {
                     if let HirAssignmentTarget::Binding(binding) = &targets[0] {
                         if let Some(display_value) = values.first().cloned() {
@@ -8075,14 +16663,12 @@ impl<'a> Interpreter<'a> {
             HirExpression::Call {
                 target: HirCallTarget::Callable(reference),
                 args,
-            } if reference.name == "deal" => {
-                self.evaluate_call_outputs(
-                    frame,
-                    &HirCallTarget::Callable(reference.clone()),
-                    args,
-                    Some(args.len().max(1)),
-                )?
-            }
+            } if reference.name == "deal" => self.evaluate_call_outputs(
+                frame,
+                &HirCallTarget::Callable(reference.clone()),
+                args,
+                Some(args.len().max(1)),
+            )?,
             _ if expression_supports_list_expansion(value) => {
                 self.evaluate_expression_outputs(frame, value)?
             }
@@ -8242,15 +16828,15 @@ impl<'a> Interpreter<'a> {
             HirExpression::Call {
                 target: HirCallTarget::Callable(reference),
                 args,
-            } if reference.name == "deal" => {
-                self.evaluate_call_outputs(
-                    frame,
-                    &HirCallTarget::Callable(reference.clone()),
-                    args,
-                    Some(args.len()),
-                )?
+            } if reference.name == "deal" => self.evaluate_call_outputs(
+                frame,
+                &HirCallTarget::Callable(reference.clone()),
+                args,
+                Some(args.len()),
+            )?,
+            _ if expression_supports_list_expansion(value) => {
+                self.evaluate_expression_outputs(frame, value)?
             }
-            _ if expression_supports_list_expansion(value) => self.evaluate_expression_outputs(frame, value)?,
             _ => {
                 let direct = self.evaluate_expression(frame, value)?;
                 let Some(values) = direct_multi_value_values_ordered(&direct)? else {
@@ -8268,7 +16854,10 @@ impl<'a> Interpreter<'a> {
             assign_struct_path(
                 Value::Struct(StructValue::default()),
                 std::slice::from_ref(field),
-                values.into_iter().next().expect("single scalar struct assignment value"),
+                values
+                    .into_iter()
+                    .next()
+                    .expect("single scalar struct assignment value"),
             )?
         } else {
             let assigned_values = Value::Matrix(MatrixValue::with_dimensions(
@@ -8340,7 +16929,10 @@ impl<'a> Interpreter<'a> {
                 .iter()
                 .any(|projection| !matches!(projection, LValueProjection::Field(_)))
             || projections.iter().any(|projection| {
-                !matches!(projection, LValueProjection::Field(_) | LValueProjection::Paren(_))
+                !matches!(
+                    projection,
+                    LValueProjection::Field(_) | LValueProjection::Paren(_)
+                )
             })
         {
             return Ok(false);
@@ -8398,7 +16990,8 @@ impl<'a> Interpreter<'a> {
             frame,
             receiver_indices,
             output_count,
-        )? else {
+        )?
+        else {
             return Ok(false);
         };
         let receiver_count = match &receivers {
@@ -8420,8 +17013,11 @@ impl<'a> Interpreter<'a> {
         field_path.push(field.clone());
         let mut updated = assign_struct_path(receivers, &field_path, assigned)?;
         if !prefix_fields.is_empty() {
-            updated =
-                assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+            updated = assign_struct_path(
+                Value::Struct(StructValue::default()),
+                &prefix_fields,
+                updated,
+            )?;
         }
         *cell.borrow_mut() = Some(updated);
         Ok(true)
@@ -8443,9 +17039,10 @@ impl<'a> Interpreter<'a> {
         };
         let evaluated_receiver_indices =
             self.evaluate_index_arguments(frame, &receiver_target, receiver_indices)?;
-        if let Some(receivers) =
-            default_struct_selection_value_for_index_update(&receiver_target, &evaluated_receiver_indices)?
-        {
+        if let Some(receivers) = default_struct_selection_value_for_index_update(
+            &receiver_target,
+            &evaluated_receiver_indices,
+        )? {
             let receiver_count = match &receivers {
                 Value::Struct(_) => 1,
                 Value::Matrix(matrix) if matrix_is_struct_array(matrix) => matrix.elements.len(),
@@ -8474,7 +17071,8 @@ impl<'a> Interpreter<'a> {
             return Ok(None);
         }
 
-        let effective_dims = indexing_dimensions_from_dims(empty_receiver.dims(), receiver_indices.len());
+        let effective_dims =
+            indexing_dimensions_from_dims(empty_receiver.dims(), receiver_indices.len());
         let mut target_dims = effective_dims.clone();
         let mut known_selection_product = 1usize;
         for (axis, argument) in evaluated_receiver_indices.iter().enumerate() {
@@ -8482,8 +17080,12 @@ impl<'a> Interpreter<'a> {
                 continue;
             }
             let label = format!("dimension {}", axis + 1);
-            let (selected, target_extent) =
-                assignment_dimension_indices(argument, effective_dims[axis], &label, "struct array")?;
+            let (selected, target_extent) = assignment_dimension_indices(
+                argument,
+                effective_dims[axis],
+                &label,
+                "struct array",
+            )?;
             if selected.is_empty() {
                 return Ok(None);
             }
@@ -8553,7 +17155,10 @@ impl<'a> Interpreter<'a> {
         let field_projections = &projections[brace_index + 1..];
         if cell.borrow().is_some()
             || projections.iter().any(|projection| {
-                !matches!(projection, LValueProjection::Field(_) | LValueProjection::Brace(_))
+                !matches!(
+                    projection,
+                    LValueProjection::Field(_) | LValueProjection::Brace(_)
+                )
             })
             || field_projections
                 .iter()
@@ -8618,7 +17223,8 @@ impl<'a> Interpreter<'a> {
             frame,
             receiver_indices,
             receiver_defaults,
-        )? else {
+        )?
+        else {
             return Ok(false);
         };
 
@@ -8630,13 +17236,13 @@ impl<'a> Interpreter<'a> {
             })
             .collect::<Vec<_>>();
         field_path.push(field.clone());
-        let mut updated = assign_struct_path(
-            Value::Cell(receivers),
-            &field_path,
-            assigned_value,
-        )?;
+        let mut updated = assign_struct_path(Value::Cell(receivers), &field_path, assigned_value)?;
         if !prefix_fields.is_empty() {
-            updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+            updated = assign_struct_path(
+                Value::Struct(StructValue::default()),
+                &prefix_fields,
+                updated,
+            )?;
         }
         *cell.borrow_mut() = Some(updated);
         Ok(true)
@@ -8678,7 +17284,10 @@ impl<'a> Interpreter<'a> {
         if cell.borrow().is_some()
             || field_projections.is_empty()
             || projections.iter().any(|projection| {
-                !matches!(projection, LValueProjection::Field(_) | LValueProjection::Brace(_))
+                !matches!(
+                    projection,
+                    LValueProjection::Field(_) | LValueProjection::Brace(_)
+                )
             })
             || field_projections
                 .iter()
@@ -8694,14 +17303,12 @@ impl<'a> Interpreter<'a> {
             HirExpression::Call {
                 target: HirCallTarget::Callable(reference),
                 args,
-            } if reference.name == "deal" => {
-                self.evaluate_call_outputs(
-                    frame,
-                    &HirCallTarget::Callable(reference.clone()),
-                    args,
-                    Some(args.len().max(1)),
-                )?
-            }
+            } if reference.name == "deal" => self.evaluate_call_outputs(
+                frame,
+                &HirCallTarget::Callable(reference.clone()),
+                args,
+                Some(args.len().max(1)),
+            )?,
             _ if expression_supports_list_expansion(value) => {
                 self.evaluate_expression_outputs(frame, value)?
             }
@@ -8746,7 +17353,8 @@ impl<'a> Interpreter<'a> {
             frame,
             receiver_indices,
             receiver_defaults,
-        )? else {
+        )?
+        else {
             return Ok(false);
         };
 
@@ -8781,7 +17389,11 @@ impl<'a> Interpreter<'a> {
             elements,
         )?);
         if !prefix_fields.is_empty() {
-            updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+            updated = assign_struct_path(
+                Value::Struct(StructValue::default()),
+                &prefix_fields,
+                updated,
+            )?;
         }
         *cell.borrow_mut() = Some(updated);
         Ok(true)
@@ -8814,15 +17426,15 @@ impl<'a> Interpreter<'a> {
             HirExpression::Call {
                 target: HirCallTarget::Callable(reference),
                 args,
-            } if reference.name == "deal" => {
-                self.evaluate_call_outputs(
-                    frame,
-                    &HirCallTarget::Callable(reference.clone()),
-                    args,
-                    Some(args.len().max(1)),
-                )?
+            } if reference.name == "deal" => self.evaluate_call_outputs(
+                frame,
+                &HirCallTarget::Callable(reference.clone()),
+                args,
+                Some(args.len().max(1)),
+            )?,
+            _ if expression_supports_list_expansion(value) => {
+                self.evaluate_expression_outputs(frame, value)?
             }
-            _ if expression_supports_list_expansion(value) => self.evaluate_expression_outputs(frame, value)?,
             _ => {
                 let direct = self.evaluate_expression(frame, value)?;
                 let Some(values) = direct_multi_value_values_ordered(&direct)? else {
@@ -8890,9 +17502,12 @@ impl<'a> Interpreter<'a> {
         let field_projections = &projections[paren_index + 1..];
         if cell.borrow().is_some()
             || field_projections.is_empty()
-            || projections
-                .iter()
-                .any(|projection| !matches!(projection, LValueProjection::Field(_) | LValueProjection::Paren(_)))
+            || projections.iter().any(|projection| {
+                !matches!(
+                    projection,
+                    LValueProjection::Field(_) | LValueProjection::Paren(_)
+                )
+            })
             || field_projections
                 .iter()
                 .any(|projection| !matches!(projection, LValueProjection::Field(_)))
@@ -8904,14 +17519,12 @@ impl<'a> Interpreter<'a> {
             HirExpression::Call {
                 target: HirCallTarget::Callable(reference),
                 args,
-            } if reference.name == "deal" => {
-                self.evaluate_call_outputs(
-                    frame,
-                    &HirCallTarget::Callable(reference.clone()),
-                    args,
-                    Some(args.len().max(1)),
-                )?
-            }
+            } if reference.name == "deal" => self.evaluate_call_outputs(
+                frame,
+                &HirCallTarget::Callable(reference.clone()),
+                args,
+                Some(args.len().max(1)),
+            )?,
             _ if expression_supports_list_expansion(value) => {
                 self.evaluate_expression_outputs(frame, value)?
             }
@@ -8932,7 +17545,8 @@ impl<'a> Interpreter<'a> {
             receiver_indices,
             indices,
             values.len(),
-        )? else {
+        )?
+        else {
             return Ok(false);
         };
         let updated = self.materialize_undefined_indexed_struct_field_brace_csl_assignment(
@@ -8946,7 +17560,11 @@ impl<'a> Interpreter<'a> {
             return Ok(false);
         };
         if !prefix_fields.is_empty() {
-            updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+            updated = assign_struct_path(
+                Value::Struct(StructValue::default()),
+                &prefix_fields,
+                updated,
+            )?;
         }
         *cell.borrow_mut() = Some(updated);
         Ok(true)
@@ -8980,7 +17598,8 @@ impl<'a> Interpreter<'a> {
             frame,
             indices,
             output_count,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         self.materialize_undefined_indexed_struct_receivers(frame, receiver_indices, receiver_count)
@@ -9061,8 +17680,8 @@ impl<'a> Interpreter<'a> {
                 let mut elements = Vec::with_capacity(matrix.elements.len());
                 for element in matrix.elements {
                     let chunk = chunks.next().expect("chunk per indexed receiver").to_vec();
-                    let Some(materialized) =
-                        self.materialize_undefined_root_brace_csl_assignment(frame, indices, chunk)?
+                    let Some(materialized) = self
+                        .materialize_undefined_root_brace_csl_assignment(frame, indices, chunk)?
                     else {
                         return Ok(None);
                     };
@@ -9139,13 +17758,16 @@ impl<'a> Interpreter<'a> {
                         _ => {
                             let direct = match self.evaluate_expression(frame, value) {
                                 Ok(direct) => Some(direct),
-                                Err(error) if is_single_output_dot_or_brace_result_error(&error) => {
+                                Err(error)
+                                    if is_single_output_dot_or_brace_result_error(&error) =>
+                                {
                                     None
                                 }
                                 Err(error) => return Err(error),
                             };
                             if let Some(direct) = direct {
-                                if distributed_cell_assignment_values(&direct, output_count).is_ok() {
+                                if distributed_cell_assignment_values(&direct, output_count).is_ok()
+                                {
                                     return Ok(vec![direct]);
                                 }
                             }
@@ -9191,7 +17813,9 @@ impl<'a> Interpreter<'a> {
                                     let direct = match self.evaluate_expression(frame, value) {
                                         Ok(direct) => Some(direct),
                                         Err(error)
-                                            if is_single_output_dot_or_brace_result_error(&error) =>
+                                            if is_single_output_dot_or_brace_result_error(
+                                                &error,
+                                            ) =>
                                         {
                                             None
                                         }
@@ -9241,7 +17865,9 @@ impl<'a> Interpreter<'a> {
                                     let direct = match self.evaluate_expression(frame, value) {
                                         Ok(direct) => Some(direct),
                                         Err(error)
-                                            if is_single_output_dot_or_brace_result_error(&error) =>
+                                            if is_single_output_dot_or_brace_result_error(
+                                                &error,
+                                            ) =>
                                         {
                                             None
                                         }
@@ -9619,7 +18245,9 @@ impl<'a> Interpreter<'a> {
                             match frame.read_reference(reference.binding_id, root_name) {
                                 Ok(receiver) => {
                                     if let Some(handle) =
-                                        try_build_bound_method_handle_from_dotted_name(receiver, &segments)?
+                                        try_build_bound_method_handle_from_dotted_name(
+                                            receiver, &segments,
+                                        )?
                                     {
                                         return Ok(handle);
                                     }
@@ -9663,12 +18291,11 @@ impl<'a> Interpreter<'a> {
             HirExpression::Unary { op, rhs } => {
                 let rhs = self.evaluate_expression(frame, rhs)?;
                 match op {
-                    matlab_frontend::ast::UnaryOp::Plus => map_numeric_unary(&rhs, |value| value),
+                    matlab_frontend::ast::UnaryOp::Plus => {
+                        invoke_stdlib_single_output("uplus", std::slice::from_ref(&rhs))
+                    }
                     matlab_frontend::ast::UnaryOp::Minus => {
-                        map_numeric_unary(&rhs, |value| NumericComplexParts {
-                            real: -value.real,
-                            imag: -value.imag,
-                        })
+                        invoke_stdlib_single_output("uminus", std::slice::from_ref(&rhs))
                     }
                     matlab_frontend::ast::UnaryOp::LogicalNot => {
                         map_numeric_unary_logical(&rhs, |value| value == 0.0)
@@ -9680,16 +18307,17 @@ impl<'a> Interpreter<'a> {
             HirExpression::Binary { op, lhs, rhs } => {
                 let lhs = self.evaluate_expression(frame, lhs)?;
                 let rhs = self.evaluate_expression(frame, rhs)?;
+                let args = [lhs.clone(), rhs.clone()];
                 match op {
                     matlab_frontend::ast::BinaryOp::Add => {
-                        map_numeric_binary(&lhs, &rhs, |lhs, rhs| lhs.plus(rhs))
+                        invoke_stdlib_single_output("plus", &args)
                     }
                     matlab_frontend::ast::BinaryOp::Subtract => {
-                        map_numeric_binary(&lhs, &rhs, |lhs, rhs| lhs.minus(rhs))
+                        invoke_stdlib_single_output("minus", &args)
                     }
                     matlab_frontend::ast::BinaryOp::Multiply => matrix_multiply(&lhs, &rhs),
                     matlab_frontend::ast::BinaryOp::ElementwiseMultiply => {
-                        map_numeric_binary(&lhs, &rhs, |lhs, rhs| lhs.times(rhs))
+                        invoke_stdlib_single_output("times", &args)
                     }
                     matlab_frontend::ast::BinaryOp::MatrixRightDivide => {
                         matrix_right_divide(&lhs, &rhs)
@@ -9722,10 +18350,10 @@ impl<'a> Interpreter<'a> {
                         map_numeric_binary_logical(&lhs, &rhs, |lhs, rhs| lhs <= rhs)
                     }
                     matlab_frontend::ast::BinaryOp::Equal => {
-                        map_numeric_binary_equality(&lhs, &rhs, |lhs, rhs| lhs.exact_eq(rhs))
+                        invoke_stdlib_single_output("eq", &args)
                     }
                     matlab_frontend::ast::BinaryOp::NotEqual => {
-                        map_numeric_binary_equality(&lhs, &rhs, |lhs, rhs| lhs.exact_ne(rhs))
+                        invoke_stdlib_single_output("ne", &args)
                     }
                     matlab_frontend::ast::BinaryOp::LogicalAnd => {
                         map_numeric_binary_logical(&lhs, &rhs, |lhs, rhs| lhs != 0.0 && rhs != 0.0)
@@ -9794,10 +18422,15 @@ impl<'a> Interpreter<'a> {
                         if let Some(root_name) = segments.first().copied() {
                             match frame.read_reference(reference.binding_id, root_name) {
                                 Ok(receiver) => {
-                                    let receiver_target =
-                                        resolve_dotted_receiver_from_root(receiver, &segments[1..])?;
-                                    let evaluated =
-                                        self.evaluate_index_arguments(frame, &receiver_target, args)?;
+                                    let receiver_target = resolve_dotted_receiver_from_root(
+                                        receiver,
+                                        &segments[1..],
+                                    )?;
+                                    let evaluated = self.evaluate_index_arguments(
+                                        frame,
+                                        &receiver_target,
+                                        args,
+                                    )?;
                                     let indexed_receiver =
                                         evaluate_expression_call(&receiver_target, &evaluated)?;
                                     return read_field_value(&indexed_receiver, field);
@@ -9965,7 +18598,10 @@ impl<'a> Interpreter<'a> {
         target: &HirExpression,
         indices: &[HirIndexArgument],
     ) -> Result<Option<usize>, RuntimeError> {
-        if let HirExpression::FieldAccess { target: receiver, .. } = target {
+        if let HirExpression::FieldAccess {
+            target: receiver, ..
+        } = target
+        {
             match self.evaluate_expression(frame, receiver) {
                 Ok(Value::Matrix(matrix)) if matrix_is_object_array(&matrix) => {
                     return Ok(None);
@@ -10071,7 +18707,8 @@ impl<'a> Interpreter<'a> {
                         field: field.clone(),
                         value: empty_matrix_value(),
                     };
-                    let Some(selected) = default_field_projection_value(&current, &[], &leaf) else {
+                    let Some(selected) = default_field_projection_value(&current, &[], &leaf)
+                    else {
                         return Ok(None);
                     };
                     current = selected;
@@ -10136,8 +18773,13 @@ impl<'a> Interpreter<'a> {
                     target: HirCallTarget::Expression(target),
                     ..
                 } => {
-                    if let HirExpression::FieldAccess { target: receiver, field } = target.as_ref() {
-                        let receiver_value = match interpreter.evaluate_expression(frame, receiver) {
+                    if let HirExpression::FieldAccess {
+                        target: receiver,
+                        field,
+                    } = target.as_ref()
+                    {
+                        let receiver_value = match interpreter.evaluate_expression(frame, receiver)
+                        {
                             Ok(value) => value,
                             Err(RuntimeError::MissingVariable(_))
                             | Err(RuntimeError::InvalidIndex(_))
@@ -10153,7 +18795,8 @@ impl<'a> Interpreter<'a> {
                     }
                     find_method_result(interpreter, frame, target)
                 }
-                HirExpression::FieldAccess { target, .. } | HirExpression::CellIndex { target, .. } => {
+                HirExpression::FieldAccess { target, .. }
+                | HirExpression::CellIndex { target, .. } => {
                     find_method_result(interpreter, frame, target)
                 }
                 _ => Ok(None),
@@ -10176,7 +18819,11 @@ impl<'a> Interpreter<'a> {
             [HirAssignmentTarget::Index { target, .. }] => target,
             _ => return Ok(None),
         };
-        let HirExpression::FieldAccess { target: receiver, field } = &**target else {
+        let HirExpression::FieldAccess {
+            target: receiver,
+            field,
+        } = &**target
+        else {
             return Ok(None);
         };
         let receiver = match self.evaluate_expression(frame, receiver) {
@@ -10240,7 +18887,9 @@ impl<'a> Interpreter<'a> {
         argument: &HirIndexArgument,
     ) -> Result<Vec<Value>, RuntimeError> {
         match argument {
-            HirIndexArgument::Expression(expression) if expression_contains_end_keyword(expression) => {
+            HirIndexArgument::Expression(expression)
+                if expression_contains_end_keyword(expression) =>
+            {
                 Ok(vec![self.evaluate_index_expression_value(
                     frame,
                     &empty_matrix_value(),
@@ -10321,18 +18970,24 @@ impl<'a> Interpreter<'a> {
 
         match expression {
             HirExpression::EndKeyword => {
-                Ok(Value::Scalar(end_index_extent(target, position, total_arguments)? as f64))
+                Ok(Value::Scalar(
+                    end_index_extent(target, position, total_arguments)? as f64,
+                ))
             }
             HirExpression::Unary { op, rhs } => {
-                let rhs =
-                    self.evaluate_index_expression_value(frame, target, rhs, position, total_arguments)?;
+                let rhs = self.evaluate_index_expression_value(
+                    frame,
+                    target,
+                    rhs,
+                    position,
+                    total_arguments,
+                )?;
                 match op {
-                    matlab_frontend::ast::UnaryOp::Plus => map_numeric_unary(&rhs, |value| value),
+                    matlab_frontend::ast::UnaryOp::Plus => {
+                        invoke_stdlib_single_output("uplus", std::slice::from_ref(&rhs))
+                    }
                     matlab_frontend::ast::UnaryOp::Minus => {
-                        map_numeric_unary(&rhs, |value| NumericComplexParts {
-                            real: -value.real,
-                            imag: -value.imag,
-                        })
+                        invoke_stdlib_single_output("uminus", std::slice::from_ref(&rhs))
                     }
                     matlab_frontend::ast::UnaryOp::LogicalNot => {
                         map_numeric_unary_logical(&rhs, |value| value == 0.0)
@@ -10342,20 +18997,31 @@ impl<'a> Interpreter<'a> {
                 }
             }
             HirExpression::Binary { op, lhs, rhs } => {
-                let lhs =
-                    self.evaluate_index_expression_value(frame, target, lhs, position, total_arguments)?;
-                let rhs =
-                    self.evaluate_index_expression_value(frame, target, rhs, position, total_arguments)?;
+                let lhs = self.evaluate_index_expression_value(
+                    frame,
+                    target,
+                    lhs,
+                    position,
+                    total_arguments,
+                )?;
+                let rhs = self.evaluate_index_expression_value(
+                    frame,
+                    target,
+                    rhs,
+                    position,
+                    total_arguments,
+                )?;
+                let args = [lhs.clone(), rhs.clone()];
                 match op {
                     matlab_frontend::ast::BinaryOp::Add => {
-                        map_numeric_binary(&lhs, &rhs, |lhs, rhs| lhs.plus(rhs))
+                        invoke_stdlib_single_output("plus", &args)
                     }
                     matlab_frontend::ast::BinaryOp::Subtract => {
-                        map_numeric_binary(&lhs, &rhs, |lhs, rhs| lhs.minus(rhs))
+                        invoke_stdlib_single_output("minus", &args)
                     }
                     matlab_frontend::ast::BinaryOp::Multiply => matrix_multiply(&lhs, &rhs),
                     matlab_frontend::ast::BinaryOp::ElementwiseMultiply => {
-                        map_numeric_binary(&lhs, &rhs, |lhs, rhs| lhs.times(rhs))
+                        invoke_stdlib_single_output("times", &args)
                     }
                     matlab_frontend::ast::BinaryOp::MatrixRightDivide => {
                         matrix_right_divide(&lhs, &rhs)
@@ -10388,10 +19054,10 @@ impl<'a> Interpreter<'a> {
                         map_numeric_binary_logical(&lhs, &rhs, |lhs, rhs| lhs <= rhs)
                     }
                     matlab_frontend::ast::BinaryOp::Equal => {
-                        map_numeric_binary_equality(&lhs, &rhs, |lhs, rhs| lhs.exact_eq(rhs))
+                        invoke_stdlib_single_output("eq", &args)
                     }
                     matlab_frontend::ast::BinaryOp::NotEqual => {
-                        map_numeric_binary_equality(&lhs, &rhs, |lhs, rhs| lhs.exact_ne(rhs))
+                        invoke_stdlib_single_output("ne", &args)
                     }
                     matlab_frontend::ast::BinaryOp::LogicalAnd => {
                         map_numeric_binary_logical(&lhs, &rhs, |lhs, rhs| lhs != 0.0 && rhs != 0.0)
@@ -10412,11 +19078,23 @@ impl<'a> Interpreter<'a> {
             }
             HirExpression::Range { start, step, end } => {
                 let start = self
-                    .evaluate_index_expression_value(frame, target, start, position, total_arguments)?
+                    .evaluate_index_expression_value(
+                        frame,
+                        target,
+                        start,
+                        position,
+                        total_arguments,
+                    )?
                     .as_scalar()?;
                 let step = match step {
                     Some(step) => self
-                        .evaluate_index_expression_value(frame, target, step, position, total_arguments)?
+                        .evaluate_index_expression_value(
+                            frame,
+                            target,
+                            step,
+                            position,
+                            total_arguments,
+                        )?
                         .as_scalar()?,
                     None => 1.0,
                 };
@@ -10463,7 +19141,10 @@ impl<'a> Interpreter<'a> {
                 )?;
                 Ok(Value::Cell(CellValue::from_rows(rows)?))
             }
-            HirExpression::Call { target: call_target, args } => match call_target {
+            HirExpression::Call {
+                target: call_target,
+                args,
+            } => match call_target {
                 HirCallTarget::Callable(reference)
                     if reference.semantic_resolution == ReferenceResolution::WorkspaceValue =>
                 {
@@ -10573,24 +19254,24 @@ impl<'a> Interpreter<'a> {
         let mut values = Vec::new();
         for argument in arguments {
             match argument {
-                HirIndexArgument::Expression(expression) => values.push(
-                    self.evaluate_index_expression_value(
+                HirIndexArgument::Expression(expression) => {
+                    values.push(self.evaluate_index_expression_value(
                         frame,
                         target,
                         expression,
                         position,
                         total_arguments,
-                    )?,
-                ),
-                HirIndexArgument::FullSlice => {
-                    return Err(RuntimeError::Unsupported(
-                        "slice-style indexing arguments are not implemented in the current interpreter"
-                            .to_string(),
+                    )?)
+                }
+                HirIndexArgument::FullSlice => return Err(RuntimeError::Unsupported(
+                    "slice-style indexing arguments are not implemented in the current interpreter"
+                        .to_string(),
+                )),
+                HirIndexArgument::End => {
+                    values.push(Value::Scalar(
+                        end_index_extent(target, position, total_arguments)? as f64,
                     ))
                 }
-                HirIndexArgument::End => values.push(Value::Scalar(
-                    end_index_extent(target, position, total_arguments)? as f64,
-                )),
             }
         }
         Ok(values)
@@ -10967,18 +19648,17 @@ impl<'a> Interpreter<'a> {
             object_matrix.rows,
             object_matrix.cols,
         )?);
-        let updated_aggregated = self.assign_lvalue_path(
-            frame,
-            aggregated,
-            rest,
-            true,
-            leaf.clone(),
-        )?;
+        let updated_aggregated =
+            self.assign_lvalue_path(frame, aggregated, rest, true, leaf.clone())?;
         let Value::Matrix(updated_matrix) = updated_aggregated else {
             return Ok(None);
         };
-        let reassigned =
-            split_concatenated_object_array_property_matrix(&updated_matrix, &property_dims, object_matrix.rows, object_matrix.cols)?;
+        let reassigned = split_concatenated_object_array_property_matrix(
+            &updated_matrix,
+            &property_dims,
+            object_matrix.rows,
+            object_matrix.cols,
+        )?;
         let mut updated_elements = Vec::with_capacity(object_matrix.elements.len());
         for (element, assigned_value) in object_matrix
             .elements
@@ -11051,7 +19731,8 @@ impl<'a> Interpreter<'a> {
         {
             return Err(RuntimeError::ShapeError(format!(
                 "object-valued property assignment expects shape {:?}, found {:?}",
-                object_matrix.dims, updated_matrix.dims()
+                object_matrix.dims,
+                updated_matrix.dims()
             )));
         }
         if !matrix_is_object_array(&updated_matrix) {
@@ -11132,7 +19813,8 @@ impl<'a> Interpreter<'a> {
         {
             return Err(RuntimeError::ShapeError(format!(
                 "object-array property aggregate assignment expects shape {:?}, found {:?}",
-                object_matrix.dims, updated_matrix.dims()
+                object_matrix.dims,
+                updated_matrix.dims()
             )));
         }
 
@@ -11196,7 +19878,10 @@ impl<'a> Interpreter<'a> {
             object_matrix.rows,
             object_matrix.cols,
             object_matrix.dims.clone(),
-            property_cells.into_iter().map(Value::Cell).collect::<Vec<_>>(),
+            property_cells
+                .into_iter()
+                .map(Value::Cell)
+                .collect::<Vec<_>>(),
         )?);
         let updated_aggregated =
             self.assign_lvalue_path(frame, aggregated, rest, false, leaf.clone())?;
@@ -11208,7 +19893,8 @@ impl<'a> Interpreter<'a> {
         {
             return Err(RuntimeError::ShapeError(format!(
                 "cell-valued object property assignment expects shape {:?}, found {:?}",
-                object_matrix.dims, updated_cell.dims()
+                object_matrix.dims,
+                updated_cell.dims()
             )));
         }
 
@@ -11255,6 +19941,7 @@ impl<'a> Interpreter<'a> {
                         return invoke_runtime_builtin_outputs(
                             &self.shared_state,
                             Some(frame),
+                            self.resolution_source_path.as_deref(),
                             method,
                             &evaluated_args,
                             requested_outputs.unwrap_or(1),
@@ -11262,7 +19949,11 @@ impl<'a> Interpreter<'a> {
                     }
                     if value_has_object_method(&receiver, field) {
                         let evaluated_args = self.evaluate_function_arguments(frame, args)?;
-                        return self.invoke_object_method_outputs(&receiver, field, &evaluated_args);
+                        return self.invoke_object_method_outputs(
+                            &receiver,
+                            field,
+                            &evaluated_args,
+                        );
                     }
                 }
             }
@@ -11378,13 +20069,105 @@ impl<'a> Interpreter<'a> {
                     return self.invoke_fcontour3_builtin_outputs(frame, args, output_arity);
                 }
                 if reference.name == "arrayfun" {
-                    return execute_arrayfun_builtin_outputs(args, output_arity, |callback, call_args, requested| {
-                        self.call_function_value_outputs(frame, callback, call_args, Some(requested))
-                    });
+                    return execute_arrayfun_builtin_outputs(
+                        args,
+                        output_arity,
+                        |callback, call_args, requested| {
+                            self.call_function_value_outputs(
+                                frame,
+                                callback,
+                                call_args,
+                                Some(requested),
+                            )
+                        },
+                    );
+                }
+                if reference.name == "nlfilter" {
+                    return execute_nlfilter_builtin_outputs(
+                        args,
+                        output_arity,
+                        |callback, call_args, requested| {
+                            self.call_function_value_outputs(
+                                frame,
+                                callback,
+                                call_args,
+                                Some(requested),
+                            )
+                        },
+                    );
+                }
+                if reference.name == "blockproc" {
+                    return execute_blockproc_builtin_outputs(
+                        args,
+                        output_arity,
+                        |callback, call_args, requested| {
+                            self.call_function_value_outputs(
+                                frame,
+                                callback,
+                                call_args,
+                                Some(requested),
+                            )
+                        },
+                    );
+                }
+                if reference.name == "colfilt" {
+                    return execute_colfilt_builtin_outputs(
+                        args,
+                        output_arity,
+                        |callback, call_args, requested| {
+                            self.call_function_value_outputs(
+                                frame,
+                                callback,
+                                call_args,
+                                Some(requested),
+                            )
+                        },
+                    );
                 }
                 if reference.name == "help" {
                     return invoke_help_builtin_outputs(
                         Some(frame),
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        output_arity,
+                    );
+                }
+                if reference.name == "doc" {
+                    return invoke_doc_builtin_outputs(
+                        Some(frame),
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        output_arity,
+                    );
+                }
+                if reference.name == "methods" {
+                    return invoke_methods_builtin_outputs(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        output_arity,
+                    );
+                }
+                if reference.name == "properties" {
+                    return invoke_properties_builtin_outputs(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        output_arity,
+                    );
+                }
+                if reference.name == "superclasses" {
+                    return invoke_superclasses_builtin_outputs(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        output_arity,
+                    );
+                }
+                if reference.name == "events" {
+                    return invoke_events_builtin_outputs(
                         &self.shared_state,
                         self.resolution_source_path.as_deref(),
                         args,
@@ -11410,6 +20193,7 @@ impl<'a> Interpreter<'a> {
                 if reference.name == "exist" {
                     let (item, search_type) = parse_exist_args(args)?;
                     return Ok(vec![exist_value_result(
+                        &self.shared_state,
                         Some(frame),
                         None,
                         self.resolution_source_path.as_deref(),
@@ -11420,6 +20204,7 @@ impl<'a> Interpreter<'a> {
                 if reference.name == "which" {
                     let (item, mode) = parse_which_args(args)?;
                     return Ok(vec![which_value_result(
+                        &self.shared_state,
                         Some(frame),
                         None,
                         self.resolution_source_path.as_deref(),
@@ -11441,19 +20226,44 @@ impl<'a> Interpreter<'a> {
                     )?]);
                 }
                 if reference.name == "cellfun" {
-                    return execute_cellfun_builtin_outputs(args, output_arity, |callback, call_args, requested| {
-                        self.call_function_value_outputs(frame, callback, call_args, Some(requested))
-                    });
+                    return execute_cellfun_builtin_outputs(
+                        args,
+                        output_arity,
+                        |callback, call_args, requested| {
+                            self.call_function_value_outputs(
+                                frame,
+                                callback,
+                                call_args,
+                                Some(requested),
+                            )
+                        },
+                    );
                 }
                 if reference.name == "structfun" {
-                    return execute_structfun_builtin_outputs(args, output_arity, |callback, call_args, requested| {
-                        self.call_function_value_outputs(frame, callback, call_args, Some(requested))
-                    });
+                    return execute_structfun_builtin_outputs(
+                        args,
+                        output_arity,
+                        |callback, call_args, requested| {
+                            self.call_function_value_outputs(
+                                frame,
+                                callback,
+                                call_args,
+                                Some(requested),
+                            )
+                        },
+                    );
                 }
                 if matches!(
                     reference.name.as_str(),
-                    "clear" | "clearvars" | "save" | "load" | "who" | "whos" | "tic"
-                        | "toc" | "format"
+                    "clear"
+                        | "clearvars"
+                        | "save"
+                        | "load"
+                        | "who"
+                        | "whos"
+                        | "tic"
+                        | "toc"
+                        | "format"
                 ) {
                     let shared_state = Rc::clone(&self.shared_state);
                     return self.invoke_workspace_builtin_outputs(
@@ -11470,6 +20280,7 @@ impl<'a> Interpreter<'a> {
                 invoke_runtime_builtin_outputs(
                     &self.shared_state,
                     Some(frame),
+                    self.resolution_source_path.as_deref(),
                     &reference.name,
                     args,
                     output_arity,
@@ -11537,9 +20348,17 @@ impl<'a> Interpreter<'a> {
                         );
                     }
                 }
+                if let Some(path) = resolve_named_callable_path(
+                    &self.shared_state,
+                    self.resolution_source_path.as_deref(),
+                    &reference.name,
+                ) {
+                    return self.load_and_invoke_external_function(&path, args);
+                }
                 invoke_runtime_builtin_outputs(
                     &self.shared_state,
                     Some(frame),
+                    self.resolution_source_path.as_deref(),
                     &reference.name,
                     args,
                     output_arity,
@@ -11565,10 +20384,34 @@ impl<'a> Interpreter<'a> {
         match name {
             "clear" => invoke_clear_builtin_outputs(frame, shared_state, args, output_arity),
             "clearvars" => invoke_clearvars_builtin_outputs(frame, args, output_arity),
-            "save" => invoke_save_builtin_outputs(frame, shared_state, args, output_arity),
-            "load" => invoke_load_builtin_outputs(frame, shared_state, args, output_arity),
-            "who" => invoke_who_builtin_outputs(Some(frame), shared_state, args, output_arity),
-            "whos" => invoke_whos_builtin_outputs(Some(frame), shared_state, args, output_arity),
+            "save" => invoke_save_builtin_outputs(
+                frame,
+                shared_state,
+                self.resolution_source_path.as_deref(),
+                args,
+                output_arity,
+            ),
+            "load" => invoke_load_builtin_outputs(
+                frame,
+                shared_state,
+                self.resolution_source_path.as_deref(),
+                args,
+                output_arity,
+            ),
+            "who" => invoke_who_builtin_outputs(
+                Some(frame),
+                shared_state,
+                self.resolution_source_path.as_deref(),
+                args,
+                output_arity,
+            ),
+            "whos" => invoke_whos_builtin_outputs(
+                Some(frame),
+                shared_state,
+                self.resolution_source_path.as_deref(),
+                args,
+                output_arity,
+            ),
             "tic" => invoke_tic_builtin_outputs(shared_state, args, output_arity),
             "toc" => invoke_toc_builtin_outputs(shared_state, args, output_arity),
             "format" => invoke_format_builtin_outputs(shared_state, args, output_arity),
@@ -12096,7 +20939,8 @@ impl<'a> Interpreter<'a> {
                         Ok(vec![self.invoke_anonymous(closure, args)?])
                     } else if let Some(closure) = self.named_function_handles.get(name).cloned() {
                         self.invoke_named_function_closure(closure, args)
-                    } else if let Some((path, function_name)) = parse_scoped_function_handle_name(name)
+                    } else if let Some((path, function_name)) =
+                        parse_scoped_function_handle_name(name)
                     {
                         self.invoke_scoped_function_handle(&path, &function_name, args)
                     } else if let Some(function) = frame.visible_functions.get(name).copied() {
@@ -12132,6 +20976,47 @@ impl<'a> Interpreter<'a> {
                                 requested_outputs.unwrap_or(1),
                             );
                         }
+                        if name == "doc" {
+                            return invoke_doc_builtin_outputs(
+                                Some(frame),
+                                &self.shared_state,
+                                self.resolution_source_path.as_deref(),
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "methods" {
+                            return invoke_methods_builtin_outputs(
+                                &self.shared_state,
+                                self.resolution_source_path.as_deref(),
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "properties" {
+                            return invoke_properties_builtin_outputs(
+                                &self.shared_state,
+                                self.resolution_source_path.as_deref(),
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "superclasses" {
+                            return invoke_superclasses_builtin_outputs(
+                                &self.shared_state,
+                                self.resolution_source_path.as_deref(),
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
+                        if name == "events" {
+                            return invoke_events_builtin_outputs(
+                                &self.shared_state,
+                                self.resolution_source_path.as_deref(),
+                                args,
+                                requested_outputs.unwrap_or(1),
+                            );
+                        }
                         if name == "lookfor" {
                             return invoke_lookfor_builtin_outputs(
                                 &self.shared_state,
@@ -12151,6 +21036,7 @@ impl<'a> Interpreter<'a> {
                         if name == "exist" {
                             let (item, search_type) = parse_exist_args(args)?;
                             return Ok(vec![exist_value_result(
+                                &self.shared_state,
                                 Some(frame),
                                 None,
                                 self.resolution_source_path.as_deref(),
@@ -12161,6 +21047,7 @@ impl<'a> Interpreter<'a> {
                         if name == "which" {
                             let (item, mode) = parse_which_args(args)?;
                             return Ok(vec![which_value_result(
+                                &self.shared_state,
                                 Some(frame),
                                 None,
                                 self.resolution_source_path.as_deref(),
@@ -12203,6 +21090,48 @@ impl<'a> Interpreter<'a> {
                                 },
                             );
                         }
+                        if name == "colfilt" {
+                            return execute_colfilt_builtin_outputs(
+                                args,
+                                requested_outputs.unwrap_or(1),
+                                |callback, call_args, requested| {
+                                    self.call_function_value_outputs(
+                                        frame,
+                                        callback,
+                                        call_args,
+                                        Some(requested),
+                                    )
+                                },
+                            );
+                        }
+                        if name == "blockproc" {
+                            return execute_blockproc_builtin_outputs(
+                                args,
+                                requested_outputs.unwrap_or(1),
+                                |callback, call_args, requested| {
+                                    self.call_function_value_outputs(
+                                        frame,
+                                        callback,
+                                        call_args,
+                                        Some(requested),
+                                    )
+                                },
+                            );
+                        }
+                        if name == "nlfilter" {
+                            return execute_nlfilter_builtin_outputs(
+                                args,
+                                requested_outputs.unwrap_or(1),
+                                |callback, call_args, requested| {
+                                    self.call_function_value_outputs(
+                                        frame,
+                                        callback,
+                                        call_args,
+                                        Some(requested),
+                                    )
+                                },
+                            );
+                        }
                         if name == "structfun" {
                             return execute_structfun_builtin_outputs(
                                 args,
@@ -12228,12 +21157,13 @@ impl<'a> Interpreter<'a> {
                         match invoke_runtime_builtin_outputs(
                             &self.shared_state,
                             Some(frame),
+                            self.resolution_source_path.as_deref(),
                             name,
                             args,
                             requested_outputs.unwrap_or(1),
                         ) {
                             Ok(values) => Ok(values),
-                            Err(RuntimeError::Unsupported(_)) => {
+                            Err(error) if runtime_builtin_can_fallback(&error, name) => {
                                 let (bundled_modules, bundled_modules_by_id) =
                                     bundled_module_registries(&self.shared_state);
                                 if let Some(values) =
@@ -12258,9 +21188,11 @@ impl<'a> Interpreter<'a> {
                                     }
                                 }
                                 if let Some(source_path) = self.resolution_source_path.as_deref() {
-                                    if let Some(path) =
-                                        resolve_named_callable_path_from_source_path(source_path, name)
-                                    {
+                                    if let Some(path) = resolve_named_callable_path(
+                                        &self.shared_state,
+                                        Some(source_path),
+                                        name,
+                                    ) {
                                         return self.load_and_invoke_external_function(&path, args);
                                     }
                                 }
@@ -12280,14 +21212,16 @@ impl<'a> Interpreter<'a> {
                             drop(state);
                             let (bundled_modules, bundled_modules_by_id) =
                                 bundled_module_registries(&self.shared_state);
-                            if let Some(values) = bytecode::invoke_bundle_named_callable_from_registry(
-                                &handle.display_name,
-                                args,
-                                bundled_modules,
-                                bundled_modules_by_id,
-                                Rc::clone(&self.shared_state),
-                                self.call_stack.clone(),
-                            )? {
+                            if let Some(values) =
+                                bytecode::invoke_bundle_named_callable_from_registry(
+                                    &handle.display_name,
+                                    args,
+                                    bundled_modules,
+                                    bundled_modules_by_id,
+                                    Rc::clone(&self.shared_state),
+                                    self.call_stack.clone(),
+                                )?
+                            {
                                 return Ok(values);
                             }
                         }
@@ -12340,7 +21274,11 @@ impl<'a> Interpreter<'a> {
                         Err(error) => Err(error),
                     }
                 }
-                FunctionHandleTarget::BoundMethod { receiver, method_name, .. } => {
+                FunctionHandleTarget::BoundMethod {
+                    receiver,
+                    method_name,
+                    ..
+                } => {
                     if !matches!(receiver.as_ref(), Value::Object(_) | Value::Matrix(_)) {
                         return Err(RuntimeError::Unsupported(format!(
                             "bound method handle `{}` does not carry an object receiver",
@@ -12709,6 +21647,8 @@ impl<'a> Frame<'a> {
 fn iteration_values(value: &Value) -> Result<Vec<Value>, RuntimeError> {
     match value {
         Value::Scalar(_)
+        | Value::Int64(_)
+        | Value::UInt64(_)
         | Value::Complex(_)
         | Value::Logical(_)
         | Value::CharArray(_)
@@ -12739,6 +21679,13 @@ fn map_numeric_unary(
             .map(|value| value_from_numeric_complex_parts(op(value)))
             .collect(),
     )?))
+}
+
+fn invoke_stdlib_single_output(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    invoke_stdlib_builtin_outputs(name, args, 1)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| RuntimeError::Unsupported(format!("{name} did not produce an output value")))
 }
 
 fn map_numeric_unary_logical(
@@ -12974,6 +21921,16 @@ fn numeric_operand(value: &Value) -> Result<NumericOperand, RuntimeError> {
             cols: 1,
             values: vec![*number],
         }),
+        Value::Int64(number) => Ok(NumericOperand {
+            rows: 1,
+            cols: 1,
+            values: vec![*number as f64],
+        }),
+        Value::UInt64(number) => Ok(NumericOperand {
+            rows: 1,
+            cols: 1,
+            values: vec![*number as f64],
+        }),
         Value::Logical(flag) => Ok(NumericOperand {
             rows: 1,
             cols: 1,
@@ -13001,6 +21958,14 @@ fn numeric_or_complex_scalar(value: &Value) -> Result<NumericComplexParts, Runti
             real: *number,
             imag: 0.0,
         }),
+        Value::Int64(number) => Ok(NumericComplexParts {
+            real: *number as f64,
+            imag: 0.0,
+        }),
+        Value::UInt64(number) => Ok(NumericComplexParts {
+            real: *number as f64,
+            imag: 0.0,
+        }),
         Value::Logical(flag) => Ok(NumericComplexParts {
             real: truth_number(*flag),
             imag: 0.0,
@@ -13018,7 +21983,11 @@ fn numeric_or_complex_scalar(value: &Value) -> Result<NumericComplexParts, Runti
 
 fn numeric_or_complex_operand(value: &Value) -> Result<NumericOrComplexOperand, RuntimeError> {
     match value {
-        Value::Scalar(_) | Value::Logical(_) | Value::Complex(_) => Ok(NumericOrComplexOperand {
+        Value::Scalar(_)
+        | Value::Int64(_)
+        | Value::UInt64(_)
+        | Value::Logical(_)
+        | Value::Complex(_) => Ok(NumericOrComplexOperand {
             rows: 1,
             cols: 1,
             values: vec![numeric_or_complex_scalar(value)?],
@@ -13880,25 +22849,45 @@ fn assign_char_array_index(
     text: String,
     args: &[EvaluatedIndexArgument],
     value: Value,
-) -> Result<String, RuntimeError> {
+) -> Result<Value, RuntimeError> {
     if is_empty_matrix_value(&value) {
         return delete_char_array_index(text, args);
     }
 
     let plan = char_array_assignment_plan(&text, args)?;
-    if plan.target_rows > 1 {
-        return Err(RuntimeError::Unsupported(
-            "char-array assignment currently only supports row-vector results".to_string(),
-        ));
+    let mut chars = vec!['\0'; plan.target_rows * plan.target_cols];
+    for (offset, ch) in text.chars().enumerate() {
+        if offset >= plan.target_cols {
+            break;
+        }
+        chars[offset] = ch;
     }
-
-    let mut chars = text.chars().collect::<Vec<_>>();
-    chars.resize(plan.target_cols, ' ');
     let values = char_array_assignment_values(&value, &plan.selection)?;
     for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
         chars[position] = value;
     }
-    Ok(chars.into_iter().collect())
+    char_value_from_dimensions(plan.target_rows, plan.target_cols, plan.target_dims, chars)
+}
+
+fn assign_char_matrix_index(
+    matrix: MatrixValue,
+    args: &[EvaluatedIndexArgument],
+    value: Value,
+) -> Result<Value, RuntimeError> {
+    if is_empty_matrix_value(&value) {
+        let updated = delete_matrix_index(matrix, args)?;
+        let chars = char_matrix_chars(&updated).unwrap_or_default();
+        return char_value_from_dimensions(updated.rows, updated.cols, updated.dims.clone(), chars);
+    }
+
+    let plan = char_matrix_assignment_plan(&matrix, args)?;
+    let mut chars = char_matrix_chars(&matrix)?;
+    chars.resize(plan.target_rows * plan.target_cols, '\0');
+    let values = char_array_assignment_values(&value, &plan.selection)?;
+    for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
+        chars[position] = value;
+    }
+    char_value_from_dimensions(plan.target_rows, plan.target_cols, plan.target_dims, chars)
 }
 
 fn assign_cell_content_index(
@@ -14031,6 +23020,18 @@ fn read_matrix_selection(
 
     let rows = selection.rows;
     let cols = selection.cols;
+    if matrix_is_char_matrix(matrix) {
+        let chars = selection
+            .positions
+            .iter()
+            .map(|&position| {
+                single_char_text_value(&matrix.elements()[position])
+                    .expect("char matrix selection guard ensures single-character elements")
+            })
+            .collect::<Vec<_>>();
+        return char_value_from_dimensions(rows, cols, selection.dims, chars);
+    }
+
     let elements = selection
         .positions
         .into_iter()
@@ -14070,11 +23071,12 @@ fn read_char_array_selection(
 ) -> Result<Value, RuntimeError> {
     let selection = char_array_selection(text, args)?;
     let chars = text.chars().collect::<Vec<_>>();
-    let mut out = String::with_capacity(selection.positions.len());
-    for position in selection.positions {
-        out.push(chars[position]);
-    }
-    Ok(Value::CharArray(out))
+    let out = selection
+        .positions
+        .iter()
+        .map(|&position| chars[position])
+        .collect::<Vec<_>>();
+    char_value_from_dimensions(selection.rows, selection.cols, selection.dims, out)
 }
 
 fn matrix_selection(
@@ -14134,6 +23136,16 @@ fn char_array_assignment_plan(
     assignment_plan(&[1, text.chars().count()], "char array", args)
 }
 
+fn char_matrix_assignment_plan(
+    matrix: &MatrixValue,
+    args: &[EvaluatedIndexArgument],
+) -> Result<AssignmentPlan, RuntimeError> {
+    match args {
+        [_] | [_, _] => assignment_plan(matrix.dims(), "char array", args),
+        _ => nd_assignment_plan(matrix.dims(), "char array", args),
+    }
+}
+
 fn assignment_plan(
     current_dims: &[usize],
     kind: &str,
@@ -14184,37 +23196,43 @@ fn linear_assignment_plan(
         }
     };
 
-    let selector =
-        plan_linear_selector(argument, current_rows, current_cols, current_dims, kind, SelectorPlanMode::Assignment)?;
+    let selector = plan_linear_selector(
+        argument,
+        current_rows,
+        current_cols,
+        current_dims,
+        kind,
+        SelectorPlanMode::Assignment,
+    )?;
 
     match selector.source {
-        SelectorSource::FullSlice
-        | SelectorSource::LogicalMask
-        | SelectorSource::ScalarLogical => Ok(AssignmentPlan {
-            selection: IndexSelection {
-                positions: selector
-                    .indices
-                    .iter()
-                    .copied()
-                    .map(|index| {
-                        linear_position_for_dimensions(
-                            index,
-                            current_rows,
-                            current_cols,
-                            current_dims,
-                            kind,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-                rows: selector.output_rows,
-                cols: selector.output_cols,
-                dims: selector.output_dims,
-                linear: true,
-            },
-            target_rows: current_rows,
-            target_cols: current_cols,
-            target_dims: stable_target_dims(),
-        }),
+        SelectorSource::FullSlice | SelectorSource::LogicalMask | SelectorSource::ScalarLogical => {
+            Ok(AssignmentPlan {
+                selection: IndexSelection {
+                    positions: selector
+                        .indices
+                        .iter()
+                        .copied()
+                        .map(|index| {
+                            linear_position_for_dimensions(
+                                index,
+                                current_rows,
+                                current_cols,
+                                current_dims,
+                                kind,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    rows: selector.output_rows,
+                    cols: selector.output_cols,
+                    dims: selector.output_dims,
+                    linear: true,
+                },
+                target_rows: current_rows,
+                target_cols: current_cols,
+                target_dims: stable_target_dims(),
+            })
+        }
         SelectorSource::Numeric => {
             let max_index = selector.indices.iter().copied().max().unwrap_or(0);
             let collapsed_growth = current_dims.len() > 2 && max_index > current_extent;
@@ -14403,7 +23421,11 @@ fn plan_dimension_selector(
             }
 
             let target_extent = if mode == SelectorPlanMode::Assignment {
-                indices.iter().copied().max().map_or(extent, |index| extent.max(index))
+                indices
+                    .iter()
+                    .copied()
+                    .max()
+                    .map_or(extent, |index| extent.max(index))
             } else {
                 extent
             };
@@ -14445,8 +23467,12 @@ fn plan_linear_selector(
             logical,
         } => {
             if *logical && is_logical_selector(values) && values.len() == current_extent {
-                let indices =
-                    logical_selector_indices(values, *selection_rows, *selection_cols, selector_dims);
+                let indices = logical_selector_indices(
+                    values,
+                    *selection_rows,
+                    *selection_cols,
+                    selector_dims,
+                );
                 let (output_rows, output_cols) =
                     logical_linear_result_shape(rows, cols, indices.len());
                 return Ok(SelectorPlan {
@@ -14546,7 +23572,14 @@ fn linear_selection(
     dims: &[usize],
     kind: &str,
 ) -> Result<IndexSelection, RuntimeError> {
-    let plan = plan_linear_selector(argument, rows, cols, dims, kind, SelectorPlanMode::Selection)?;
+    let plan = plan_linear_selector(
+        argument,
+        rows,
+        cols,
+        dims,
+        kind,
+        SelectorPlanMode::Selection,
+    )?;
     Ok(IndexSelection {
         positions: plan
             .indices
@@ -14697,10 +23730,14 @@ fn dimension_indices(
     dimension: &str,
     kind: &str,
 ) -> Result<Vec<usize>, RuntimeError> {
-    Ok(
-        plan_dimension_selector(argument, extent, dimension, kind, SelectorPlanMode::Selection)?
-            .indices,
-    )
+    Ok(plan_dimension_selector(
+        argument,
+        extent,
+        dimension,
+        kind,
+        SelectorPlanMode::Selection,
+    )?
+    .indices)
 }
 
 fn matrix_assignment_values(
@@ -14813,7 +23850,10 @@ fn object_assignment_target_class(
         Value::Matrix(rhs) => {
             if let Some(class) = object_array_class_metadata(rhs) {
                 Ok(Some(class))
-            } else if rhs.iter().all(|element| matches!(element, Value::Object(_))) {
+            } else if rhs
+                .iter()
+                .all(|element| matches!(element, Value::Object(_)))
+            {
                 Err(RuntimeError::TypeError(
                     "object-array assignment from an empty matrix root currently expects homogeneous object rhs values"
                         .to_string(),
@@ -14861,11 +23901,7 @@ fn build_matrix_literal_value(rows: Vec<Vec<Value>>) -> Result<Value, RuntimeErr
     if rows.is_empty() {
         return Ok(empty_matrix_value());
     }
-    if !rows
-        .iter()
-        .flatten()
-        .all(matrix_literal_concat_compatible)
-    {
+    if !rows.iter().flatten().all(matrix_literal_concat_compatible) {
         return Ok(Value::Matrix(MatrixValue::from_rows(rows)?));
     }
 
@@ -14913,9 +23949,12 @@ fn char_array_assignment_values(
 ) -> Result<Vec<char>, RuntimeError> {
     let rhs = match value {
         Value::CharArray(text) | Value::String(text) => text.chars().collect::<Vec<_>>(),
+        Value::Matrix(matrix) if matrix_is_char_matrix(matrix) => {
+            expand_char_matrix_assignment_values(matrix, selection)?
+        }
         other => {
             return Err(RuntimeError::TypeError(format!(
-                "char-array assignment expects char or string rhs, found {}",
+                "char-array assignment expects char, string, or char-matrix rhs, found {}",
                 other.kind_name()
             )))
         }
@@ -14933,6 +23972,80 @@ fn char_array_assignment_values(
         "char-array assignment expects 1 or {} character(s), found {}",
         selection.positions.len(),
         rhs.len()
+    )))
+}
+
+fn expand_char_matrix_assignment_values(
+    matrix: &MatrixValue,
+    selection: &IndexSelection,
+) -> Result<Vec<char>, RuntimeError> {
+    let count = selection.positions.len();
+    if matrix.rows * matrix.cols == 1 {
+        let ch = single_char_text_value(&matrix.elements()[0]).ok_or_else(|| {
+            RuntimeError::TypeError(
+                "char-array assignment expects single-character char matrix elements".to_string(),
+            )
+        })?;
+        return Ok(vec![ch; count]);
+    }
+
+    if selection.linear {
+        if matrix.rows * matrix.cols != count {
+            return Err(RuntimeError::ShapeError(format!(
+                "linear char-array assignment expects {} rhs element(s), found {}",
+                count,
+                matrix.rows * matrix.cols
+            )));
+        }
+        return linearized_matrix_elements(matrix)?
+            .into_iter()
+            .map(|value| {
+                single_char_text_value(&value).ok_or_else(|| {
+                    RuntimeError::TypeError(
+                        "char-array assignment expects single-character char matrix elements"
+                            .to_string(),
+                    )
+                })
+            })
+            .collect();
+    }
+
+    if equivalent_dimensions(matrix.dims(), &selection.dims) {
+        return matrix
+            .elements()
+            .iter()
+            .map(|value| {
+                single_char_text_value(value).ok_or_else(|| {
+                    RuntimeError::TypeError(
+                        "char-array assignment expects single-character char matrix elements"
+                            .to_string(),
+                    )
+                })
+            })
+            .collect();
+    }
+
+    if matrix.element_count() == count {
+        return Ok(reorder_matlab_linear_values_to_row_major(
+            linearized_matrix_elements(matrix)?
+                .into_iter()
+                .map(|value| {
+                    single_char_text_value(&value).ok_or_else(|| {
+                        RuntimeError::TypeError(
+                            "char-array assignment expects single-character char matrix elements"
+                                .to_string(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            &selection.dims,
+        ));
+    }
+
+    Err(RuntimeError::ShapeError(format!(
+        "char-array assignment expects rhs dimensions {:?}, found {:?}",
+        selection.dims,
+        matrix.dims()
     )))
 }
 
@@ -15351,26 +24464,27 @@ fn delete_matrix_index(
 fn delete_char_array_index(
     text: String,
     args: &[EvaluatedIndexArgument],
-) -> Result<String, RuntimeError> {
+) -> Result<Value, RuntimeError> {
     let len = text.chars().count();
     match args {
-        [argument] => delete_vector_text_elements(text, argument),
+        [argument] => delete_vector_text_elements(text, argument).map(Value::CharArray),
         [row_argument, EvaluatedIndexArgument::FullSlice] => {
             let rows = dimension_indices(row_argument, 1, "row", "char array")?;
             if rows.contains(&1) {
-                Ok(String::new())
+                Ok(Value::CharArray(String::new()))
             } else {
-                Ok(text)
+                Ok(Value::CharArray(text))
             }
         }
         [EvaluatedIndexArgument::FullSlice, col_argument] => {
             let indices = dimension_indices(col_argument, len, "column", "char array")?;
             let removed = removal_mask(len, &indices);
-            Ok(text
-                .chars()
-                .enumerate()
-                .filter_map(|(offset, ch)| (!removed[offset]).then_some(ch))
-                .collect())
+            Ok(Value::CharArray(
+                text.chars()
+                    .enumerate()
+                    .filter_map(|(offset, ch)| (!removed[offset]).then_some(ch))
+                    .collect(),
+            ))
         }
         _ => Err(RuntimeError::Unsupported(
             "char-array deletion currently supports removing full rows, full columns, or linear elements"
@@ -15420,12 +24534,7 @@ fn delete_vector_matrix_elements(
     matrix: MatrixValue,
     argument: &EvaluatedIndexArgument,
 ) -> Result<MatrixValue, RuntimeError> {
-    let indices = dimension_indices(
-        argument,
-        matrix.rows * matrix.cols,
-        "linear",
-        "matrix",
-    )?;
+    let indices = dimension_indices(argument, matrix.rows * matrix.cols, "linear", "matrix")?;
     let removed = removal_mask(matrix.rows * matrix.cols, &indices);
     let elements = linearized_matrix_elements(&matrix)?
         .into_iter()
@@ -16330,11 +25439,9 @@ fn aggregate_object_array_property_value(
             elements,
         )?)))
     } else if all_matrices {
-        Ok(Some(Value::Matrix(concatenate_object_array_property_matrices(
-            &matrix_values,
-            matrix.rows,
-            matrix.cols,
-        )?)))
+        Ok(Some(Value::Matrix(
+            concatenate_object_array_property_matrices(&matrix_values, matrix.rows, matrix.cols)?,
+        )))
     } else {
         Ok(Some(Value::Matrix(MatrixValue::with_dimensions(
             matrix.rows,
@@ -16696,7 +25803,9 @@ fn assign_struct_path(target: Value, path: &[String], value: Value) -> Result<Va
             let assigned = if path.len() == 1 {
                 value
             } else {
-                let next = object.property_value(field).unwrap_or_else(empty_matrix_value);
+                let next = object
+                    .property_value(field)
+                    .unwrap_or_else(empty_matrix_value);
                 assign_struct_path(next, &path[1..], value)?
             };
             object.set_property_value(field, assigned)?;
@@ -16722,7 +25831,9 @@ fn assign_struct_path(target: Value, path: &[String], value: Value) -> Result<Va
                     split_concatenated_matrix_field_assignment_values(&matrix, &path[0], &value)?
                 {
                     let mut elements = Vec::with_capacity(matrix.elements.len());
-                    for (element, assigned_value) in matrix.elements.into_iter().zip(assigned_values) {
+                    for (element, assigned_value) in
+                        matrix.elements.into_iter().zip(assigned_values)
+                    {
                         elements.push(assign_struct_path(element, path, assigned_value)?);
                     }
                     return Ok(Value::Matrix(MatrixValue::with_dimensions(
@@ -16752,7 +25863,9 @@ fn assign_struct_path(target: Value, path: &[String], value: Value) -> Result<Va
                     split_concatenated_matrix_field_assignment_values(&matrix, &path[0], &value)?
                 {
                     let mut elements = Vec::with_capacity(matrix.elements.len());
-                    for (element, assigned_value) in matrix.elements.into_iter().zip(assigned_values) {
+                    for (element, assigned_value) in
+                        matrix.elements.into_iter().zip(assigned_values)
+                    {
                         elements.push(assign_struct_path(element, path, assigned_value)?);
                     }
                     return Ok(Value::Matrix(MatrixValue::with_dimensions(
@@ -16909,7 +26022,9 @@ fn distributed_struct_assignment_values(
         Value::Matrix(matrix) if matrix.rows == 1 && matrix.cols == 1 => {
             Ok(vec![matrix.elements[0].clone(); count])
         }
-        Value::Matrix(matrix) if matrix.elements.len() == count => linearized_matrix_elements(matrix),
+        Value::Matrix(matrix) if matrix.elements.len() == count => {
+            linearized_matrix_elements(matrix)
+        }
         Value::Cell(cell) if cell.rows == 1 && cell.cols == 1 => {
             Ok(vec![cell.elements[0].clone(); count])
         }
@@ -17084,7 +26199,9 @@ fn struct_assignment_values(
         Value::Matrix(matrix) if matrix.rows == 1 && matrix.cols == 1 => {
             Ok(vec![matrix.elements[0].clone(); rows * cols])
         }
-        Value::Matrix(matrix) if matrix.elements.len() == rows * cols => Ok(matrix.elements.clone()),
+        Value::Matrix(matrix) if matrix.elements.len() == rows * cols => {
+            Ok(matrix.elements.clone())
+        }
         Value::Matrix(matrix)
             if matrix.rows == rows
                 && matrix.cols == cols
@@ -17268,7 +26385,9 @@ fn format_text_with_values_for_builtin(
         )));
     };
     match value {
-        Value::Cell(cell) if cell.elements.len() == 1 => Ok(text_value(&cell.elements[0])?.to_string()),
+        Value::Cell(cell) if cell.elements.len() == 1 => {
+            Ok(text_value(&cell.elements[0])?.to_string())
+        }
         Value::Cell(_) => Err(RuntimeError::Unsupported(format!(
             "{builtin_name} formatting currently expects a single rendered text result"
         ))),
@@ -17380,7 +26499,9 @@ fn infer_missing_root_receiver_count_from_value(
     let full_slice_axes = receiver_indices
         .iter()
         .enumerate()
-        .filter_map(|(axis, argument)| matches!(argument, HirIndexArgument::FullSlice).then_some(axis))
+        .filter_map(|(axis, argument)| {
+            matches!(argument, HirIndexArgument::FullSlice).then_some(axis)
+        })
         .collect::<Vec<_>>();
     if full_slice_axes.len() != 1 {
         return None;
@@ -17426,12 +26547,13 @@ fn apply_index_update(
     kind: IndexAssignmentKind,
 ) -> Result<Value, RuntimeError> {
     match (kind, current) {
+        (IndexAssignmentKind::Paren, Value::Matrix(matrix)) if matrix_is_char_matrix(&matrix) => {
+            assign_char_matrix_index(matrix, indices, value)
+        }
         (IndexAssignmentKind::Paren, Value::Matrix(matrix)) => {
             Ok(Value::Matrix(assign_matrix_index(matrix, indices, value)?))
         }
-        (IndexAssignmentKind::Paren, Value::CharArray(text)) => {
-            Ok(Value::CharArray(assign_char_array_index(text, indices, value)?))
-        }
+        (IndexAssignmentKind::Paren, Value::CharArray(text)) => assign_char_array_index(text, indices, value),
         (IndexAssignmentKind::Brace, Value::Cell(cell_value)) => {
             Ok(Value::Cell(assign_cell_content_index(cell_value, indices, value)?))
         }
@@ -17470,6 +26592,44 @@ fn apply_index_update(
         ))),
         (IndexAssignmentKind::Brace, other) => Err(RuntimeError::TypeError(format!(
             "indexed assignment with `{{}}` is only defined for cell values in the current interpreter, found {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+fn value_is_text_path_operand(value: &Value) -> bool {
+    match value {
+        Value::CharArray(_) | Value::String(_) => true,
+        Value::Matrix(matrix) => matrix
+            .elements()
+            .iter()
+            .all(|element| matches!(element, Value::CharArray(_) | Value::String(_))),
+        Value::Cell(cell) => cell
+            .elements()
+            .iter()
+            .all(|element| matches!(element, Value::CharArray(_) | Value::String(_))),
+        _ => false,
+    }
+}
+
+fn collect_text_path_values(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<Vec<String>, RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => Ok(vec![text.clone()]),
+        Value::Matrix(matrix) => matrix
+            .elements()
+            .iter()
+            .map(|element| Ok(text_value(element)?.to_string()))
+            .collect(),
+        Value::Cell(cell) => cell
+            .elements()
+            .iter()
+            .map(|element| Ok(text_value(element)?.to_string()))
+            .collect(),
+        other => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects text path inputs, found {}",
             other.kind_name()
         ))),
     }
@@ -17526,17 +26686,18 @@ fn format_semantic_diagnostics(
 mod tests {
     use super::{
         consume_figure_backend_events, distributed_cell_assignment_values,
-        distributed_struct_assignment_values, execute_function_file_with_identity,
-        execute_function_file_bytecode_module, execute_script, execute_script_bytecode,
-        execute_script_with_identity,
+        distributed_struct_assignment_values, execute_function_file_bytecode_module,
+        execute_function_file_with_identity, execute_script, execute_script_bytecode,
         execute_script_bytecode_bundle, execute_script_bytecode_module,
-        invoke_graphics_builtin_outputs, linearized_cell_elements, linearized_matrix_elements,
-        logical_value, plan_dimension_selector, plan_linear_selector, render_execution_result,
+        execute_script_with_identity, invoke_graphics_builtin_outputs, linearized_cell_elements,
+        linearized_matrix_elements, logical_value, parse_scoped_function_handle_name,
+        plan_dimension_selector, plan_linear_selector, render_execution_result,
         render_figure_backend_index, render_matlab_execution_result,
-        render_native_figure_host_index, session_manifest_json, EvaluatedIndexArgument,
-        FigureBackendState, Frame, HirItem, Interpreter, RenderedFigure, SelectorPlanMode,
-        parse_scoped_function_handle_name, resize_matrix_to_dims,
+        render_native_figure_host_index, resize_matrix_to_dims, session_manifest_json,
+        EvaluatedIndexArgument, FigureBackendState, Frame, HirItem, Interpreter, RenderedFigure,
+        SelectorPlanMode,
     };
+    use matlab_codegen::emit_bytecode;
     use matlab_frontend::{
         ast::CompilationUnitKind,
         parser::{parse_source, ParseMode},
@@ -17544,7 +26705,6 @@ mod tests {
     };
     use matlab_interop::{read_mat_file, read_workspace_snapshot_with_modules, write_mat_file};
     use matlab_ir::lower_to_hir;
-    use matlab_codegen::emit_bytecode;
     use matlab_optimizer::optimize_module;
     use matlab_platform::{
         collect_bytecode_dependency_paths, collect_bytecode_dependency_paths_with_context,
@@ -17619,14 +26779,12 @@ mod tests {
             CompilationUnitKind::Script => {
                 execute_script_with_identity(&hir, "<root>".to_string(), Some(path.to_path_buf()))
             }
-            CompilationUnitKind::FunctionFile => {
-                execute_function_file_with_identity(
-                    &hir,
-                    args,
-                    "<root>".to_string(),
-                    Some(path.to_path_buf()),
-                )
-            }
+            CompilationUnitKind::FunctionFile => execute_function_file_with_identity(
+                &hir,
+                args,
+                "<root>".to_string(),
+                Some(path.to_path_buf()),
+            ),
             CompilationUnitKind::ClassFile => Err(RuntimeError::Unsupported(
                 "class-file tests must execute a script or function entrypoint".to_string(),
             )),
@@ -17684,6 +26842,16 @@ mod tests {
         }
     }
 
+    fn struct_scalar_field(struct_value: &StructValue, name: &str) -> f64 {
+        match struct_value.fields.get(name).expect("struct scalar field") {
+            Value::Scalar(value) => *value,
+            other => panic!(
+                "expected scalar field `{name}`, found {}",
+                other.kind_name()
+            ),
+        }
+    }
+
     fn struct_workspace_capture(struct_value: &StructValue) -> Option<&StructValue> {
         let Some(Value::Cell(cell)) = struct_value.fields.get("workspace") else {
             return None;
@@ -17706,7 +26874,10 @@ mod tests {
                 .iter()
                 .map(|value| match value {
                     Value::CharArray(text) | Value::String(text) => text.clone(),
-                    other => panic!("expected text parentage element, found {}", other.kind_name()),
+                    other => panic!(
+                        "expected text parentage element, found {}",
+                        other.kind_name()
+                    ),
                 })
                 .collect(),
         )
@@ -17739,7 +26910,10 @@ mod tests {
             .iter()
             .map(|value| match value {
                 Value::FunctionHandle(handle) => handle.display_name.clone(),
-                other => panic!("expected function handle cell element, found {}", other.kind_name()),
+                other => panic!(
+                    "expected function handle cell element, found {}",
+                    other.kind_name()
+                ),
             })
             .collect()
     }
@@ -17752,6 +26926,30 @@ mod tests {
                 other => panic!("expected text cell element, found {}", other.kind_name()),
             })
             .collect()
+    }
+
+    fn split_path_text(text: &str) -> Vec<String> {
+        std::env::split_paths(std::ffi::OsStr::new(text))
+            .map(|path| path.display().to_string())
+            .collect()
+    }
+
+    fn normalized_test_path_text(text: &str) -> String {
+        #[cfg(windows)]
+        {
+            text.replace('/', "\\").to_ascii_lowercase()
+        }
+        #[cfg(not(windows))]
+        {
+            text.to_string()
+        }
+    }
+
+    fn assert_path_text_eq(actual: &str, expected: &std::path::Path) {
+        assert_eq!(
+            normalized_test_path_text(actual),
+            normalized_test_path_text(&expected.display().to_string())
+        );
     }
 
     fn struct_cell_texts(struct_value: &StructValue, name: &str) -> Vec<String> {
@@ -17787,7 +26985,8 @@ mod tests {
                 continue;
             }
             let bytecode = compile_bytecode_module(&next_path);
-            for dependency in collect_bytecode_dependency_paths_with_context(&bytecode, &next_path) {
+            for dependency in collect_bytecode_dependency_paths_with_context(&bytecode, &next_path)
+            {
                 let dep_key = dependency.display().to_string();
                 if !seen.contains(&dep_key) {
                     pending.push(dependency);
@@ -17853,7 +27052,10 @@ mod tests {
         .expect("write private-access class");
     }
 
-    fn write_inherited_private_access_classes(base_path: &std::path::Path, child_path: &std::path::Path) {
+    fn write_inherited_private_access_classes(
+        base_path: &std::path::Path,
+        child_path: &std::path::Path,
+    ) {
         fs::write(
             base_path,
             "classdef Base\n\
@@ -17955,6 +27157,18 @@ mod tests {
     fn matlab_render_includes_fprintf_output() {
         let result = execute_script_source("fprintf(\"value=%d\", 5)\n");
         assert_eq!(render_matlab_execution_result(&result), "value=5");
+    }
+
+    #[test]
+    fn fprintf_zero_file_id_is_rejected() {
+        let error = execute_script_source_result("fprintf(0, \"nope\")\n")
+            .expect_err("fprintf(0) should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("operation is not implemented for requested file identifier"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -18330,6 +27544,3385 @@ mod tests {
     }
 
     #[test]
+    fn command_form_class_reflection_builtins_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("command-form-class-reflection");
+        let helper_path = temp_dir.join("helper.m");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(
+            &helper_path,
+            "function y = helper(x)\n\
+             %HELPER Rarealpha helper summary.\n\
+             %   HELPER(X) returns X + 1.\n\
+             y = x + 1;\n\
+             end\n",
+        )
+        .expect("write helper");
+        fs::write(
+            &base_path,
+            "classdef Base < handle\n\
+             properties\n\
+             baseValue = 1;\n\
+             end\n\
+             methods\n\
+             function obj = Base()\n\
+             end\n\
+             function out = baseOnly(obj)\n\
+             out = obj.baseValue;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write Base");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             properties\n\
+             childValue = 2;\n\
+             end\n\
+             methods\n\
+             function obj = Child()\n\
+             end\n\
+             function out = childOnly(obj)\n\
+             out = obj.childValue;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write Child");
+        fs::write(
+            &main_path,
+            "methods Child\n\
+             properties Child\n\
+             superclasses Child\n\
+             events Child\n\
+             help helper\n\
+             doc sum\n\
+             lookfor rarealpha\n",
+        )
+        .expect("write main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        let interpreted_rendered = render_matlab_execution_result(&interpreted);
+        assert!(interpreted_rendered.contains("baseOnly"));
+        assert!(interpreted_rendered.contains("childOnly"));
+        assert!(interpreted_rendered.contains("Properties for class Child:"));
+        assert!(interpreted_rendered.contains("baseValue"));
+        assert!(interpreted_rendered.contains("childValue"));
+        assert!(interpreted_rendered.contains("Superclasses for class Child:"));
+        assert!(interpreted_rendered.contains("Base"));
+        assert!(interpreted_rendered.contains("handle"));
+        assert!(interpreted_rendered.contains("Events for class Child:"));
+        assert!(interpreted_rendered.contains("ObjectBeingDestroyed"));
+        assert!(interpreted_rendered.contains("HELPER Rarealpha helper summary."));
+        assert!(interpreted_rendered.contains("Documentation for sum:"));
+        assert!(interpreted_rendered.contains("https://www.mathworks.com/help/matlab/ref/sum.html"));
+        assert!(interpreted_rendered.contains("helper - HELPER Rarealpha helper summary."));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        let bytecode_rendered = render_matlab_execution_result(&bytecode);
+        assert!(bytecode_rendered.contains("baseOnly"));
+        assert!(bytecode_rendered.contains("childOnly"));
+        assert!(bytecode_rendered.contains("Properties for class Child:"));
+        assert!(bytecode_rendered.contains("baseValue"));
+        assert!(bytecode_rendered.contains("childValue"));
+        assert!(bytecode_rendered.contains("Superclasses for class Child:"));
+        assert!(bytecode_rendered.contains("Base"));
+        assert!(bytecode_rendered.contains("handle"));
+        assert!(bytecode_rendered.contains("Events for class Child:"));
+        assert!(bytecode_rendered.contains("ObjectBeingDestroyed"));
+        assert!(bytecode_rendered.contains("HELPER Rarealpha helper summary."));
+        assert!(bytecode_rendered.contains("Documentation for sum:"));
+        assert!(bytecode_rendered.contains("https://www.mathworks.com/help/matlab/ref/sum.html"));
+        assert!(bytecode_rendered.contains("helper - HELPER Rarealpha helper summary."));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn command_form_additional_reflection_builtins_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("command-form-reflection-extra");
+        let private_dir = temp_dir.join("private");
+        let class_dir = temp_dir.join("@Counter");
+        fs::create_dir_all(&private_dir).expect("create private dir");
+        fs::create_dir_all(&class_dir).expect("create class dir");
+
+        let helper_path = temp_dir.join("helper.m");
+        let private_helper_path = private_dir.join("helper.m");
+        let class_path = class_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n").expect("write helper");
+        fs::write(
+            &private_helper_path,
+            "function y = helper(x)\ny = x + 2;\nend\n",
+        )
+        .expect("write private helper");
+        fs::write(
+            &class_path,
+            "classdef Counter\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write class");
+        fs::write(
+            &main_path,
+            "value = helper(4);\n\
+             c = Counter(9);\n\
+             p = which helper\n\
+             p_all = which helper -all\n\
+             e_var = exist value var\n\
+             e_builtin = exist plot builtin\n\
+             w = what Counter\n\
+             what .\n\
+             [ffull, mfull, cfull] = inmem -completenames\n\
+             function y = helper(x)\n\
+             y = x + 10;\n\
+             end\n",
+        )
+        .expect("write main");
+
+        let local_helper_marker = format!("{}>helper", main_path.display());
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(
+            interpreted.workspace.get("p"),
+            Some(&Value::CharArray(local_helper_marker.clone()))
+        );
+        let p_all = workspace_cell(&interpreted.workspace, "p_all");
+        assert_eq!(cell_texts(p_all)[0], local_helper_marker);
+        assert!(cell_texts(p_all).contains(&helper_path.display().to_string()));
+        assert_eq!(
+            interpreted.workspace.get("e_var"),
+            Some(&Value::Scalar(1.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_builtin"),
+            Some(&Value::Scalar(5.0))
+        );
+        let w = workspace_struct(&interpreted.workspace, "w");
+        assert_eq!(
+            struct_text_field(w, "path"),
+            class_dir.display().to_string()
+        );
+        let interpreted_rendered = render_matlab_execution_result(&interpreted);
+        assert!(interpreted_rendered.contains("MATLAB Code files in folder"));
+        assert!(interpreted_rendered.contains(&temp_dir.display().to_string()));
+        let ffull = workspace_cell(&interpreted.workspace, "ffull");
+        assert_eq!(ffull.rows, 0);
+        assert_eq!(ffull.cols, 0);
+        let mfull = workspace_cell(&interpreted.workspace, "mfull");
+        assert_eq!(mfull.rows, 0);
+        assert_eq!(mfull.cols, 0);
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "cfull")),
+            vec!["Counter".to_string()]
+        );
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(
+            bytecode.workspace.get("p"),
+            Some(&Value::CharArray(format!("{}>helper", main_path.display())))
+        );
+        let p_all = workspace_cell(&bytecode.workspace, "p_all");
+        assert_eq!(
+            cell_texts(p_all)[0],
+            format!("{}>helper", main_path.display())
+        );
+        assert!(cell_texts(p_all).contains(&helper_path.display().to_string()));
+        assert_eq!(bytecode.workspace.get("e_var"), Some(&Value::Scalar(1.0)));
+        assert_eq!(
+            bytecode.workspace.get("e_builtin"),
+            Some(&Value::Scalar(5.0))
+        );
+        let w = workspace_struct(&bytecode.workspace, "w");
+        assert_eq!(
+            struct_text_field(w, "path"),
+            class_dir.display().to_string()
+        );
+        let bytecode_rendered = render_matlab_execution_result(&bytecode);
+        assert!(bytecode_rendered.contains("MATLAB Code files in folder"));
+        assert!(bytecode_rendered.contains(&temp_dir.display().to_string()));
+        let ffull = workspace_cell(&bytecode.workspace, "ffull");
+        assert_eq!(ffull.rows, 0);
+        assert_eq!(ffull.cols, 0);
+        let mfull = workspace_cell(&bytecode.workspace, "mfull");
+        assert_eq!(mfull.rows, 0);
+        assert_eq!(mfull.cols, 0);
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "cfull")),
+            vec!["Counter".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn pwd_dir_and_ls_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("pwd-dir-ls");
+        let sub_dir = temp_dir.join("sub");
+        fs::create_dir_all(&sub_dir).expect("create subdir");
+        fs::write(temp_dir.join("alpha.txt"), "alpha").expect("write alpha");
+        fs::write(temp_dir.join("beta.m"), "function y = beta\n y = 1;\nend\n")
+            .expect("write beta");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "p = pwd;\n\
+             d = dir .;\n\
+             l = ls .;\n\
+             dir .\n\
+             ls .\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("p"),
+                Some(&Value::CharArray(temp_dir.display().to_string()))
+            );
+            let Value::Matrix(matrix) = result.workspace.get("d").expect("dir output") else {
+                panic!("expected dir matrix output");
+            };
+            let mut names = matrix
+                .elements()
+                .iter()
+                .map(|value| {
+                    let Value::Struct(struct_value) = value else {
+                        panic!("expected struct entry");
+                    };
+                    struct_text_field(struct_value, "name")
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            assert!(names.contains(&"alpha.txt".to_string()));
+            assert!(names.contains(&"beta.m".to_string()));
+            assert!(names.contains(&"main.m".to_string()));
+            assert!(names.contains(&"sub".to_string()));
+
+            let Value::CharArray(ls_output) = result.workspace.get("l").expect("ls output") else {
+                panic!("expected ls text output");
+            };
+            assert!(ls_output.contains("alpha.txt"));
+            assert!(ls_output.contains("beta.m"));
+            assert!(ls_output.contains("main.m"));
+            assert!(ls_output.contains("sub"));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn cd_updates_current_directory_and_lookup_state_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("cd-runtime-state");
+        let sub_dir = temp_dir.join("sub");
+        fs::create_dir_all(&sub_dir).expect("create subdir");
+        fs::write(
+            sub_dir.join("helper.m"),
+            "function y = helper\n y = 1;\nend\n",
+        )
+        .expect("write helper");
+        fs::write(
+            temp_dir.join("changer.m"),
+            "function old = changer()\nold = cd('sub');\nend\n",
+        )
+        .expect("write changer");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "p0 = pwd;\n\
+             old = changer();\n\
+             p1 = pwd;\n\
+             p2 = cd;\n\
+             w = what .;\n\
+             d = dir .;\n\
+             l = ls .;\n\
+             which_helper = which helper;\n\
+             exist_helper = exist helper file;\n\
+             cd(old);\n\
+             p3 = pwd;\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("p0"),
+                Some(&Value::CharArray(temp_dir.display().to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("old"),
+                Some(&Value::CharArray(temp_dir.display().to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("p1"),
+                Some(&Value::CharArray(sub_dir.display().to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("p2"),
+                Some(&Value::CharArray(sub_dir.display().to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("p3"),
+                Some(&Value::CharArray(temp_dir.display().to_string()))
+            );
+
+            let what = workspace_struct(&result.workspace, "w");
+            assert_eq!(
+                struct_text_field(what, "path"),
+                sub_dir.display().to_string()
+            );
+
+            let Value::Matrix(matrix) = result.workspace.get("d").expect("dir output") else {
+                panic!("expected dir matrix output");
+            };
+            let mut names = matrix
+                .elements()
+                .iter()
+                .map(|value| {
+                    let Value::Struct(struct_value) = value else {
+                        panic!("expected struct entry");
+                    };
+                    struct_text_field(struct_value, "name")
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            assert!(names.contains(&"helper.m".to_string()));
+
+            let Value::CharArray(ls_output) = result.workspace.get("l").expect("ls output") else {
+                panic!("expected ls text output");
+            };
+            assert!(ls_output.contains("helper.m"));
+
+            assert_eq!(
+                result.workspace.get("which_helper"),
+                Some(&Value::CharArray(
+                    sub_dir.join("helper.m").display().to_string()
+                ))
+            );
+            assert_eq!(
+                result.workspace.get("exist_helper"),
+                Some(&Value::Scalar(2.0))
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn cd_affects_save_load_and_workspace_file_queries_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("cd-save-load");
+        let sub_dir = temp_dir.join("sub");
+        fs::create_dir_all(&sub_dir).expect("create subdir");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "value = 42;\n\
+             cd('sub');\n\
+             save data value\n\
+             loaded = load('data');\n\
+             names = who('-file', 'data');\n\
+             stats = whos('-file', 'data');\n\
+             cd('..');\n\
+             loaded2 = load('sub/data');\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert!(sub_dir.join("data.mat").is_file());
+            assert!(!temp_dir.join("data.mat").is_file());
+
+            let loaded = workspace_struct(&result.workspace, "loaded");
+            assert_eq!(loaded.fields.get("value"), Some(&Value::Scalar(42.0)));
+
+            let loaded2 = workspace_struct(&result.workspace, "loaded2");
+            assert_eq!(loaded2.fields.get("value"), Some(&Value::Scalar(42.0)));
+
+            let Value::Cell(names) = result.workspace.get("names").expect("names output") else {
+                panic!("expected who cell output");
+            };
+            assert_eq!(cell_texts(names), vec!["value".to_string()]);
+
+            let Value::Matrix(stats) = result.workspace.get("stats").expect("stats output") else {
+                panic!("expected whos matrix output");
+            };
+            let Value::Struct(summary) = stats.elements().first().expect("whos entry") else {
+                panic!("expected whos struct entry");
+            };
+            assert_eq!(struct_text_field(summary, "name"), "value".to_string());
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn path_addpath_rmpath_and_genpath_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("path-builtins");
+        let dir_a = temp_dir.join("dirA");
+        let dir_b = temp_dir.join("dirB");
+        let tree_dir = temp_dir.join("tree");
+        let tree_sub = tree_dir.join("sub");
+        let tree_inner = tree_sub.join("inner");
+        fs::create_dir_all(&dir_a).expect("create dirA");
+        fs::create_dir_all(&dir_b).expect("create dirB");
+        fs::create_dir_all(&tree_inner).expect("create tree inner");
+        fs::create_dir_all(tree_dir.join("private")).expect("create private");
+        fs::create_dir_all(tree_dir.join("@Hidden")).expect("create class folder");
+        fs::create_dir_all(tree_dir.join("+pkg")).expect("create package folder");
+        fs::create_dir_all(tree_dir.join("resources")).expect("create resources");
+        fs::write(
+            dir_a.join("helper.m"),
+            "function y = helper\n y = 1;\nend\n",
+        )
+        .expect("write dirA helper");
+        fs::write(
+            dir_b.join("helper.m"),
+            "function y = helper\n y = 2;\nend\n",
+        )
+        .expect("write dirB helper");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "p0 = path;\n\
+             oldAdd = addpath('dirA');\n\
+             p1 = path;\n\
+             fa = str2func('helper');\n\
+             a = fa();\n\
+             oldBegin = addpath('dirB', '-begin');\n\
+             p2 = path;\n\
+             fb = str2func('helper');\n\
+             b = fb();\n\
+             oldRm = rmpath('dirB');\n\
+             p3 = path;\n\
+             fc = str2func('helper');\n\
+             c = fc();\n\
+             path(p0);\n\
+             p4 = path;\n\
+             path('dirB', p0);\n\
+             p5 = path;\n\
+             fd = str2func('helper');\n\
+             d = fd();\n\
+             path(p0);\n\
+             path(p0, 'dirA');\n\
+             p6 = path;\n\
+             fe = str2func('helper');\n\
+             e = fe();\n\
+             gp = genpath('tree');\n\
+             path(p0);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let p0 = match result.workspace.get("p0").expect("p0") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p0 text, found {}", other.kind_name()),
+            };
+            let p1 = match result.workspace.get("p1").expect("p1") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p1 text, found {}", other.kind_name()),
+            };
+            let p2 = match result.workspace.get("p2").expect("p2") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p2 text, found {}", other.kind_name()),
+            };
+            let p3 = match result.workspace.get("p3").expect("p3") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p3 text, found {}", other.kind_name()),
+            };
+            let p4 = match result.workspace.get("p4").expect("p4") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p4 text, found {}", other.kind_name()),
+            };
+            let p5 = match result.workspace.get("p5").expect("p5") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p5 text, found {}", other.kind_name()),
+            };
+            let p6 = match result.workspace.get("p6").expect("p6") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p6 text, found {}", other.kind_name()),
+            };
+            let old_add = match result.workspace.get("oldAdd").expect("oldAdd") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected oldAdd text, found {}", other.kind_name()),
+            };
+            let old_begin = match result.workspace.get("oldBegin").expect("oldBegin") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected oldBegin text, found {}", other.kind_name()),
+            };
+            let old_rm = match result.workspace.get("oldRm").expect("oldRm") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected oldRm text, found {}", other.kind_name()),
+            };
+
+            assert_eq!(old_add, p0);
+            assert_eq!(old_begin, p1);
+            assert_eq!(old_rm, p2);
+            assert_eq!(p4, p0);
+
+            let p1_entries = split_path_text(&p1);
+            assert!(p1_entries.contains(&dir_a.display().to_string()));
+
+            let p2_entries = split_path_text(&p2);
+            assert!(!p2_entries.is_empty());
+            assert_eq!(p2_entries.first(), Some(&dir_b.display().to_string()));
+            assert!(p2_entries.contains(&dir_a.display().to_string()));
+
+            let p3_entries = split_path_text(&p3);
+            assert!(!p3_entries.contains(&dir_b.display().to_string()));
+            assert!(p3_entries.contains(&dir_a.display().to_string()));
+
+            let p5_entries = split_path_text(&p5);
+            assert_eq!(p5_entries.first(), Some(&dir_b.display().to_string()));
+
+            let p6_entries = split_path_text(&p6);
+            assert_eq!(p6_entries.last(), Some(&dir_a.display().to_string()));
+
+            assert_eq!(result.workspace.get("a"), Some(&Value::Scalar(1.0)));
+            assert_eq!(result.workspace.get("b"), Some(&Value::Scalar(2.0)));
+            assert_eq!(result.workspace.get("c"), Some(&Value::Scalar(1.0)));
+            assert_eq!(result.workspace.get("d"), Some(&Value::Scalar(2.0)));
+            assert_eq!(result.workspace.get("e"), Some(&Value::Scalar(1.0)));
+
+            let Value::CharArray(genpath_text) = result.workspace.get("gp").expect("gp") else {
+                panic!("expected genpath text output");
+            };
+            let genpath_entries = split_path_text(genpath_text);
+            assert!(genpath_entries.contains(&tree_dir.display().to_string()));
+            assert!(genpath_entries.contains(&tree_sub.display().to_string()));
+            assert!(genpath_entries.contains(&tree_inner.display().to_string()));
+            assert!(!genpath_entries.contains(&tree_dir.join("private").display().to_string()));
+            assert!(!genpath_entries.contains(&tree_dir.join("@Hidden").display().to_string()));
+            assert!(!genpath_entries.contains(&tree_dir.join("+pkg").display().to_string()));
+            assert!(!genpath_entries.contains(&tree_dir.join("resources").display().to_string()));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn restoredefaultpath_and_rehash_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("restoredefaultpath-rehash");
+        let dir_a = temp_dir.join("dirA");
+        fs::create_dir_all(&dir_a).expect("create dirA");
+        fs::write(
+            dir_a.join("helper.m"),
+            "function y = helper\n y = 7;\nend\n",
+        )
+        .expect("write helper");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "p0 = path;\n\
+             oldAdd = addpath('dirA');\n\
+             p1 = path;\n\
+             restoredefaultpath\n\
+             p2 = path;\n\
+             e0 = exist('helper', 'file');\n\
+             addpath('dirA');\n\
+             rehash\n\
+             rehash path\n\
+             rehash toolbox\n\
+             rehash toolboxcache\n\
+             fh = str2func('helper');\n\
+             value = fh();\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let p0 = match result.workspace.get("p0").expect("p0") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p0 text, found {}", other.kind_name()),
+            };
+            let p1 = match result.workspace.get("p1").expect("p1") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p1 text, found {}", other.kind_name()),
+            };
+            let p2 = match result.workspace.get("p2").expect("p2") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p2 text, found {}", other.kind_name()),
+            };
+            let old_add = match result.workspace.get("oldAdd").expect("oldAdd") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected oldAdd text, found {}", other.kind_name()),
+            };
+            assert_eq!(old_add, p0);
+            assert_eq!(p2, p0);
+            assert!(split_path_text(&p1).contains(&dir_a.display().to_string()));
+            assert_eq!(result.workspace.get("e0"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("value"), Some(&Value::Scalar(7.0)));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn matlabroot_userpath_and_savepath_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("matlabroot-userpath-savepath");
+        let custom_user = temp_dir.join("customUser");
+        let save_dir = temp_dir.join("saveDir");
+        let save_file = save_dir.join("pathdef.m");
+        let main_path = temp_dir.join("main.m");
+        let custom_user_matlab = custom_user.display().to_string().replace('\\', "/");
+        let save_file_matlab = save_file.display().to_string().replace('\\', "/");
+        fs::write(
+            &main_path,
+            format!(
+                "mr = matlabroot;\n\
+                 u0 = userpath;\n\
+                 userpath('{custom_user_matlab}');\n\
+                 u1 = userpath;\n\
+                 p1 = path;\n\
+                 userpath('clear');\n\
+                 u2 = userpath;\n\
+                 p2 = path;\n\
+                 userpath('reset');\n\
+                 u3 = userpath;\n\
+                 p3 = path;\n\
+                 s = savepath('{save_file_matlab}');\n\
+                 pd = pathdef;\n\
+                 ps = pathsep;\n\
+                 fs = filesep;\n\
+                 p4 = path;\n\
+                 pathtool\n\
+                 p5 = path;\n"
+            ),
+        )
+        .expect("write main");
+
+        let expected_root = crate::runtime_matlab_root().display().to_string();
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("mr"),
+                Some(&Value::CharArray(expected_root.clone()))
+            );
+
+            let u1 = match result.workspace.get("u1").expect("u1") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected u1 text, found {}", other.kind_name()),
+            };
+            let u2 = match result.workspace.get("u2").expect("u2") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected u2 text, found {}", other.kind_name()),
+            };
+            let u3 = match result.workspace.get("u3").expect("u3") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected u3 text, found {}", other.kind_name()),
+            };
+            assert_path_text_eq(&u1, &custom_user);
+            assert_eq!(u2, "");
+
+            let p1 = match result.workspace.get("p1").expect("p1") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p1 text, found {}", other.kind_name()),
+            };
+            let p2 = match result.workspace.get("p2").expect("p2") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p2 text, found {}", other.kind_name()),
+            };
+            let p3 = match result.workspace.get("p3").expect("p3") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p3 text, found {}", other.kind_name()),
+            };
+            let p4 = match result.workspace.get("p4").expect("p4") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p4 text, found {}", other.kind_name()),
+            };
+            let p5 = match result.workspace.get("p5").expect("p5") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected p5 text, found {}", other.kind_name()),
+            };
+            let p1_entries = split_path_text(&p1);
+            assert!(p1_entries.first().is_some_and(|entry| {
+                normalized_test_path_text(entry)
+                    == normalized_test_path_text(&custom_user.display().to_string())
+            }));
+            let p2_entries = split_path_text(&p2);
+            assert!(!p2_entries.iter().any(|entry| {
+                normalized_test_path_text(entry)
+                    == normalized_test_path_text(&custom_user.display().to_string())
+            }));
+            if !u3.is_empty() {
+                let p3_entries = split_path_text(&p3);
+                assert!(p3_entries.first().is_some_and(|entry| {
+                    normalized_test_path_text(entry) == normalized_test_path_text(&u3)
+                }));
+            }
+            assert_eq!(p4, p5);
+
+            assert_eq!(result.workspace.get("s"), Some(&Value::Scalar(0.0)));
+            let pd = match result.workspace.get("pd").expect("pd") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected pd text, found {}", other.kind_name()),
+            };
+            assert_eq!(pd, p3);
+            #[cfg(windows)]
+            assert_eq!(
+                result.workspace.get("ps"),
+                Some(&Value::CharArray(";".to_string()))
+            );
+            #[cfg(not(windows))]
+            assert_eq!(
+                result.workspace.get("ps"),
+                Some(&Value::CharArray(":".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("fs"),
+                Some(&Value::CharArray(std::path::MAIN_SEPARATOR.to_string()))
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        let saved = fs::read_to_string(&save_file).expect("read saved pathdef");
+        assert!(saved.contains("function p = pathdef"));
+        assert!(saved.contains("PATHDEF Search path defaults."));
+        let interpreted_rendered = render_matlab_execution_result(&interpreted);
+        assert!(interpreted_rendered.contains("MATLABPATH"));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        let saved = fs::read_to_string(&save_file).expect("read saved pathdef");
+        assert!(saved.contains("function p = pathdef"));
+        assert!(saved.contains("PATHDEF Search path defaults."));
+        let bytecode_rendered = render_matlab_execution_result(&bytecode);
+        assert!(bytecode_rendered.contains("MATLABPATH"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn toolboxdir_reports_supported_virtual_toolboxes_and_missing_errors() {
+        let source = "tm = toolboxdir('matlab');\ntl = toolboxdir('local');\n";
+        let interpreted = execute_script_source(source);
+        let bytecode = execute_script_source_bytecode(source);
+        let expected_matlab = crate::runtime_toolbox_root().join("matlab");
+        let expected_local = crate::runtime_toolbox_root().join("local");
+
+        let tm = match interpreted.workspace.get("tm").expect("tm") {
+            Value::CharArray(text) => text.clone(),
+            other => panic!("expected tm text, found {}", other.kind_name()),
+        };
+        let tl = match interpreted.workspace.get("tl").expect("tl") {
+            Value::CharArray(text) => text.clone(),
+            other => panic!("expected tl text, found {}", other.kind_name()),
+        };
+        assert_path_text_eq(&tm, &expected_matlab);
+        assert_path_text_eq(&tl, &expected_local);
+
+        let tm = match bytecode.workspace.get("tm").expect("tm") {
+            Value::CharArray(text) => text.clone(),
+            other => panic!("expected tm text, found {}", other.kind_name()),
+        };
+        let tl = match bytecode.workspace.get("tl").expect("tl") {
+            Value::CharArray(text) => text.clone(),
+            other => panic!("expected tl text, found {}", other.kind_name()),
+        };
+        assert_path_text_eq(&tm, &expected_matlab);
+        assert_path_text_eq(&tl, &expected_local);
+
+        let missing = execute_script_source_result("toolboxdir('definitely_missing_toolbox')\n")
+            .expect_err("missing toolbox should error");
+        assert!(missing.to_string().contains("could not locate toolbox"));
+
+        let missing =
+            execute_script_source_bytecode_result("toolboxdir('definitely_missing_toolbox')\n")
+                .expect_err("missing toolbox should error in bytecode");
+        assert!(missing.to_string().contains("could not locate toolbox"));
+    }
+
+    #[test]
+    fn version_computer_temp_and_license_builtins_work_in_interpreter_and_bytecode() {
+        let source = "v = version;\n\
+                      rel = version('-release');\n\
+                      desc = version('-description');\n\
+                      dt = version('-date');\n\
+                      jv = version('-java');\n\
+                      [v2, d2] = version;\n\
+                      [c, m, e] = computer;\n\
+                      arch = computer('arch');\n\
+                      td = tempdir;\n\
+                      tn = tempname;\n\
+                      tn2 = tempname(td);\n\
+                      info = ver('matlab');\n\
+                      older = verLessThan('matlab', '99.0');\n\
+                      newer = verLessThan('matlab', '1.0');\n\
+                      lic = license;\n\
+                      lin = license('inuse');\n\
+                      ltest = license('test', 'matlab');\n\
+                      [chk, msg] = license('checkout', 'matlab');\n";
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("v"),
+                Some(&Value::CharArray(super::MATLAB_VERSION_TEXT.to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("rel"),
+                Some(&Value::CharArray(super::MATLAB_RELEASE_VALUE.to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("desc"),
+                Some(&Value::CharArray(
+                    super::MATLAB_VERSION_DESCRIPTION.to_string()
+                ))
+            );
+            assert_eq!(
+                result.workspace.get("dt"),
+                Some(&Value::CharArray(super::MATLAB_VERSION_DATE.to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("jv"),
+                Some(&Value::CharArray(super::MATLAB_JAVA_VERSION.to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("v2"),
+                Some(&Value::CharArray(super::MATLAB_VERSION_TEXT.to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("d2"),
+                Some(&Value::CharArray(super::MATLAB_VERSION_DATE.to_string()))
+            );
+
+            let computer = result.workspace.get("c").expect("computer type");
+            assert_eq!(
+                computer,
+                &Value::CharArray(super::computer_type_text().to_string())
+            );
+            assert_eq!(
+                result.workspace.get("arch"),
+                Some(&Value::CharArray(super::computer_arch_text().to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("m"),
+                Some(&Value::Scalar(((1u64 << 48) - 1) as f64))
+            );
+            assert_eq!(
+                result.workspace.get("e"),
+                Some(&Value::CharArray("L".to_string()))
+            );
+
+            let td = match result.workspace.get("td").expect("tempdir") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected tempdir text, found {}", other.kind_name()),
+            };
+            assert_eq!(td, super::tempdir_text());
+            let tn = match result.workspace.get("tn").expect("tempname") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!("expected tempname text, found {}", other.kind_name()),
+            };
+            let tn2 = match result.workspace.get("tn2").expect("tempname(folder)") {
+                Value::CharArray(text) => text.clone(),
+                other => panic!(
+                    "expected tempname(folder) text, found {}",
+                    other.kind_name()
+                ),
+            };
+            assert!(normalized_test_path_text(&tn).starts_with(&normalized_test_path_text(&td)));
+            assert!(normalized_test_path_text(&tn2).starts_with(&normalized_test_path_text(&td)));
+
+            let info = workspace_struct(&result.workspace, "info");
+            assert_eq!(struct_text_field(info, "Name"), "MATLAB".to_string());
+            assert_eq!(
+                struct_text_field(info, "Version"),
+                super::MATLAB_VERSION_NUMBER.to_string()
+            );
+            assert_eq!(
+                struct_text_field(info, "Release"),
+                super::MATLAB_RELEASE_NAME.to_string()
+            );
+            assert_eq!(
+                struct_text_field(info, "Date"),
+                super::MATLAB_VERSION_DATE.to_string()
+            );
+
+            assert_eq!(result.workspace.get("older"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("newer"), Some(&Value::Logical(false)));
+            assert_eq!(
+                result.workspace.get("lic"),
+                Some(&Value::CharArray(super::MATLAB_LICENSE_ID.to_string()))
+            );
+            let lin = workspace_struct(&result.workspace, "lin");
+            assert_eq!(struct_text_field(lin, "feature"), "matlab".to_string());
+            assert_eq!(struct_text_field(lin, "user"), "".to_string());
+            assert_eq!(result.workspace.get("ltest"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("chk"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("msg"),
+                Some(&Value::CharArray(String::new()))
+            );
+        };
+
+        let interpreted = execute_script_source(source);
+        assert_result(&interpreted);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_result(&bytecode);
+
+        let interpreted_display = execute_script_source("ver\nlicense('inuse')\n");
+        let interpreted_rendered = render_matlab_execution_result(&interpreted_display);
+        assert!(interpreted_rendered.contains("MATLAB Version:"));
+        assert!(interpreted_rendered.contains("matlab"));
+
+        let bytecode_display = execute_script_source_bytecode("ver\nlicense('inuse')\n");
+        let bytecode_rendered = render_matlab_execution_result(&bytecode_display);
+        assert!(bytecode_rendered.contains("MATLAB Version:"));
+        assert!(bytecode_rendered.contains("matlab"));
+    }
+
+    #[test]
+    fn fullfile_and_fileparts_work_in_interpreter_and_bytecode() {
+        let source = "p = fullfile('folder','sub','archive.tar.gz');\n\
+                      [fp,nm,ext] = fileparts(p);\n";
+        let expected = format!(
+            "folder{}sub{}archive.tar.gz",
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        );
+        let expected_fp = format!("folder{}sub", std::path::MAIN_SEPARATOR);
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("p"),
+                Some(&Value::CharArray(expected.clone()))
+            );
+            assert_eq!(
+                result.workspace.get("fp"),
+                Some(&Value::CharArray(expected_fp.clone()))
+            );
+            assert_eq!(
+                result.workspace.get("nm"),
+                Some(&Value::CharArray("archive.tar".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("ext"),
+                Some(&Value::CharArray(".gz".to_string()))
+            );
+        };
+
+        let interpreted = execute_script_source(source);
+        assert_result(&interpreted);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_result(&bytecode);
+    }
+
+    #[test]
+    fn fileread_and_type_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("fileread-type");
+        let helper_path = temp_dir.join("helper.m");
+        let plain_path = temp_dir.join("plain.txt");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n").expect("write helper");
+        fs::write(&plain_path, "first line\nsecond line\n").expect("write plain text");
+        fs::write(
+            &main_path,
+            "txt = fileread('plain.txt');\n\
+             src = fileread('helper.m');\n\
+             type helper\n\
+             type plain.txt\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("txt"),
+                Some(&Value::CharArray("first line\nsecond line\n".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("src"),
+                Some(&Value::CharArray(
+                    "function y = helper(x)\ny = x + 1;\nend\n".to_string()
+                ))
+            );
+            let rendered = render_matlab_execution_result(result);
+            assert!(rendered.contains("function y = helper(x)"));
+            assert!(rendered.contains("first line"));
+            assert!(rendered.contains("second line"));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fopen_fclose_fgetl_fgets_and_fprintf_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("file-io");
+        let lines_path = temp_dir.join("lines.txt");
+        let out_path = temp_dir.join("out.txt");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&lines_path, "alpha\nbeta\r\ngamma").expect("write lines");
+        fs::write(
+            &main_path,
+            " [fid,msg] = fopen('lines.txt');\n\
+              l1 = fgetl(fid);\n\
+              l2 = fgets(fid);\n\
+              l3 = fgetl(fid);\n\
+              l4 = fgetl(fid);\n\
+              status1 = fclose(fid);\n\
+              [missing,missing_msg] = fopen('missing.txt','r');\n\
+              [wid,wmsg] = fopen('out.txt','w');\n\
+              count1 = fprintf(wid, 'value=%d\\n', 42);\n\
+              status_mid = fclose(wid);\n\
+              [aid,amsg] = fopen('out.txt','a');\n\
+              count2 = fprintf(aid, 'tail\\n');\n\
+              status2 = fclose('all');\n\
+              written = fileread('out.txt');\n\
+              bad_close = fclose(999);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let Some(Value::Scalar(fid)) = result.workspace.get("fid") else {
+                panic!("expected fid scalar");
+            };
+            assert!(*fid >= 3.0);
+            assert_eq!(
+                result.workspace.get("msg"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("l1"),
+                Some(&Value::CharArray("alpha".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("l2"),
+                Some(&Value::CharArray("beta\r\n".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("l3"),
+                Some(&Value::CharArray("gamma".to_string()))
+            );
+            assert_eq!(result.workspace.get("l4"), Some(&Value::Scalar(-1.0)));
+            assert_eq!(result.workspace.get("status1"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("missing"), Some(&Value::Scalar(-1.0)));
+            let Some(Value::CharArray(missing_msg)) = result.workspace.get("missing_msg") else {
+                panic!("expected missing_msg text");
+            };
+            assert!(!missing_msg.is_empty());
+
+            let Some(Value::Scalar(wid)) = result.workspace.get("wid") else {
+                panic!("expected wid scalar");
+            };
+            let Some(Value::Scalar(aid)) = result.workspace.get("aid") else {
+                panic!("expected aid scalar");
+            };
+            assert!(*wid >= 3.0);
+            assert!(*aid >= 3.0);
+            assert_eq!(
+                result.workspace.get("wmsg"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("amsg"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(result.workspace.get("count1"), Some(&Value::Scalar(9.0)));
+            assert_eq!(
+                result.workspace.get("status_mid"),
+                Some(&Value::Scalar(0.0))
+            );
+            assert_eq!(result.workspace.get("count2"), Some(&Value::Scalar(5.0)));
+            assert_eq!(result.workspace.get("status2"), Some(&Value::Scalar(0.0)));
+            assert_eq!(
+                result.workspace.get("written"),
+                Some(&Value::CharArray("value=42\ntail\n".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("bad_close"),
+                Some(&Value::Scalar(-1.0))
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        assert_eq!(
+            fs::read_to_string(&out_path).expect("read interpreter output"),
+            "value=42\ntail\n"
+        );
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        assert_eq!(
+            fs::read_to_string(&out_path).expect("read bytecode output"),
+            "value=42\ntail\n"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn feof_ferror_frewind_fseek_and_ftell_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("file-position");
+        let lines_path = temp_dir.join("lines.txt");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&lines_path, "alpha\nbeta\r\ngamma").expect("write lines");
+        fs::write(
+            &main_path,
+            "fid = fopen('lines.txt');\n\
+             p0 = ftell(fid);\n\
+             e0 = feof(fid);\n\
+             m0 = ferror(fid);\n\
+             [m00,n00] = ferror(fid);\n\
+             l1 = fgetl(fid);\n\
+             p1 = ftell(fid);\n\
+             s1 = fseek(fid, 1, 0);\n\
+             p2 = ftell(fid);\n\
+             s2 = fseek(fid, 2, 'cof');\n\
+             p3 = ftell(fid);\n\
+             s3 = fseek(fid, 0, 'eof');\n\
+             p4 = ftell(fid);\n\
+             e1 = feof(fid);\n\
+             tail = fgetl(fid);\n\
+             e2 = feof(fid);\n\
+             s4 = fseek(fid, -100, 'bof');\n\
+             [m1,n1] = ferror(fid);\n\
+             [m2,n2] = ferror(fid, 'clear');\n\
+             [m3,n3] = ferror(fid);\n\
+             frewind(fid);\n\
+             p5 = ftell(fid);\n\
+             e3 = feof(fid);\n\
+             status = fclose(fid);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let Some(Value::Scalar(fid)) = result.workspace.get("fid") else {
+                panic!("expected fid scalar");
+            };
+            assert!(*fid >= 3.0);
+            assert_eq!(result.workspace.get("p0"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("e0"), Some(&Value::Scalar(0.0)));
+            assert_eq!(
+                result.workspace.get("m0"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("m00"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(result.workspace.get("n00"), Some(&Value::Scalar(0.0)));
+            assert_eq!(
+                result.workspace.get("l1"),
+                Some(&Value::CharArray("alpha".to_string()))
+            );
+            assert_eq!(result.workspace.get("p1"), Some(&Value::Scalar(6.0)));
+            assert_eq!(result.workspace.get("s1"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("p2"), Some(&Value::Scalar(7.0)));
+            assert_eq!(result.workspace.get("s2"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("p3"), Some(&Value::Scalar(9.0)));
+            assert_eq!(result.workspace.get("s3"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("p4"), Some(&Value::Scalar(17.0)));
+            assert_eq!(result.workspace.get("e1"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("tail"), Some(&Value::Scalar(-1.0)));
+            assert_eq!(result.workspace.get("e2"), Some(&Value::Scalar(1.0)));
+            assert_eq!(result.workspace.get("s4"), Some(&Value::Scalar(-1.0)));
+            assert_eq!(
+                result.workspace.get("m1"),
+                Some(&Value::CharArray(
+                    "Offset is bad - before beginning-of-file.".to_string()
+                ))
+            );
+            assert_eq!(result.workspace.get("n1"), Some(&Value::Scalar(-1.0)));
+            assert_eq!(
+                result.workspace.get("m2"),
+                Some(&Value::CharArray(
+                    "Offset is bad - before beginning-of-file.".to_string()
+                ))
+            );
+            assert_eq!(result.workspace.get("n2"), Some(&Value::Scalar(-1.0)));
+            assert_eq!(
+                result.workspace.get("m3"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(result.workspace.get("n3"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("p5"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("e3"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("status"), Some(&Value::Scalar(0.0)));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fread_and_fwrite_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("binary-io");
+        let nums_path = temp_dir.join("nums.bin");
+        let text_path = temp_dir.join("text.bin");
+        let be_path = temp_dir.join("be.bin");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "wid = fopen('nums.bin','w');\n\
+             cw = fwrite(wid, [1 2 3 4 5 6], 'uint16');\n\
+             fclose(wid);\n\
+             rid = fopen('nums.bin','r');\n\
+             [a,ca] = fread(rid);\n\
+             frewind(rid);\n\
+             [b,cb] = fread(rid, [2 3], 'uint16');\n\
+             frewind(rid);\n\
+             [c,cc] = fread(rid, [2 2], '2*uint16', 2);\n\
+             fclose(rid);\n\
+             tw = fopen('text.bin','w');\n\
+             ct = fwrite(tw, 'Hi', 'char');\n\
+             fclose(tw);\n\
+             tr = fopen('text.bin','r');\n\
+             [t,tc] = fread(tr, '*char');\n\
+             fclose(tr);\n\
+             bw = fopen('be.bin','w');\n\
+             cbw = fwrite(bw, [1 256 513], 'uint16', 'ieee-be');\n\
+             fclose(bw);\n\
+             br = fopen('be.bin','r');\n\
+             [be,bec] = fread(br, 3, 'uint16', 'ieee-be');\n\
+             fclose(br);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(result.workspace.get("cw"), Some(&Value::Scalar(6.0)));
+            assert_eq!(result.workspace.get("ca"), Some(&Value::Scalar(12.0)));
+            let Value::Matrix(a) = result.workspace.get("a").expect("a matrix") else {
+                panic!("expected a matrix");
+            };
+            assert_eq!(a.rows, 12);
+            assert_eq!(a.cols, 1);
+            assert_eq!(
+                a.scalar_elements().expect("a scalars"),
+                vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 5.0, 0.0, 6.0, 0.0]
+            );
+
+            assert_eq!(result.workspace.get("cb"), Some(&Value::Scalar(6.0)));
+            let Value::Matrix(b) = result.workspace.get("b").expect("b matrix") else {
+                panic!("expected b matrix");
+            };
+            assert_eq!(b.rows, 2);
+            assert_eq!(b.cols, 3);
+            assert_eq!(
+                b.scalar_elements().expect("b scalars"),
+                vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]
+            );
+
+            assert_eq!(result.workspace.get("cc"), Some(&Value::Scalar(4.0)));
+            let Value::Matrix(c) = result.workspace.get("c").expect("c matrix") else {
+                panic!("expected c matrix");
+            };
+            assert_eq!(c.rows, 2);
+            assert_eq!(c.cols, 2);
+            assert_eq!(
+                c.scalar_elements().expect("c scalars"),
+                vec![1.0, 4.0, 2.0, 5.0]
+            );
+
+            assert_eq!(result.workspace.get("ct"), Some(&Value::Scalar(2.0)));
+            assert_eq!(
+                result.workspace.get("t"),
+                Some(&Value::CharArray("Hi".to_string()))
+            );
+            assert_eq!(result.workspace.get("tc"), Some(&Value::Scalar(2.0)));
+
+            assert_eq!(result.workspace.get("cbw"), Some(&Value::Scalar(3.0)));
+            assert_eq!(result.workspace.get("bec"), Some(&Value::Scalar(3.0)));
+            let Value::Matrix(be) = result.workspace.get("be").expect("be matrix") else {
+                panic!("expected be matrix");
+            };
+            assert_eq!(be.rows, 3);
+            assert_eq!(be.cols, 1);
+            assert_eq!(
+                be.scalar_elements().expect("be scalars"),
+                vec![1.0, 256.0, 513.0]
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        assert_eq!(
+            fs::read(&nums_path).expect("read nums"),
+            vec![1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]
+        );
+        assert_eq!(fs::read(&text_path).expect("read text"), b"Hi");
+        assert_eq!(fs::read(&be_path).expect("read be"), vec![0, 1, 1, 0, 2, 1]);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        assert_eq!(
+            fs::read(&nums_path).expect("read nums after bytecode"),
+            vec![1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]
+        );
+        assert_eq!(
+            fs::read(&text_path).expect("read text after bytecode"),
+            b"Hi"
+        );
+        assert_eq!(
+            fs::read(&be_path).expect("read be after bytecode"),
+            vec![0, 1, 1, 0, 2, 1]
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fscanf_works_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("fscanf");
+        let numbers_path = temp_dir.join("numbers.txt");
+        let words_path = temp_dir.join("words.txt");
+        let mixed_path = temp_dir.join("mixed.txt");
+        let literal_path = temp_dir.join("literal.txt");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&numbers_path, "1 2 3 4").expect("write numbers");
+        fs::write(&words_path, "alpha beta").expect("write words");
+        fs::write(&mixed_path, "X7Y8").expect("write mixed");
+        fs::write(&literal_path, "Level1Level2").expect("write literal");
+        fs::write(
+            &main_path,
+            "fid = fopen('numbers.txt','r');\n\
+             [a,ca] = fscanf(fid, '%d', [2 2]);\n\
+             pa = ftell(fid);\n\
+             frewind(fid);\n\
+             [c,cc] = fscanf(fid, '%c', 3);\n\
+             fclose(fid);\n\
+             sid = fopen('words.txt','r');\n\
+             [s,cs] = fscanf(sid, '%s');\n\
+             fclose(sid);\n\
+             mid = fopen('mixed.txt','r');\n\
+             [m,cm] = fscanf(mid, '%c%d');\n\
+             fclose(mid);\n\
+             lid = fopen('literal.txt','r');\n\
+             [l,cl] = fscanf(lid, 'Level%d');\n\
+             fclose(lid);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let Value::Matrix(a) = result.workspace.get("a").expect("a matrix") else {
+                panic!("expected a matrix");
+            };
+            assert_eq!(a.rows, 2);
+            assert_eq!(a.cols, 2);
+            assert_eq!(
+                a.scalar_elements().expect("a scalars"),
+                vec![1.0, 3.0, 2.0, 4.0]
+            );
+            assert_eq!(result.workspace.get("ca"), Some(&Value::Scalar(7.0)));
+            assert_eq!(result.workspace.get("pa"), Some(&Value::Scalar(7.0)));
+
+            assert_eq!(
+                result.workspace.get("c"),
+                Some(&Value::CharArray("1 2".to_string()))
+            );
+            assert_eq!(result.workspace.get("cc"), Some(&Value::Scalar(3.0)));
+
+            assert_eq!(
+                result.workspace.get("s"),
+                Some(&Value::CharArray("alphabeta".to_string()))
+            );
+            assert_eq!(result.workspace.get("cs"), Some(&Value::Scalar(10.0)));
+
+            let Value::Matrix(m) = result.workspace.get("m").expect("m matrix") else {
+                panic!("expected m matrix");
+            };
+            assert_eq!(m.rows, 4);
+            assert_eq!(m.cols, 1);
+            assert_eq!(
+                m.scalar_elements().expect("m scalars"),
+                vec![88.0, 7.0, 89.0, 8.0]
+            );
+            assert_eq!(result.workspace.get("cm"), Some(&Value::Scalar(4.0)));
+
+            let Value::Matrix(l) = result.workspace.get("l").expect("l matrix") else {
+                panic!("expected l matrix");
+            };
+            assert_eq!(l.rows, 2);
+            assert_eq!(l.cols, 1);
+            assert_eq!(l.scalar_elements().expect("l scalars"), vec![1.0, 2.0]);
+            assert_eq!(result.workspace.get("cl"), Some(&Value::Scalar(12.0)));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn char_matrix_file_io_outputs_preserve_char_class_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("char-matrix-file-io");
+        let chars_path = temp_dir.join("chars.txt");
+        let scan_path = temp_dir.join("scan.txt");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&chars_path, "abcdef").expect("write chars");
+        fs::write(&scan_path, "wxyz").expect("write scan");
+        fs::write(
+            &main_path,
+            "fid = fopen('chars.txt','r');\n\
+             [cm,nm] = fread(fid, [2 3], '*char');\n\
+             fclose(fid);\n\
+             kcm = class(cm);\n\
+             tcm = ischar(cm);\n\
+             dcm = double(cm);\n\
+             lcm = logical(cm);\n\
+             fid = fopen('scan.txt','r');\n\
+             [fm,fn] = fscanf(fid, '%c', [2 2]);\n\
+             fclose(fid);\n\
+             kfm = class(fm);\n\
+             tfm = ischar(fm);\n\
+             dfm = double(fm);\n\
+             sm = sscanf('QRST', '%c', [2 2]);\n\
+             ksm = class(sm);\n\
+             tsm = ischar(sm);\n\
+             dsm = double(sm);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let Value::Matrix(cm) = result.workspace.get("cm").expect("cm matrix") else {
+                panic!("expected cm matrix");
+            };
+            assert_eq!(cm.rows, 2);
+            assert_eq!(cm.cols, 3);
+            assert_eq!(
+                cm.elements(),
+                &[
+                    Value::CharArray("a".to_string()),
+                    Value::CharArray("c".to_string()),
+                    Value::CharArray("e".to_string()),
+                    Value::CharArray("b".to_string()),
+                    Value::CharArray("d".to_string()),
+                    Value::CharArray("f".to_string()),
+                ]
+            );
+            assert_eq!(result.workspace.get("nm"), Some(&Value::Scalar(6.0)));
+            assert_eq!(
+                result.workspace.get("kcm"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("tcm"), Some(&Value::Logical(true)));
+
+            let Value::Matrix(dcm) = result.workspace.get("dcm").expect("dcm matrix") else {
+                panic!("expected dcm matrix");
+            };
+            assert_eq!(dcm.rows, 2);
+            assert_eq!(dcm.cols, 3);
+            assert_eq!(
+                dcm.scalar_elements().expect("dcm scalars"),
+                vec![97.0, 99.0, 101.0, 98.0, 100.0, 102.0]
+            );
+
+            let Value::Matrix(lcm) = result.workspace.get("lcm").expect("lcm matrix") else {
+                panic!("expected lcm matrix");
+            };
+            assert_eq!(lcm.rows, 2);
+            assert_eq!(lcm.cols, 3);
+            assert_eq!(
+                lcm.elements(),
+                &[
+                    Value::Logical(true),
+                    Value::Logical(true),
+                    Value::Logical(true),
+                    Value::Logical(true),
+                    Value::Logical(true),
+                    Value::Logical(true),
+                ]
+            );
+
+            let Value::Matrix(fm) = result.workspace.get("fm").expect("fm matrix") else {
+                panic!("expected fm matrix");
+            };
+            assert_eq!(fm.rows, 2);
+            assert_eq!(fm.cols, 2);
+            assert_eq!(
+                fm.elements(),
+                &[
+                    Value::CharArray("w".to_string()),
+                    Value::CharArray("y".to_string()),
+                    Value::CharArray("x".to_string()),
+                    Value::CharArray("z".to_string()),
+                ]
+            );
+            assert_eq!(result.workspace.get("fn"), Some(&Value::Scalar(4.0)));
+            assert_eq!(
+                result.workspace.get("kfm"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("tfm"), Some(&Value::Logical(true)));
+            let Value::Matrix(dfm) = result.workspace.get("dfm").expect("dfm matrix") else {
+                panic!("expected dfm matrix");
+            };
+            assert_eq!(
+                dfm.scalar_elements().expect("dfm scalars"),
+                vec![119.0, 121.0, 120.0, 122.0]
+            );
+
+            let Value::Matrix(sm) = result.workspace.get("sm").expect("sm matrix") else {
+                panic!("expected sm matrix");
+            };
+            assert_eq!(sm.rows, 2);
+            assert_eq!(sm.cols, 2);
+            assert_eq!(
+                sm.elements(),
+                &[
+                    Value::CharArray("Q".to_string()),
+                    Value::CharArray("S".to_string()),
+                    Value::CharArray("R".to_string()),
+                    Value::CharArray("T".to_string()),
+                ]
+            );
+            assert_eq!(
+                result.workspace.get("ksm"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("tsm"), Some(&Value::Logical(true)));
+            let Value::Matrix(dsm) = result.workspace.get("dsm").expect("dsm matrix") else {
+                panic!("expected dsm matrix");
+            };
+            assert_eq!(
+                dsm.scalar_elements().expect("dsm scalars"),
+                vec![81.0, 83.0, 82.0, 84.0]
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn char_array_selection_and_assignment_promote_to_char_matrices_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("char-array-promotion");
+        let main_path = temp_dir.join("main.m");
+        let bin_path = temp_dir.join("char_assign.bin");
+        fs::write(
+            &main_path,
+            "g = 'ab';\n\
+             g(2,2) = 'z';\n\
+             dg = double(g);\n\
+             c = 'ab';\n\
+             idx = [1; 2];\n\
+             s = c(idx);\n\
+             ks = class(s);\n\
+            ts = ischar(s);\n\
+            ds = double(s);\n\
+            c(2,2) = 'z';\n\
+             c(:,1) = 'pq';\n\
+             row = c(1,:);\n\
+             krow = class(row);\n\
+             trow = ischar(row);\n\
+             kc = class(c);\n\
+             tc = ischar(c);\n\
+             dc = double(c);\n\
+             fid = fopen('char_assign.bin', 'w');\n\
+             nw = fwrite(fid, c, 'char');\n\
+             fclose(fid);\n\
+             fid = fopen('char_assign.bin', 'r');\n\
+             [t, nt] = fread(fid, '*char');\n\
+             frewind(fid);\n\
+             tr = fread(fid, [1 4], '*char');\n\
+             fclose(fid);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let Value::Matrix(s) = result.workspace.get("s").expect("s matrix") else {
+                panic!("expected s matrix");
+            };
+            assert_eq!(s.rows, 2);
+            assert_eq!(s.cols, 1);
+            assert_eq!(
+                s.elements(),
+                &[
+                    Value::CharArray("a".to_string()),
+                    Value::CharArray("b".to_string())
+                ]
+            );
+            assert_eq!(
+                result.workspace.get("ks"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("ts"), Some(&Value::Logical(true)));
+            let Value::Matrix(ds) = result.workspace.get("ds").expect("ds matrix") else {
+                panic!("expected ds matrix");
+            };
+            assert_eq!(ds.rows, 2);
+            assert_eq!(ds.cols, 1);
+            assert_eq!(ds.scalar_elements().expect("ds scalars"), vec![97.0, 98.0]);
+
+            let Value::Matrix(dg) = result.workspace.get("dg").expect("dg matrix") else {
+                panic!("expected dg matrix");
+            };
+            assert_eq!(dg.rows, 2);
+            assert_eq!(dg.cols, 2);
+            assert_eq!(
+                dg.scalar_elements().expect("dg scalars"),
+                vec![97.0, 98.0, 0.0, 122.0]
+            );
+
+            let Value::Matrix(c) = result.workspace.get("c").expect("c matrix") else {
+                panic!("expected c matrix");
+            };
+            assert_eq!(c.rows, 2);
+            assert_eq!(c.cols, 2);
+            assert_eq!(
+                c.elements(),
+                &[
+                    Value::CharArray("p".to_string()),
+                    Value::CharArray("b".to_string()),
+                    Value::CharArray("q".to_string()),
+                    Value::CharArray("z".to_string()),
+                ]
+            );
+            assert_eq!(
+                result.workspace.get("kc"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("tc"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("row"),
+                Some(&Value::CharArray("pb".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("krow"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("trow"), Some(&Value::Logical(true)));
+            let Value::Matrix(dc) = result.workspace.get("dc").expect("dc matrix") else {
+                panic!("expected dc matrix");
+            };
+            assert_eq!(dc.rows, 2);
+            assert_eq!(dc.cols, 2);
+            assert_eq!(
+                dc.scalar_elements().expect("dc scalars"),
+                vec![112.0, 98.0, 113.0, 122.0]
+            );
+
+            assert_eq!(result.workspace.get("nw"), Some(&Value::Scalar(4.0)));
+            assert_eq!(
+                result.workspace.get("t"),
+                Some(&Value::CharArray("pqbz".to_string()))
+            );
+            assert_eq!(result.workspace.get("nt"), Some(&Value::Scalar(4.0)));
+            assert_eq!(
+                result.workspace.get("tr"),
+                Some(&Value::CharArray("pqbz".to_string()))
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        assert_eq!(fs::read(&bin_path).expect("read bin"), b"pqbz");
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        assert_eq!(fs::read(&bin_path).expect("read bin bytecode"), b"pqbz");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn empty_results_from_char_matrix_paths_preserve_char_identity_in_interpreter_and_bytecode() {
+        let source = "c = 'ab';\n\
+                      c(2,2) = 'z';\n\
+                      c(:, :) = [];\n\
+                      k = class(c);\n\
+                      t = ischar(c);\n\
+                      e = isempty(c);\n\
+                      v = isvector(c);\n\
+                      r = isrow(c);\n\
+                      col = iscolumn(c);\n\
+                      m = ismatrix(c);\n\
+                      sc = isscalar(c);\n\
+                      s = size(c);\n\
+                      d = double(c);\n";
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("c"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("k"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("t"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("e"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("v"), Some(&Value::Logical(false)));
+            assert_eq!(result.workspace.get("r"), Some(&Value::Logical(false)));
+            assert_eq!(result.workspace.get("col"), Some(&Value::Logical(false)));
+            assert_eq!(result.workspace.get("m"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("sc"), Some(&Value::Logical(false)));
+            assert_eq!(
+                result.workspace.get("s"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(0.0)])
+                        .expect("size result"),
+                ))
+            );
+            assert_eq!(
+                result.workspace.get("d"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("double empty char")
+                ))
+            );
+        };
+
+        let interpreted = execute_script_source(source);
+        assert_result(&interpreted);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_result(&bytecode);
+    }
+
+    #[test]
+    fn empty_char_literals_report_zero_by_zero_size_in_interpreter_and_bytecode() {
+        let source = "c = '';\n\
+                      s = size(c);\n\
+                      n = numel(c);\n\
+                      e = isempty(c);\n\
+                      v = isvector(c);\n\
+                      r = isrow(c);\n\
+                      col = iscolumn(c);\n\
+                      m = ismatrix(c);\n\
+                      sc = isscalar(c);\n\
+                      d = double(c);\n\
+                      l = logical(c);\n\
+                      k = class(c);\n";
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("c"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("s"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(0.0)])
+                        .expect("size result"),
+                ))
+            );
+            assert_eq!(result.workspace.get("n"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("e"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("v"), Some(&Value::Logical(false)));
+            assert_eq!(result.workspace.get("r"), Some(&Value::Logical(false)));
+            assert_eq!(result.workspace.get("col"), Some(&Value::Logical(false)));
+            assert_eq!(result.workspace.get("m"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("sc"), Some(&Value::Logical(false)));
+            assert_eq!(
+                result.workspace.get("d"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("double empty char")
+                ))
+            );
+            assert_eq!(
+                result.workspace.get("l"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(0, 0, Vec::new()).expect("logical empty char")
+                ))
+            );
+            assert_eq!(
+                result.workspace.get("k"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+        };
+
+        let interpreted = execute_script_source(source);
+        assert_result(&interpreted);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_result(&bytecode);
+    }
+
+    #[test]
+    fn promoted_char_matrix_deletion_preserves_char_identity_in_interpreter_and_bytecode() {
+        let source = "c = 'ab';\n\
+                      c(2,2) = 'z';\n\
+                      c(:,1) = 'pq';\n\
+                      rowdrop = c;\n\
+                      rowdrop(1,:) = [];\n\
+                      krow = class(rowdrop);\n\
+                      trow = ischar(rowdrop);\n\
+                      drow = double(rowdrop);\n\
+                      coldrop = c;\n\
+                      coldrop(:,2) = [];\n\
+                      kcol = class(coldrop);\n\
+                      tcol = ischar(coldrop);\n\
+                      dcol = double(coldrop);\n\
+                      lindrop = c;\n\
+                      lindrop([1 3]) = [];\n\
+                      klin = class(lindrop);\n\
+                      tlin = ischar(lindrop);\n\
+                      dlin = double(lindrop);\n";
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("rowdrop"),
+                Some(&Value::CharArray("qz".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("krow"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("trow"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("drow"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(113.0), Value::Scalar(122.0)])
+                        .expect("drow"),
+                ))
+            );
+
+            let Value::Matrix(coldrop) = result.workspace.get("coldrop").expect("coldrop matrix")
+            else {
+                panic!("expected coldrop matrix");
+            };
+            assert_eq!(coldrop.rows, 2);
+            assert_eq!(coldrop.cols, 1);
+            assert_eq!(
+                coldrop.elements(),
+                &[
+                    Value::CharArray("p".to_string()),
+                    Value::CharArray("q".to_string())
+                ]
+            );
+            assert_eq!(
+                result.workspace.get("kcol"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("tcol"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("dcol"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(112.0), Value::Scalar(113.0)])
+                        .expect("dcol"),
+                ))
+            );
+
+            let Value::Matrix(lindrop) = result.workspace.get("lindrop").expect("lindrop matrix")
+            else {
+                panic!("expected lindrop matrix");
+            };
+            assert_eq!(lindrop.rows, 2);
+            assert_eq!(lindrop.cols, 1);
+            assert_eq!(
+                lindrop.elements(),
+                &[
+                    Value::CharArray("q".to_string()),
+                    Value::CharArray("z".to_string())
+                ]
+            );
+            assert_eq!(
+                result.workspace.get("klin"),
+                Some(&Value::CharArray("char".to_string()))
+            );
+            assert_eq!(result.workspace.get("tlin"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("dlin"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(113.0), Value::Scalar(122.0)])
+                        .expect("dlin"),
+                ))
+            );
+        };
+
+        let interpreted = execute_script_source(source);
+        assert_result(&interpreted);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_result(&bytecode);
+    }
+
+    #[test]
+    fn fscanf_extended_specifiers_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("fscanf-extended");
+        let hex_path = temp_dir.join("hex.txt");
+        let oct_path = temp_dir.join("oct.txt");
+        let set_path = temp_dir.join("set.txt");
+        let neg_path = temp_dir.join("neg.txt");
+        let ws_path = temp_dir.join("wsset.txt");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&hex_path, "10 FF 20 7b").expect("write hex");
+        fs::write(&oct_path, "10 17 20").expect("write oct");
+        fs::write(&set_path, "abc123 XYZ").expect("write set");
+        fs::write(&neg_path, "abc123").expect("write neg");
+        fs::write(&ws_path, "  abc").expect("write ws");
+        fs::write(
+            &main_path,
+            "hid = fopen('hex.txt','r');\n\
+             [h,ch] = fscanf(hid, '%x', [2 2]);\n\
+             fclose(hid);\n\
+             oid = fopen('oct.txt','r');\n\
+             [o,co] = fscanf(oid, '%o');\n\
+             fclose(oid);\n\
+             sid = fopen('set.txt','r');\n\
+             [s,cs] = fscanf(sid, '%[a-z0-9]');\n\
+             ps = ftell(sid);\n\
+             frewind(sid);\n\
+             [m,cm] = fscanf(sid, '%[a-z]%d');\n\
+             fclose(sid);\n\
+             nid = fopen('neg.txt','r');\n\
+             [n,cn] = fscanf(nid, '%[^0-9]');\n\
+             fclose(nid);\n\
+             wid = fopen('wsset.txt','r');\n\
+             [w,cw] = fscanf(wid, '%[a-z]');\n\
+             pw = ftell(wid);\n\
+             fclose(wid);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let Value::Matrix(h) = result.workspace.get("h").expect("h matrix") else {
+                panic!("expected h matrix");
+            };
+            assert_eq!(h.rows, 2);
+            assert_eq!(h.cols, 2);
+            assert_eq!(
+                h.scalar_elements().expect("h scalars"),
+                vec![16.0, 32.0, 255.0, 123.0]
+            );
+            assert_eq!(result.workspace.get("ch"), Some(&Value::Scalar(11.0)));
+
+            let Value::Matrix(o) = result.workspace.get("o").expect("o matrix") else {
+                panic!("expected o matrix");
+            };
+            assert_eq!(o.rows, 3);
+            assert_eq!(o.cols, 1);
+            assert_eq!(
+                o.scalar_elements().expect("o scalars"),
+                vec![8.0, 15.0, 16.0]
+            );
+            assert_eq!(result.workspace.get("co"), Some(&Value::Scalar(8.0)));
+
+            assert_eq!(
+                result.workspace.get("s"),
+                Some(&Value::CharArray("abc123".to_string()))
+            );
+            assert_eq!(result.workspace.get("cs"), Some(&Value::Scalar(6.0)));
+            assert_eq!(result.workspace.get("ps"), Some(&Value::Scalar(6.0)));
+
+            let Value::Matrix(m) = result.workspace.get("m").expect("m matrix") else {
+                panic!("expected m matrix");
+            };
+            assert_eq!(m.rows, 4);
+            assert_eq!(m.cols, 1);
+            assert_eq!(
+                m.scalar_elements().expect("m scalars"),
+                vec![97.0, 98.0, 99.0, 123.0]
+            );
+            assert_eq!(result.workspace.get("cm"), Some(&Value::Scalar(6.0)));
+
+            assert_eq!(
+                result.workspace.get("n"),
+                Some(&Value::CharArray("abc".to_string()))
+            );
+            assert_eq!(result.workspace.get("cn"), Some(&Value::Scalar(3.0)));
+
+            assert_eq!(
+                result.workspace.get("w"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(result.workspace.get("cw"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("pw"), Some(&Value::Scalar(0.0)));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn sscanf_works_in_interpreter_and_bytecode() {
+        let source = "a = sscanf('2.7183 3.1416 0.0073', '%f', [1 3]);\n\
+                      [b,nb,msgb,nextb] = sscanf('3.14159 are the first 6 digits of pi', '%f');\n\
+                      [c,nc,msgc,nextc] = sscanf('78F 72F 64F', '%dF');\n\
+                      [d,nd,msgd,nextd] = sscanf('42 answer', '%*d %s');\n";
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let Value::Matrix(a) = result.workspace.get("a").expect("a matrix") else {
+                panic!("expected a matrix");
+            };
+            assert_eq!(a.rows, 1);
+            assert_eq!(a.cols, 3);
+            assert_eq!(
+                a.scalar_elements().expect("a scalars"),
+                vec![2.7183, 3.1416, 0.0073]
+            );
+
+            let Value::Matrix(b) = result.workspace.get("b").expect("b matrix") else {
+                panic!("expected b matrix");
+            };
+            assert_eq!(b.rows, 1);
+            assert_eq!(b.cols, 1);
+            let b_values = b.scalar_elements().expect("b scalars");
+            assert_eq!(b_values.len(), 1);
+            assert!((b_values[0] - 3.14159).abs() < 1e-10);
+            assert_eq!(result.workspace.get("nb"), Some(&Value::Scalar(1.0)));
+            assert_eq!(
+                result.workspace.get("msgb"),
+                Some(&Value::CharArray(
+                    "Input file or string does not contain specified format.".to_string()
+                ))
+            );
+            assert_eq!(result.workspace.get("nextb"), Some(&Value::Scalar(9.0)));
+
+            let Value::Matrix(c) = result.workspace.get("c").expect("c matrix") else {
+                panic!("expected c matrix");
+            };
+            assert_eq!(c.rows, 3);
+            assert_eq!(c.cols, 1);
+            assert_eq!(
+                c.scalar_elements().expect("c scalars"),
+                vec![78.0, 72.0, 64.0]
+            );
+            assert_eq!(result.workspace.get("nc"), Some(&Value::Scalar(3.0)));
+            assert_eq!(
+                result.workspace.get("msgc"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(result.workspace.get("nextc"), Some(&Value::Scalar(12.0)));
+
+            let Value::Matrix(d) = result.workspace.get("d").expect("d matrix") else {
+                panic!("expected d matrix");
+            };
+            assert_eq!(d.rows, 6);
+            assert_eq!(d.cols, 1);
+            assert_eq!(
+                d.scalar_elements().expect("d scalars"),
+                vec![97.0, 110.0, 115.0, 119.0, 101.0, 114.0]
+            );
+            assert_eq!(result.workspace.get("nd"), Some(&Value::Scalar(6.0)));
+            assert_eq!(
+                result.workspace.get("msgd"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(result.workspace.get("nextd"), Some(&Value::Scalar(10.0)));
+        };
+
+        let interpreted = execute_script_source(source);
+        assert_result(&interpreted);
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_result(&bytecode);
+    }
+
+    #[test]
+    fn scanf_long_integer_aliases_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("scanf-long");
+        let main_path = temp_dir.join("main.m");
+        fs::write(temp_dir.join("long_dec.txt"), "4294967296").expect("write long_dec");
+        fs::write(temp_dir.join("long_auto.txt"), "0x100000000").expect("write long_auto");
+        fs::write(temp_dir.join("long_unsigned.txt"), "4294967296").expect("write long_unsigned");
+        fs::write(temp_dir.join("long_octal.txt"), "40000000000").expect("write long_octal");
+        fs::write(temp_dir.join("long_hex.txt"), "100000000").expect("write long_hex");
+        fs::write(
+            &main_path,
+            "s1 = sscanf('4294967296', '%ld');\n\
+             s2 = sscanf('0x100000000', '%li');\n\
+             s3 = sscanf('4294967296', '%lu');\n\
+             s4 = sscanf('40000000000', '%lo');\n\
+             s5 = sscanf('100000000', '%lx');\n\
+             fid = fopen('long_dec.txt', 'r');\n\
+             [f1,c1] = fscanf(fid, '%ld');\n\
+             fclose(fid);\n\
+             fid = fopen('long_auto.txt', 'r');\n\
+             [f2,c2] = fscanf(fid, '%li');\n\
+             fclose(fid);\n\
+             fid = fopen('long_unsigned.txt', 'r');\n\
+             [f3,c3] = fscanf(fid, '%lu');\n\
+             fclose(fid);\n\
+             fid = fopen('long_octal.txt', 'r');\n\
+             [f4,c4] = fscanf(fid, '%lo');\n\
+             fclose(fid);\n\
+             fid = fopen('long_hex.txt', 'r');\n\
+             [f5,c5] = fscanf(fid, '%lx');\n\
+             fclose(fid);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            for name in ["s1", "s2", "s3", "s4", "s5"] {
+                let Value::Matrix(matrix) = result.workspace.get(name).expect("sscanf matrix")
+                else {
+                    panic!("expected sscanf matrix");
+                };
+                assert_eq!(matrix.rows, 1);
+                assert_eq!(matrix.cols, 1);
+            }
+            assert_eq!(
+                result.workspace.get("s1"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(1, 1, vec![Value::Scalar(4294967296.0)]).expect("s1")
+                ))
+            );
+            assert_eq!(
+                result.workspace.get("s2"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(1, 1, vec![Value::Scalar(4294967296.0)]).expect("s2")
+                ))
+            );
+            assert_eq!(
+                result.workspace.get("s3"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(1, 1, vec![Value::Scalar(4294967296.0)]).expect("s3")
+                ))
+            );
+            assert_eq!(
+                result.workspace.get("s4"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(1, 1, vec![Value::Scalar(4294967296.0)]).expect("s4")
+                ))
+            );
+            assert_eq!(
+                result.workspace.get("s5"),
+                Some(&Value::Matrix(
+                    MatrixValue::new(1, 1, vec![Value::Scalar(4294967296.0)]).expect("s5")
+                ))
+            );
+
+            for (name, count) in [
+                ("c1", 10.0),
+                ("c2", 11.0),
+                ("c3", 10.0),
+                ("c4", 11.0),
+                ("c5", 9.0),
+            ] {
+                assert_eq!(result.workspace.get(name), Some(&Value::Scalar(count)));
+            }
+
+            let Value::Matrix(f1) = result.workspace.get("f1").expect("f1") else {
+                panic!("expected f1 matrix");
+            };
+            let Value::Matrix(f2) = result.workspace.get("f2").expect("f2") else {
+                panic!("expected f2 matrix");
+            };
+            let Value::Matrix(f3) = result.workspace.get("f3").expect("f3") else {
+                panic!("expected f3 matrix");
+            };
+            let Value::Matrix(f4) = result.workspace.get("f4").expect("f4") else {
+                panic!("expected f4 matrix");
+            };
+            let Value::Matrix(f5) = result.workspace.get("f5").expect("f5") else {
+                panic!("expected f5 matrix");
+            };
+            assert_eq!(
+                f1.scalar_elements().expect("f1 scalars"),
+                vec![4294967296.0]
+            );
+            assert_eq!(
+                f2.scalar_elements().expect("f2 scalars"),
+                vec![4294967296.0]
+            );
+            assert_eq!(
+                f3.scalar_elements().expect("f3 scalars"),
+                vec![4294967296.0]
+            );
+            assert_eq!(
+                f4.scalar_elements().expect("f4 scalars"),
+                vec![4294967296.0]
+            );
+            assert_eq!(
+                f5.scalar_elements().expect("f5 scalars"),
+                vec![4294967296.0]
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fopen_query_and_opened_files_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("fopen-query");
+        let read_path = temp_dir.join("plain.txt");
+        let out_path = temp_dir.join("out.bin");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&read_path, "plain\n").expect("write plain");
+        fs::write(
+            &main_path,
+            "w = fopen('out.bin', 'w', 'ieee-be', 'UTF-8');\n\
+             [namew, permw, mfw, encw] = fopen(w);\n\
+             r = fopen('plain.txt');\n\
+             [namer, permr, mfr, encr] = fopen(r);\n\
+             [stdin_name, stdin_perm, stdin_mf, stdin_enc] = fopen(0);\n\
+             [stdout_name, stdout_perm, stdout_mf, stdout_enc] = fopen(1);\n\
+             [stderr_name, stderr_perm, stderr_mf, stderr_enc] = fopen(2);\n\
+             [stdmsg, stdnum] = ferror(1);\n\
+             ids1 = openedFiles;\n\
+             count = fwrite(w, [1 256], 'uint16');\n\
+             ids2 = openedFiles;\n\
+             fclose(r);\n\
+             ids3 = openedFiles;\n\
+             [miss1, miss2, miss3, miss4] = fopen(999);\n\
+             fclose(w);\n\
+             ids4 = openedFiles;\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("namew"),
+                Some(&Value::CharArray("out.bin".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("permw"),
+                Some(&Value::CharArray("wb".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("mfw"),
+                Some(&Value::CharArray("ieee-be".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("encw"),
+                Some(&Value::CharArray("UTF-8".to_string()))
+            );
+
+            assert_eq!(
+                result.workspace.get("namer"),
+                Some(&Value::CharArray(read_path.display().to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("permr"),
+                Some(&Value::CharArray("rb".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("mfr"),
+                Some(&Value::CharArray("native".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("encr"),
+                Some(&Value::CharArray("UTF-8".to_string()))
+            );
+
+            assert_eq!(
+                result.workspace.get("stdin_name"),
+                Some(&Value::CharArray("stdin".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("stdin_perm"),
+                Some(&Value::CharArray("rb".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("stdin_mf"),
+                Some(&Value::CharArray("native".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("stdin_enc"),
+                Some(&Value::CharArray("UTF-8".to_string()))
+            );
+
+            assert_eq!(
+                result.workspace.get("stdout_name"),
+                Some(&Value::CharArray("stdout".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("stdout_perm"),
+                Some(&Value::CharArray("wb".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("stdout_mf"),
+                Some(&Value::CharArray("native".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("stdout_enc"),
+                Some(&Value::CharArray("UTF-8".to_string()))
+            );
+
+            assert_eq!(
+                result.workspace.get("stderr_name"),
+                Some(&Value::CharArray("stderr".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("stderr_perm"),
+                Some(&Value::CharArray("wb".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("stderr_mf"),
+                Some(&Value::CharArray("native".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("stderr_enc"),
+                Some(&Value::CharArray("UTF-8".to_string()))
+            );
+
+            assert_eq!(
+                result.workspace.get("stdmsg"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(result.workspace.get("stdnum"), Some(&Value::Scalar(0.0)));
+
+            assert_eq!(result.workspace.get("count"), Some(&Value::Scalar(2.0)));
+
+            let Value::Matrix(ids1) = result.workspace.get("ids1").expect("ids1 matrix") else {
+                panic!("expected ids1 matrix");
+            };
+            assert_eq!(ids1.rows, 1);
+            assert_eq!(ids1.cols, 2);
+            assert_eq!(
+                ids1.scalar_elements().expect("ids1 scalars"),
+                vec![3.0, 4.0]
+            );
+
+            let Value::Matrix(ids2) = result.workspace.get("ids2").expect("ids2 matrix") else {
+                panic!("expected ids2 matrix");
+            };
+            assert_eq!(ids2.rows, 1);
+            assert_eq!(ids2.cols, 2);
+            assert_eq!(
+                ids2.scalar_elements().expect("ids2 scalars"),
+                vec![3.0, 4.0]
+            );
+
+            let Value::Matrix(ids3) = result.workspace.get("ids3").expect("ids3 matrix") else {
+                panic!("expected ids3 matrix");
+            };
+            assert_eq!(ids3.rows, 1);
+            assert_eq!(ids3.cols, 1);
+            assert_eq!(ids3.scalar_elements().expect("ids3 scalars"), vec![3.0]);
+
+            for name in ["miss1", "miss2", "miss3", "miss4"] {
+                assert_eq!(
+                    result.workspace.get(name),
+                    Some(&Value::CharArray(String::new()))
+                );
+            }
+
+            let Value::Matrix(ids4) = result.workspace.get("ids4").expect("ids4 matrix") else {
+                panic!("expected ids4 matrix");
+            };
+            assert_eq!(ids4.rows, 1);
+            assert_eq!(ids4.cols, 0);
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        assert_eq!(fs::read(&out_path).expect("read out"), vec![0, 1, 1, 0]);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        assert_eq!(
+            fs::read(&out_path).expect("read out bytecode"),
+            vec![0, 1, 1, 0]
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fopen_update_modes_support_mixed_read_and_write_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("fopen-update");
+        let rw_path = temp_dir.join("rw.txt");
+        let app_path = temp_dir.join("app.txt");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&rw_path, "ABCDE").expect("write rw");
+        fs::write(&app_path, "AB").expect("write app");
+        fs::write(
+            &main_path,
+            "fid = fopen('rw.txt', 'r+');\n\
+             [name1, perm1] = fopen(fid);\n\
+             c1 = fwrite(fid, 'Z', 'char');\n\
+             fseek(fid, 0, 'bof');\n\
+             [t1, n1] = fread(fid, '*char');\n\
+             fclose(fid);\n\
+             fid = fopen('new.txt', 'w+');\n\
+             [name2, perm2] = fopen(fid);\n\
+             c2 = fwrite(fid, 'Hi', 'char');\n\
+             frewind(fid);\n\
+             [t2, n2] = fread(fid, '*char');\n\
+             fclose(fid);\n\
+             fid = fopen('app.txt', 'a+');\n\
+             [name3, perm3] = fopen(fid);\n\
+             c3 = fwrite(fid, 'C', 'char');\n\
+             fseek(fid, 0, 'bof');\n\
+             [t3, n3] = fread(fid, '*char');\n\
+             fclose(fid);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("name1"),
+                Some(&Value::CharArray(rw_path.display().to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("perm1"),
+                Some(&Value::CharArray("r+b".to_string()))
+            );
+            assert_eq!(result.workspace.get("c1"), Some(&Value::Scalar(1.0)));
+            assert_eq!(
+                result.workspace.get("t1"),
+                Some(&Value::CharArray("ZBCDE".to_string()))
+            );
+            assert_eq!(result.workspace.get("n1"), Some(&Value::Scalar(5.0)));
+
+            assert_eq!(
+                result.workspace.get("name2"),
+                Some(&Value::CharArray("new.txt".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("perm2"),
+                Some(&Value::CharArray("w+b".to_string()))
+            );
+            assert_eq!(result.workspace.get("c2"), Some(&Value::Scalar(2.0)));
+            assert_eq!(
+                result.workspace.get("t2"),
+                Some(&Value::CharArray("Hi".to_string()))
+            );
+            assert_eq!(result.workspace.get("n2"), Some(&Value::Scalar(2.0)));
+
+            assert_eq!(
+                result.workspace.get("name3"),
+                Some(&Value::CharArray("app.txt".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("perm3"),
+                Some(&Value::CharArray("a+b".to_string()))
+            );
+            assert_eq!(result.workspace.get("c3"), Some(&Value::Scalar(1.0)));
+            assert_eq!(
+                result.workspace.get("t3"),
+                Some(&Value::CharArray("ABC".to_string()))
+            );
+            assert_eq!(result.workspace.get("n3"), Some(&Value::Scalar(3.0)));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        assert_eq!(fs::read_to_string(&rw_path).expect("read rw"), "ZBCDE");
+        assert_eq!(
+            fs::read_to_string(temp_dir.join("new.txt")).expect("read new"),
+            "Hi"
+        );
+        assert_eq!(fs::read_to_string(&app_path).expect("read app"), "ABC");
+
+        fs::write(&rw_path, "ABCDE").expect("rewrite rw");
+        fs::write(&app_path, "AB").expect("rewrite app");
+        let _ = fs::remove_file(temp_dir.join("new.txt"));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        assert_eq!(
+            fs::read_to_string(&rw_path).expect("read rw bytecode"),
+            "ZBCDE"
+        );
+        assert_eq!(
+            fs::read_to_string(temp_dir.join("new.txt")).expect("read new bytecode"),
+            "Hi"
+        );
+        assert_eq!(
+            fs::read_to_string(&app_path).expect("read app bytecode"),
+            "ABC"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fopen_text_mode_permissions_and_newlines_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("fopen-text-mode");
+        let read_path = temp_dir.join("crlf.txt");
+        let note_path = temp_dir.join("note.txt");
+        let sink_path = temp_dir.join("sink.txt");
+        let main_path = temp_dir.join("main.m");
+        fs::write(&read_path, b"alpha\r\nbeta\r\n").expect("write crlf");
+        fs::write(
+            &main_path,
+            "rid = fopen('crlf.txt', 'rt');\n\
+             [n1,p1,m1,e1] = fopen(rid);\n\
+             l1 = fgetl(rid);\n\
+             l2 = fgets(rid);\n\
+             fclose(rid);\n\
+             wid = fopen('note.txt', 'wt');\n\
+             [n2,p2,m2,e2] = fopen(wid);\n\
+             c1 = fprintf(wid, 'left\\nright\\n');\n\
+             fclose(wid);\n\
+             sid = fopen('sink.txt', 'Wt');\n\
+             [n3,p3,m3,e3] = fopen(sid);\n\
+             c2 = fprintf(sid, 'sink\\n');\n\
+             fclose(sid);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("n1"),
+                Some(&Value::CharArray(read_path.display().to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("p1"),
+                Some(&Value::CharArray("rt".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("m1"),
+                Some(&Value::CharArray("native".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("e1"),
+                Some(&Value::CharArray("UTF-8".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("l1"),
+                Some(&Value::CharArray("alpha".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("l2"),
+                Some(&Value::CharArray("beta\n".to_string()))
+            );
+
+            assert_eq!(
+                result.workspace.get("n2"),
+                Some(&Value::CharArray("note.txt".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("p2"),
+                Some(&Value::CharArray("wt".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("m2"),
+                Some(&Value::CharArray("native".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("e2"),
+                Some(&Value::CharArray("UTF-8".to_string()))
+            );
+            assert_eq!(result.workspace.get("c1"), Some(&Value::Scalar(11.0)));
+
+            assert_eq!(
+                result.workspace.get("n3"),
+                Some(&Value::CharArray("sink.txt".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("p3"),
+                Some(&Value::CharArray("Wt".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("m3"),
+                Some(&Value::CharArray("native".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("e3"),
+                Some(&Value::CharArray("UTF-8".to_string()))
+            );
+            assert_eq!(result.workspace.get("c2"), Some(&Value::Scalar(5.0)));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        if cfg!(windows) {
+            assert_eq!(
+                fs::read(&note_path).expect("read note"),
+                b"left\r\nright\r\n"
+            );
+            assert_eq!(fs::read(&sink_path).expect("read sink"), b"sink\r\n");
+        } else {
+            assert_eq!(fs::read(&note_path).expect("read note"), b"left\nright\n");
+            assert_eq!(fs::read(&sink_path).expect("read sink"), b"sink\n");
+        }
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        if cfg!(windows) {
+            assert_eq!(
+                fs::read(&note_path).expect("read note bytecode"),
+                b"left\r\nright\r\n"
+            );
+            assert_eq!(
+                fs::read(&sink_path).expect("read sink bytecode"),
+                b"sink\r\n"
+            );
+        } else {
+            assert_eq!(
+                fs::read(&note_path).expect("read note bytecode"),
+                b"left\nright\n"
+            );
+            assert_eq!(fs::read(&sink_path).expect("read sink bytecode"), b"sink\n");
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fread_typed_int64_and_uint64_outputs_preserve_class_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("fread-typed-64");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "w = fopen('typed.bin','w');\n\
+             fwrite(w, 42, 'uint64');\n\
+             fwrite(w, 1099511627776, 'uint64');\n\
+             fwrite(w, -42, 'int64');\n\
+             fwrite(w, -1099511627776, 'int64');\n\
+             fclose(w);\n\
+             r = fopen('typed.bin','r');\n\
+             u = fread(r, [1 2], '*uint64');\n\
+             i = fread(r, [1 2], '*int64');\n\
+             fclose(r);\n\
+             ku = class(u);\n\
+             ki = class(i);\n\
+             du = double(u);\n\
+             li = logical(i);\n\
+             ds = double(i(1));\n\
+             ls = logical(u(1));\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            let Value::Matrix(u) = result.workspace.get("u").expect("u matrix") else {
+                panic!("expected u matrix");
+            };
+            assert_eq!(u.rows, 1);
+            assert_eq!(u.cols, 2);
+            assert_eq!(
+                u.elements(),
+                &[Value::UInt64(42), Value::UInt64(1_099_511_627_776)]
+            );
+
+            let Value::Matrix(i) = result.workspace.get("i").expect("i matrix") else {
+                panic!("expected i matrix");
+            };
+            assert_eq!(i.rows, 1);
+            assert_eq!(i.cols, 2);
+            assert_eq!(
+                i.elements(),
+                &[Value::Int64(-42), Value::Int64(-1_099_511_627_776)]
+            );
+
+            assert_eq!(
+                result.workspace.get("ku"),
+                Some(&Value::CharArray("uint64".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("ki"),
+                Some(&Value::CharArray("int64".to_string()))
+            );
+
+            let Value::Matrix(du) = result.workspace.get("du").expect("du matrix") else {
+                panic!("expected du matrix");
+            };
+            assert_eq!(du.rows, 1);
+            assert_eq!(du.cols, 2);
+            assert_eq!(
+                du.scalar_elements().expect("du scalars"),
+                vec![42.0, 1_099_511_627_776.0]
+            );
+
+            let Value::Matrix(li) = result.workspace.get("li").expect("li matrix") else {
+                panic!("expected li matrix");
+            };
+            assert_eq!(li.rows, 1);
+            assert_eq!(li.cols, 2);
+            assert_eq!(li.elements(), &[Value::Logical(true), Value::Logical(true)]);
+
+            assert_eq!(result.workspace.get("ds"), Some(&Value::Scalar(-42.0)));
+            assert_eq!(result.workspace.get("ls"), Some(&Value::Logical(true)));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn int64_and_uint64_basic_arithmetic_preserve_class_and_saturate() {
+        let temp_dir = unique_temp_script_dir("int64-arith");
+        let path = temp_dir.join("ints.bin");
+        let main_path = temp_dir.join("main.m");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&i64::MAX.to_le_bytes());
+        bytes.extend_from_slice(&1i64.to_le_bytes());
+        bytes.extend_from_slice(&i64::MIN.to_le_bytes());
+        bytes.extend_from_slice(&1i64.to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&4u64.to_le_bytes());
+        fs::write(&path, bytes).expect("write ints");
+        fs::write(
+            &main_path,
+            "fid = fopen('ints.bin','r');\n\
+             imax = fread(fid, 1, '*int64');\n\
+             ione = fread(fid, 1, '*int64');\n\
+             imin = fread(fid, 1, '*int64');\n\
+             itwo = fread(fid, 1, '*int64');\n\
+             umax = fread(fid, 1, '*uint64');\n\
+             uone = fread(fid, 1, '*uint64');\n\
+             uthree = fread(fid, 1, '*uint64');\n\
+             ufour = fread(fid, 1, '*uint64');\n\
+             fclose(fid);\n\
+             kimax = class(imax);\n\
+             kuone = class(uone);\n\
+             s1 = plus(imax, ione);\n\
+             s2 = minus(imin, itwo);\n\
+             s3 = uminus(imin);\n\
+             u1 = plus(umax, uone);\n\
+             u2 = minus(uone, uthree);\n\
+             u3 = times(ufour, uthree);\n\
+             c1 = imax > ione;\n\
+             c2 = uone == uthree;\n\
+             k1 = class(s1);\n\
+             k2 = class(u1);\n\
+             k3 = class(u3);\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(
+                result.workspace.get("kimax"),
+                Some(&Value::CharArray("int64".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("kuone"),
+                Some(&Value::CharArray("uint64".to_string()))
+            );
+            assert_eq!(result.workspace.get("s1"), Some(&Value::Int64(i64::MAX)));
+            assert_eq!(result.workspace.get("s2"), Some(&Value::Int64(i64::MIN)));
+            assert_eq!(result.workspace.get("s3"), Some(&Value::Int64(i64::MAX)));
+            assert_eq!(result.workspace.get("u1"), Some(&Value::UInt64(u64::MAX)));
+            assert_eq!(result.workspace.get("u2"), Some(&Value::UInt64(0)));
+            assert_eq!(result.workspace.get("u3"), Some(&Value::UInt64(12)));
+            assert_eq!(result.workspace.get("c1"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("c2"), Some(&Value::Logical(false)));
+            assert_eq!(
+                result.workspace.get("k1"),
+                Some(&Value::CharArray("int64".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("k2"),
+                Some(&Value::CharArray("uint64".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("k3"),
+                Some(&Value::CharArray("uint64".to_string()))
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn mkdir_and_rmdir_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("mkdir-rmdir");
+        let nested_dir = temp_dir.join("gamma");
+        fs::create_dir_all(nested_dir.join("sub")).expect("create nested dir");
+        fs::write(nested_dir.join("sub").join("note.txt"), "note").expect("write nested file");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "cwd = pwd;\n\
+             [s1,m1,id1] = mkdir('alpha');\n\
+             [s2,m2,id2] = mkdir('alpha');\n\
+             [s3,m3,id3] = mkdir(cwd, 'beta');\n\
+             e1 = exist('alpha', 'dir');\n\
+             e2 = exist('beta', 'dir');\n\
+             [s4,m4,id4] = rmdir('alpha');\n\
+             e3 = exist('alpha', 'dir');\n\
+             [s5,m5,id5] = rmdir('gamma', 's');\n\
+             e4 = exist('gamma', 'dir');\n\
+             [s6,m6,id6] = rmdir('missing');\n\
+             mkdir delta\n\
+             rmdir delta\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(result.workspace.get("s1"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("m1"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("id1"),
+                Some(&Value::CharArray(String::new()))
+            );
+
+            assert_eq!(result.workspace.get("s2"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("m2"),
+                Some(&Value::CharArray("Directory already exists.".to_string()))
+            );
+            assert_eq!(
+                result.workspace.get("id2"),
+                Some(&Value::CharArray(
+                    "MATLAB:MKDIR:DirectoryExists".to_string()
+                ))
+            );
+
+            assert_eq!(result.workspace.get("s3"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("m3"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("id3"),
+                Some(&Value::CharArray(String::new()))
+            );
+
+            assert_eq!(result.workspace.get("e1"), Some(&Value::Scalar(7.0)));
+            assert_eq!(result.workspace.get("e2"), Some(&Value::Scalar(7.0)));
+            assert_eq!(result.workspace.get("s4"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("e3"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("s5"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("e4"), Some(&Value::Scalar(0.0)));
+
+            assert_eq!(result.workspace.get("s6"), Some(&Value::Logical(false)));
+            let Value::CharArray(m6) = result.workspace.get("m6").expect("m6") else {
+                panic!("expected m6 text");
+            };
+            assert!(!m6.is_empty());
+            assert_eq!(
+                result.workspace.get("id6"),
+                Some(&Value::CharArray(
+                    "MATLAB:RMDIR:DirectoryNotRemoved".to_string()
+                ))
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        assert!(!temp_dir.join("delta").exists());
+        if temp_dir.join("beta").exists() {
+            fs::remove_dir_all(temp_dir.join("beta")).expect("remove beta after interpreted run");
+        }
+        fs::create_dir_all(nested_dir.join("sub")).expect("recreate nested dir");
+        fs::write(nested_dir.join("sub").join("note.txt"), "note").expect("rewrite nested file");
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        assert!(!temp_dir.join("delta").exists());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn copyfile_movefile_and_fileattrib_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("copy-move-fileattrib");
+        let source_dir = temp_dir.join("srcdir");
+        fs::create_dir_all(&source_dir).expect("create srcdir");
+        fs::write(temp_dir.join("src.txt"), "alpha").expect("write src file");
+        fs::write(source_dir.join("inner.txt"), "beta").expect("write inner file");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "cwd = pwd;\n\
+             [s1,m1,id1] = copyfile('src.txt', 'dst.txt');\n\
+             [s2,m2,id2] = copyfile('srcdir', 'copiedDir');\n\
+             e1 = exist('dst.txt', 'file');\n\
+             e2 = exist('copiedDir', 'dir');\n\
+             [s3,m3,id3] = movefile('dst.txt', 'moved.txt');\n\
+             [s4,m4,id4] = movefile('copiedDir', 'movedDir');\n\
+             e3 = exist('moved.txt', 'file');\n\
+             e4 = exist('movedDir', 'dir');\n\
+             [fa_status, fa_values] = fileattrib('moved.txt');\n\
+             copyfile src.txt copiedAgain.txt\n\
+             movefile copiedAgain.txt final.txt\n",
+        )
+        .expect("write main");
+
+        let moved_file = temp_dir.join("moved.txt");
+        let moved_dir = temp_dir.join("movedDir");
+        let assert_result = |result: &super::ExecutionResult| {
+            for name in ["s1", "s2", "s3", "s4"] {
+                assert_eq!(result.workspace.get(name), Some(&Value::Logical(true)));
+            }
+            for name in ["m1", "m2", "m3", "m4", "id1", "id2", "id3", "id4"] {
+                assert_eq!(
+                    result.workspace.get(name),
+                    Some(&Value::CharArray(String::new()))
+                );
+            }
+            assert_eq!(result.workspace.get("e1"), Some(&Value::Scalar(2.0)));
+            assert_eq!(result.workspace.get("e2"), Some(&Value::Scalar(7.0)));
+            assert_eq!(result.workspace.get("e3"), Some(&Value::Scalar(2.0)));
+            assert_eq!(result.workspace.get("e4"), Some(&Value::Scalar(7.0)));
+            assert_eq!(
+                result.workspace.get("fa_status"),
+                Some(&Value::Logical(true))
+            );
+
+            let fa = workspace_struct(&result.workspace, "fa_values");
+            assert_path_text_eq(&struct_text_field(fa, "Name"), &moved_file);
+            assert_eq!(fa.fields.get("directory"), Some(&Value::Scalar(0.0)));
+            assert_eq!(fa.fields.get("UserRead"), Some(&Value::Scalar(1.0)));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        assert_eq!(
+            fs::read_to_string(&moved_file).expect("read moved file"),
+            "alpha"
+        );
+        assert_eq!(
+            fs::read_to_string(moved_dir.join("inner.txt")).expect("read moved inner file"),
+            "beta"
+        );
+        assert!(temp_dir.join("final.txt").is_file());
+
+        let _ = fs::remove_file(&moved_file);
+        let _ = fs::remove_file(temp_dir.join("final.txt"));
+        let _ = fs::remove_dir_all(&moved_dir);
+        fs::write(temp_dir.join("src.txt"), "alpha").expect("rewrite src file");
+        fs::create_dir_all(&source_dir).expect("recreate srcdir");
+        fs::write(source_dir.join("inner.txt"), "beta").expect("rewrite inner file");
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        assert_eq!(
+            fs::read_to_string(&moved_file).expect("read moved file"),
+            "alpha"
+        );
+        assert_eq!(
+            fs::read_to_string(moved_dir.join("inner.txt")).expect("read moved inner file"),
+            "beta"
+        );
+        assert!(temp_dir.join("final.txt").is_file());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn fileattrib_supports_write_toggle_recursive_and_missing_status_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("fileattrib-setter");
+        let tree_dir = temp_dir.join("tree");
+        fs::create_dir_all(&tree_dir).expect("create tree");
+        fs::write(temp_dir.join("note.txt"), "note").expect("write note");
+        fs::write(tree_dir.join("child.txt"), "child").expect("write child");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            " [s0,v0] = fileattrib('note.txt');\n\
+              [s1,m1,id1] = fileattrib('note.txt','-w');\n\
+              [s2,v2] = fileattrib('note.txt');\n\
+              [s3,m3,id3] = fileattrib('note.txt','+w');\n\
+              [s4,v4] = fileattrib('note.txt');\n\
+              [s5,m5,id5] = fileattrib('tree','-w','','s');\n\
+              [s6,v6] = fileattrib(fullfile('tree','child.txt'));\n\
+              [s7,v7] = fileattrib('missing.txt');\n\
+              [s8,m8,id8] = fileattrib('missing.txt','+w');\n",
+        )
+        .expect("write main");
+
+        let set_writable = |path: &std::path::Path, writable: bool| {
+            let mut permissions = fs::metadata(path).expect("metadata").permissions();
+            permissions.set_readonly(!writable);
+            fs::set_permissions(path, permissions).expect("set permissions");
+        };
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(result.workspace.get("s0"), Some(&Value::Logical(true)));
+            let v0 = workspace_struct(&result.workspace, "v0");
+            assert_eq!(struct_scalar_field(v0, "UserWrite"), 1.0);
+
+            assert_eq!(result.workspace.get("s1"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("m1"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("id1"),
+                Some(&Value::CharArray(String::new()))
+            );
+
+            assert_eq!(result.workspace.get("s2"), Some(&Value::Logical(true)));
+            let v2 = workspace_struct(&result.workspace, "v2");
+            assert_eq!(struct_scalar_field(v2, "UserWrite"), 0.0);
+
+            assert_eq!(result.workspace.get("s3"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("m3"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("id3"),
+                Some(&Value::CharArray(String::new()))
+            );
+
+            assert_eq!(result.workspace.get("s4"), Some(&Value::Logical(true)));
+            let v4 = workspace_struct(&result.workspace, "v4");
+            assert_eq!(struct_scalar_field(v4, "UserWrite"), 1.0);
+
+            assert_eq!(result.workspace.get("s5"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("m5"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("id5"),
+                Some(&Value::CharArray(String::new()))
+            );
+
+            assert_eq!(result.workspace.get("s6"), Some(&Value::Logical(true)));
+            let v6 = workspace_struct(&result.workspace, "v6");
+            assert_eq!(struct_scalar_field(v6, "UserWrite"), 0.0);
+
+            assert_eq!(result.workspace.get("s7"), Some(&Value::Logical(false)));
+            let Value::Matrix(v7) = result.workspace.get("v7").expect("v7") else {
+                panic!("expected empty matrix for missing fileattrib getter");
+            };
+            assert_eq!(v7.rows, 0);
+            assert_eq!(v7.cols, 0);
+
+            assert_eq!(result.workspace.get("s8"), Some(&Value::Logical(false)));
+            let Value::CharArray(m8) = result.workspace.get("m8").expect("m8") else {
+                panic!("expected m8 text");
+            };
+            assert!(!m8.is_empty());
+            assert_eq!(
+                result.workspace.get("id8"),
+                Some(&Value::CharArray(
+                    "MATLAB:FILEATTRIB:FileNotFound".to_string()
+                ))
+            );
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+
+        set_writable(&tree_dir.join("child.txt"), true);
+        set_writable(&tree_dir, true);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+
+        set_writable(&tree_dir.join("child.txt"), true);
+        set_writable(&tree_dir, true);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn copyfile_and_movefile_accept_text_collections_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("copy-move-collections");
+        let main_path = temp_dir.join("main.m");
+
+        let seed_files = |base: &std::path::Path| {
+            fs::write(base.join("a.txt"), "a").expect("write a");
+            fs::write(base.join("b.txt"), "b").expect("write b");
+            fs::write(base.join("c.txt"), "c").expect("write c");
+            if base.join("copied").exists() {
+                fs::remove_dir_all(base.join("copied")).expect("remove copied");
+            }
+            if base.join("moved").exists() {
+                fs::remove_dir_all(base.join("moved")).expect("remove moved");
+            }
+            if base.join("a.txt").exists() && base.join("copied").exists() {
+                unreachable!("seed should start from clean state");
+            }
+        };
+
+        fs::write(
+            &main_path,
+            "s1 = copyfile({'a.txt','b.txt'}, 'copied');\n\
+             s2 = movefile({'a.txt','b.txt'}, 'moved');\n\
+             e1 = exist('copied', 'dir');\n\
+             e2 = exist('moved', 'dir');\n\
+             ea = exist('a.txt', 'file');\n\
+             eb = exist('b.txt', 'file');\n\
+             ec = exist('c.txt', 'file');\n",
+        )
+        .expect("write main");
+
+        let assert_files = |base: &std::path::Path| {
+            assert_eq!(
+                fs::read_to_string(base.join("copied").join("a.txt")).expect("copied a"),
+                "a"
+            );
+            assert_eq!(
+                fs::read_to_string(base.join("copied").join("b.txt")).expect("copied b"),
+                "b"
+            );
+            assert_eq!(
+                fs::read_to_string(base.join("moved").join("a.txt")).expect("moved a"),
+                "a"
+            );
+            assert_eq!(
+                fs::read_to_string(base.join("moved").join("b.txt")).expect("moved b"),
+                "b"
+            );
+            assert!(!base.join("a.txt").exists());
+            assert!(!base.join("b.txt").exists());
+            assert!(base.join("c.txt").exists());
+        };
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(result.workspace.get("s1"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("s2"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("e1"), Some(&Value::Scalar(7.0)));
+            assert_eq!(result.workspace.get("e2"), Some(&Value::Scalar(7.0)));
+            assert_eq!(result.workspace.get("ea"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("eb"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("ec"), Some(&Value::Scalar(2.0)));
+        };
+
+        seed_files(&temp_dir);
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        assert_files(&temp_dir);
+
+        seed_files(&temp_dir);
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        assert_files(&temp_dir);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn copyfile_and_movefile_handle_wildcard_singletons_and_force_overwrite() {
+        let temp_dir = unique_temp_script_dir("copy-move-force-wildcard");
+        let main_path = temp_dir.join("main.m");
+
+        let seed = |base: &std::path::Path| {
+            let _ = fs::remove_dir_all(base.join("single.out"));
+            let _ = fs::remove_dir_all(base.join("move.out"));
+            let _ = fs::remove_file(base.join("src.txt"));
+            let _ = fs::remove_file(base.join("src2.txt"));
+            let _ = fs::remove_file(base.join("src3.txt"));
+            let _ = fs::remove_file(base.join("alpha.txt"));
+            let _ = fs::remove_file(base.join("ro.txt"));
+            let _ = fs::remove_file(base.join("ro2.txt"));
+
+            fs::write(base.join("alpha.txt"), "alpha").expect("write alpha");
+            fs::write(base.join("src.txt"), "fresh").expect("write src");
+            fs::write(base.join("src2.txt"), "moved").expect("write src2");
+            fs::write(base.join("src3.txt"), "forced").expect("write src3");
+            fs::write(base.join("ro.txt"), "old").expect("write ro");
+            fs::write(base.join("ro2.txt"), "old2").expect("write ro2");
+
+            let mut ro_perms = fs::metadata(base.join("ro.txt"))
+                .expect("ro metadata")
+                .permissions();
+            ro_perms.set_readonly(true);
+            fs::set_permissions(base.join("ro.txt"), ro_perms).expect("set ro readonly");
+            let mut ro2_perms = fs::metadata(base.join("ro2.txt"))
+                .expect("ro2 metadata")
+                .permissions();
+            ro2_perms.set_readonly(true);
+            fs::set_permissions(base.join("ro2.txt"), ro2_perms).expect("set ro2 readonly");
+        };
+
+        fs::write(
+            &main_path,
+            "w1 = copyfile('alpha*.txt', 'single.out');\n\
+             [c0,cm0,ci0] = copyfile('src.txt', 'ro.txt');\n\
+             [c1,cm1,ci1] = copyfile('src.txt', 'ro.txt', 'f');\n\
+             w2 = movefile('src2*.txt', 'move.out');\n\
+             [m0,mm0,mi0] = movefile('src3.txt', 'ro2.txt');\n\
+             [m1,mm1,mi1] = movefile('src3.txt', 'ro2.txt', 'f');\n\
+             e1 = exist(fullfile('single.out', 'alpha.txt'), 'file');\n\
+             e2 = exist(fullfile('move.out', 'src2.txt'), 'file');\n\
+             e3 = exist('src2.txt', 'file');\n\
+             e4 = exist('src3.txt', 'file');\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult, base: &std::path::Path| {
+            assert_eq!(result.workspace.get("w1"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("w2"), Some(&Value::Logical(true)));
+
+            assert_eq!(result.workspace.get("c0"), Some(&Value::Logical(false)));
+            let Value::CharArray(cm0) = result.workspace.get("cm0").expect("cm0") else {
+                panic!("expected cm0");
+            };
+            assert!(!cm0.is_empty());
+            assert_eq!(
+                result.workspace.get("ci0"),
+                Some(&Value::CharArray("MATLAB:COPYFILE:OSError".to_string()))
+            );
+
+            assert_eq!(result.workspace.get("c1"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("cm1"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("ci1"),
+                Some(&Value::CharArray(String::new()))
+            );
+
+            assert_eq!(result.workspace.get("m0"), Some(&Value::Logical(false)));
+            let Value::CharArray(mm0) = result.workspace.get("mm0").expect("mm0") else {
+                panic!("expected mm0");
+            };
+            assert!(!mm0.is_empty());
+            assert_eq!(
+                result.workspace.get("mi0"),
+                Some(&Value::CharArray("MATLAB:MOVEFILE:OSError".to_string()))
+            );
+
+            assert_eq!(result.workspace.get("m1"), Some(&Value::Logical(true)));
+            assert_eq!(
+                result.workspace.get("mm1"),
+                Some(&Value::CharArray(String::new()))
+            );
+            assert_eq!(
+                result.workspace.get("mi1"),
+                Some(&Value::CharArray(String::new()))
+            );
+
+            assert_eq!(result.workspace.get("e1"), Some(&Value::Scalar(2.0)));
+            assert_eq!(result.workspace.get("e2"), Some(&Value::Scalar(2.0)));
+            assert_eq!(result.workspace.get("e3"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("e4"), Some(&Value::Scalar(0.0)));
+
+            assert_eq!(
+                fs::read_to_string(base.join("single.out").join("alpha.txt"))
+                    .expect("single wildcard copy"),
+                "alpha"
+            );
+            assert_eq!(
+                fs::read_to_string(base.join("move.out").join("src2.txt"))
+                    .expect("single wildcard move"),
+                "moved"
+            );
+            assert_eq!(
+                fs::read_to_string(base.join("ro.txt")).expect("forced copy target"),
+                "fresh"
+            );
+            assert_eq!(
+                fs::read_to_string(base.join("ro2.txt")).expect("forced move target"),
+                "forced"
+            );
+        };
+
+        seed(&temp_dir);
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted, &temp_dir);
+
+        seed(&temp_dir);
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode, &temp_dir);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn isfile_isfolder_and_delete_text_paths_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("isfile-isfolder-delete");
+        let data_dir = temp_dir.join("data");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+        fs::write(temp_dir.join("alpha.txt"), "a").expect("write alpha");
+        fs::write(temp_dir.join("beta.log"), "b").expect("write beta");
+        fs::write(data_dir.join("inner.txt"), "c").expect("write inner");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &main_path,
+            "fa = isfile('alpha.txt');\n\
+             fb = isfile('data');\n\
+             fc = isfolder('data');\n\
+             gd = isdir('data');\n\
+             fd = isfolder({'alpha.txt','data'});\n\
+             delete('*.txt')\n\
+             delete({'beta.log'})\n\
+             e1 = exist('alpha.txt', 'file');\n\
+             e2 = exist('beta.log', 'file');\n\
+             e3 = exist('data', 'dir');\n",
+        )
+        .expect("write main");
+
+        let assert_result = |result: &super::ExecutionResult| {
+            assert_eq!(result.workspace.get("fa"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("fb"), Some(&Value::Logical(false)));
+            assert_eq!(result.workspace.get("fc"), Some(&Value::Logical(true)));
+            assert_eq!(result.workspace.get("gd"), Some(&Value::Logical(true)));
+            let Value::Matrix(fd) = result.workspace.get("fd").expect("fd matrix") else {
+                panic!("expected fd matrix");
+            };
+            assert_eq!(
+                fd.elements(),
+                &[Value::Logical(false), Value::Logical(true)]
+            );
+            assert_eq!(result.workspace.get("e1"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("e2"), Some(&Value::Scalar(0.0)));
+            assert_eq!(result.workspace.get("e3"), Some(&Value::Scalar(7.0)));
+        };
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_result(&interpreted);
+        assert!(!temp_dir.join("alpha.txt").exists());
+        assert!(!temp_dir.join("beta.log").exists());
+        assert!(data_dir.exists());
+
+        fs::write(temp_dir.join("alpha.txt"), "a").expect("rewrite alpha");
+        fs::write(temp_dir.join("beta.log"), "b").expect("rewrite beta");
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_result(&bytecode);
+        assert!(!temp_dir.join("alpha.txt").exists());
+        assert!(!temp_dir.join("beta.log").exists());
+        assert!(data_dir.exists());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn save_and_load_function_handle_roundtrip() {
         let path = unique_temp_mat_path("save-load-function-handle");
         let matlab_path = path.to_string_lossy().replace('\\', "/");
@@ -18363,8 +30956,7 @@ mod tests {
             "f = str2func('helper');\nname = func2str(f);\nout = f(5);\n",
         )
         .expect("write main");
-        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
-            .expect("write helper");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n").expect("write helper");
 
         let interpreted = execute_path(&main_path, &[]);
         assert_eq!(
@@ -18462,8 +31054,8 @@ mod tests {
     }
 
     #[test]
-    fn str2func_resolves_package_folder_class_constructors_from_source_path_in_interpreter_and_bytecode()
-    {
+    fn str2func_resolves_package_folder_class_constructors_from_source_path_in_interpreter_and_bytecode(
+    ) {
         let temp_dir = unique_temp_script_dir("str2func-package-folder-class-resolution");
         let class_dir = temp_dir.join("+pkg").join("@Counter");
         fs::create_dir_all(&class_dir).expect("create package class dir");
@@ -18531,8 +31123,8 @@ mod tests {
     }
 
     #[test]
-    fn str2func_resolves_packaged_static_method_handles_from_source_path_in_interpreter_and_bytecode()
-    {
+    fn str2func_resolves_packaged_static_method_handles_from_source_path_in_interpreter_and_bytecode(
+    ) {
         let temp_dir = unique_temp_script_dir("str2func-package-static-method-resolution");
         let package_dir = temp_dir.join("+pkg");
         fs::create_dir_all(&package_dir).expect("create package dir");
@@ -18665,8 +31257,8 @@ mod tests {
     }
 
     #[test]
-    fn str2func_saved_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode()
-    {
+    fn str2func_saved_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode(
+    ) {
         let source_dir = unique_temp_script_dir("str2func-save-load-source");
         let consumer_dir = unique_temp_script_dir("str2func-save-load-consumer");
         let helper_path = source_dir.join("helper.m");
@@ -18675,8 +31267,7 @@ mod tests {
         let mat_path = unique_temp_mat_path("str2func-save-load");
         let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
 
-        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
-            .expect("write helper");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n").expect("write helper");
         fs::write(
             &producer_path,
             format!("f = str2func('helper');\nsave('{matlab_path}', 'f');\n"),
@@ -18689,7 +31280,8 @@ mod tests {
         .expect("write consumer");
 
         let produced = execute_path(&producer_path, &[]);
-        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle")
+        else {
             panic!("expected function handle");
         };
         assert_eq!(handle.display_name, "helper");
@@ -18705,8 +31297,10 @@ mod tests {
         );
 
         let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
-        let Value::FunctionHandle(handle_bytecode) =
-            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        let Value::FunctionHandle(handle_bytecode) = produced_bytecode
+            .workspace
+            .get("f")
+            .expect("bytecode producer handle")
         else {
             panic!("expected function handle");
         };
@@ -18728,8 +31322,8 @@ mod tests {
     }
 
     #[test]
-    fn str2func_saved_packaged_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode()
-    {
+    fn str2func_saved_packaged_handles_remain_executable_outside_source_directory_in_interpreter_and_bytecode(
+    ) {
         let source_dir = unique_temp_script_dir("str2func-save-load-pkg-source");
         let consumer_dir = unique_temp_script_dir("str2func-save-load-pkg-consumer");
         let package_dir = source_dir.join("+pkg");
@@ -18754,7 +31348,8 @@ mod tests {
         .expect("write consumer");
 
         let produced = execute_path(&producer_path, &[]);
-        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle")
+        else {
             panic!("expected function handle");
         };
         assert_eq!(handle.display_name, "pkg.helper");
@@ -18770,8 +31365,10 @@ mod tests {
         );
 
         let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
-        let Value::FunctionHandle(handle_bytecode) =
-            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        let Value::FunctionHandle(handle_bytecode) = produced_bytecode
+            .workspace
+            .get("f")
+            .expect("bytecode producer handle")
         else {
             panic!("expected function handle");
         };
@@ -18826,7 +31423,8 @@ mod tests {
         .expect("write consumer");
 
         let produced = execute_path(&producer_path, &[]);
-        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle")
+        else {
             panic!("expected function handle");
         };
         assert_eq!(handle.display_name, "Point.origin");
@@ -18842,8 +31440,10 @@ mod tests {
         );
 
         let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
-        let Value::FunctionHandle(handle_bytecode) =
-            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        let Value::FunctionHandle(handle_bytecode) = produced_bytecode
+            .workspace
+            .get("f")
+            .expect("bytecode producer handle")
         else {
             panic!("expected function handle");
         };
@@ -18900,7 +31500,8 @@ mod tests {
         .expect("write consumer");
 
         let produced = execute_path(&producer_path, &[]);
-        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle")
+        else {
             panic!("expected function handle");
         };
         assert_eq!(handle.display_name, "pkg.Point.unit");
@@ -18916,8 +31517,10 @@ mod tests {
         );
 
         let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
-        let Value::FunctionHandle(handle_bytecode) =
-            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        let Value::FunctionHandle(handle_bytecode) = produced_bytecode
+            .workspace
+            .get("f")
+            .expect("bytecode producer handle")
         else {
             panic!("expected function handle");
         };
@@ -18984,7 +31587,8 @@ mod tests {
         .expect("write consumer");
 
         let produced = execute_path(&producer_path, &[]);
-        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle")
+        else {
             panic!("expected function handle");
         };
         assert_eq!(handle.display_name, "Point.total");
@@ -19000,8 +31604,10 @@ mod tests {
         );
 
         let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
-        let Value::FunctionHandle(handle_bytecode) =
-            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        let Value::FunctionHandle(handle_bytecode) = produced_bytecode
+            .workspace
+            .get("f")
+            .expect("bytecode producer handle")
         else {
             panic!("expected function handle");
         };
@@ -19082,7 +31688,8 @@ mod tests {
         .expect("write consumer");
 
         let produced = execute_path(&producer_path, &[]);
-        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle") else {
+        let Value::FunctionHandle(handle) = produced.workspace.get("f").expect("producer handle")
+        else {
             panic!("expected function handle");
         };
         assert_eq!(handle.display_name, "pkg.Counter.plusWithOffset");
@@ -19098,8 +31705,10 @@ mod tests {
         );
 
         let produced_bytecode = execute_path_bytecode(&producer_path, &[]);
-        let Value::FunctionHandle(handle_bytecode) =
-            produced_bytecode.workspace.get("f").expect("bytecode producer handle")
+        let Value::FunctionHandle(handle_bytecode) = produced_bytecode
+            .workspace
+            .get("f")
+            .expect("bytecode producer handle")
         else {
             panic!("expected function handle");
         };
@@ -19177,7 +31786,10 @@ mod tests {
         let local = workspace_struct(&interpreted.workspace, "local");
         assert_eq!(struct_text_field(local, "function"), "helper");
         assert_eq!(struct_text_field(local, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(local, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_text_field(local, "file"),
+            main_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(local).expect("local parentage"),
             vec!["helper".to_string(), "main".to_string()]
@@ -19186,7 +31798,10 @@ mod tests {
 
         let anon = workspace_struct(&interpreted.workspace, "anon");
         assert_eq!(struct_text_field(anon, "type"), "anonymous");
-        assert_eq!(struct_text_field(anon, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_text_field(anon, "file"),
+            main_path.display().to_string()
+        );
         assert_eq!(
             struct_within_file_path(anon).as_deref(),
             Some("__base_function")
@@ -19222,7 +31837,10 @@ mod tests {
         let local = workspace_struct(&bytecode.workspace, "local");
         assert_eq!(struct_text_field(local, "function"), "helper");
         assert_eq!(struct_text_field(local, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(local, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_text_field(local, "file"),
+            main_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(local).expect("local parentage"),
             vec!["helper".to_string(), "main".to_string()]
@@ -19231,7 +31849,10 @@ mod tests {
 
         let anon = workspace_struct(&bytecode.workspace, "anon");
         assert_eq!(struct_text_field(anon, "type"), "anonymous");
-        assert_eq!(struct_text_field(anon, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_text_field(anon, "file"),
+            main_path.display().to_string()
+        );
         assert_eq!(
             struct_within_file_path(anon).as_deref(),
             Some("__base_function")
@@ -19278,16 +31899,25 @@ mod tests {
         let interpreted = execute_path(&function_path, &[Value::Scalar(13.0)]);
         let s_nest = workspace_struct(&interpreted.workspace, "sNest");
         let s_local = workspace_struct(&interpreted.workspace, "sLocal");
-        assert_eq!(struct_text_field(s_nest, "function"), "nestedShape/nestFunction");
+        assert_eq!(
+            struct_text_field(s_nest, "function"),
+            "nestedShape/nestFunction"
+        );
         assert_eq!(struct_text_field(s_nest, "type"), "nested");
-        assert_eq!(struct_text_field(s_nest, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s_nest, "file"),
+            function_path.display().to_string()
+        );
         let nested_workspace = struct_workspace_capture(s_nest).expect("nested workspace");
         assert_eq!(nested_workspace.fields.get("v"), Some(&Value::Scalar(13.0)));
         assert!(!struct_has_field(s_nest, "parentage"));
 
         assert_eq!(struct_text_field(s_local, "function"), "localFunction");
         assert_eq!(struct_text_field(s_local, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s_local, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s_local, "file"),
+            function_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s_local).expect("local parentage"),
             vec!["localFunction".to_string(), "nestedShape".to_string()]
@@ -19297,16 +31927,25 @@ mod tests {
         let bytecode = execute_path_bytecode(&function_path, &[Value::Scalar(13.0)]);
         let s_nest = workspace_struct(&bytecode.workspace, "sNest");
         let s_local = workspace_struct(&bytecode.workspace, "sLocal");
-        assert_eq!(struct_text_field(s_nest, "function"), "nestedShape/nestFunction");
+        assert_eq!(
+            struct_text_field(s_nest, "function"),
+            "nestedShape/nestFunction"
+        );
         assert_eq!(struct_text_field(s_nest, "type"), "nested");
-        assert_eq!(struct_text_field(s_nest, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s_nest, "file"),
+            function_path.display().to_string()
+        );
         let nested_workspace = struct_workspace_capture(s_nest).expect("nested workspace");
         assert_eq!(nested_workspace.fields.get("v"), Some(&Value::Scalar(13.0)));
         assert!(!struct_has_field(s_nest, "parentage"));
 
         assert_eq!(struct_text_field(s_local, "function"), "localFunction");
         assert_eq!(struct_text_field(s_local, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s_local, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s_local, "file"),
+            function_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s_local).expect("local parentage"),
             vec!["localFunction".to_string(), "nestedShape".to_string()]
@@ -19342,19 +31981,28 @@ mod tests {
         let fh = workspace_cell(&interpreted.workspace, "fh");
         assert_eq!(fh.rows, 2);
         assert_eq!(fh.cols, 1);
-        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            cell_handle_names(fh),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
         let s1 = workspace_struct(&interpreted.workspace, "s1");
         let s2 = workspace_struct(&interpreted.workspace, "s2");
         assert_eq!(struct_text_field(s1, "function"), "alpha");
         assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s1, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s1, "file"),
+            main_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s1).expect("script local parentage"),
             vec!["alpha".to_string(), "main".to_string()]
         );
         assert_eq!(struct_text_field(s2, "function"), "beta");
         assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s2, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s2, "file"),
+            main_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s2).expect("script local parentage"),
             vec!["beta".to_string(), "main".to_string()]
@@ -19366,19 +32014,28 @@ mod tests {
         let fh = workspace_cell(&bytecode.workspace, "fh");
         assert_eq!(fh.rows, 2);
         assert_eq!(fh.cols, 1);
-        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            cell_handle_names(fh),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
         let s1 = workspace_struct(&bytecode.workspace, "s1");
         let s2 = workspace_struct(&bytecode.workspace, "s2");
         assert_eq!(struct_text_field(s1, "function"), "alpha");
         assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s1, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s1, "file"),
+            main_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s1).expect("script local parentage"),
             vec!["alpha".to_string(), "main".to_string()]
         );
         assert_eq!(struct_text_field(s2, "function"), "beta");
         assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s2, "file"), main_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s2, "file"),
+            main_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s2).expect("script local parentage"),
             vec!["beta".to_string(), "main".to_string()]
@@ -19421,19 +32078,28 @@ mod tests {
         let fh = workspace_cell(&interpreted.workspace, "fh");
         assert_eq!(fh.rows, 2);
         assert_eq!(fh.cols, 1);
-        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            cell_handle_names(fh),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
         let s1 = workspace_struct(&interpreted.workspace, "s1");
         let s2 = workspace_struct(&interpreted.workspace, "s2");
         assert_eq!(struct_text_field(s1, "function"), "alpha");
         assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s1, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s1, "file"),
+            function_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s1).expect("function local parentage"),
             vec!["alpha".to_string(), "factory".to_string()]
         );
         assert_eq!(struct_text_field(s2, "function"), "beta");
         assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s2, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s2, "file"),
+            function_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s2).expect("function local parentage"),
             vec!["beta".to_string(), "factory".to_string()]
@@ -19445,19 +32111,28 @@ mod tests {
         let fh = workspace_cell(&bytecode.workspace, "fh");
         assert_eq!(fh.rows, 2);
         assert_eq!(fh.cols, 1);
-        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            cell_handle_names(fh),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
         let s1 = workspace_struct(&bytecode.workspace, "s1");
         let s2 = workspace_struct(&bytecode.workspace, "s2");
         assert_eq!(struct_text_field(s1, "function"), "alpha");
         assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s1, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s1, "file"),
+            function_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s1).expect("function local parentage"),
             vec!["alpha".to_string(), "factory".to_string()]
         );
         assert_eq!(struct_text_field(s2, "function"), "beta");
         assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s2, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s2, "file"),
+            function_path.display().to_string()
+        );
         assert_eq!(
             struct_parentage_texts(s2).expect("function local parentage"),
             vec!["beta".to_string(), "factory".to_string()]
@@ -19470,8 +32145,7 @@ mod tests {
     fn workspace_snapshot_load_preserves_bundle_backed_localfunctions_function_file_handles_without_source_tree(
     ) {
         let source_dir = unique_temp_script_dir("snapshot-bundle-localfunctions-fnfile-source");
-        let consumer_dir =
-            unique_temp_script_dir("snapshot-bundle-localfunctions-fnfile-consumer");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-localfunctions-fnfile-consumer");
         let function_path = source_dir.join("factory.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
@@ -19502,9 +32176,11 @@ mod tests {
 
         let bundle = compile_bytecode_bundle(&producer_path);
         fs::remove_dir_all(&source_dir).expect("remove localfunctions source tree");
-        let produced = execute_script_bytecode_bundle(&bundle).expect("execute localfunctions producer");
+        let produced =
+            execute_script_bytecode_bundle(&bundle).expect("execute localfunctions producer");
         let fh = workspace_cell(&produced.workspace, "fh");
-        let Value::FunctionHandle(first_runtime) = fh.elements().first().expect("runtime handle") else {
+        let Value::FunctionHandle(first_runtime) = fh.elements().first().expect("runtime handle")
+        else {
             panic!("expected runtime function handle");
         };
         assert!(
@@ -19518,11 +32194,14 @@ mod tests {
 
         let snapshot = read_workspace_snapshot_with_modules(&snapshot_path)
             .expect("read localfunctions snapshot");
-        let Value::Cell(saved_handles) = snapshot.workspace.get("fh").expect("saved handles") else {
+        let Value::Cell(saved_handles) = snapshot.workspace.get("fh").expect("saved handles")
+        else {
             panic!("expected saved handles cell");
         };
-        let Value::FunctionHandle(first_saved) =
-            saved_handles.elements().first().expect("first saved handle")
+        let Value::FunctionHandle(first_saved) = saved_handles
+            .elements()
+            .first()
+            .expect("first saved handle")
         else {
             panic!("expected saved function handle");
         };
@@ -19551,26 +32230,44 @@ mod tests {
         assert_eq!(interpreted.workspace.get("a"), Some(&Value::Scalar(11.0)));
         assert_eq!(interpreted.workspace.get("b"), Some(&Value::Scalar(12.0)));
         let fh = workspace_cell(&interpreted.workspace, "fh");
-        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            cell_handle_names(fh),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
         let s1 = workspace_struct(&interpreted.workspace, "s1");
         let s2 = workspace_struct(&interpreted.workspace, "s2");
         assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
         assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s1, "file"), function_path.display().to_string());
-        assert_eq!(struct_text_field(s2, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s1, "file"),
+            function_path.display().to_string()
+        );
+        assert_eq!(
+            struct_text_field(s2, "file"),
+            function_path.display().to_string()
+        );
         assert_eq!(interpreted.bundle_modules().len(), 1);
 
         let bytecode = execute_path_bytecode(&consumer_path, &[]);
         assert_eq!(bytecode.workspace.get("a"), Some(&Value::Scalar(11.0)));
         assert_eq!(bytecode.workspace.get("b"), Some(&Value::Scalar(12.0)));
         let fh = workspace_cell(&bytecode.workspace, "fh");
-        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            cell_handle_names(fh),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
         let s1 = workspace_struct(&bytecode.workspace, "s1");
         let s2 = workspace_struct(&bytecode.workspace, "s2");
         assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
         assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s1, "file"), function_path.display().to_string());
-        assert_eq!(struct_text_field(s2, "file"), function_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s1, "file"),
+            function_path.display().to_string()
+        );
+        assert_eq!(
+            struct_text_field(s2, "file"),
+            function_path.display().to_string()
+        );
         assert_eq!(bytecode.bundle_modules().len(), 1);
 
         let _ = fs::remove_file(snapshot_path);
@@ -19581,8 +32278,7 @@ mod tests {
     fn workspace_snapshot_load_preserves_bundle_backed_localfunctions_script_handles_without_source_tree(
     ) {
         let source_dir = unique_temp_script_dir("snapshot-bundle-localfunctions-script-source");
-        let consumer_dir =
-            unique_temp_script_dir("snapshot-bundle-localfunctions-script-consumer");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-localfunctions-script-consumer");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
         let snapshot_path =
@@ -19623,26 +32319,44 @@ mod tests {
         assert_eq!(interpreted.workspace.get("a"), Some(&Value::Scalar(11.0)));
         assert_eq!(interpreted.workspace.get("b"), Some(&Value::Scalar(12.0)));
         let fh = workspace_cell(&interpreted.workspace, "fh");
-        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            cell_handle_names(fh),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
         let s1 = workspace_struct(&interpreted.workspace, "s1");
         let s2 = workspace_struct(&interpreted.workspace, "s2");
         assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
         assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s1, "file"), producer_path.display().to_string());
-        assert_eq!(struct_text_field(s2, "file"), producer_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s1, "file"),
+            producer_path.display().to_string()
+        );
+        assert_eq!(
+            struct_text_field(s2, "file"),
+            producer_path.display().to_string()
+        );
         assert_eq!(interpreted.bundle_modules().len(), 1);
 
         let bytecode = execute_path_bytecode(&consumer_path, &[]);
         assert_eq!(bytecode.workspace.get("a"), Some(&Value::Scalar(11.0)));
         assert_eq!(bytecode.workspace.get("b"), Some(&Value::Scalar(12.0)));
         let fh = workspace_cell(&bytecode.workspace, "fh");
-        assert_eq!(cell_handle_names(fh), vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            cell_handle_names(fh),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
         let s1 = workspace_struct(&bytecode.workspace, "s1");
         let s2 = workspace_struct(&bytecode.workspace, "s2");
         assert_eq!(struct_text_field(s1, "type"), "scopedfunction");
         assert_eq!(struct_text_field(s2, "type"), "scopedfunction");
-        assert_eq!(struct_text_field(s1, "file"), producer_path.display().to_string());
-        assert_eq!(struct_text_field(s2, "file"), producer_path.display().to_string());
+        assert_eq!(
+            struct_text_field(s1, "file"),
+            producer_path.display().to_string()
+        );
+        assert_eq!(
+            struct_text_field(s2, "file"),
+            producer_path.display().to_string()
+        );
         assert_eq!(bytecode.bundle_modules().len(), 1);
 
         let _ = fs::remove_file(snapshot_path);
@@ -19650,7 +32364,8 @@ mod tests {
     }
 
     #[test]
-    fn which_and_filemarker_builtins_cover_current_resolution_baseline_in_interpreter_and_bytecode() {
+    fn which_and_filemarker_builtins_cover_current_resolution_baseline_in_interpreter_and_bytecode()
+    {
         let temp_dir = unique_temp_script_dir("which-filemarker");
         let package_dir = temp_dir.join("+pkg");
         let private_dir = temp_dir.join("private");
@@ -19664,12 +32379,17 @@ mod tests {
         let class_path = class_dir.join("Counter.m");
         let factory_path = temp_dir.join("factory.m");
         let main_path = temp_dir.join("main.m");
-        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
-            .expect("write helper");
-        fs::write(&package_helper_path, "function y = helper(x)\ny = x + 2;\nend\n")
-            .expect("write package helper");
-        fs::write(&private_helper_path, "function y = helper(x)\ny = x + 3;\nend\n")
-            .expect("write private helper");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n").expect("write helper");
+        fs::write(
+            &package_helper_path,
+            "function y = helper(x)\ny = x + 2;\nend\n",
+        )
+        .expect("write package helper");
+        fs::write(
+            &private_helper_path,
+            "function y = helper(x)\ny = x + 3;\nend\n",
+        )
+        .expect("write private helper");
         fs::write(
             &class_path,
             "classdef Counter < handle\n\
@@ -19721,7 +32441,10 @@ mod tests {
         let in_nested_marker = format!("{}>factory>nested", factory_path.display());
 
         let interpreted = execute_path(&main_path, &[]);
-        assert_eq!(interpreted.workspace.get("marker"), Some(&Value::CharArray(">".to_string())));
+        assert_eq!(
+            interpreted.workspace.get("marker"),
+            Some(&Value::CharArray(">".to_string()))
+        );
         assert_eq!(
             interpreted.workspace.get("p_helper"),
             Some(&Value::CharArray(local_helper_marker.clone()))
@@ -19767,7 +32490,10 @@ mod tests {
         );
 
         let bytecode = execute_path_bytecode(&main_path, &[]);
-        assert_eq!(bytecode.workspace.get("marker"), Some(&Value::CharArray(">".to_string())));
+        assert_eq!(
+            bytecode.workspace.get("marker"),
+            Some(&Value::CharArray(">".to_string()))
+        );
         assert_eq!(
             bytecode.workspace.get("p_helper"),
             Some(&Value::CharArray(local_helper_marker.clone()))
@@ -19831,10 +32557,8 @@ mod tests {
         let class_path = class_dir.join("Counter.m");
         let main_path = temp_dir.join("main.m");
 
-        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
-            .expect("write helper");
-        fs::write(&hidden_path, "function y = hidden(x)\ny = x + 2;\nend\n")
-            .expect("write hidden");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n").expect("write helper");
+        fs::write(&hidden_path, "function y = hidden(x)\ny = x + 2;\nend\n").expect("write hidden");
         fs::write(&plot_path, "function y = plot(varargin)\ny = 7;\nend\n")
             .expect("write plot shadow");
         fs::write(
@@ -19878,22 +32602,70 @@ mod tests {
         .expect("write main");
 
         let interpreted = execute_path(&main_path, &[]);
-        assert_eq!(interpreted.workspace.get("e_var"), Some(&Value::Scalar(1.0)));
-        assert_eq!(interpreted.workspace.get("e_var_only"), Some(&Value::Scalar(1.0)));
-        assert_eq!(interpreted.workspace.get("e_var_file"), Some(&Value::Scalar(0.0)));
-        assert_eq!(interpreted.workspace.get("e_local"), Some(&Value::Scalar(2.0)));
-        assert_eq!(interpreted.workspace.get("e_local_file"), Some(&Value::Scalar(2.0)));
-        assert_eq!(interpreted.workspace.get("e_hidden"), Some(&Value::Scalar(2.0)));
-        assert_eq!(interpreted.workspace.get("e_plot"), Some(&Value::Scalar(2.0)));
-        assert_eq!(interpreted.workspace.get("e_plot_builtin"), Some(&Value::Scalar(5.0)));
-        assert_eq!(interpreted.workspace.get("e_disp_builtin"), Some(&Value::Scalar(5.0)));
-        assert_eq!(interpreted.workspace.get("e_counter"), Some(&Value::Scalar(8.0)));
-        assert_eq!(interpreted.workspace.get("e_counter_class"), Some(&Value::Scalar(8.0)));
-        assert_eq!(interpreted.workspace.get("e_counter_file"), Some(&Value::Scalar(2.0)));
-        assert_eq!(interpreted.workspace.get("e_data"), Some(&Value::Scalar(7.0)));
-        assert_eq!(interpreted.workspace.get("e_data_dir"), Some(&Value::Scalar(7.0)));
-        assert_eq!(interpreted.workspace.get("e_data_file"), Some(&Value::Scalar(7.0)));
-        assert_eq!(interpreted.workspace.get("e_missing"), Some(&Value::Scalar(0.0)));
+        assert_eq!(
+            interpreted.workspace.get("e_var"),
+            Some(&Value::Scalar(1.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_var_only"),
+            Some(&Value::Scalar(1.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_var_file"),
+            Some(&Value::Scalar(0.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_local"),
+            Some(&Value::Scalar(2.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_local_file"),
+            Some(&Value::Scalar(2.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_hidden"),
+            Some(&Value::Scalar(2.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_plot"),
+            Some(&Value::Scalar(2.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_plot_builtin"),
+            Some(&Value::Scalar(5.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_disp_builtin"),
+            Some(&Value::Scalar(5.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_counter"),
+            Some(&Value::Scalar(8.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_counter_class"),
+            Some(&Value::Scalar(8.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_counter_file"),
+            Some(&Value::Scalar(2.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_data"),
+            Some(&Value::Scalar(7.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_data_dir"),
+            Some(&Value::Scalar(7.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_data_file"),
+            Some(&Value::Scalar(7.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("e_missing"),
+            Some(&Value::Scalar(0.0))
+        );
         assert_eq!(
             interpreted.workspace.get("e_missing_builtin"),
             Some(&Value::Scalar(0.0))
@@ -19901,21 +32673,57 @@ mod tests {
 
         let bytecode = execute_path_bytecode(&main_path, &[]);
         assert_eq!(bytecode.workspace.get("e_var"), Some(&Value::Scalar(1.0)));
-        assert_eq!(bytecode.workspace.get("e_var_only"), Some(&Value::Scalar(1.0)));
-        assert_eq!(bytecode.workspace.get("e_var_file"), Some(&Value::Scalar(0.0)));
+        assert_eq!(
+            bytecode.workspace.get("e_var_only"),
+            Some(&Value::Scalar(1.0))
+        );
+        assert_eq!(
+            bytecode.workspace.get("e_var_file"),
+            Some(&Value::Scalar(0.0))
+        );
         assert_eq!(bytecode.workspace.get("e_local"), Some(&Value::Scalar(2.0)));
-        assert_eq!(bytecode.workspace.get("e_local_file"), Some(&Value::Scalar(2.0)));
-        assert_eq!(bytecode.workspace.get("e_hidden"), Some(&Value::Scalar(2.0)));
+        assert_eq!(
+            bytecode.workspace.get("e_local_file"),
+            Some(&Value::Scalar(2.0))
+        );
+        assert_eq!(
+            bytecode.workspace.get("e_hidden"),
+            Some(&Value::Scalar(2.0))
+        );
         assert_eq!(bytecode.workspace.get("e_plot"), Some(&Value::Scalar(2.0)));
-        assert_eq!(bytecode.workspace.get("e_plot_builtin"), Some(&Value::Scalar(5.0)));
-        assert_eq!(bytecode.workspace.get("e_disp_builtin"), Some(&Value::Scalar(5.0)));
-        assert_eq!(bytecode.workspace.get("e_counter"), Some(&Value::Scalar(8.0)));
-        assert_eq!(bytecode.workspace.get("e_counter_class"), Some(&Value::Scalar(8.0)));
-        assert_eq!(bytecode.workspace.get("e_counter_file"), Some(&Value::Scalar(2.0)));
+        assert_eq!(
+            bytecode.workspace.get("e_plot_builtin"),
+            Some(&Value::Scalar(5.0))
+        );
+        assert_eq!(
+            bytecode.workspace.get("e_disp_builtin"),
+            Some(&Value::Scalar(5.0))
+        );
+        assert_eq!(
+            bytecode.workspace.get("e_counter"),
+            Some(&Value::Scalar(8.0))
+        );
+        assert_eq!(
+            bytecode.workspace.get("e_counter_class"),
+            Some(&Value::Scalar(8.0))
+        );
+        assert_eq!(
+            bytecode.workspace.get("e_counter_file"),
+            Some(&Value::Scalar(2.0))
+        );
         assert_eq!(bytecode.workspace.get("e_data"), Some(&Value::Scalar(7.0)));
-        assert_eq!(bytecode.workspace.get("e_data_dir"), Some(&Value::Scalar(7.0)));
-        assert_eq!(bytecode.workspace.get("e_data_file"), Some(&Value::Scalar(7.0)));
-        assert_eq!(bytecode.workspace.get("e_missing"), Some(&Value::Scalar(0.0)));
+        assert_eq!(
+            bytecode.workspace.get("e_data_dir"),
+            Some(&Value::Scalar(7.0))
+        );
+        assert_eq!(
+            bytecode.workspace.get("e_data_file"),
+            Some(&Value::Scalar(7.0))
+        );
+        assert_eq!(
+            bytecode.workspace.get("e_missing"),
+            Some(&Value::Scalar(0.0))
+        );
         assert_eq!(
             bytecode.workspace.get("e_missing_builtin"),
             Some(&Value::Scalar(0.0))
@@ -19934,8 +32742,11 @@ mod tests {
         fs::create_dir_all(&class_dir).expect("create class dir");
         fs::create_dir_all(&data_dir).expect("create data dir");
 
-        fs::write(temp_dir.join("helper.m"), "function y = helper(x)\ny = x + 1;\nend\n")
-            .expect("write helper");
+        fs::write(
+            temp_dir.join("helper.m"),
+            "function y = helper(x)\ny = x + 1;\nend\n",
+        )
+        .expect("write helper");
         fs::write(temp_dir.join("app.mlapp"), "placeholder").expect("write mlapp");
         fs::write(temp_dir.join("live.mlx"), "placeholder").expect("write mlx");
         fs::write(temp_dir.join("saved.mat"), "placeholder").expect("write mat");
@@ -19946,10 +32757,16 @@ mod tests {
             "classdef Counter\nmethods\nfunction obj = Counter()\nend\nend\nend\n",
         )
         .expect("write classdef");
-        fs::write(package_dir.join("tool.m"), "function y = tool(x)\ny = x;\nend\n")
-            .expect("write package tool");
-        fs::write(data_dir.join("dataset.m"), "function y = dataset(x)\ny = x;\nend\n")
-            .expect("write dataset");
+        fs::write(
+            package_dir.join("tool.m"),
+            "function y = tool(x)\ny = x;\nend\n",
+        )
+        .expect("write package tool");
+        fs::write(
+            data_dir.join("dataset.m"),
+            "function y = dataset(x)\ny = x;\nend\n",
+        )
+        .expect("write dataset");
 
         let main_path = temp_dir.join("main.m");
         fs::write(
@@ -19964,33 +32781,72 @@ mod tests {
 
         let interpreted = execute_path(&main_path, &[]);
         let current = workspace_struct(&interpreted.workspace, "current");
-        assert_eq!(struct_text_field(current, "path"), temp_dir.display().to_string());
+        assert_eq!(
+            struct_text_field(current, "path"),
+            temp_dir.display().to_string()
+        );
         assert_eq!(
             struct_cell_texts(current, "m"),
             vec!["helper.m".to_string(), "main.m".to_string()]
         );
-        assert_eq!(struct_cell_texts(current, "mlapp"), vec!["app.mlapp".to_string()]);
-        assert_eq!(struct_cell_texts(current, "mlx"), vec!["live.mlx".to_string()]);
-        assert_eq!(struct_cell_texts(current, "mat"), vec!["saved.mat".to_string()]);
-        assert_eq!(struct_cell_texts(current, "slx"), vec!["model.slx".to_string()]);
-        assert_eq!(struct_cell_texts(current, "p"), vec!["cached.p".to_string()]);
-        assert_eq!(struct_cell_texts(current, "classes"), vec!["Counter".to_string()]);
-        assert_eq!(struct_cell_texts(current, "packages"), vec!["pkg".to_string()]);
+        assert_eq!(
+            struct_cell_texts(current, "mlapp"),
+            vec!["app.mlapp".to_string()]
+        );
+        assert_eq!(
+            struct_cell_texts(current, "mlx"),
+            vec!["live.mlx".to_string()]
+        );
+        assert_eq!(
+            struct_cell_texts(current, "mat"),
+            vec!["saved.mat".to_string()]
+        );
+        assert_eq!(
+            struct_cell_texts(current, "slx"),
+            vec!["model.slx".to_string()]
+        );
+        assert_eq!(
+            struct_cell_texts(current, "p"),
+            vec!["cached.p".to_string()]
+        );
+        assert_eq!(
+            struct_cell_texts(current, "classes"),
+            vec!["Counter".to_string()]
+        );
+        assert_eq!(
+            struct_cell_texts(current, "packages"),
+            vec!["pkg".to_string()]
+        );
 
         let class_info = workspace_struct(&interpreted.workspace, "classInfo");
-        assert_eq!(struct_text_field(class_info, "path"), class_dir.display().to_string());
-        assert_eq!(struct_cell_texts(class_info, "m"), vec!["Counter.m".to_string()]);
+        assert_eq!(
+            struct_text_field(class_info, "path"),
+            class_dir.display().to_string()
+        );
+        assert_eq!(
+            struct_cell_texts(class_info, "m"),
+            vec!["Counter.m".to_string()]
+        );
 
         let package_info = workspace_struct(&interpreted.workspace, "packageInfo");
         assert_eq!(
             struct_text_field(package_info, "path"),
             package_dir.display().to_string()
         );
-        assert_eq!(struct_cell_texts(package_info, "m"), vec!["tool.m".to_string()]);
+        assert_eq!(
+            struct_cell_texts(package_info, "m"),
+            vec!["tool.m".to_string()]
+        );
 
         let data_info = workspace_struct(&interpreted.workspace, "dataInfo");
-        assert_eq!(struct_text_field(data_info, "path"), data_dir.display().to_string());
-        assert_eq!(struct_cell_texts(data_info, "m"), vec!["dataset.m".to_string()]);
+        assert_eq!(
+            struct_text_field(data_info, "path"),
+            data_dir.display().to_string()
+        );
+        assert_eq!(
+            struct_cell_texts(data_info, "m"),
+            vec!["dataset.m".to_string()]
+        );
         let rendered = render_matlab_execution_result(&interpreted);
         assert!(rendered.contains("MATLAB Code files in folder"));
         assert!(rendered.contains(&data_dir.display().to_string()));
@@ -19998,28 +32854,52 @@ mod tests {
 
         let bytecode = execute_path_bytecode(&main_path, &[]);
         let current = workspace_struct(&bytecode.workspace, "current");
-        assert_eq!(struct_text_field(current, "path"), temp_dir.display().to_string());
+        assert_eq!(
+            struct_text_field(current, "path"),
+            temp_dir.display().to_string()
+        );
         assert_eq!(
             struct_cell_texts(current, "m"),
             vec!["helper.m".to_string(), "main.m".to_string()]
         );
-        assert_eq!(struct_cell_texts(current, "classes"), vec!["Counter".to_string()]);
-        assert_eq!(struct_cell_texts(current, "packages"), vec!["pkg".to_string()]);
+        assert_eq!(
+            struct_cell_texts(current, "classes"),
+            vec!["Counter".to_string()]
+        );
+        assert_eq!(
+            struct_cell_texts(current, "packages"),
+            vec!["pkg".to_string()]
+        );
 
         let class_info = workspace_struct(&bytecode.workspace, "classInfo");
-        assert_eq!(struct_text_field(class_info, "path"), class_dir.display().to_string());
-        assert_eq!(struct_cell_texts(class_info, "m"), vec!["Counter.m".to_string()]);
+        assert_eq!(
+            struct_text_field(class_info, "path"),
+            class_dir.display().to_string()
+        );
+        assert_eq!(
+            struct_cell_texts(class_info, "m"),
+            vec!["Counter.m".to_string()]
+        );
 
         let package_info = workspace_struct(&bytecode.workspace, "packageInfo");
         assert_eq!(
             struct_text_field(package_info, "path"),
             package_dir.display().to_string()
         );
-        assert_eq!(struct_cell_texts(package_info, "m"), vec!["tool.m".to_string()]);
+        assert_eq!(
+            struct_cell_texts(package_info, "m"),
+            vec!["tool.m".to_string()]
+        );
 
         let data_info = workspace_struct(&bytecode.workspace, "dataInfo");
-        assert_eq!(struct_text_field(data_info, "path"), data_dir.display().to_string());
-        assert_eq!(struct_cell_texts(data_info, "m"), vec!["dataset.m".to_string()]);
+        assert_eq!(
+            struct_text_field(data_info, "path"),
+            data_dir.display().to_string()
+        );
+        assert_eq!(
+            struct_cell_texts(data_info, "m"),
+            vec!["dataset.m".to_string()]
+        );
         let rendered = render_matlab_execution_result(&bytecode);
         assert!(rendered.contains("MATLAB Code files in folder"));
         assert!(rendered.contains(&data_dir.display().to_string()));
@@ -20035,8 +32915,7 @@ mod tests {
         let class_path = temp_dir.join("Counter.m");
         let main_path = temp_dir.join("main.m");
 
-        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n")
-            .expect("write helper");
+        fs::write(&helper_path, "function y = helper(x)\ny = x + 1;\nend\n").expect("write helper");
         fs::write(
             &class_path,
             "classdef Counter\n\
@@ -20063,7 +32942,10 @@ mod tests {
         .expect("write main");
 
         let interpreted = execute_path(&main_path, &[]);
-        assert_eq!(interpreted.workspace.get("value"), Some(&Value::Scalar(5.0)));
+        assert_eq!(
+            interpreted.workspace.get("value"),
+            Some(&Value::Scalar(5.0))
+        );
         assert_eq!(
             cell_texts(workspace_cell(&interpreted.workspace, "f")),
             vec!["helper".to_string()]
@@ -20204,7 +33086,8 @@ mod tests {
 
         let expected_builtin = "sum is a built-in function.".to_string();
         let expected_helper = "HELPER Increment value.\nHELPER(X) returns X plus one.".to_string();
-        let expected_class = "COUNTER Counter test class.\nCOUNTER(VALUE) stores VALUE.".to_string();
+        let expected_class =
+            "COUNTER Counter test class.\nCOUNTER(VALUE) stores VALUE.".to_string();
         let expected_method =
             "TOTAL Return stored value.\nTOTAL(OBJ) returns the stored value.".to_string();
         let expected_local = "LOCALDOC Local helper docs.\nLOCALDOC returns one.".to_string();
@@ -20338,6 +33221,526 @@ mod tests {
         assert!(bytecode_rendered.contains("Counter:"));
         assert!(bytecode_rendered.contains("Counter - COUNTER Value counter."));
         assert!(bytecode_rendered.contains("COUNTER storetag keeps a value."));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn doc_builtin_reports_urls_and_local_docs_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("doc-builtin");
+        let helper_path = temp_dir.join("helper.m");
+        let class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(
+            &helper_path,
+            "function y = helper(x)\n\
+             %HELPER Local documentation sample.\n\
+             %   HELPER(X) adds one.\n\
+             y = x + 1;\n\
+             end\n",
+        )
+        .expect("write helper");
+        fs::write(
+            &class_path,
+            "classdef Counter\n\
+             %COUNTER Counter class docs.\n\
+             %   COUNTER(VALUE) stores VALUE.\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Counter(value)\n\
+             obj.value = value;\n\
+             end\n\
+             function out = total(obj)\n\
+             %TOTAL Method documentation block.\n\
+             %   TOTAL(OBJ) returns the stored value.\n\
+             out = obj.value;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write class");
+        fs::write(
+            &main_path,
+            "obj = Counter(4);\n\
+             doc sum\n\
+             doc helper\n\
+             doc Counter.total\n\
+             doc obj\n",
+        )
+        .expect("write main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        let interpreted_rendered = render_matlab_execution_result(&interpreted);
+        assert!(interpreted_rendered.contains("Documentation for sum:"));
+        assert!(interpreted_rendered.contains("https://www.mathworks.com/help/matlab/ref/sum.html"));
+        assert!(interpreted_rendered.contains("Documentation for helper:"));
+        assert!(interpreted_rendered.contains("HELPER Local documentation sample."));
+        assert!(interpreted_rendered.contains("Documentation for Counter.total:"));
+        assert!(interpreted_rendered.contains("TOTAL Method documentation block."));
+        assert!(interpreted_rendered.contains("Documentation for Counter:"));
+        assert!(interpreted_rendered.contains("COUNTER Counter class docs."));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        let bytecode_rendered = render_matlab_execution_result(&bytecode);
+        assert!(bytecode_rendered.contains("Documentation for sum:"));
+        assert!(bytecode_rendered.contains("https://www.mathworks.com/help/matlab/ref/sum.html"));
+        assert!(bytecode_rendered.contains("Documentation for helper:"));
+        assert!(bytecode_rendered.contains("HELPER Local documentation sample."));
+        assert!(bytecode_rendered.contains("Documentation for Counter.total:"));
+        assert!(bytecode_rendered.contains("TOTAL Method documentation block."));
+        assert!(bytecode_rendered.contains("Documentation for Counter:"));
+        assert!(bytecode_rendered.contains("COUNTER Counter class docs."));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn methods_builtin_lists_public_methods_and_inheritance_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("methods-builtin");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             methods\n\
+             function obj = Base()\n\
+             end\n\
+             function out = baseOnly(obj)\n\
+             out = 1;\n\
+             end\n\
+             end\n\
+             methods (Static)\n\
+             function out = makeBase()\n\
+             out = Base();\n\
+             end\n\
+             end\n\
+             methods (Access=private)\n\
+             function out = hiddenBase(obj)\n\
+             out = 0;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write Base");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             methods\n\
+             function obj = Child()\n\
+             end\n\
+             function out = childOnly(obj)\n\
+             out = 2;\n\
+             end\n\
+             end\n\
+             methods (Static)\n\
+             function out = makeChild()\n\
+             out = Child();\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write Child");
+        fs::write(
+            &main_path,
+            "obj = Child();\n\
+             methods Child\n\
+             mObj = methods(obj);\n\
+             mCls = methods('Child');\n\
+             mFull = methods('Child', '-full');\n",
+        )
+        .expect("write main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        let m_obj = cell_texts(workspace_cell(&interpreted.workspace, "mObj"));
+        let m_cls = cell_texts(workspace_cell(&interpreted.workspace, "mCls"));
+        let m_full = cell_texts(workspace_cell(&interpreted.workspace, "mFull"));
+        for expected in [
+            "Base",
+            "Child",
+            "baseOnly",
+            "childOnly",
+            "makeBase",
+            "makeChild",
+        ] {
+            assert!(m_obj.iter().any(|entry| entry == expected), "{m_obj:?}");
+            assert!(m_cls.iter().any(|entry| entry == expected), "{m_cls:?}");
+        }
+        assert!(!m_obj.iter().any(|entry| entry == "hiddenBase"));
+        assert!(!m_cls.iter().any(|entry| entry == "hiddenBase"));
+        for expected in [
+            "Base (constructor)",
+            "Child (constructor)",
+            "Base.baseOnly",
+            "Child.childOnly",
+            "Base.makeBase",
+            "Child.makeChild",
+        ] {
+            assert!(m_full.iter().any(|entry| entry == expected), "{m_full:?}");
+        }
+        assert!(!m_full.iter().any(|entry| entry.contains("hiddenBase")));
+        let interpreted_rendered = render_matlab_execution_result(&interpreted);
+        assert!(interpreted_rendered.contains("baseOnly"));
+        assert!(interpreted_rendered.contains("childOnly"));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        let m_obj = cell_texts(workspace_cell(&bytecode.workspace, "mObj"));
+        let m_cls = cell_texts(workspace_cell(&bytecode.workspace, "mCls"));
+        let m_full = cell_texts(workspace_cell(&bytecode.workspace, "mFull"));
+        for expected in [
+            "Base",
+            "Child",
+            "baseOnly",
+            "childOnly",
+            "makeBase",
+            "makeChild",
+        ] {
+            assert!(m_obj.iter().any(|entry| entry == expected), "{m_obj:?}");
+            assert!(m_cls.iter().any(|entry| entry == expected), "{m_cls:?}");
+        }
+        assert!(!m_obj.iter().any(|entry| entry == "hiddenBase"));
+        assert!(!m_cls.iter().any(|entry| entry == "hiddenBase"));
+        for expected in [
+            "Base (constructor)",
+            "Child (constructor)",
+            "Base.baseOnly",
+            "Child.childOnly",
+            "Base.makeBase",
+            "Child.makeChild",
+        ] {
+            assert!(m_full.iter().any(|entry| entry == expected), "{m_full:?}");
+        }
+        assert!(!m_full.iter().any(|entry| entry.contains("hiddenBase")));
+        let bytecode_rendered = render_matlab_execution_result(&bytecode);
+        assert!(bytecode_rendered.contains("baseOnly"));
+        assert!(bytecode_rendered.contains("childOnly"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn properties_and_property_reflection_builtins_work_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("properties-builtin");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(
+            &base_path,
+            "classdef Base\n\
+             properties\n\
+             baseValue = 1;\n\
+             end\n\
+             properties (Access=private)\n\
+             hiddenBase = 7;\n\
+             end\n\
+             methods\n\
+             function obj = Base()\n\
+             end\n\
+             function out = baseOnly(obj)\n\
+             out = obj.baseValue;\n\
+             end\n\
+             end\n\
+             methods (Access=private)\n\
+             function out = hiddenBaseMethod(obj)\n\
+             out = obj.hiddenBase;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write Base");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             properties\n\
+             childValue = 2;\n\
+             end\n\
+             properties (Access=private)\n\
+             hiddenChild = 9;\n\
+             end\n\
+             methods\n\
+             function obj = Child()\n\
+             end\n\
+             function out = childOnly(obj)\n\
+             out = obj.childValue;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write Child");
+        fs::write(
+            &main_path,
+            "obj = Child();\n\
+             objs = [obj obj];\n\
+             properties Child\n\
+             pObj = properties(obj);\n\
+             pCls = properties('Child');\n\
+             toObj = isobject(obj);\n\
+             toObjs = isobject(objs);\n\
+             toNum = isobject(5);\n\
+             tfBase = isprop(obj, 'baseValue');\n\
+             tfChild = isprop(obj, 'childValue');\n\
+             tfHiddenBase = isprop(obj, 'hiddenBase');\n\
+             tfHiddenChild = isprop(obj, 'hiddenChild');\n\
+             tfMissing = isprop(obj, 'missingProp');\n\
+             tmBase = ismethod(obj, 'baseOnly');\n\
+             tmChild = ismethod(obj, 'childOnly');\n\
+             tmHidden = ismethod(obj, 'hiddenBaseMethod');\n\
+             tmMissing = ismethod(obj, 'missingMethod');\n",
+        )
+        .expect("write main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        let p_obj = cell_texts(workspace_cell(&interpreted.workspace, "pObj"));
+        let p_cls = cell_texts(workspace_cell(&interpreted.workspace, "pCls"));
+        for expected in ["baseValue", "childValue"] {
+            assert!(p_obj.iter().any(|entry| entry == expected), "{p_obj:?}");
+            assert!(p_cls.iter().any(|entry| entry == expected), "{p_cls:?}");
+        }
+        assert!(!p_obj.iter().any(|entry| entry == "hiddenBase"));
+        assert!(!p_obj.iter().any(|entry| entry == "hiddenChild"));
+        assert!(!p_cls.iter().any(|entry| entry == "hiddenBase"));
+        assert!(!p_cls.iter().any(|entry| entry == "hiddenChild"));
+        assert_eq!(
+            interpreted.workspace.get("toObj"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            interpreted.workspace.get("toObjs"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            interpreted.workspace.get("toNum"),
+            Some(&logical_value(false))
+        );
+        assert_eq!(
+            interpreted.workspace.get("tfBase"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            interpreted.workspace.get("tfChild"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            interpreted.workspace.get("tfHiddenBase"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            interpreted.workspace.get("tfHiddenChild"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            interpreted.workspace.get("tfMissing"),
+            Some(&logical_value(false))
+        );
+        assert_eq!(
+            interpreted.workspace.get("tmBase"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            interpreted.workspace.get("tmChild"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            interpreted.workspace.get("tmHidden"),
+            Some(&logical_value(false))
+        );
+        assert_eq!(
+            interpreted.workspace.get("tmMissing"),
+            Some(&logical_value(false))
+        );
+        let interpreted_rendered = render_matlab_execution_result(&interpreted);
+        assert!(interpreted_rendered.contains("Properties for class Child:"));
+        assert!(interpreted_rendered.contains("baseValue"));
+        assert!(interpreted_rendered.contains("childValue"));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        let p_obj = cell_texts(workspace_cell(&bytecode.workspace, "pObj"));
+        let p_cls = cell_texts(workspace_cell(&bytecode.workspace, "pCls"));
+        for expected in ["baseValue", "childValue"] {
+            assert!(p_obj.iter().any(|entry| entry == expected), "{p_obj:?}");
+            assert!(p_cls.iter().any(|entry| entry == expected), "{p_cls:?}");
+        }
+        assert!(!p_obj.iter().any(|entry| entry == "hiddenBase"));
+        assert!(!p_obj.iter().any(|entry| entry == "hiddenChild"));
+        assert!(!p_cls.iter().any(|entry| entry == "hiddenBase"));
+        assert!(!p_cls.iter().any(|entry| entry == "hiddenChild"));
+        assert_eq!(bytecode.workspace.get("toObj"), Some(&logical_value(true)));
+        assert_eq!(bytecode.workspace.get("toObjs"), Some(&logical_value(true)));
+        assert_eq!(bytecode.workspace.get("toNum"), Some(&logical_value(false)));
+        assert_eq!(bytecode.workspace.get("tfBase"), Some(&logical_value(true)));
+        assert_eq!(
+            bytecode.workspace.get("tfChild"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            bytecode.workspace.get("tfHiddenBase"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            bytecode.workspace.get("tfHiddenChild"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            bytecode.workspace.get("tfMissing"),
+            Some(&logical_value(false))
+        );
+        assert_eq!(bytecode.workspace.get("tmBase"), Some(&logical_value(true)));
+        assert_eq!(
+            bytecode.workspace.get("tmChild"),
+            Some(&logical_value(true))
+        );
+        assert_eq!(
+            bytecode.workspace.get("tmHidden"),
+            Some(&logical_value(false))
+        );
+        assert_eq!(
+            bytecode.workspace.get("tmMissing"),
+            Some(&logical_value(false))
+        );
+        let bytecode_rendered = render_matlab_execution_result(&bytecode);
+        assert!(bytecode_rendered.contains("Properties for class Child:"));
+        assert!(bytecode_rendered.contains("baseValue"));
+        assert!(bytecode_rendered.contains("childValue"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn superclasses_builtin_reports_class_hierarchies_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("superclasses-builtin");
+        let base_path = temp_dir.join("Base.m");
+        let child_path = temp_dir.join("Child.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(
+            &base_path,
+            "classdef Base < handle\n\
+             methods\n\
+             function obj = Base()\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write Base");
+        fs::write(
+            &child_path,
+            "classdef Child < Base\n\
+             methods\n\
+             function obj = Child()\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write Child");
+        fs::write(
+            &main_path,
+            "obj = Child();\n\
+             superclasses(obj)\n\
+             sObj = superclasses(obj);\n\
+             sCls = superclasses('Child');\n",
+        )
+        .expect("write main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        let s_obj = cell_texts(workspace_cell(&interpreted.workspace, "sObj"));
+        let s_cls = cell_texts(workspace_cell(&interpreted.workspace, "sCls"));
+        assert_eq!(s_obj, vec!["Base".to_string(), "handle".to_string()]);
+        assert_eq!(s_cls, vec!["Base".to_string(), "handle".to_string()]);
+        let interpreted_rendered = render_matlab_execution_result(&interpreted);
+        assert!(interpreted_rendered.contains("Superclasses for class Child:"));
+        assert!(interpreted_rendered.contains("Base"));
+        assert!(interpreted_rendered.contains("handle"));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        let s_obj = cell_texts(workspace_cell(&bytecode.workspace, "sObj"));
+        let s_cls = cell_texts(workspace_cell(&bytecode.workspace, "sCls"));
+        assert_eq!(s_obj, vec!["Base".to_string(), "handle".to_string()]);
+        assert_eq!(s_cls, vec!["Base".to_string(), "handle".to_string()]);
+        let bytecode_rendered = render_matlab_execution_result(&bytecode);
+        assert!(bytecode_rendered.contains("Superclasses for class Child:"));
+        assert!(bytecode_rendered.contains("Base"));
+        assert!(bytecode_rendered.contains("handle"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn events_builtin_reports_handle_events_in_interpreter_and_bytecode() {
+        let temp_dir = unique_temp_script_dir("events-builtin");
+        let handle_path = temp_dir.join("HandleThing.m");
+        let value_path = temp_dir.join("ValueThing.m");
+        let main_path = temp_dir.join("main.m");
+
+        fs::write(
+            &handle_path,
+            "classdef HandleThing < handle\n\
+             methods\n\
+             function obj = HandleThing()\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write HandleThing");
+        fs::write(
+            &value_path,
+            "classdef ValueThing\n\
+             methods\n\
+             function obj = ValueThing()\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write ValueThing");
+        fs::write(
+            &main_path,
+            "h = HandleThing();\n\
+             v = ValueThing();\n\
+             events(h)\n\
+             eHandleObj = events(h);\n\
+             eHandleCls = events('HandleThing');\n\
+             eValueObj = events(v);\n\
+             eValueCls = events('ValueThing');\n",
+        )
+        .expect("write main");
+
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "eHandleObj")),
+            vec!["ObjectBeingDestroyed".to_string()]
+        );
+        assert_eq!(
+            cell_texts(workspace_cell(&interpreted.workspace, "eHandleCls")),
+            vec!["ObjectBeingDestroyed".to_string()]
+        );
+        let e_value_obj = workspace_cell(&interpreted.workspace, "eValueObj");
+        let e_value_cls = workspace_cell(&interpreted.workspace, "eValueCls");
+        assert_eq!((e_value_obj.rows, e_value_obj.cols), (0, 0));
+        assert_eq!((e_value_cls.rows, e_value_cls.cols), (0, 0));
+        let interpreted_rendered = render_matlab_execution_result(&interpreted);
+        assert!(interpreted_rendered.contains("Events for class HandleThing:"));
+        assert!(interpreted_rendered.contains("ObjectBeingDestroyed"));
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "eHandleObj")),
+            vec!["ObjectBeingDestroyed".to_string()]
+        );
+        assert_eq!(
+            cell_texts(workspace_cell(&bytecode.workspace, "eHandleCls")),
+            vec!["ObjectBeingDestroyed".to_string()]
+        );
+        let e_value_obj = workspace_cell(&bytecode.workspace, "eValueObj");
+        let e_value_cls = workspace_cell(&bytecode.workspace, "eValueCls");
+        assert_eq!((e_value_obj.rows, e_value_obj.cols), (0, 0));
+        assert_eq!((e_value_cls.rows, e_value_cls.cols), (0, 0));
+        let bytecode_rendered = render_matlab_execution_result(&bytecode);
+        assert!(bytecode_rendered.contains("Events for class HandleThing:"));
+        assert!(bytecode_rendered.contains("ObjectBeingDestroyed"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -20814,7 +34217,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -21051,9 +34458,16 @@ mod tests {
         let matrix_linearized = linearized_matrix_elements(&matrix)
             .expect("matrix linearization should succeed")
             .into_iter()
-            .map(|value| value.as_scalar().expect("matrix helper should return scalars"))
+            .map(|value| {
+                value
+                    .as_scalar()
+                    .expect("matrix helper should return scalars")
+            })
             .collect::<Vec<_>>();
-        assert_eq!(matrix_linearized, vec![1.0, 5.0, 3.0, 7.0, 2.0, 6.0, 4.0, 8.0]);
+        assert_eq!(
+            matrix_linearized,
+            vec![1.0, 5.0, 3.0, 7.0, 2.0, 6.0, 4.0, 8.0]
+        );
 
         let cell = CellValue::with_dimensions(
             2,
@@ -21067,16 +34481,30 @@ mod tests {
         let cell_linearized = linearized_cell_elements(&cell)
             .expect("cell linearization should succeed")
             .into_iter()
-            .map(|value| value.as_scalar().expect("cell helper should return scalars"))
+            .map(|value| {
+                value
+                    .as_scalar()
+                    .expect("cell helper should return scalars")
+            })
             .collect::<Vec<_>>();
-        assert_eq!(cell_linearized, vec![1.0, 5.0, 3.0, 7.0, 2.0, 6.0, 4.0, 8.0]);
+        assert_eq!(
+            cell_linearized,
+            vec![1.0, 5.0, 3.0, 7.0, 2.0, 6.0, 4.0, 8.0]
+        );
 
         let distributed_cell = distributed_cell_assignment_values(&Value::Cell(cell.clone()), 8)
             .expect("distributed cell assignment should accept matching nd rhs")
             .into_iter()
-            .map(|value| value.as_scalar().expect("distributed cell helper should return scalars"))
+            .map(|value| {
+                value
+                    .as_scalar()
+                    .expect("distributed cell helper should return scalars")
+            })
             .collect::<Vec<_>>();
-        assert_eq!(distributed_cell, vec![1.0, 5.0, 3.0, 7.0, 2.0, 6.0, 4.0, 8.0]);
+        assert_eq!(
+            distributed_cell,
+            vec![1.0, 5.0, 3.0, 7.0, 2.0, 6.0, 4.0, 8.0]
+        );
 
         let distributed_struct =
             distributed_struct_assignment_values(&Value::Matrix(matrix.clone()), 8)
@@ -21116,7 +34544,11 @@ mod tests {
         let resized_scalars = resized
             .elements()
             .iter()
-            .map(|value| value.as_scalar().expect("resized matrix helper should return scalars"))
+            .map(|value| {
+                value
+                    .as_scalar()
+                    .expect("resized matrix helper should return scalars")
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             resized_scalars,
@@ -21126,8 +34558,7 @@ mod tests {
 
     #[test]
     fn cat_nd_storage_order_matches_runtime_expectations() {
-        let result =
-            execute_script_source("a = cat(3, [1 2; 3 4], [5 6; 7 8]);\n");
+        let result = execute_script_source("a = cat(3, [1 2; 3 4], [5 6; 7 8]);\n");
         let Value::Matrix(matrix) = result.workspace.get("a").expect("cat output matrix") else {
             panic!("expected matrix output from cat");
         };
@@ -21231,7 +34662,10 @@ mod tests {
             "cells = {1, 2};\n\
              out = {cells{:}};\n",
         );
-        assert_eq!(render_execution_result(&wrapped), "workspace\n  cells = {1, 2}\n  out = {1, 2}\n");
+        assert_eq!(
+            render_execution_result(&wrapped),
+            "workspace\n  cells = {1, 2}\n  out = {1, 2}\n"
+        );
 
         let wrapped_bytecode = execute_script_source_bytecode(
             "cells = {1, 2};\n\
@@ -21332,8 +34766,8 @@ mod tests {
             "{interpreted}"
         );
 
-        let bytecode =
-            execute_script_source_bytecode_result(source).expect_err("bytecode numeric 0/1 row selector should fail");
+        let bytecode = execute_script_source_bytecode_result(source)
+            .expect_err("bytecode numeric 0/1 row selector should fail");
         assert!(
             bytecode
                 .to_string()
@@ -21341,8 +34775,7 @@ mod tests {
             "{bytecode}"
         );
 
-        let assign_source =
-            "x = [1 2 3; 4 5 6; 7 8 9];\nx([1 0 1], [0 1 1]) = [10 20; 30 40];\n";
+        let assign_source = "x = [1 2 3; 4 5 6; 7 8 9];\nx([1 0 1], [0 1 1]) = [10 20; 30 40];\n";
         let interpreted = execute_script_source_result(assign_source)
             .expect_err("numeric 0/1 assignment selectors should fail");
         assert!(
@@ -21445,10 +34878,16 @@ mod tests {
     fn arrayfun_supports_uniform_scalar_outputs_in_interpreter_and_bytecode() {
         let source = "out = arrayfun(@(x) x + 1, [1 2 3]);\n";
         let interpreted = execute_script_source(source);
-        assert_eq!(render_execution_result(&interpreted), "workspace\n  out = [2, 3, 4]\n");
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = [2, 3, 4]\n"
+        );
 
         let bytecode = execute_script_source_bytecode(source);
-        assert_eq!(render_execution_result(&bytecode), "workspace\n  out = [2, 3, 4]\n");
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = [2, 3, 4]\n"
+        );
     }
 
     #[test]
@@ -21471,10 +34910,16 @@ mod tests {
     fn cellfun_supports_uniform_scalar_outputs_in_interpreter_and_bytecode() {
         let source = "out = cellfun(@(x) x + 1, {1, 2, 3});\n";
         let interpreted = execute_script_source(source);
-        assert_eq!(render_execution_result(&interpreted), "workspace\n  out = [2, 3, 4]\n");
+        assert_eq!(
+            render_execution_result(&interpreted),
+            "workspace\n  out = [2, 3, 4]\n"
+        );
 
         let bytecode = execute_script_source_bytecode(source);
-        assert_eq!(render_execution_result(&bytecode), "workspace\n  out = [2, 3, 4]\n");
+        assert_eq!(
+            render_execution_result(&bytecode),
+            "workspace\n  out = [2, 3, 4]\n"
+        );
     }
 
     #[test]
@@ -21787,8 +35232,7 @@ mod tests {
         let source = "outer = {{0, 0}, {0, 0}};\n\
              [outer{1:2}{:}] = [1 2; 3 4];\n\
              out = [outer{1:2}{:}];\n";
-        let expected =
-            "workspace\n  out = [1, 3, 2, 4]\n  outer = {{1, 3}, {2, 4}}\n";
+        let expected = "workspace\n  out = [1, 3, 2, 4]\n  outer = {{1, 3}, {2, 4}}\n";
 
         let interpreted = execute_script_source(source);
         assert_eq!(render_execution_result(&interpreted), expected);
@@ -22161,7 +35605,6 @@ mod tests {
             render_execution_result(&explicit_bytecode),
             "workspace\n  out = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n  q = [struct{field1=[10, 20]}, struct{field1=[14, 12]}]\n"
         );
-
     }
 
     #[test]
@@ -22199,7 +35642,8 @@ mod tests {
     #[test]
     fn plain_scalar_struct_field_assignment_preserves_matrix_rhs_as_scalar_field_value() {
         let source = "s.field1 = [10 20];\nout = s;\n";
-        let expected = "workspace\n  out = struct{field1=[10, 20]}\n  s = struct{field1=[10, 20]}\n";
+        let expected =
+            "workspace\n  out = struct{field1=[10, 20]}\n  s = struct{field1=[10, 20]}\n";
 
         let interpreted = execute_script_source(source);
         assert_eq!(render_execution_result(&interpreted), expected);
@@ -22227,18 +35671,18 @@ mod tests {
         let interpreted = execute_script_source_result(source)
             .expect_err("plain multi-element struct field assignment should fail");
         assert!(
-            interpreted
-                .to_string()
-                .contains("assigning to 2 elements using a simple assignment statement is not supported"),
+            interpreted.to_string().contains(
+                "assigning to 2 elements using a simple assignment statement is not supported"
+            ),
             "{interpreted}"
         );
 
         let bytecode = execute_script_source_bytecode_result(source)
             .expect_err("bytecode plain multi-element struct field assignment should fail");
         assert!(
-            bytecode
-                .to_string()
-                .contains("assigning to 2 elements using a simple assignment statement is not supported"),
+            bytecode.to_string().contains(
+                "assigning to 2 elements using a simple assignment statement is not supported"
+            ),
             "{bytecode}"
         );
     }
@@ -22250,20 +35694,19 @@ mod tests {
         let interpreted = execute_script_source_result(source)
             .expect_err("plain missing-root multi-element struct field assignment should fail");
         assert!(
-            interpreted
-                .to_string()
-                .contains("assigning to 2 elements using a simple assignment statement is not supported"),
+            interpreted.to_string().contains(
+                "assigning to 2 elements using a simple assignment statement is not supported"
+            ),
             "{interpreted}"
         );
 
-        let bytecode = execute_script_source_bytecode_result(source)
-            .expect_err(
-                "bytecode plain missing-root multi-element struct field assignment should fail",
-            );
+        let bytecode = execute_script_source_bytecode_result(source).expect_err(
+            "bytecode plain missing-root multi-element struct field assignment should fail",
+        );
         assert!(
-            bytecode
-                .to_string()
-                .contains("assigning to 2 elements using a simple assignment statement is not supported"),
+            bytecode.to_string().contains(
+                "assigning to 2 elements using a simple assignment statement is not supported"
+            ),
             "{bytecode}"
         );
     }
@@ -22295,8 +35738,8 @@ mod tests {
     #[test]
     fn single_output_struct_array_field_access_requires_concatenation() {
         let source = "s = struct('name', {'alpha', 'beta'});\nout = s.name;\n";
-        let interpreted =
-            execute_script_source_result(source).expect_err("single-output struct array field read should fail");
+        let interpreted = execute_script_source_result(source)
+            .expect_err("single-output struct array field read should fail");
         assert!(
             interpreted
                 .to_string()
@@ -22313,7 +35756,6 @@ mod tests {
             "{bytecode}"
         );
     }
-
 
     #[test]
     fn linear_matrix_deletion_flattens_nonvector_inputs_in_matlab_order() {
@@ -23924,7 +37366,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -23954,7 +37400,8 @@ mod tests {
     }
 
     #[test]
-    fn classdef_bundle_execution_preserves_handle_aliasing_across_save_and_load_without_source_tree() {
+    fn classdef_bundle_execution_preserves_handle_aliasing_across_save_and_load_without_source_tree(
+    ) {
         let temp_dir = unique_temp_script_dir("classdef-bundle-handle-alias");
         let class_path = temp_dir.join("Counter.m");
         let main_path = temp_dir.join("main.m");
@@ -24003,7 +37450,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -24036,7 +37487,8 @@ mod tests {
     }
 
     #[test]
-    fn classdef_bundle_execution_keeps_loaded_and_new_handles_distinct_across_save_append_without_source_tree() {
+    fn classdef_bundle_execution_keeps_loaded_and_new_handles_distinct_across_save_append_without_source_tree(
+    ) {
         let temp_dir = unique_temp_script_dir("classdef-bundle-handle-append-distinct");
         let class_path = temp_dir.join("Counter.m");
         let main_path = temp_dir.join("main.m");
@@ -24088,7 +37540,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -24324,8 +37780,7 @@ mod tests {
         )
         .expect("write private-helper script");
 
-        let expected =
-            "workspace\n  c = Counter with properties {value=10}\n  out = 17\n";
+        let expected = "workspace\n  c = Counter with properties {value=10}\n  out = 17\n";
         let interpreted = execute_path(&main_path, &[]);
         assert_eq!(render_execution_result(&interpreted), expected);
 
@@ -24419,7 +37874,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -24532,7 +37991,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -24553,8 +38016,8 @@ mod tests {
         };
 
         fs::remove_dir_all(&temp_dir).expect("remove source tree");
-        let result =
-            execute_script_bytecode_bundle(&bundle).expect("execute packaged folder-method class bundle");
+        let result = execute_script_bytecode_bundle(&bundle)
+            .expect("execute packaged folder-method class bundle");
         assert_eq!(
             render_execution_result(&result),
             "workspace\n  c = pkg.Counter with properties {value=20}\n  out = [27, 28]\n"
@@ -24577,11 +38040,7 @@ mod tests {
              end\n",
         )
         .expect("write static class");
-        fs::write(
-            &main_path,
-            "out = Point.origin();\n",
-        )
-        .expect("write static script");
+        fs::write(&main_path, "out = Point.origin();\n").expect("write static script");
 
         let expected = "workspace\n  out = [0, 0]\n";
         let interpreted = execute_path(&main_path, &[]);
@@ -24611,11 +38070,7 @@ mod tests {
              end\n",
         )
         .expect("write package static class");
-        fs::write(
-            &main_path,
-            "out = pkg.Point.unit();\n",
-        )
-        .expect("write package static script");
+        fs::write(&main_path, "out = pkg.Point.unit();\n").expect("write package static script");
 
         let expected = "workspace\n  out = [1, 1]\n";
         let interpreted = execute_path(&main_path, &[]);
@@ -24643,11 +38098,7 @@ mod tests {
              end\n",
         )
         .expect("write bundled static class");
-        fs::write(
-            &main_path,
-            "out = Point.origin();\n",
-        )
-        .expect("write bundled static script");
+        fs::write(&main_path, "out = Point.origin();\n").expect("write bundled static script");
 
         let source = fs::read_to_string(&main_path).expect("read root source");
         let parsed = parse_source(&source, SourceFileId(1), ParseMode::AutoDetect);
@@ -24677,7 +38128,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -24699,9 +38154,11 @@ mod tests {
         };
 
         fs::remove_dir_all(&temp_dir).expect("remove source tree");
-        let result =
-            execute_script_bytecode_bundle(&bundle).expect("execute static bundle");
-        assert_eq!(render_execution_result(&result), "workspace\n  out = [4, 5]\n");
+        let result = execute_script_bytecode_bundle(&bundle).expect("execute static bundle");
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  out = [4, 5]\n"
+        );
     }
 
     #[test]
@@ -25143,7 +38600,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -25241,7 +38702,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -25340,7 +38805,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -25375,14 +38844,12 @@ mod tests {
     #[test]
     fn classdef_bundle_property_produced_full_2d_bound_handles_roundtrip_preserve_receiver_layout_without_source_tree(
     ) {
-        let temp_dir =
-            unique_temp_script_dir("classdef-property-produced-full-2d-bound-bundle");
+        let temp_dir = unique_temp_script_dir("classdef-property-produced-full-2d-bound-bundle");
         let point_path = temp_dir.join("Point.m");
         let wrap_path = temp_dir.join("Wrap.m");
         let main_path = temp_dir.join("main.m");
-        let snapshot_path =
-            unique_temp_mat_path("classdef-property-produced-full-2d-bound-bundle")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("classdef-property-produced-full-2d-bound-bundle")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &point_path,
@@ -25455,7 +38922,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -25559,7 +39030,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -25596,8 +39071,8 @@ mod tests {
         let temp_dir = unique_temp_script_dir("classdef-load-property-produced-handle-alias");
         let class_path = temp_dir.join("Counter.m");
         let main_path = temp_dir.join("main.m");
-        let snapshot_path =
-            unique_temp_mat_path("classdef-load-property-produced-handle-alias").with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("classdef-load-property-produced-handle-alias")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -25644,11 +39119,17 @@ mod tests {
         let Value::Matrix(receiver_matrix) = receiver.as_ref() else {
             panic!("expected matrix receiver");
         };
-        for (parent, receiver_value) in objs.elements().iter().zip(receiver_matrix.elements().iter()) {
+        for (parent, receiver_value) in objs
+            .elements()
+            .iter()
+            .zip(receiver_matrix.elements().iter())
+        {
             let Value::Object(parent_object) = parent else {
                 panic!("expected parent object");
             };
-            let Value::Object(child_object) = parent_object.property_value("child").expect("child property")
+            let Value::Object(child_object) = parent_object
+                .property_value("child")
+                .expect("child property")
             else {
                 panic!("expected child object");
             };
@@ -25735,8 +39216,7 @@ mod tests {
     #[test]
     fn load_restores_property_produced_handle_bound_method_aliasing_from_mat_file_for_later_assignment(
     ) {
-        let temp_dir =
-            unique_temp_script_dir("classdef-load-property-produced-handle-alias-mat");
+        let temp_dir = unique_temp_script_dir("classdef-load-property-produced-handle-alias-mat");
         let class_path = temp_dir.join("Counter.m");
         let main_path = temp_dir.join("main.m");
         let mat_path = unique_temp_mat_path("classdef-load-property-produced-handle-alias-mat");
@@ -25859,7 +39339,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -25881,8 +39365,8 @@ mod tests {
         };
 
         fs::remove_dir_all(&temp_dir).expect("remove source tree");
-        let result = execute_script_bytecode_bundle(&bundle)
-            .expect("execute bundled load alias script");
+        let result =
+            execute_script_bytecode_bundle(&bundle).expect("execute bundled load alias script");
         assert_eq!(
             render_execution_result(&result),
             "workspace\n  f = @Counter.total\n  objs = [Counter with properties {value=1, child=Counter with properties {value=100, child=[]}}, Counter with properties {value=2, child=Counter with properties {value=200, child=[]}}]\n  out = 300\n  vals = [100, 200]\n"
@@ -26005,8 +39489,7 @@ mod tests {
     fn workspace_snapshot_load_preserves_bundle_backed_packaged_plain_function_handles_without_source_tree(
     ) {
         let source_dir = unique_temp_script_dir("snapshot-bundle-packaged-plain-handle-source");
-        let consumer_dir =
-            unique_temp_script_dir("snapshot-bundle-packaged-plain-handle-consumer");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-packaged-plain-handle-consumer");
         let package_dir = source_dir.join("+pkg");
         fs::create_dir_all(&package_dir).expect("create package dir");
         let helper_path = package_dir.join("helper.m");
@@ -26032,8 +39515,7 @@ mod tests {
         .expect("write snapshot packaged plain-handle producer");
 
         let bundle = compile_bytecode_bundle(&producer_path);
-        fs::remove_dir_all(&source_dir)
-            .expect("remove snapshot packaged plain-handle source tree");
+        fs::remove_dir_all(&source_dir).expect("remove snapshot packaged plain-handle source tree");
         execute_script_bytecode_bundle(&bundle)
             .expect("execute snapshot packaged plain-handle producer");
 
@@ -26065,16 +39547,14 @@ mod tests {
     fn workspace_snapshot_load_preserves_bundle_backed_str2func_packaged_handles_without_source_tree(
     ) {
         let source_dir = unique_temp_script_dir("snapshot-bundle-str2func-packaged-source");
-        let consumer_dir =
-            unique_temp_script_dir("snapshot-bundle-str2func-packaged-consumer");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-str2func-packaged-consumer");
         let package_dir = source_dir.join("+pkg");
         fs::create_dir_all(&package_dir).expect("create package dir");
         let helper_path = package_dir.join("helper.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("snapshot-bundle-str2func-packaged-handle")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("snapshot-bundle-str2func-packaged-handle")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &helper_path,
@@ -26093,8 +39573,7 @@ mod tests {
         .expect("write snapshot str2func packaged producer");
 
         let bundle = compile_bytecode_bundle(&producer_path);
-        fs::remove_dir_all(&source_dir)
-            .expect("remove snapshot str2func packaged source tree");
+        fs::remove_dir_all(&source_dir).expect("remove snapshot str2func packaged source tree");
         execute_script_bytecode_bundle(&bundle)
             .expect("execute snapshot str2func packaged producer");
 
@@ -26134,9 +39613,8 @@ mod tests {
         let class_path = class_dir.join("Counter.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("snapshot-bundle-str2func-constructor-handle")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("snapshot-bundle-str2func-constructor-handle")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -26162,8 +39640,7 @@ mod tests {
         .expect("write snapshot str2func constructor producer");
 
         let bundle = compile_bytecode_bundle(&producer_path);
-        fs::remove_dir_all(&source_dir)
-            .expect("remove snapshot str2func constructor source tree");
+        fs::remove_dir_all(&source_dir).expect("remove snapshot str2func constructor source tree");
         execute_script_bytecode_bundle(&bundle)
             .expect("execute snapshot str2func constructor producer");
 
@@ -26198,9 +39675,8 @@ mod tests {
     ) {
         let source_dir =
             unique_temp_script_dir("snapshot-bundle-str2func-packaged-constructor-handle-source");
-        let consumer_dir = unique_temp_script_dir(
-            "snapshot-bundle-str2func-packaged-constructor-handle-consumer",
-        );
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-packaged-constructor-handle-consumer");
         let class_dir = source_dir.join("+pkg").join("@Counter");
         fs::create_dir_all(&class_dir).expect("create package class dir");
         let class_path = class_dir.join("Counter.m");
@@ -26266,10 +39742,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_snapshot_load_preserves_bundle_backed_str2func_static_handles_without_source_tree(
-    ) {
-        let source_dir =
-            unique_temp_script_dir("snapshot-bundle-str2func-static-handle-source");
+    fn workspace_snapshot_load_preserves_bundle_backed_str2func_static_handles_without_source_tree()
+    {
+        let source_dir = unique_temp_script_dir("snapshot-bundle-str2func-static-handle-source");
         let consumer_dir =
             unique_temp_script_dir("snapshot-bundle-str2func-static-handle-consumer");
         let class_path = source_dir.join("Point.m");
@@ -26331,17 +39806,15 @@ mod tests {
     ) {
         let source_dir =
             unique_temp_script_dir("snapshot-bundle-str2func-packaged-static-handle-source");
-        let consumer_dir = unique_temp_script_dir(
-            "snapshot-bundle-str2func-packaged-static-handle-consumer",
-        );
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-packaged-static-handle-consumer");
         let package_dir = source_dir.join("+pkg");
         fs::create_dir_all(&package_dir).expect("create package dir");
         let class_path = package_dir.join("Point.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("snapshot-bundle-str2func-packaged-static-handle")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("snapshot-bundle-str2func-packaged-static-handle")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -26396,15 +39869,14 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_preserves_bundle_backed_str2func_unbound_instance_handles_without_source_tree(
     ) {
-        let source_dir =
-            unique_temp_script_dir("snapshot-bundle-str2func-instance-handle-source");
+        let source_dir = unique_temp_script_dir("snapshot-bundle-str2func-instance-handle-source");
         let consumer_dir =
             unique_temp_script_dir("snapshot-bundle-str2func-instance-handle-consumer");
         let class_path = source_dir.join("Point.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("snapshot-bundle-str2func-instance-handle").with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("snapshot-bundle-str2func-instance-handle")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -26471,9 +39943,8 @@ mod tests {
     ) {
         let source_dir =
             unique_temp_script_dir("snapshot-bundle-str2func-packaged-instance-handle-source");
-        let consumer_dir = unique_temp_script_dir(
-            "snapshot-bundle-str2func-packaged-instance-handle-consumer",
-        );
+        let consumer_dir =
+            unique_temp_script_dir("snapshot-bundle-str2func-packaged-instance-handle-consumer");
         let class_dir = source_dir.join("+pkg").join("@Counter");
         let private_dir = class_dir.join("private");
         fs::create_dir_all(&private_dir).expect("create package class private dir");
@@ -26612,8 +40083,7 @@ mod tests {
     fn workspace_snapshot_load_allows_new_bundle_backed_packaged_plain_function_calls_without_source_tree(
     ) {
         let source_dir = unique_temp_script_dir("snapshot-bundle-packaged-plain-call-source");
-        let consumer_dir =
-            unique_temp_script_dir("snapshot-bundle-packaged-plain-call-consumer");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-packaged-plain-call-consumer");
         let package_dir = source_dir.join("+pkg");
         fs::create_dir_all(&package_dir).expect("create package dir");
         let helper_path = package_dir.join("helper.m");
@@ -26639,8 +40109,7 @@ mod tests {
         .expect("write snapshot packaged plain-call producer");
 
         let bundle = compile_bytecode_bundle(&producer_path);
-        fs::remove_dir_all(&source_dir)
-            .expect("remove snapshot packaged plain-call source tree");
+        fs::remove_dir_all(&source_dir).expect("remove snapshot packaged plain-call source tree");
         execute_script_bytecode_bundle(&bundle)
             .expect("execute snapshot packaged plain-call producer");
 
@@ -26735,8 +40204,7 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_preserves_bundle_backed_packaged_plain_function_private_helpers_without_source_tree(
     ) {
-        let source_dir =
-            unique_temp_script_dir("snapshot-bundle-packaged-private-helper-source");
+        let source_dir = unique_temp_script_dir("snapshot-bundle-packaged-private-helper-source");
         let consumer_dir =
             unique_temp_script_dir("snapshot-bundle-packaged-private-helper-consumer");
         let package_dir = source_dir.join("+pkg");
@@ -26853,18 +40321,18 @@ mod tests {
         let interpreted = execute_path_result(&consumer_path, &[])
             .expect_err("interpreted snapshot private helper should stay hidden");
         assert!(
-            interpreted
-                .to_string()
-                .contains("call target `privateHelper` is not executable in the current interpreter"),
+            interpreted.to_string().contains(
+                "call target `privateHelper` is not executable in the current interpreter"
+            ),
             "{interpreted}"
         );
 
         let bytecode = execute_path_bytecode_result(&consumer_path, &[])
             .expect_err("bytecode snapshot private helper should stay hidden");
         assert!(
-            bytecode
-                .to_string()
-                .contains("call target `privateHelper` is not executable in the current bytecode VM"),
+            bytecode.to_string().contains(
+                "call target `privateHelper` is not executable in the current bytecode VM"
+            ),
             "{bytecode}"
         );
 
@@ -26875,8 +40343,7 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_does_not_expose_bundle_backed_packaged_private_helpers_without_source_tree(
     ) {
-        let source_dir =
-            unique_temp_script_dir("snapshot-bundle-packaged-private-hidden-source");
+        let source_dir = unique_temp_script_dir("snapshot-bundle-packaged-private-hidden-source");
         let consumer_dir =
             unique_temp_script_dir("snapshot-bundle-packaged-private-hidden-consumer");
         let package_dir = source_dir.join("+pkg");
@@ -26887,8 +40354,7 @@ mod tests {
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
         let snapshot_path =
-            unique_temp_mat_path("snapshot-bundle-packaged-private-hidden")
-                .with_extension("matws");
+            unique_temp_mat_path("snapshot-bundle-packaged-private-hidden").with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &public_path,
@@ -26931,18 +40397,18 @@ mod tests {
         let interpreted = execute_path_result(&consumer_path, &[])
             .expect_err("interpreted snapshot packaged private helper should stay hidden");
         assert!(
-            interpreted
-                .to_string()
-                .contains("call target `pkg.privateHelper` is not executable in the current interpreter"),
+            interpreted.to_string().contains(
+                "call target `pkg.privateHelper` is not executable in the current interpreter"
+            ),
             "{interpreted}"
         );
 
         let bytecode = execute_path_bytecode_result(&consumer_path, &[])
             .expect_err("bytecode snapshot packaged private helper should stay hidden");
         assert!(
-            bytecode
-                .to_string()
-                .contains("call target `pkg.privateHelper` is not executable in the current bytecode VM"),
+            bytecode.to_string().contains(
+                "call target `pkg.privateHelper` is not executable in the current bytecode VM"
+            ),
             "{bytecode}"
         );
 
@@ -26952,8 +40418,7 @@ mod tests {
 
     #[test]
     fn workspace_snapshot_load_keeps_bundle_backed_plain_handles_while_later_script_local_functions_win(
-    )
-    {
+    ) {
         let source_dir = unique_temp_script_dir("snapshot-bundle-local-precedence-source");
         let consumer_dir = unique_temp_script_dir("snapshot-bundle-local-precedence-consumer");
         let helper_path = source_dir.join("helper.m");
@@ -26981,7 +40446,8 @@ mod tests {
 
         let bundle = compile_bytecode_bundle(&producer_path);
         fs::remove_dir_all(&source_dir).expect("remove snapshot local-precedence source tree");
-        execute_script_bytecode_bundle(&bundle).expect("execute snapshot local-precedence producer");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot local-precedence producer");
 
         fs::write(
             &consumer_helper_path,
@@ -27016,10 +40482,8 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_keeps_bundle_backed_packaged_plain_handles_while_later_local_package_functions_win(
     ) {
-        let source_dir =
-            unique_temp_script_dir("snapshot-bundle-package-precedence-source");
-        let consumer_dir =
-            unique_temp_script_dir("snapshot-bundle-package-precedence-consumer");
+        let source_dir = unique_temp_script_dir("snapshot-bundle-package-precedence-source");
+        let consumer_dir = unique_temp_script_dir("snapshot-bundle-package-precedence-consumer");
         let source_package_dir = source_dir.join("+pkg");
         let consumer_package_dir = consumer_dir.join("+pkg");
         fs::create_dir_all(&source_package_dir).expect("create source package dir");
@@ -27083,8 +40547,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_snapshot_load_keeps_bundle_backed_plain_handles_while_later_local_functions_win()
-    {
+    fn workspace_snapshot_load_keeps_bundle_backed_plain_handles_while_later_local_functions_win() {
         let source_dir = unique_temp_script_dir("snapshot-bundle-localfn-precedence-source");
         let consumer_dir = unique_temp_script_dir("snapshot-bundle-localfn-precedence-consumer");
         let helper_path = source_dir.join("helper.m");
@@ -27184,27 +40647,48 @@ mod tests {
         .expect("write snapshot handlevar-precedence consumer");
 
         let interpreted = execute_path(&consumer_path, &[]);
-        assert_eq!(interpreted.workspace.get("out_handle"), Some(&Value::Scalar(12.0)));
-        assert_eq!(interpreted.workspace.get("out_local"), Some(&Value::Scalar(107.0)));
+        assert_eq!(
+            interpreted.workspace.get("out_handle"),
+            Some(&Value::Scalar(12.0))
+        );
+        assert_eq!(
+            interpreted.workspace.get("out_local"),
+            Some(&Value::Scalar(107.0))
+        );
         assert!(
-            matches!(interpreted.workspace.get("f"), Some(Value::FunctionHandle(_))),
+            matches!(
+                interpreted.workspace.get("f"),
+                Some(Value::FunctionHandle(_))
+            ),
             "expected bundled helper handle"
         );
         assert!(
-            matches!(interpreted.workspace.get("helper"), Some(Value::FunctionHandle(_))),
+            matches!(
+                interpreted.workspace.get("helper"),
+                Some(Value::FunctionHandle(_))
+            ),
             "expected later workspace helper binding to be a function handle"
         );
         assert_eq!(interpreted.bundle_modules().len(), 1);
 
         let bytecode = execute_path_bytecode(&consumer_path, &[]);
-        assert_eq!(bytecode.workspace.get("out_handle"), Some(&Value::Scalar(12.0)));
-        assert_eq!(bytecode.workspace.get("out_local"), Some(&Value::Scalar(107.0)));
+        assert_eq!(
+            bytecode.workspace.get("out_handle"),
+            Some(&Value::Scalar(12.0))
+        );
+        assert_eq!(
+            bytecode.workspace.get("out_local"),
+            Some(&Value::Scalar(107.0))
+        );
         assert!(
             matches!(bytecode.workspace.get("f"), Some(Value::FunctionHandle(_))),
             "expected bundled helper handle"
         );
         assert!(
-            matches!(bytecode.workspace.get("helper"), Some(Value::FunctionHandle(_))),
+            matches!(
+                bytecode.workspace.get("helper"),
+                Some(Value::FunctionHandle(_))
+            ),
             "expected later workspace helper binding to be a function handle"
         );
         assert_eq!(bytecode.bundle_modules().len(), 1);
@@ -27242,7 +40726,8 @@ mod tests {
 
         let bundle = compile_bytecode_bundle(&producer_path);
         fs::remove_dir_all(&source_dir).expect("remove snapshot new plain-handle source tree");
-        execute_script_bytecode_bundle(&bundle).expect("execute snapshot new plain-handle producer");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot new plain-handle producer");
 
         fs::write(
             &consumer_path,
@@ -27278,9 +40763,8 @@ mod tests {
         let helper_path = package_dir.join("helper.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("snapshot-bundle-new-packaged-plain-handle")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("snapshot-bundle-new-packaged-plain-handle")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &helper_path,
@@ -27397,8 +40881,7 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_allows_new_bundle_backed_constructor_and_static_handle_calls_without_source_tree(
     ) {
-        let source_dir =
-            unique_temp_script_dir("classdef-snapshot-bundle-new-constructor-source");
+        let source_dir = unique_temp_script_dir("classdef-snapshot-bundle-new-constructor-source");
         let consumer_dir =
             unique_temp_script_dir("classdef-snapshot-bundle-new-constructor-consumer");
         let class_path = source_dir.join("Point.m");
@@ -27541,9 +41024,8 @@ mod tests {
         let wrap_path = source_dir.join("Wrap.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("classdef-snapshot-bundle-object-property-growth")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("classdef-snapshot-bundle-object-property-growth")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &point_path,
@@ -27696,9 +41178,8 @@ mod tests {
         let class_path = source_dir.join("Point.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("classdef-snapshot-bundle-new-constructor-handle")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("classdef-snapshot-bundle-new-constructor-handle")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -27757,8 +41238,9 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_allows_new_packaged_bundle_backed_constructor_handles_without_source_tree(
     ) {
-        let source_dir =
-            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-constructor-handle-source");
+        let source_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-packaged-constructor-handle-source",
+        );
         let consumer_dir = unique_temp_script_dir(
             "classdef-snapshot-bundle-new-packaged-constructor-handle-consumer",
         );
@@ -27835,9 +41317,8 @@ mod tests {
         let class_path = source_dir.join("Point.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("classdef-snapshot-bundle-new-instance-handle")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("classdef-snapshot-bundle-new-instance-handle")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -27900,8 +41381,9 @@ mod tests {
     ) {
         let source_dir =
             unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-instance-handle-source");
-        let consumer_dir =
-            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-instance-handle-consumer");
+        let consumer_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-packaged-instance-handle-consumer",
+        );
         let package_dir = source_dir.join("+pkg");
         fs::create_dir_all(&package_dir).expect("create package dir");
         let class_path = package_dir.join("Point.m");
@@ -27978,9 +41460,8 @@ mod tests {
         let class_path = source_dir.join("Point.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("classdef-snapshot-bundle-new-instance-call")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("classdef-snapshot-bundle-new-instance-call")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -28124,9 +41605,8 @@ mod tests {
         let helper_path = private_dir.join("offset.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path =
-            unique_temp_mat_path("classdef-snapshot-bundle-new-folder-method")
-                .with_extension("matws");
+        let snapshot_path = unique_temp_mat_path("classdef-snapshot-bundle-new-folder-method")
+            .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -28166,8 +41646,7 @@ mod tests {
         .expect("write snapshot new folder-method producer");
 
         let bundle = compile_bytecode_bundle(&producer_path);
-        fs::remove_dir_all(&source_dir)
-            .expect("remove snapshot new folder-method source tree");
+        fs::remove_dir_all(&source_dir).expect("remove snapshot new folder-method source tree");
         execute_script_bytecode_bundle(&bundle)
             .expect("execute snapshot new folder-method producer");
 
@@ -28203,12 +41682,10 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_allows_new_packaged_bundle_backed_folder_method_handles_and_calls_without_source_tree(
     ) {
-        let source_dir = unique_temp_script_dir(
-            "classdef-snapshot-bundle-new-packaged-folder-method-source",
-        );
-        let consumer_dir = unique_temp_script_dir(
-            "classdef-snapshot-bundle-new-packaged-folder-method-consumer",
-        );
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-folder-method-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-packaged-folder-method-consumer");
         let class_dir = source_dir.join("+pkg").join("@Counter");
         let private_dir = class_dir.join("private");
         fs::create_dir_all(&private_dir).expect("create package class private dir");
@@ -28217,10 +41694,9 @@ mod tests {
         let helper_path = private_dir.join("offset.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path = unique_temp_mat_path(
-            "classdef-snapshot-bundle-new-packaged-folder-method",
-        )
-        .with_extension("matws");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-packaged-folder-method")
+                .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -28297,9 +41773,8 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_allows_new_bundle_backed_unqualified_folder_method_handles_without_source_tree(
     ) {
-        let source_dir = unique_temp_script_dir(
-            "classdef-snapshot-bundle-new-unqualified-folder-handle-source",
-        );
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-unqualified-folder-handle-source");
         let consumer_dir = unique_temp_script_dir(
             "classdef-snapshot-bundle-new-unqualified-folder-handle-consumer",
         );
@@ -28311,10 +41786,9 @@ mod tests {
         let helper_path = private_dir.join("offset.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path = unique_temp_mat_path(
-            "classdef-snapshot-bundle-new-unqualified-folder-handle",
-        )
-        .with_extension("matws");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-unqualified-folder-handle")
+                .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -28401,10 +41875,9 @@ mod tests {
         let helper_path = private_dir.join("offset.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path = unique_temp_mat_path(
-            "classdef-snapshot-bundle-new-packaged-unqualified-folder-handle",
-        )
-        .with_extension("matws");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-packaged-unqualified-folder-handle")
+                .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -28479,9 +41952,8 @@ mod tests {
     ) {
         let source_dir =
             unique_temp_script_dir("classdef-snapshot-bundle-new-indexed-folder-handle-source");
-        let consumer_dir = unique_temp_script_dir(
-            "classdef-snapshot-bundle-new-indexed-folder-handle-consumer",
-        );
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-indexed-folder-handle-consumer");
         let class_dir = source_dir.join("+pkg").join("@Counter");
         let private_dir = class_dir.join("private");
         fs::create_dir_all(&private_dir).expect("create package class private dir");
@@ -28565,12 +42037,10 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_allows_new_packaged_bundle_backed_property_produced_folder_method_handles_without_source_tree(
     ) {
-        let source_dir = unique_temp_script_dir(
-            "classdef-snapshot-bundle-new-property-folder-handle-source",
-        );
-        let consumer_dir = unique_temp_script_dir(
-            "classdef-snapshot-bundle-new-property-folder-handle-consumer",
-        );
+        let source_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-property-folder-handle-source");
+        let consumer_dir =
+            unique_temp_script_dir("classdef-snapshot-bundle-new-property-folder-handle-consumer");
         let class_dir = source_dir.join("+pkg").join("@Counter");
         let private_dir = class_dir.join("private");
         let wrap_path = source_dir.join("Wrap.m");
@@ -28669,8 +42139,9 @@ mod tests {
     #[test]
     fn workspace_snapshot_load_allows_new_bundle_backed_indexed_folder_method_handles_without_source_tree(
     ) {
-        let source_dir =
-            unique_temp_script_dir("classdef-snapshot-bundle-new-unqualified-indexed-folder-handle-source");
+        let source_dir = unique_temp_script_dir(
+            "classdef-snapshot-bundle-new-unqualified-indexed-folder-handle-source",
+        );
         let consumer_dir = unique_temp_script_dir(
             "classdef-snapshot-bundle-new-unqualified-indexed-folder-handle-consumer",
         );
@@ -28682,10 +42153,9 @@ mod tests {
         let helper_path = private_dir.join("offset.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path = unique_temp_mat_path(
-            "classdef-snapshot-bundle-new-unqualified-indexed-folder-handle",
-        )
-        .with_extension("matws");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-unqualified-indexed-folder-handle")
+                .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -28773,10 +42243,9 @@ mod tests {
         let helper_path = private_dir.join("offset.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path = unique_temp_mat_path(
-            "classdef-snapshot-bundle-new-unqualified-property-folder-handle",
-        )
-        .with_extension("matws");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-new-unqualified-property-folder-handle")
+                .with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -28925,15 +42394,14 @@ mod tests {
     fn workspace_snapshot_load_preserves_packaged_bundle_backed_multi_output_static_handles_without_source_tree(
     ) {
         let source_dir = unique_temp_script_dir("classdef-snapshot-bundle-pkg-multiout-source");
-        let consumer_dir =
-            unique_temp_script_dir("classdef-snapshot-bundle-pkg-multiout-consumer");
+        let consumer_dir = unique_temp_script_dir("classdef-snapshot-bundle-pkg-multiout-consumer");
         let package_dir = source_dir.join("+pkg");
         fs::create_dir_all(&package_dir).expect("create package dir");
         let class_path = package_dir.join("Point.m");
         let producer_path = source_dir.join("producer.m");
         let consumer_path = consumer_dir.join("consumer.m");
-        let snapshot_path = unique_temp_mat_path("classdef-snapshot-bundle-pkg-multiout")
-            .with_extension("matws");
+        let snapshot_path =
+            unique_temp_mat_path("classdef-snapshot-bundle-pkg-multiout").with_extension("matws");
         let snapshot_text = snapshot_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &class_path,
@@ -28971,8 +42439,7 @@ mod tests {
         )
         .expect("write snapshot packaged multi-output consumer");
 
-        let expected =
-            "workspace\n  a = 7\n  b = 8\n  f = @pkg.Point.pair\n  out = [7, 8]\n";
+        let expected = "workspace\n  a = 7\n  b = 8\n  f = @pkg.Point.pair\n  out = [7, 8]\n";
         let interpreted = execute_path(&consumer_path, &[]);
         assert_eq!(render_execution_result(&interpreted), expected);
         assert_eq!(interpreted.bundle_modules().len(), 1);
@@ -29027,7 +42494,8 @@ mod tests {
 
         let bundle = compile_bytecode_bundle(&producer_path);
         fs::remove_dir_all(&source_dir).expect("remove snapshot inherited static source tree");
-        execute_script_bytecode_bundle(&bundle).expect("execute snapshot inherited static producer");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot inherited static producer");
 
         fs::write(
             &consumer_path,
@@ -29103,7 +42571,8 @@ mod tests {
 
         let bundle = compile_bytecode_bundle(&producer_path);
         fs::remove_dir_all(&source_dir).expect("remove snapshot inherited object source tree");
-        execute_script_bytecode_bundle(&bundle).expect("execute snapshot inherited object producer");
+        execute_script_bytecode_bundle(&bundle)
+            .expect("execute snapshot inherited object producer");
 
         fs::write(
             &consumer_path,
@@ -29203,7 +42672,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -29225,8 +42698,8 @@ mod tests {
         };
 
         fs::remove_dir_all(&temp_dir).expect("remove source tree");
-        let result = execute_script_bytecode_bundle(&bundle)
-            .expect("execute bundled load alias mat script");
+        let result =
+            execute_script_bytecode_bundle(&bundle).expect("execute bundled load alias mat script");
         assert_eq!(
             render_execution_result(&result),
             "workspace\n  f = @Counter.total\n  objs = [Counter with properties {value=1, child=Counter with properties {value=100, child=[]}}, Counter with properties {value=2, child=Counter with properties {value=200, child=[]}}]\n  out = 300\n  vals = [100, 200]\n"
@@ -29309,7 +42782,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -29403,7 +42880,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -29436,7 +42917,8 @@ mod tests {
     #[test]
     fn classdef_bundle_package_folder_inherited_bound_method_handles_survive_save_and_load_without_source_tree(
     ) {
-        let temp_dir = unique_temp_script_dir("classdef-package-folder-inherited-bound-handle-bundle");
+        let temp_dir =
+            unique_temp_script_dir("classdef-package-folder-inherited-bound-handle-bundle");
         let base_dir = temp_dir.join("+pkg").join("@Base");
         let private_dir = base_dir.join("private");
         let child_dir = temp_dir.join("+pkg").join("@Child");
@@ -29447,7 +42929,8 @@ mod tests {
         let bonus_path = private_dir.join("bonus.m");
         let child_path = child_dir.join("Child.m");
         let main_path = temp_dir.join("main.m");
-        let mat_path = unique_temp_mat_path("classdef-package-folder-inherited-bound-handle-bundle");
+        let mat_path =
+            unique_temp_mat_path("classdef-package-folder-inherited-bound-handle-bundle");
         let matlab_path = mat_path.to_string_lossy().replace('\\', "/");
         fs::write(
             &base_path,
@@ -29538,7 +43021,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -29654,7 +43141,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -29808,11 +43299,7 @@ mod tests {
         let class_path = temp_dir.join("Vault.m");
         let main_path = temp_dir.join("main.m");
         write_private_access_class(&class_path);
-        fs::write(
-            &main_path,
-            "out = Vault.code();\n",
-        )
-        .expect("write private static script");
+        fs::write(&main_path, "out = Vault.code();\n").expect("write private static script");
 
         let interpreted = execute_path_result(&main_path, &[])
             .expect_err("interpreted private static call should fail");
@@ -30158,7 +43645,11 @@ mod tests {
                 assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
                 let hir = lower_to_hir(&unit, &analysis);
                 let optimized = optimize_module(&hir);
-                (path, format!("dep{index}"), emit_bytecode(&optimized.module))
+                (
+                    path,
+                    format!("dep{index}"),
+                    emit_bytecode(&optimized.module),
+                )
             })
             .collect::<Vec<_>>();
         let path_to_module_id = compiled_dependencies
@@ -30596,11 +44087,8 @@ mod tests {
              end\n",
         )
         .expect("write other class");
-        fs::write(
-            &main_path,
-            "a = [Point(1), Other(2)];\n",
-        )
-        .expect("write mixed object literal script");
+        fs::write(&main_path, "a = [Point(1), Other(2)];\n")
+            .expect("write mixed object literal script");
 
         let source = execute_path_result(&main_path, &[])
             .expect_err("mixed-class object literal should fail in interpreter");
@@ -30801,12 +44289,20 @@ mod tests {
         );
 
         let bytecode = execute_script_source_bytecode(source);
-        let Value::Matrix(h) = bytecode.workspace.get("h").expect("bytecode horizontal result") else {
+        let Value::Matrix(h) = bytecode
+            .workspace
+            .get("h")
+            .expect("bytecode horizontal result")
+        else {
             panic!("expected matrix literal result");
         };
         assert_eq!(h.rows, 2);
         assert_eq!(h.cols, 4);
-        let Value::Matrix(v) = bytecode.workspace.get("v").expect("bytecode vertical result") else {
+        let Value::Matrix(v) = bytecode
+            .workspace
+            .get("v")
+            .expect("bytecode vertical result")
+        else {
             panic!("expected matrix literal result");
         };
         assert_eq!(v.rows, 4);
@@ -31078,7 +44574,10 @@ mod tests {
         let expected_handle =
             "workspace\n  arr = [Counter with properties {value=9}, Counter with properties {value=9}, Counter with properties {value=9}]\n  obj = Counter with properties {value=9}\n  out = [9, 9, 9, 9]\n";
         let interpreted_handle = execute_path(&handle_main_path, &[]);
-        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        assert_eq!(
+            render_execution_result(&interpreted_handle),
+            expected_handle
+        );
         let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
         assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
 
@@ -31133,7 +44632,10 @@ mod tests {
         let expected_handle =
             "workspace\n  arr = [Counter with properties {value=9}, Counter with properties {value=9}, Counter with properties {value=9}]\n  obj = Counter with properties {value=9}\n  out = [9, 9, 9, 9]\n";
         let interpreted_handle = execute_path(&handle_main_path, &[]);
-        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        assert_eq!(
+            render_execution_result(&interpreted_handle),
+            expected_handle
+        );
         let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
         assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
 
@@ -31200,7 +44702,10 @@ mod tests {
         let expected_handle =
             "workspace\n  c = Counter with properties {value=22}\n  f = Counter with properties {value=22}\n  i = Counter with properties {value=22}\n  obj = Counter with properties {value=22}\n  out = [22, 22, 22, 22, 22, 22]\n  p = Counter with properties {value=22}\n  r = [Counter with properties {value=22}]\n";
         let interpreted_handle = execute_path(&handle_main_path, &[]);
-        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        assert_eq!(
+            render_execution_result(&interpreted_handle),
+            expected_handle
+        );
         let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
         assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
 
@@ -31258,7 +44763,10 @@ mod tests {
         let expected_handle =
             "workspace\n  c = Counter with properties {value=12}\n  obj = Counter with properties {value=12}\n  out = [12, 12, 12]\n  p = Counter with properties {value=12}\n";
         let interpreted_handle = execute_path(&handle_main_path, &[]);
-        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        assert_eq!(
+            render_execution_result(&interpreted_handle),
+            expected_handle
+        );
         let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
         assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
 
@@ -31317,7 +44825,10 @@ mod tests {
         let expected_handle =
             "workspace\n  obj = Counter with properties {value=9}\n  out = [9, 9]\n  t = Counter with properties {value=9}\n";
         let interpreted_handle = execute_path(&handle_main_path, &[]);
-        assert_eq!(render_execution_result(&interpreted_handle), expected_handle);
+        assert_eq!(
+            render_execution_result(&interpreted_handle),
+            expected_handle
+        );
         let bytecode_handle = execute_path_bytecode(&handle_main_path, &[]);
         assert_eq!(render_execution_result(&bytecode_handle), expected_handle);
 
@@ -31734,8 +45245,7 @@ mod tests {
 
     #[test]
     fn classdef_handle_object_arrays_support_bulk_assignment_on_handle_valued_property_reads() {
-        let temp_dir =
-            unique_temp_script_dir("classdef-handle-array-handle-property-bulk-assign");
+        let temp_dir = unique_temp_script_dir("classdef-handle-array-handle-property-bulk-assign");
         let counter_path = temp_dir.join("Counter.m");
         let wrap_path = temp_dir.join("Wrap.m");
         let main_path = temp_dir.join("main.m");
@@ -31869,7 +45379,8 @@ mod tests {
 
     #[test]
     fn classdef_object_arrays_support_bulk_assignment_on_2d_matrix_valued_property_reads() {
-        let temp_dir = unique_temp_script_dir("classdef-object-array-matrix-property-bulk-assign-2d");
+        let temp_dir =
+            unique_temp_script_dir("classdef-object-array-matrix-property-bulk-assign-2d");
         let class_path = temp_dir.join("Wrap.m");
         let main_path = temp_dir.join("main.m");
         fs::write(
@@ -32703,8 +46214,7 @@ mod tests {
 
     #[test]
     fn classdef_property_produced_full_2d_bound_handles_roundtrip_preserve_receiver_layout() {
-        let temp_dir =
-            unique_temp_script_dir("classdef-property-produced-full-2d-bound-roundtrip");
+        let temp_dir = unique_temp_script_dir("classdef-property-produced-full-2d-bound-roundtrip");
         let point_path = temp_dir.join("Point.m");
         let wrap_path = temp_dir.join("Wrap.m");
         let main_path = temp_dir.join("main.m");
@@ -32897,9 +46407,9 @@ mod tests {
     }
 
     #[test]
-    fn classdef_property_produced_logical_mask_selectors_support_method_dispatch_and_bound_handles() {
-        let temp_dir =
-            unique_temp_script_dir("classdef-property-produced-logical-mask-method");
+    fn classdef_property_produced_logical_mask_selectors_support_method_dispatch_and_bound_handles()
+    {
+        let temp_dir = unique_temp_script_dir("classdef-property-produced-logical-mask-method");
         let class_path = temp_dir.join("Point.m");
         let main_path = temp_dir.join("main.m");
         fs::write(
@@ -33070,8 +46580,8 @@ mod tests {
 
         let bundle = compile_bytecode_bundle(&main_path);
         fs::remove_dir_all(&temp_dir).expect("remove bundled end-selector source tree");
-        let result = execute_script_bytecode_bundle(&bundle)
-            .expect("execute bundled end-selector script");
+        let result =
+            execute_script_bytecode_bundle(&bundle).expect("execute bundled end-selector script");
         assert_eq!(
             render_execution_result(&result),
             "workspace\n  direct = 40\n  f = @Point.total\n  objs = [Point with properties {x=1, child=Point with properties {x=10, child=[]}}, Point with properties {x=2, child=Point with properties {x=20, child=[]}} ; Point with properties {x=3, child=Point with properties {x=30, child=[]}}, Point with properties {x=4, child=Point with properties {x=40, child=[]}}]\n  sel = Point with properties {x=40, child=[]}\n  via = 40\n"
@@ -33287,8 +46797,7 @@ mod tests {
 
     #[test]
     fn classdef_object_array_scalar_property_aggregate_shape_changes_are_rejected() {
-        let temp_dir =
-            unique_temp_script_dir("classdef-object-array-scalar-property-shape-error");
+        let temp_dir = unique_temp_script_dir("classdef-object-array-scalar-property-shape-error");
         let class_path = temp_dir.join("Point.m");
         let handle_path = temp_dir.join("Counter.m");
         let value_main_path = temp_dir.join("value_main.m");
@@ -33836,11 +47345,7 @@ mod tests {
              end\n",
         )
         .expect("write child static class");
-        fs::write(
-            &main_path,
-            "out = Child.origin();\n",
-        )
-        .expect("write inherit static script");
+        fs::write(&main_path, "out = Child.origin();\n").expect("write inherit static script");
 
         let expected = "workspace\n  out = [1, 2]\n";
         let interpreted = execute_path(&main_path, &[]);
@@ -33988,7 +47493,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -34009,8 +47518,8 @@ mod tests {
         };
 
         fs::remove_dir_all(&temp_dir).expect("remove source tree");
-        let result = execute_script_bytecode_bundle(&bundle)
-            .expect("execute bundled inheritance script");
+        let result =
+            execute_script_bytecode_bundle(&bundle).expect("execute bundled inheritance script");
         assert_eq!(
             render_execution_result(&result),
             "workspace\n  c = Child with properties {x=1, y=4}\n  ok = true\n  origin = [9, 9]\n  total = 3\n"
@@ -34107,7 +47616,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -34137,7 +47650,8 @@ mod tests {
     }
 
     #[test]
-    fn classdef_bundle_package_folder_inheritance_supports_external_parent_methods_without_source_tree() {
+    fn classdef_bundle_package_folder_inheritance_supports_external_parent_methods_without_source_tree(
+    ) {
         let temp_dir = unique_temp_script_dir("classdef-package-folder-inherit-bundle");
         let base_dir = temp_dir.join("+pkg").join("@Base");
         let base_private_dir = base_dir.join("private");
@@ -34236,7 +47750,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -34356,7 +47874,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -34377,8 +47899,8 @@ mod tests {
         };
 
         fs::remove_dir_all(&temp_dir).expect("remove source tree");
-        let result = execute_script_bytecode_bundle(&bundle)
-            .expect("execute bundled super ctor script");
+        let result =
+            execute_script_bytecode_bundle(&bundle).expect("execute bundled super ctor script");
         assert_eq!(
             render_execution_result(&result),
             "workspace\n  c = pkg.Child with properties {x=7}\n  f = @pkg.Child.total\n  out = [7, 8]\n"
@@ -34463,7 +47985,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -34588,7 +48114,11 @@ mod tests {
                     pending.push(dependency);
                 }
             }
-            compiled_dependencies.push((next_path, format!("dep{}", compiled_dependencies.len()), bytecode));
+            compiled_dependencies.push((
+                next_path,
+                format!("dep{}", compiled_dependencies.len()),
+                bytecode,
+            ));
         }
         let path_to_module_id = compiled_dependencies
             .iter()
@@ -34640,4 +48170,3 @@ mod tests {
 pub fn summary() -> &'static str {
     "Owns interpreter, bytecode execution, and future JIT/AOT execution orchestration."
 }
-

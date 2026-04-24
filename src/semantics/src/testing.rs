@@ -74,7 +74,8 @@ pub fn render_analysis(result: &AnalysisResult) -> String {
             if !class.properties.is_empty() {
                 out.push_str(&format!(
                     "    properties [{}]\n",
-                    class.properties
+                    class
+                        .properties
                         .iter()
                         .map(|property| {
                             if property.default.is_some() {
@@ -120,7 +121,8 @@ pub fn render_analysis(result: &AnalysisResult) -> String {
             if !class.external_methods.is_empty() {
                 out.push_str(&format!(
                     "    external_methods [{}]\n",
-                    class.external_methods
+                    class
+                        .external_methods
                         .iter()
                         .map(|method| format!("{}={}", method.name, method.path.display()))
                         .collect::<Vec<_>>()

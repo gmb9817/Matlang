@@ -112,16 +112,12 @@ fn sample_workspace() -> Workspace {
                 class_name: "Vault".to_string(),
                 package: Some("pkg".to_string()),
                 superclass_name: Some("pkg.Base".to_string()),
-                ancestor_class_names: std::collections::BTreeSet::from([
-                    "pkg.Base".to_string(),
-                ]),
+                ancestor_class_names: std::collections::BTreeSet::from(["pkg.Base".to_string()]),
                 storage_kind: ObjectStorageKind::Value,
                 source_path: Some("+pkg/Vault.m".into()),
                 module_target: Some(ObjectMethodTarget::Path("+pkg/Vault.m".into())),
                 property_order: vec!["secret".to_string()],
-                private_properties: std::collections::BTreeSet::from([
-                    "secret".to_string(),
-                ]),
+                private_properties: std::collections::BTreeSet::from(["secret".to_string()]),
                 private_property_owners: std::collections::BTreeMap::from([(
                     "secret".to_string(),
                     "pkg.Vault".to_string(),
@@ -130,24 +126,19 @@ fn sample_workspace() -> Workspace {
                     "reveal".to_string(),
                     "hidden".to_string(),
                 ]),
-                private_inline_methods: std::collections::BTreeSet::from([
-                    "hidden".to_string(),
-                ]),
+                private_inline_methods: std::collections::BTreeSet::from(["hidden".to_string()]),
                 private_instance_method_owners: std::collections::BTreeMap::from([(
                     "hidden".to_string(),
                     "pkg.Vault".to_string(),
                 )]),
                 private_static_inline_methods: std::collections::BTreeSet::from([
-                    "code".to_string(),
+                    "code".to_string()
                 ]),
                 external_methods: std::collections::BTreeMap::new(),
                 constructor: Some("Vault".to_string()),
             },
             StructValue::with_field_order(
-                std::collections::BTreeMap::from([(
-                    "secret".to_string(),
-                    Value::Scalar(41.0),
-                )]),
+                std::collections::BTreeMap::from([("secret".to_string(), Value::Scalar(41.0))]),
                 vec!["secret".to_string()],
             ),
         )),
@@ -190,10 +181,7 @@ fn handle_alias_workspace() -> Workspace {
             constructor: Some("Counter".to_string()),
         },
         StructValue::with_field_order(
-            std::collections::BTreeMap::from([(
-                "value".to_string(),
-                Value::Scalar(5.0),
-            )]),
+            std::collections::BTreeMap::from([("value".to_string(), Value::Scalar(5.0))]),
             vec!["value".to_string()],
         ),
     ));
@@ -296,11 +284,11 @@ fn assert_property_produced_handle_bound_aliasing(decoded: &Workspace) {
         let Value::Object(parent_object) = parent else {
             panic!("expected parent object");
         };
-        let child = parent_object.property_value("child").expect("child property");
-        let (
-            Value::Object(child_object),
-            Value::Object(receiver_object),
-        ) = (&child, receiver_value)
+        let child = parent_object
+            .property_value("child")
+            .expect("child property");
+        let (Value::Object(child_object), Value::Object(receiver_object)) =
+            (&child, receiver_value)
         else {
             panic!("expected handle child objects");
         };
@@ -356,8 +344,7 @@ fn workspace_snapshot_roundtrips_embedded_bundle_module_records() {
     }];
     let encoded = encode_workspace_snapshot_with_modules(&workspace, &bundle_modules)
         .expect("encode with modules");
-    let decoded =
-        decode_workspace_snapshot_with_modules(&encoded).expect("decode with modules");
+    let decoded = decode_workspace_snapshot_with_modules(&encoded).expect("decode with modules");
     assert_eq!(decoded.workspace, workspace);
     assert_eq!(decoded.bundle_modules, bundle_modules);
 }
@@ -423,16 +410,12 @@ fn sample_mat_workspace() -> Workspace {
             class_name: "Point".to_string(),
             package: Some("pkg".to_string()),
             superclass_name: Some("pkg.Base".to_string()),
-            ancestor_class_names: std::collections::BTreeSet::from([
-                "pkg.Base".to_string(),
-            ]),
+            ancestor_class_names: std::collections::BTreeSet::from(["pkg.Base".to_string()]),
             storage_kind: ObjectStorageKind::Value,
             source_path: Some("+pkg/Point.m".into()),
             module_target: Some(ObjectMethodTarget::Path("+pkg/Point.m".into())),
             property_order: vec!["x".to_string()],
-            private_properties: std::collections::BTreeSet::from([
-                "x".to_string(),
-            ]),
+            private_properties: std::collections::BTreeSet::from(["x".to_string()]),
             private_property_owners: std::collections::BTreeMap::from([(
                 "x".to_string(),
                 "pkg.Point".to_string(),
@@ -441,24 +424,17 @@ fn sample_mat_workspace() -> Workspace {
                 "value".to_string(),
                 "hidden".to_string(),
             ]),
-            private_inline_methods: std::collections::BTreeSet::from([
-                "hidden".to_string(),
-            ]),
+            private_inline_methods: std::collections::BTreeSet::from(["hidden".to_string()]),
             private_instance_method_owners: std::collections::BTreeMap::from([(
                 "hidden".to_string(),
                 "pkg.Point".to_string(),
             )]),
-            private_static_inline_methods: std::collections::BTreeSet::from([
-                "code".to_string(),
-            ]),
+            private_static_inline_methods: std::collections::BTreeSet::from(["code".to_string()]),
             external_methods: std::collections::BTreeMap::new(),
             constructor: Some("Point".to_string()),
         },
         StructValue::with_field_order(
-            std::collections::BTreeMap::from([(
-                "x".to_string(),
-                Value::Scalar(3.0),
-            )]),
+            std::collections::BTreeMap::from([("x".to_string(), Value::Scalar(3.0))]),
             vec!["x".to_string()],
         ),
     ));
@@ -523,15 +499,13 @@ fn sample_mat_workspace() -> Workspace {
                             package: Some("pkg".to_string()),
                             superclass_name: Some("pkg.Base".to_string()),
                             ancestor_class_names: std::collections::BTreeSet::from([
-                                "pkg.Base".to_string(),
+                                "pkg.Base".to_string()
                             ]),
                             storage_kind: ObjectStorageKind::Value,
                             source_path: Some("+pkg/Point.m".into()),
                             module_target: Some(ObjectMethodTarget::Path("+pkg/Point.m".into())),
                             property_order: vec!["x".to_string()],
-                            private_properties: std::collections::BTreeSet::from([
-                                "x".to_string(),
-                            ]),
+                            private_properties: std::collections::BTreeSet::from(["x".to_string()]),
                             private_property_owners: std::collections::BTreeMap::from([(
                                 "x".to_string(),
                                 "pkg.Point".to_string(),
@@ -541,7 +515,7 @@ fn sample_mat_workspace() -> Workspace {
                                 "hidden".to_string(),
                             ]),
                             private_inline_methods: std::collections::BTreeSet::from([
-                                "hidden".to_string(),
+                                "hidden".to_string()
                             ]),
                             private_instance_method_owners: std::collections::BTreeMap::from([(
                                 "hidden".to_string(),
@@ -567,15 +541,13 @@ fn sample_mat_workspace() -> Workspace {
                             package: Some("pkg".to_string()),
                             superclass_name: Some("pkg.Base".to_string()),
                             ancestor_class_names: std::collections::BTreeSet::from([
-                                "pkg.Base".to_string(),
+                                "pkg.Base".to_string()
                             ]),
                             storage_kind: ObjectStorageKind::Value,
                             source_path: Some("+pkg/Point.m".into()),
                             module_target: Some(ObjectMethodTarget::Path("+pkg/Point.m".into())),
                             property_order: vec!["x".to_string()],
-                            private_properties: std::collections::BTreeSet::from([
-                                "x".to_string(),
-                            ]),
+                            private_properties: std::collections::BTreeSet::from(["x".to_string()]),
                             private_property_owners: std::collections::BTreeMap::from([(
                                 "x".to_string(),
                                 "pkg.Point".to_string(),
@@ -585,7 +557,7 @@ fn sample_mat_workspace() -> Workspace {
                                 "hidden".to_string(),
                             ]),
                             private_inline_methods: std::collections::BTreeSet::from([
-                                "hidden".to_string(),
+                                "hidden".to_string()
                             ]),
                             private_instance_method_owners: std::collections::BTreeMap::from([(
                                 "hidden".to_string(),
@@ -629,7 +601,11 @@ fn mat_file_roundtrips_supported_values() {
     let Value::Matrix(decoded_array) = decoded.get("sa").expect("decoded struct array") else {
         panic!("expected struct array");
     };
-    let Value::Struct(first) = decoded_array.elements().first().expect("first struct element") else {
+    let Value::Struct(first) = decoded_array
+        .elements()
+        .first()
+        .expect("first struct element")
+    else {
         panic!("expected struct array element");
     };
     assert_eq!(
@@ -779,4 +755,3 @@ fn execution_result_roundtrips_through_snapshot() {
         render_workspace(&result.workspace)
     );
 }
-

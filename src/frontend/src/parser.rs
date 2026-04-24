@@ -2,8 +2,8 @@
 
 use crate::{
     ast::{
-        AssignmentTarget, BinaryOp, ClassDef, ClassMethodBlock, ClassPropertyBlock,
-        ClassMemberAccess, ClassPropertyDef, CompilationUnit, CompilationUnitKind,
+        AssignmentTarget, BinaryOp, ClassDef, ClassMemberAccess, ClassMethodBlock,
+        ClassPropertyBlock, ClassPropertyDef, CompilationUnit, CompilationUnitKind,
         ConditionalBranch, Expression, ExpressionKind, FunctionDef, FunctionHandleTarget,
         Identifier, IndexArgument, Item, QualifiedName, Statement, StatementKind, SwitchCase,
         UnaryOp,
@@ -273,11 +273,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_unsupported_class_block(
-        &mut self,
-        block_name: &str,
-        code: &'static str,
-    ) {
+    fn parse_unsupported_class_block(&mut self, block_name: &str, code: &'static str) {
         let start = self.current().span;
         self.diagnostics.push(Diagnostic::error(
             code,
@@ -582,11 +578,7 @@ impl<'a> Parser<'a> {
             self.skip_separators();
         }
 
-        let end = self.expect_keyword(
-            Keyword::End,
-            "PAR119",
-            "expected `end` after methods block",
-        );
+        let end = self.expect_keyword(Keyword::End, "PAR119", "expected `end` after methods block");
         ClassMethodBlock {
             access,
             is_static,
@@ -662,7 +654,10 @@ impl<'a> Parser<'a> {
             "expected `)` after properties block attributes",
         );
         if !saw_any {
-            self.error_here("PAR121", "empty properties attribute lists are not supported");
+            self.error_here(
+                "PAR121",
+                "empty properties attribute lists are not supported",
+            );
         }
         access
     }
@@ -1300,7 +1295,9 @@ impl<'a> Parser<'a> {
 
     fn parse_primary_expression(&mut self) -> Expression {
         match &self.current().kind {
-            TokenKind::Identifier => {
+            TokenKind::Identifier
+            | TokenKind::Keyword(Keyword::Methods)
+            | TokenKind::Keyword(Keyword::Properties) => {
                 let identifier = self.parse_identifier();
                 Expression {
                     span: identifier.span,
@@ -1417,18 +1414,19 @@ impl<'a> Parser<'a> {
             "PAR023",
             "expected function name or receiver expression after `@`",
         );
-        let expression = self.parse_function_handle_target_expression(
-            Expression {
-                span: identifier.span,
-                kind: ExpressionKind::Identifier(identifier),
-            },
-        );
+        let expression = self.parse_function_handle_target_expression(Expression {
+            span: identifier.span,
+            kind: ExpressionKind::Identifier(identifier),
+        });
         expression_as_qualified_name(&expression)
             .map(FunctionHandleTarget::Name)
             .unwrap_or_else(|| FunctionHandleTarget::Expression(Box::new(expression)))
     }
 
-    fn parse_function_handle_target_expression(&mut self, mut expression: Expression) -> Expression {
+    fn parse_function_handle_target_expression(
+        &mut self,
+        mut expression: Expression,
+    ) -> Expression {
         loop {
             if self.at_delimiter(DelimiterKind::LeftParen)
                 && self.function_handle_index_continues_receiver_chain(
@@ -2133,7 +2131,7 @@ impl<'a> Parser<'a> {
     }
 
     fn command_target_end_index(&self) -> Option<usize> {
-        if !self.at_identifier() {
+        if !self.at_callable_identifier() {
             return None;
         }
 
@@ -2171,6 +2169,10 @@ impl<'a> Parser<'a> {
             return true;
         }
 
+        if matches!(kind, TokenKind::Operator(OperatorKind::Dot)) {
+            return true;
+        }
+
         matches!(
             kind,
             TokenKind::Operator(
@@ -2180,7 +2182,6 @@ impl<'a> Parser<'a> {
                     | OperatorKind::Power
                     | OperatorKind::ElementwiseMultiply
                     | OperatorKind::ElementwisePower
-                    | OperatorKind::Dot
                     | OperatorKind::RightDivide
                     | OperatorKind::LeftDivide
                     | OperatorKind::ElementwiseRightDivide
@@ -2331,6 +2332,13 @@ impl<'a> Parser<'a> {
 
     fn at_identifier(&self) -> bool {
         matches!(self.current().kind, TokenKind::Identifier)
+    }
+
+    fn at_callable_identifier(&self) -> bool {
+        matches!(
+            self.current().kind,
+            TokenKind::Identifier | TokenKind::Keyword(Keyword::Methods | Keyword::Properties)
+        )
     }
 
     fn current_identifier_is(&self, expected: &str) -> bool {
@@ -2489,6 +2497,8 @@ fn token_can_start_expression_kind(kind: &TokenKind) -> bool {
     matches!(
         kind,
         TokenKind::Identifier
+            | TokenKind::Keyword(Keyword::Methods)
+            | TokenKind::Keyword(Keyword::Properties)
             | TokenKind::NumberLiteral(_)
             | TokenKind::CharLiteral
             | TokenKind::StringLiteral
@@ -2579,7 +2589,11 @@ fn function_handle_target_span(target: &FunctionHandleTarget) -> SourceSpan {
 }
 
 impl Parser<'_> {
-    fn function_handle_index_continues_receiver_chain(&self, open: DelimiterKind, close: DelimiterKind) -> bool {
+    fn function_handle_index_continues_receiver_chain(
+        &self,
+        open: DelimiterKind,
+        close: DelimiterKind,
+    ) -> bool {
         if !self.at_delimiter(open) {
             return false;
         }
@@ -2701,8 +2715,7 @@ mod tests {
 
     #[test]
     fn distinguishes_bracketed_single_target_assignment_from_plain_assignment() {
-        let bracketed =
-            parse_source("[s.field] = [1 2]\n", SourceFileId(1), ParseMode::Script);
+        let bracketed = parse_source("[s.field] = [1 2]\n", SourceFileId(1), ParseMode::Script);
         assert!(!bracketed.has_errors(), "{:?}", bracketed.diagnostics);
         let bracketed_unit = bracketed.unit.expect("compilation unit");
         let Item::Statement(bracketed_statement) = &bracketed_unit.items[0] else {
@@ -2895,7 +2908,8 @@ mod tests {
         let StatementKind::Assignment { value, .. } = &statement.kind else {
             panic!("expected assignment");
         };
-        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Expression(target)) = &value.kind else {
+        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Expression(target)) = &value.kind
+        else {
             panic!("expected expression-backed function handle");
         };
         let ExpressionKind::FieldAccess { target, field } = &target.kind else {
@@ -2926,7 +2940,8 @@ mod tests {
         let StatementKind::Assignment { value, .. } = &statement.kind else {
             panic!("expected assignment");
         };
-        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Expression(target)) = &value.kind else {
+        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Expression(target)) = &value.kind
+        else {
             panic!("expected expression-backed function handle");
         };
         let ExpressionKind::FieldAccess { target, field } = &target.kind else {
@@ -2935,10 +2950,18 @@ mod tests {
         let ExpressionKind::ParenApply { target, indices } = &target.kind else {
             panic!("expected indexed receiver after method result");
         };
-        let ExpressionKind::ParenApply { target, indices: first_indices } = &target.kind else {
+        let ExpressionKind::ParenApply {
+            target,
+            indices: first_indices,
+        } = &target.kind
+        else {
             panic!("expected method call receiver");
         };
-        let ExpressionKind::FieldAccess { target, field: method } = &target.kind else {
+        let ExpressionKind::FieldAccess {
+            target,
+            field: method,
+        } = &target.kind
+        else {
             panic!("expected method field access");
         };
         let ExpressionKind::Identifier(root) = &target.kind else {
@@ -3176,6 +3199,69 @@ mod tests {
             &first.kind,
             ExpressionKind::CharLiteral(text) if text == "'alpha'"
         ));
+    }
+
+    #[test]
+    fn parses_methods_and_properties_keywords_as_callable_identifiers_in_expressions() {
+        let source = "x = methods(obj);\ny = properties(obj);\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("compilation unit");
+
+        let expected = ["methods", "properties"];
+        for (item, expected_name) in unit.items.iter().zip(expected) {
+            let Item::Statement(statement) = item else {
+                panic!("expected statement");
+            };
+            let StatementKind::Assignment { value, .. } = &statement.kind else {
+                panic!("expected assignment");
+            };
+            let ExpressionKind::ParenApply { target, .. } = &value.kind else {
+                panic!("expected call expression");
+            };
+            let ExpressionKind::Identifier(identifier) = &target.kind else {
+                panic!("expected identifier target");
+            };
+            assert_eq!(identifier.name, expected_name);
+        }
+    }
+
+    #[test]
+    fn parses_methods_and_properties_keywords_in_command_form() {
+        let source = "methods Child\nx = properties Child\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("compilation unit");
+
+        let Item::Statement(first) = &unit.items[0] else {
+            panic!("expected first statement");
+        };
+        let StatementKind::Expression(expression) = &first.kind else {
+            panic!("expected command-form expression");
+        };
+        let ExpressionKind::ParenApply { target, indices } = &expression.kind else {
+            panic!("expected command-form apply");
+        };
+        let ExpressionKind::Identifier(identifier) = &target.kind else {
+            panic!("expected identifier target");
+        };
+        assert_eq!(identifier.name, "methods");
+        assert_eq!(indices.len(), 1);
+
+        let Item::Statement(second) = &unit.items[1] else {
+            panic!("expected second statement");
+        };
+        let StatementKind::Assignment { value, .. } = &second.kind else {
+            panic!("expected assignment");
+        };
+        let ExpressionKind::ParenApply { target, indices } = &value.kind else {
+            panic!("expected command-form rhs");
+        };
+        let ExpressionKind::Identifier(identifier) = &target.kind else {
+            panic!("expected identifier target");
+        };
+        assert_eq!(identifier.name, "properties");
+        assert_eq!(indices.len(), 1);
     }
 
     #[test]
@@ -3771,6 +3857,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_command_form_standalone_dot_argument() {
+        let source = "x = what .\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Statement(statement) = &unit.items[0] else {
+            panic!("expected statement");
+        };
+        let StatementKind::Assignment { value, .. } = &statement.kind else {
+            panic!("expected assignment");
+        };
+        let ExpressionKind::ParenApply { target, indices } = &value.kind else {
+            panic!("expected command-form rhs");
+        };
+        let ExpressionKind::Identifier(identifier) = &target.kind else {
+            panic!("expected identifier target");
+        };
+        assert_eq!(identifier.name, "what");
+        assert_eq!(indices.len(), 1);
+        let IndexArgument::Expression(argument) = &indices[0] else {
+            panic!("expected command argument");
+        };
+        assert!(matches!(
+            &argument.kind,
+            ExpressionKind::CharLiteral(text) if text == "'.'"
+        ));
+    }
+
+    #[test]
     fn parses_standalone_quoted_command_arguments_as_raw_text() {
         let source = "x = cmdpkg.helper \"two words\"\ny = cmdpkg.helper \"two words\" \"three words\"\nz = cmdpkg.helper 'two words'\na = cmdpkg.helper \"a,b\" more\nb = cmdpkg.helper \"a;b\" tail\nc = cmdpkg.helper key=\"a\"\"b\"\n";
         let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
@@ -4091,9 +4206,9 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.message.clone())
             .collect::<Vec<_>>();
-        assert!(messages.iter().any(|message| {
-            message.contains("`classdef` attribute `Sealed` is not supported")
-        }));
+        assert!(messages
+            .iter()
+            .any(|message| { message.contains("`classdef` attribute `Sealed` is not supported") }));
         assert!(messages.iter().any(|message| {
             message.contains("`classdef` attribute `ConstructOnLoad` is not supported")
         }));
@@ -4125,10 +4240,16 @@ mod tests {
             panic!("expected class item");
         };
         assert_eq!(class_def.property_blocks.len(), 1);
-        assert_eq!(class_def.property_blocks[0].access, ClassMemberAccess::Private);
+        assert_eq!(
+            class_def.property_blocks[0].access,
+            ClassMemberAccess::Private
+        );
         assert_eq!(class_def.method_blocks.len(), 1);
         assert!(class_def.method_blocks[0].is_static);
-        assert_eq!(class_def.method_blocks[0].access, ClassMemberAccess::Private);
+        assert_eq!(
+            class_def.method_blocks[0].access,
+            ClassMemberAccess::Private
+        );
     }
 
     #[test]
@@ -4157,9 +4278,15 @@ mod tests {
             panic!("expected class item");
         };
         assert_eq!(class_def.property_blocks.len(), 1);
-        assert_eq!(class_def.property_blocks[0].access, ClassMemberAccess::Private);
+        assert_eq!(
+            class_def.property_blocks[0].access,
+            ClassMemberAccess::Private
+        );
         assert_eq!(class_def.property_blocks[0].properties.len(), 1);
-        assert_eq!(class_def.property_blocks[0].properties[0].name.name, "value");
+        assert_eq!(
+            class_def.property_blocks[0].properties[0].name.name,
+            "value"
+        );
     }
 
     #[test]
@@ -4191,7 +4318,10 @@ mod tests {
         };
         assert_eq!(class_def.method_blocks.len(), 1);
         assert!(class_def.method_blocks[0].is_static);
-        assert_eq!(class_def.method_blocks[0].access, ClassMemberAccess::Private);
+        assert_eq!(
+            class_def.method_blocks[0].access,
+            ClassMemberAccess::Private
+        );
         assert_eq!(class_def.method_blocks[0].methods.len(), 1);
         assert_eq!(class_def.method_blocks[0].methods[0].name.name, "demo");
     }
@@ -4384,12 +4514,9 @@ mod tests {
                       end\n";
         let parsed = parse_source(source, SourceFileId(1), ParseMode::AutoDetect);
         assert!(parsed.has_errors(), "expected parse diagnostics");
-        assert!(parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic
-                .message
-                .contains("`Static=true` is the only supported explicit Static form")));
+        assert!(parsed.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("`Static=true` is the only supported explicit Static form")));
 
         let unit = parsed.unit.expect("compilation unit");
         let Item::Class(class_def) = &unit.items[0] else {
@@ -4397,7 +4524,10 @@ mod tests {
         };
         assert_eq!(class_def.method_blocks.len(), 1);
         assert!(!class_def.method_blocks[0].is_static);
-        assert_eq!(class_def.method_blocks[0].access, ClassMemberAccess::Private);
+        assert_eq!(
+            class_def.method_blocks[0].access,
+            ClassMemberAccess::Private
+        );
         assert_eq!(class_def.method_blocks[0].methods.len(), 1);
         assert_eq!(class_def.method_blocks[0].methods[0].name.name, "demo");
     }

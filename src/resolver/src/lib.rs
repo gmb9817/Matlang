@@ -242,11 +242,7 @@ pub fn resolve_all_callables(name: &str, context: &ResolverContext) -> Vec<Resol
 
     for root in context.effective_search_roots() {
         if let Some(class_def) = resolve_folder_class_definition(name, &root, context) {
-            push_unique_callable_match(
-                &mut matches,
-                &mut seen,
-                ResolvedCallable::Class(class_def),
-            );
+            push_unique_callable_match(&mut matches, &mut seen, ResolvedCallable::Class(class_def));
         }
 
         if let Some(package) = resolve_package_function(name, &root) {
@@ -258,16 +254,15 @@ pub fn resolve_all_callables(name: &str, context: &ResolverContext) -> Vec<Resol
         }
 
         if let Some(class_def) = resolve_static_class_reference(name, &root, context) {
-            push_unique_callable_match(
-                &mut matches,
-                &mut seen,
-                ResolvedCallable::Class(class_def),
-            );
+            push_unique_callable_match(&mut matches, &mut seen, ResolvedCallable::Class(class_def));
         }
 
         let candidate = root.join(format!("{name}.m"));
         if candidate.is_file() && !m_file_looks_like_classdef(&candidate) {
-            let kind = if context.source_dir().is_some_and(|dir| dir == root.as_path()) {
+            let kind = if context
+                .source_dir()
+                .is_some_and(|dir| dir == root.as_path())
+            {
                 ResolvedFunctionKind::CurrentDirectory
             } else {
                 ResolvedFunctionKind::SearchPath
@@ -286,11 +281,7 @@ pub fn resolve_all_callables(name: &str, context: &ResolverContext) -> Vec<Resol
         }
 
         if let Some(class_def) = resolve_plain_class_definition(name, &root, context) {
-            push_unique_callable_match(
-                &mut matches,
-                &mut seen,
-                ResolvedCallable::Class(class_def),
-            );
+            push_unique_callable_match(&mut matches, &mut seen, ResolvedCallable::Class(class_def));
         }
     }
 
@@ -338,7 +329,10 @@ pub fn resolve_class_definition(name: &str, context: &ResolverContext) -> Option
     None
 }
 
-pub fn resolve_class_folder_method(class_definition_path: &Path, method_name: &str) -> Option<PathBuf> {
+pub fn resolve_class_folder_method(
+    class_definition_path: &Path,
+    method_name: &str,
+) -> Option<PathBuf> {
     let class_dir = class_definition_path.parent()?;
     let folder_name = class_dir.file_name()?.to_str()?;
     if !folder_name.starts_with('@') {
@@ -383,10 +377,7 @@ fn resolve_plain_class_definition(
 
     Some(ResolvedClass {
         name: name.to_string(),
-        kind: if context
-            .source_dir()
-            .is_some_and(|dir| dir == root)
-        {
+        kind: if context.source_dir().is_some_and(|dir| dir == root) {
             ResolvedClassKind::CurrentDirectory
         } else {
             ResolvedClassKind::SearchPath
@@ -413,10 +404,7 @@ fn resolve_folder_class_definition(
 
     Some(ResolvedClass {
         name: name.to_string(),
-        kind: if context
-            .source_dir()
-            .is_some_and(|dir| dir == root)
-        {
+        kind: if context.source_dir().is_some_and(|dir| dir == root) {
             ResolvedClassKind::FolderCurrentDirectory
         } else {
             ResolvedClassKind::FolderSearchPath
@@ -468,14 +456,13 @@ fn resolve_package_folder_class_definition(
 
     while let Some(segment) = segments.next() {
         if segments.peek().is_none() {
-            let candidate = current.join(format!("@{segment}")).join(format!("{segment}.m"));
+            let candidate = current
+                .join(format!("@{segment}"))
+                .join(format!("{segment}.m"));
             if candidate.is_file() {
                 return Some(ResolvedClass {
                     name: name.to_string(),
-                    kind: if context
-                        .source_dir()
-                        .is_some_and(|dir| dir == root)
-                    {
+                    kind: if context.source_dir().is_some_and(|dir| dir == root) {
                         ResolvedClassKind::FolderCurrentDirectory
                     } else {
                         ResolvedClassKind::FolderPackageDirectory
@@ -549,8 +536,11 @@ fn m_file_looks_like_classdef(path: &Path) -> bool {
         rest = trimmed;
         break;
     }
-    rest.strip_prefix("classdef")
-        .is_some_and(|tail| tail.chars().next().is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_'))
+    rest.strip_prefix("classdef").is_some_and(|tail| {
+        tail.chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+    })
 }
 
 fn normalize_path_key(path: &Path) -> OsString {
@@ -720,7 +710,10 @@ mod tests {
         let workspace = temp_test_dir();
         fs::create_dir_all(workspace.join("@Point")).expect("create class dir");
         write_file(&workspace.join("main.m"), "p = Point();\n");
-        write_file(&workspace.join("Point.m"), "function y = Point()\ny = 1;\nend\n");
+        write_file(
+            &workspace.join("Point.m"),
+            "function y = Point()\ny = 1;\nend\n",
+        );
         write_file(
             &workspace.join("@Point").join("Point.m"),
             "classdef Point\nend\n",
@@ -771,11 +764,9 @@ mod tests {
         write_file(&child_path, "classdef Child < pkg.Base\nend\n");
         write_file(&package_dir.join("Base.m"), "classdef Base\nend\n");
 
-        let resolved = resolve_class_definition(
-            "pkg.Base",
-            &ResolverContext::from_source_file(child_path),
-        )
-        .expect("package class should resolve from inside package");
+        let resolved =
+            resolve_class_definition("pkg.Base", &ResolverContext::from_source_file(child_path))
+                .expect("package class should resolve from inside package");
 
         assert_eq!(resolved.kind, ResolvedClassKind::PackageDirectory);
         assert_eq!(resolved.package.as_deref(), Some("pkg"));
@@ -789,7 +780,8 @@ mod tests {
         let source = workspace.join("src");
         let root = workspace.join("packages");
         fs::create_dir_all(&source).expect("create source dir");
-        fs::create_dir_all(root.join("+pkg").join("@Counter")).expect("create package folder class dir");
+        fs::create_dir_all(root.join("+pkg").join("@Counter"))
+            .expect("create package folder class dir");
         write_file(&source.join("main.m"), "obj = pkg.Counter();\n");
         write_file(
             &root.join("+pkg").join("@Counter").join("Counter.m"),

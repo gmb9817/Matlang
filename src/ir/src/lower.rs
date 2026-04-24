@@ -182,9 +182,8 @@ impl<'a> LoweringContext<'a> {
             kind: unit.kind,
             scope_id: ScopeId(0),
             workspace_id: WorkspaceId(0),
-            implicit_ans: (unit.kind != CompilationUnitKind::ClassFile).then(|| {
-                self.lookup_current_binding(ScopeId(0), "ans", SymbolKind::Variable)
-            }),
+            implicit_ans: (unit.kind != CompilationUnitKind::ClassFile)
+                .then(|| self.lookup_current_binding(ScopeId(0), "ans", SymbolKind::Variable)),
             classes,
             items: self.lower_items(&unit.items, ScopeId(0)),
         }
@@ -195,7 +194,9 @@ impl<'a> LoweringContext<'a> {
             .iter()
             .flat_map(|item| match item {
                 Item::Statement(statement) => {
-                    vec![HirItem::Statement(self.lower_statement(statement, scope_id))]
+                    vec![HirItem::Statement(
+                        self.lower_statement(statement, scope_id),
+                    )]
                 }
                 Item::Function(function) => {
                     vec![HirItem::Function(self.lower_function(function, None))]
@@ -208,13 +209,12 @@ impl<'a> LoweringContext<'a> {
                         let owner_class_name = self
                             .analysis_class(&class_def.name.name)
                             .map(|class| {
-                                qualified_class_name(
-                                    &class.name,
-                                    class.package.as_deref(),
-                                )
+                                qualified_class_name(&class.name, class.package.as_deref())
                             })
                             .unwrap_or_else(|| class_def.name.name.clone());
-                        HirItem::Function(self.lower_function(method, Some(owner_class_name.as_str())))
+                        HirItem::Function(
+                            self.lower_function(method, Some(owner_class_name.as_str())),
+                        )
                     })
                     .collect::<Vec<_>>(),
             })
@@ -232,9 +232,7 @@ impl<'a> LoweringContext<'a> {
             superclass_path: metadata
                 .as_ref()
                 .and_then(|class| class.superclass_path.clone()),
-            inherits_handle: metadata
-                .as_ref()
-                .is_some_and(|class| class.inherits_handle),
+            inherits_handle: metadata.as_ref().is_some_and(|class| class.inherits_handle),
             properties: class_def
                 .property_blocks
                 .iter()
@@ -244,7 +242,12 @@ impl<'a> LoweringContext<'a> {
                     access: class_def
                         .property_blocks
                         .iter()
-                        .find(|block| block.properties.iter().any(|candidate| candidate.name.name == property.name.name))
+                        .find(|block| {
+                            block
+                                .properties
+                                .iter()
+                                .any(|candidate| candidate.name.name == property.name.name)
+                        })
                         .map(|block| block.access)
                         .unwrap_or(matlab_frontend::ast::ClassMemberAccess::Public),
                     default: property
@@ -283,12 +286,20 @@ impl<'a> LoweringContext<'a> {
                 .as_ref()
                 .map(|class| class.external_methods.clone())
                 .unwrap_or_default(),
-            constructor: metadata.as_ref().and_then(|class| class.constructor.clone()),
-            source_path: metadata.as_ref().and_then(|class| class.source_path.clone()),
+            constructor: metadata
+                .as_ref()
+                .and_then(|class| class.constructor.clone()),
+            source_path: metadata
+                .as_ref()
+                .and_then(|class| class.source_path.clone()),
         }
     }
 
-    fn lower_function(&mut self, function: &FunctionDef, owner_class_name: Option<&str>) -> HirFunction {
+    fn lower_function(
+        &mut self,
+        function: &FunctionDef,
+        owner_class_name: Option<&str>,
+    ) -> HirFunction {
         let frame = self
             .function_frames
             .pop_front()
@@ -511,10 +522,16 @@ impl<'a> LoweringContext<'a> {
         let StatementKind::Expression(call_expr) = &second.kind else {
             return None;
         };
-        let ExpressionKind::ParenApply { target, indices: args } = &call_expr.kind else {
+        let ExpressionKind::ParenApply {
+            target,
+            indices: args,
+        } = &call_expr.kind
+        else {
             return None;
         };
-        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Name(qualified_name)) = &target.kind else {
+        let ExpressionKind::FunctionHandle(FunctionHandleTarget::Name(qualified_name)) =
+            &target.kind
+        else {
             return None;
         };
         let qualified = qualified_name
@@ -528,9 +545,11 @@ impl<'a> LoweringContext<'a> {
         }
 
         Some(HirStatement::Assignment {
-            targets: vec![HirAssignmentTarget::Binding(
-                self.lookup_current_binding(scope_id, "obj", SymbolKind::Output),
-            )],
+            targets: vec![HirAssignmentTarget::Binding(self.lookup_current_binding(
+                scope_id,
+                "obj",
+                SymbolKind::Output,
+            ))],
             value: HirExpression::Call {
                 target: HirCallTarget::Callable({
                     let mut reference = self.lower_callable_reference(
@@ -574,8 +593,7 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_expression(&mut self, expression: &Expression, scope_id: ScopeId) -> HirExpression {
         if let Some((name, span)) = call_target_name_span(expression) {
-            if let Some(reference) = self.lookup_reference(&name, span, ReferenceRole::CallTarget)
-            {
+            if let Some(reference) = self.lookup_reference(&name, span, ReferenceRole::CallTarget) {
                 if reference.resolution != ReferenceResolution::WorkspaceValue {
                     return HirExpression::Call {
                         target: self.lower_call_target(expression, scope_id),

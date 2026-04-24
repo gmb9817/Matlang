@@ -1173,20 +1173,19 @@ fn builtin_clf(
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let (handle, reset) = match args {
-        [] => (ensure_current_figure(state), false),
-        [mode] if is_text_keyword(mode, "reset")? => (ensure_current_figure(state), true),
-        [requested] => (scalar_handle(requested, "clf")?, false),
-        [requested, mode] if is_text_keyword(mode, "reset")? => {
-            (scalar_handle(requested, "clf")?, true)
-        }
-        _ => {
-            return Err(RuntimeError::Unsupported(
+    let (handle, reset) =
+        match args {
+            [] => (ensure_current_figure(state), false),
+            [mode] if is_text_keyword(mode, "reset")? => (ensure_current_figure(state), true),
+            [requested] => (scalar_handle(requested, "clf")?, false),
+            [requested, mode] if is_text_keyword(mode, "reset")? => {
+                (scalar_handle(requested, "clf")?, true)
+            }
+            _ => return Err(RuntimeError::Unsupported(
                 "clf currently supports `clf`, `clf(fig)`, `clf('reset')`, or `clf(fig, 'reset')`"
                     .to_string(),
-            ))
-        }
-    };
+            )),
+        };
 
     let figure = state.figures.get_mut(&handle).ok_or_else(|| {
         RuntimeError::MissingVariable(format!("figure handle `{handle}` does not exist"))
@@ -1226,20 +1225,19 @@ fn builtin_cla(
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let (handle, reset) = match args {
-        [] => (current_axes_handle(state), false),
-        [mode] if is_text_keyword(mode, "reset")? => (current_axes_handle(state), true),
-        [requested] => (scalar_handle(requested, "cla")?, false),
-        [requested, mode] if is_text_keyword(mode, "reset")? => {
-            (scalar_handle(requested, "cla")?, true)
-        }
-        _ => {
-            return Err(RuntimeError::Unsupported(
+    let (handle, reset) =
+        match args {
+            [] => (current_axes_handle(state), false),
+            [mode] if is_text_keyword(mode, "reset")? => (current_axes_handle(state), true),
+            [requested] => (scalar_handle(requested, "cla")?, false),
+            [requested, mode] if is_text_keyword(mode, "reset")? => {
+                (scalar_handle(requested, "cla")?, true)
+            }
+            _ => return Err(RuntimeError::Unsupported(
                 "cla currently supports `cla`, `cla(ax)`, `cla('reset')`, or `cla(ax, 'reset')`"
                     .to_string(),
-            ))
-        }
-    };
+            )),
+        };
 
     let axes = &mut axes_slot_mut_by_handle(state, handle)?.axes;
     if reset {
@@ -1597,28 +1595,27 @@ fn builtin_hold(
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let (target_axes, enabled) = match args {
-        [] => {
-            ensure_current_figure(state);
-            let enabled = !current_axes_snapshot(current_figure(state)).hold_enabled;
-            (None, enabled)
-        }
-        [mode] if matches!(mode, Value::CharArray(_) | Value::String(_)) => {
-            (None, parse_hold_mode(mode)?)
-        }
-        [axes] => {
-            let handle = scalar_handle(axes, "hold")?;
-            let enabled = !axes_slot_by_handle(state, handle)?.axes.hold_enabled;
-            (Some(handle), enabled)
-        }
-        [axes, mode] => (Some(scalar_handle(axes, "hold")?), parse_hold_mode(mode)?),
-        _ => {
-            return Err(RuntimeError::Unsupported(
+    let (target_axes, enabled) =
+        match args {
+            [] => {
+                ensure_current_figure(state);
+                let enabled = !current_axes_snapshot(current_figure(state)).hold_enabled;
+                (None, enabled)
+            }
+            [mode] if matches!(mode, Value::CharArray(_) | Value::String(_)) => {
+                (None, parse_hold_mode(mode)?)
+            }
+            [axes] => {
+                let handle = scalar_handle(axes, "hold")?;
+                let enabled = !axes_slot_by_handle(state, handle)?.axes.hold_enabled;
+                (Some(handle), enabled)
+            }
+            [axes, mode] => (Some(scalar_handle(axes, "hold")?), parse_hold_mode(mode)?),
+            _ => return Err(RuntimeError::Unsupported(
                 "hold currently supports `hold`, `hold(state)`, `hold(ax)`, or `hold(ax, state)`"
                     .to_string(),
-            ))
-        }
-    };
+            )),
+        };
 
     let output_value = if let Some(handle) = target_axes {
         axes_slot_mut_by_handle(state, handle)?.axes.hold_enabled = enabled;
@@ -3394,28 +3391,35 @@ fn builtin_grid(
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let (target_axes, enabled) = match args {
-        [] => {
-            ensure_current_figure(state);
-            let enabled = !current_axes_snapshot(current_figure(state)).grid_enabled;
-            (None, enabled)
-        }
-        [mode] if matches!(mode, Value::CharArray(_) | Value::String(_) | Value::Logical(_)) => {
-            (None, on_off_flag(mode, "grid")?)
-        }
-        [axes] => {
-            let handle = scalar_handle(axes, "grid")?;
-            let enabled = !axes_slot_by_handle(state, handle)?.axes.grid_enabled;
-            (Some(handle), enabled)
-        }
-        [axes, mode] => (Some(scalar_handle(axes, "grid")?), on_off_flag(mode, "grid")?),
-        _ => {
-            return Err(RuntimeError::Unsupported(
+    let (target_axes, enabled) =
+        match args {
+            [] => {
+                ensure_current_figure(state);
+                let enabled = !current_axes_snapshot(current_figure(state)).grid_enabled;
+                (None, enabled)
+            }
+            [mode]
+                if matches!(
+                    mode,
+                    Value::CharArray(_) | Value::String(_) | Value::Logical(_)
+                ) =>
+            {
+                (None, on_off_flag(mode, "grid")?)
+            }
+            [axes] => {
+                let handle = scalar_handle(axes, "grid")?;
+                let enabled = !axes_slot_by_handle(state, handle)?.axes.grid_enabled;
+                (Some(handle), enabled)
+            }
+            [axes, mode] => (
+                Some(scalar_handle(axes, "grid")?),
+                on_off_flag(mode, "grid")?,
+            ),
+            _ => return Err(RuntimeError::Unsupported(
                 "grid currently supports `grid`, `grid(state)`, `grid(ax)`, or `grid(ax, state)`"
                     .to_string(),
-            ))
-        }
-    };
+            )),
+        };
 
     let output_value = if let Some(handle) = target_axes {
         axes_slot_mut_by_handle(state, handle)?.axes.grid_enabled = enabled;
@@ -3439,7 +3443,12 @@ fn builtin_box(
             let enabled = !current_axes_snapshot(current_figure(state)).box_enabled;
             (None, enabled)
         }
-        [mode] if matches!(mode, Value::CharArray(_) | Value::String(_) | Value::Logical(_)) => {
+        [mode]
+            if matches!(
+                mode,
+                Value::CharArray(_) | Value::String(_) | Value::Logical(_)
+            ) =>
+        {
             (None, on_off_flag(mode, "box")?)
         }
         [axes] => {
@@ -3887,18 +3896,16 @@ fn builtin_colorbar(
         }
     };
     let output_value = if let Some(handle) = target_axes {
-        axes_slot_mut_by_handle(state, handle)?.axes.colorbar_enabled = enabled;
+        axes_slot_mut_by_handle(state, handle)?
+            .axes
+            .colorbar_enabled = enabled;
         Value::Scalar(handle as f64)
     } else {
         let figure_handle = ensure_current_figure(state);
         current_axes_mut(state).colorbar_enabled = enabled;
         Value::Scalar(figure_handle as f64)
     };
-    one_or_zero_outputs(
-        output_value,
-        output_arity,
-        "colorbar",
-    )
+    one_or_zero_outputs(output_value, output_arity, "colorbar")
 }
 
 fn builtin_legend(
@@ -7374,12 +7381,10 @@ fn axes_property_value(
         AxesProperty::Position => axes_position_value(state, axes_handle),
         AxesProperty::Title => Ok(Value::CharArray(property_axes.title.clone())),
         AxesProperty::XLabel => Ok(Value::CharArray(property_axes.xlabel.clone())),
-        AxesProperty::YLabel => Ok(Value::CharArray(
-            match property_axes.active_y_axis {
-                YAxisSide::Left => property_axes.ylabel.clone(),
-                YAxisSide::Right => property_axes.ylabel_right.clone(),
-            },
-        )),
+        AxesProperty::YLabel => Ok(Value::CharArray(match property_axes.active_y_axis {
+            YAxisSide::Left => property_axes.ylabel.clone(),
+            YAxisSide::Right => property_axes.ylabel_right.clone(),
+        })),
         AxesProperty::ZLabel => Ok(Value::CharArray(property_axes.zlabel.clone())),
         AxesProperty::XScale => Ok(Value::CharArray(
             property_axes.x_scale.as_text().to_string(),
@@ -7410,16 +7415,18 @@ fn axes_property_value(
         AxesProperty::XTickLabel => {
             tick_labels_value(&resolved_tick_labels(property_axes, TickKind::X))
         }
-        AxesProperty::YTickLabel => {
-            tick_labels_value(&resolved_tick_labels_active_side(property_axes, TickKind::Y))
-        }
+        AxesProperty::YTickLabel => tick_labels_value(&resolved_tick_labels_active_side(
+            property_axes,
+            TickKind::Y,
+        )),
         AxesProperty::ZTickLabel => {
             tick_labels_value(&resolved_tick_labels(property_axes, TickKind::Z))
         }
         AxesProperty::XTickAngle => Ok(Value::Scalar(property_axes.xtick_angle)),
-        AxesProperty::YTickAngle => {
-            Ok(Value::Scalar(resolved_tick_angle_active_side(property_axes, TickKind::Y)))
-        }
+        AxesProperty::YTickAngle => Ok(Value::Scalar(resolved_tick_angle_active_side(
+            property_axes,
+            TickKind::Y,
+        ))),
         AxesProperty::ZTickAngle => Ok(Value::Scalar(property_axes.ztick_angle)),
         AxesProperty::Visible => Ok(on_off_value(property_axes.axis_visible)),
         AxesProperty::Box => Ok(on_off_value(property_axes.box_enabled)),
@@ -7711,7 +7718,9 @@ fn set_axes_property(
             *current_y_scale_mut(axes, axes.active_y_axis) = parse_axis_scale(value, "set")?
         }
         AxesProperty::XLim => axes.xlim = Some(numeric_limit_pair(value, "set")?),
-        AxesProperty::YLim => *current_y_limit_mut(axes, axes.active_y_axis) = Some(numeric_limit_pair(value, "set")?),
+        AxesProperty::YLim => {
+            *current_y_limit_mut(axes, axes.active_y_axis) = Some(numeric_limit_pair(value, "set")?)
+        }
         AxesProperty::ZLim => axes.zlim = Some(numeric_limit_pair(value, "set")?),
         AxesProperty::XTick => {
             axes.xticks = Some(tick_vector(value, "set")?);
@@ -9449,7 +9458,10 @@ fn validate_histogram_counts_and_edges(
             counts.len()
         )));
     }
-    if counts.iter().any(|count| !count.is_finite() || *count < 0.0) {
+    if counts
+        .iter()
+        .any(|count| !count.is_finite() || *count < 0.0)
+    {
         return Err(RuntimeError::TypeError(format!(
             "{builtin_name} currently expects finite nonnegative bin counts"
         )));
@@ -18114,4 +18126,3 @@ impl TickKind {
         }
     }
 }
-

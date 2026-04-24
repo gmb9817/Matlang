@@ -12,6 +12,12 @@ workspace
   aj = [4 ; 2]
   ak = 2
   al = [2 ; 0]
+  am = {'ab' ; 'cde'}
+  an = true
+  ao = {'alpha', 'beta'}
+  ap = [2, 1]
+  aq = true
+  ar = false
   b = ["alpha", "beta" ; "Gamma", "delta"]
   c = ["ALPHA", "BETA" ; "GAMMA", "DELTA"]
   d = [true, true ; true, true]

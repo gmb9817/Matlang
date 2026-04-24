@@ -351,7 +351,9 @@ impl Optimizer {
                     HirFunctionHandleTarget::Callable(reference.clone())
                 }
                 HirFunctionHandleTarget::Expression(expression) => {
-                    HirFunctionHandleTarget::Expression(Box::new(self.optimize_expression(expression)))
+                    HirFunctionHandleTarget::Expression(Box::new(
+                        self.optimize_expression(expression),
+                    ))
                 }
             }),
             HirExpression::EndKeyword => HirExpression::EndKeyword,

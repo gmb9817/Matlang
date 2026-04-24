@@ -44,12 +44,14 @@ fn resolve_final_reference(
         ReferenceResolution::BuiltinFunction => {
             if let Some(resolved) = resolve_callable(&reference.name, context) {
                 match resolved {
-                    ResolvedCallable::Function(resolved) => FinalReferenceResolution::ResolvedPath {
-                        kind: map_path_kind(resolved.kind),
-                        path: resolved.path,
-                        package: resolved.package,
-                        shadowed_builtin: true,
-                    },
+                    ResolvedCallable::Function(resolved) => {
+                        FinalReferenceResolution::ResolvedPath {
+                            kind: map_path_kind(resolved.kind),
+                            path: resolved.path,
+                            package: resolved.package,
+                            shadowed_builtin: true,
+                        }
+                    }
                     ResolvedCallable::Class(resolved) => FinalReferenceResolution::ResolvedPath {
                         kind: map_class_path_kind(resolved.kind),
                         path: resolved.path,
@@ -64,12 +66,14 @@ fn resolve_final_reference(
         ReferenceResolution::ExternalFunctionCandidate => {
             if let Some(resolved) = resolve_callable(&reference.name, context) {
                 match resolved {
-                    ResolvedCallable::Function(resolved) => FinalReferenceResolution::ResolvedPath {
-                        kind: map_path_kind(resolved.kind),
-                        path: resolved.path,
-                        package: resolved.package,
-                        shadowed_builtin: false,
-                    },
+                    ResolvedCallable::Function(resolved) => {
+                        FinalReferenceResolution::ResolvedPath {
+                            kind: map_path_kind(resolved.kind),
+                            path: resolved.path,
+                            package: resolved.package,
+                            shadowed_builtin: false,
+                        }
+                    }
                     ResolvedCallable::Class(resolved) => FinalReferenceResolution::ResolvedPath {
                         kind: map_class_path_kind(resolved.kind),
                         path: resolved.path,
@@ -99,7 +103,9 @@ fn map_class_path_kind(kind: ResolvedClassKind) -> PathResolutionKind {
         ResolvedClassKind::CurrentDirectory => PathResolutionKind::ClassCurrentDirectory,
         ResolvedClassKind::SearchPath => PathResolutionKind::ClassSearchPath,
         ResolvedClassKind::PackageDirectory => PathResolutionKind::ClassPackageDirectory,
-        ResolvedClassKind::FolderCurrentDirectory => PathResolutionKind::ClassFolderCurrentDirectory,
+        ResolvedClassKind::FolderCurrentDirectory => {
+            PathResolutionKind::ClassFolderCurrentDirectory
+        }
         ResolvedClassKind::FolderSearchPath => PathResolutionKind::ClassFolderSearchPath,
         ResolvedClassKind::FolderPackageDirectory => {
             PathResolutionKind::ClassFolderPackageDirectory

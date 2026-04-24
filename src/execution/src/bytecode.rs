@@ -8,8 +8,8 @@ use std::{
 
 use super::*;
 use matlab_codegen::{
-    emit_bytecode, verify_bytecode, BytecodeExternalMethod, BytecodeFunction,
-    BytecodeInstruction, BytecodeModule,
+    emit_bytecode, verify_bytecode, BytecodeExternalMethod, BytecodeFunction, BytecodeInstruction,
+    BytecodeModule,
 };
 use matlab_platform::BytecodeBundle;
 use matlab_runtime::RuntimeStackFrame;
@@ -176,6 +176,7 @@ pub fn execute_script_bytecode(module: &HirModule) -> Result<ExecutionResult, Ru
 }
 
 fn exist_value_result_vm(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     frame: &VmFrame,
     resolution_source_path: Option<&Path>,
     name: &str,
@@ -190,7 +191,10 @@ fn exist_value_result_vm(
     if matches!(
         search_type,
         super::ExistSearchType::Default | super::ExistSearchType::Var
-    ) && frame.visible_workspace_names().iter().any(|candidate| candidate == trimmed)
+    ) && frame
+        .visible_workspace_names()
+        .iter()
+        .any(|candidate| candidate == trimmed)
     {
         return Ok(Value::Scalar(1.0));
     }
@@ -199,6 +203,7 @@ fn exist_value_result_vm(
     }
     let visible_functions = frame.visible_functions.keys().cloned().collect::<Vec<_>>();
     super::exist_value_result(
+        shared_state,
         None,
         Some(&visible_functions),
         resolution_source_path,
@@ -208,6 +213,7 @@ fn exist_value_result_vm(
 }
 
 fn which_value_result_vm(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
     frame: &VmFrame,
     resolution_source_path: Option<&Path>,
     name: &str,
@@ -220,12 +226,16 @@ fn which_value_result_vm(
         ));
     }
     if !matches!(&mode, super::WhichMode::In(_))
-        && frame.visible_workspace_names().iter().any(|candidate| candidate == trimmed)
+        && frame
+            .visible_workspace_names()
+            .iter()
+            .any(|candidate| candidate == trimmed)
     {
         return super::which_output_value(vec!["variable".to_string()], &mode);
     }
     let visible_functions = frame.visible_functions.keys().cloned().collect::<Vec<_>>();
     super::which_value_result(
+        shared_state,
         None,
         Some(&visible_functions),
         resolution_source_path,
@@ -445,10 +455,7 @@ pub(crate) fn construct_bundle_object_value_from_path_registry(
         call_stack,
     )?;
     let value = vm
-        .construct_class_from_bytecode(
-            &[],
-            Some(ObjectMethodTarget::Path(path.to_path_buf())),
-        )?
+        .construct_class_from_bytecode(&[], Some(ObjectMethodTarget::Path(path.to_path_buf())))?
         .into_iter()
         .next()
         .unwrap_or_else(empty_matrix_value);
@@ -728,7 +735,11 @@ pub(crate) fn invoke_bundle_scoped_function_from_registry(
         .visible_functions
         .get(function_name)
         .cloned()
-        .or_else(|| vm.functions.contains_key(function_name).then(|| function_name.to_string()))
+        .or_else(|| {
+            vm.functions
+                .contains_key(function_name)
+                .then(|| function_name.to_string())
+        })
         .ok_or_else(|| {
             RuntimeError::Unsupported(format!(
                 "function `{function_name}` is not available in bundled module `{}`",
@@ -882,15 +893,14 @@ impl BytecodeVm {
                                         captures
                                             .iter()
                                             .filter_map(|capture| {
-                                                closure
-                                                    .captured_cells
-                                                    .get(&capture.binding_id)
-                                                    .map(|cell| {
+                                                closure.captured_cells.get(&capture.binding_id).map(
+                                                    |cell| {
                                                         (
                                                             capture.name.clone(),
                                                             super::capture_cell_value(cell),
                                                         )
-                                                    })
+                                                    },
+                                                )
                                             })
                                             .collect(),
                                     ),
@@ -907,15 +917,14 @@ impl BytecodeVm {
                                     captures
                                         .iter()
                                         .filter_map(|capture| {
-                                            closure
-                                                .captured_cells
-                                                .get(&capture.binding_id)
-                                                .map(|cell| {
+                                            closure.captured_cells.get(&capture.binding_id).map(
+                                                |cell| {
                                                     (
                                                         capture.name.clone(),
                                                         super::capture_cell_value(cell),
                                                     )
-                                                })
+                                                },
+                                            )
                                         })
                                         .collect(),
                                 ),
@@ -927,7 +936,9 @@ impl BytecodeVm {
                             )]
                         },
                     )
-                } else if self.visible_functions.contains_key(name) || self.functions.contains_key(name) {
+                } else if self.visible_functions.contains_key(name)
+                    || self.functions.contains_key(name)
+                {
                     let file = self
                         .resolution_source_path
                         .as_ref()
@@ -941,7 +952,8 @@ impl BytecodeVm {
                             functions_parentage_value(&handle.display_name, file.as_deref()),
                         )],
                     )
-                } else if let Some((path, function_name)) = parse_scoped_function_handle_name(name) {
+                } else if let Some((path, function_name)) = parse_scoped_function_handle_name(name)
+                {
                     let file = path.display().to_string();
                     (
                         function_name.clone(),
@@ -962,18 +974,12 @@ impl BytecodeVm {
                 resolved_path_functions_file(path, &handle.display_name),
                 Vec::new(),
             ),
-            FunctionHandleTarget::BundleModule(_) => (
-                handle.display_name.clone(),
-                "simple",
-                None,
-                Vec::new(),
-            ),
-            FunctionHandleTarget::BoundMethod { receiver: _, .. } => (
-                handle.display_name.clone(),
-                "simple",
-                None,
-                Vec::new(),
-            ),
+            FunctionHandleTarget::BundleModule(_) => {
+                (handle.display_name.clone(), "simple", None, Vec::new())
+            }
+            FunctionHandleTarget::BoundMethod { receiver: _, .. } => {
+                (handle.display_name.clone(), "simple", None, Vec::new())
+            }
         };
 
         Ok(functions_info_struct_value(
@@ -1027,7 +1033,9 @@ impl BytecodeVm {
             ));
         }
         let text = match super::parse_help_args(args)? {
-            None => "Type `help name` for help on a specific function, class, or folder.".to_string(),
+            None => {
+                "Type `help name` for help on a specific function, class, or folder.".to_string()
+            }
             Some(value) => self.help_text_for_value(frame, value)?,
         };
         if output_arity == 0 {
@@ -1052,13 +1060,17 @@ impl BytecodeVm {
                             .to_string(),
                     ));
                 }
-                if let Some(text) =
-                    super::help_text_for_name(None, self.resolution_source_path.as_deref(), trimmed)?
-                {
+                if let Some(text) = super::help_text_for_name(
+                    &self.shared_state,
+                    None,
+                    self.resolution_source_path.as_deref(),
+                    trimmed,
+                )? {
                     Ok(text)
                 } else if let Some(frame) = frame {
                     if let Ok(variable) = frame.read_reference(None, trimmed) {
                         super::help_text_for_class_name(
+                            &self.shared_state,
                             self.resolution_source_path.as_deref(),
                             &super::matlab_class_name(&variable),
                         )
@@ -1070,9 +1082,84 @@ impl BytecodeVm {
                 }
             }
             other => super::help_text_for_class_name(
+                &self.shared_state,
                 self.resolution_source_path.as_deref(),
                 &super::matlab_class_name(other),
             ),
+        }
+    }
+
+    fn invoke_doc_builtin_outputs(
+        &self,
+        frame: Option<&VmFrame>,
+        args: &[Value],
+        output_arity: usize,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if output_arity > 0 {
+            return Err(RuntimeError::Unsupported(
+                "doc currently does not return outputs".to_string(),
+            ));
+        }
+        let text = match super::parse_doc_args(args)? {
+            None => "MATLAB documentation is available at https://www.mathworks.com/help/matlab/."
+                .to_string(),
+            Some(value) => self.doc_text_for_value(frame, value)?,
+        };
+        push_text_displayed_output(&self.shared_state, text, true);
+        Ok(Vec::new())
+    }
+
+    fn doc_text_for_value(
+        &self,
+        frame: Option<&VmFrame>,
+        value: &Value,
+    ) -> Result<String, RuntimeError> {
+        match value {
+            Value::CharArray(text) | Value::String(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return Err(RuntimeError::TypeError(
+                        "doc currently expects a nonempty function, class, or folder name"
+                            .to_string(),
+                    ));
+                }
+                let docs_url = super::doc_url_for_name(trimmed);
+                if is_builtin_function_name(trimmed) {
+                    return Ok(format!("Documentation for {trimmed}:\n{docs_url}"));
+                }
+                if let Some(text) = super::help_text_for_name(
+                    &self.shared_state,
+                    None,
+                    self.resolution_source_path.as_deref(),
+                    trimmed,
+                )? {
+                    return Ok(format!("Documentation for {trimmed}:\n\n{text}"));
+                }
+                if let Some(frame) = frame {
+                    if let Ok(variable) = frame.read_reference(None, trimmed) {
+                        let class_name = super::matlab_class_name(&variable);
+                        let class_help = super::help_text_for_class_name(
+                            &self.shared_state,
+                            self.resolution_source_path.as_deref(),
+                            &class_name,
+                        )?;
+                        return Ok(format!("Documentation for {class_name}:\n\n{class_help}"));
+                    }
+                }
+                Ok(format!(
+                    "No local documentation found for '{trimmed}'.\nSearch the documentation: {}",
+                    super::doc_search_url(trimmed)
+                ))
+            }
+            other => {
+                let class_name = super::matlab_class_name(other);
+                let class_help = super::help_text_for_class_name(
+                    &self.shared_state,
+                    self.resolution_source_path.as_deref(),
+                    &class_name,
+                )?;
+                Ok(format!("Documentation for {class_name}:\n\n{class_help}"))
+            }
         }
     }
 
@@ -1175,8 +1262,8 @@ impl BytecodeVm {
                 path.display()
             ))
         })?;
-        let context =
-            ResolverContext::from_source_file(path.to_path_buf()).with_env_search_roots("MATC_PATH");
+        let context = ResolverContext::from_source_file(path.to_path_buf())
+            .with_env_search_roots("MATC_PATH");
         let analysis = analyze_compilation_unit_with_context(&unit, &context);
         if analysis.has_errors() {
             return Err(RuntimeError::Unsupported(format!(
@@ -1190,18 +1277,19 @@ impl BytecodeVm {
         if unit.kind == CompilationUnitKind::ClassFile {
             return self.invoke_static_class_method_from_path(path, function_name, args);
         }
-        let mut vm = BytecodeVm::from_hir(
-            &hir,
-            "<root>".to_string(),
-            Rc::clone(&self.shared_state),
-        )?;
+        let mut vm =
+            BytecodeVm::from_hir(&hir, "<root>".to_string(), Rc::clone(&self.shared_state))?;
         vm.call_stack = self.call_stack.clone();
         vm.resolution_source_path = Some(path.to_path_buf());
         let actual_name = vm
             .visible_functions
             .get(function_name)
             .cloned()
-            .or_else(|| vm.functions.contains_key(function_name).then(|| function_name.to_string()))
+            .or_else(|| {
+                vm.functions
+                    .contains_key(function_name)
+                    .then(|| function_name.to_string())
+            })
             .ok_or_else(|| {
                 RuntimeError::Unsupported(format!(
                     "function `{function_name}` is not available in `{}`",
@@ -1242,10 +1330,13 @@ impl BytecodeVm {
     }
 
     fn lookup_bundle_module_by_path(&self, path: &Path) -> Option<BytecodeModule> {
-        self.bundled_modules
-            .get(path)
-            .cloned()
-            .or_else(|| self.shared_state.borrow().bundled_modules.get(path).cloned())
+        self.bundled_modules.get(path).cloned().or_else(|| {
+            self.shared_state
+                .borrow()
+                .bundled_modules
+                .get(path)
+                .cloned()
+        })
     }
 
     fn current_bundle_registries(
@@ -1540,9 +1631,11 @@ impl BytecodeVm {
                     } => {
                         let list_origin = *rows == 1
                             && *cols == elements.len()
-                            && elements
-                                .iter()
-                                .all(|temp_id| temp(&temps, *temp_id).map(|temp| temp.list_origin).unwrap_or(false));
+                            && elements.iter().all(|temp_id| {
+                                temp(&temps, *temp_id)
+                                    .map(|temp| temp.list_origin)
+                                    .unwrap_or(false)
+                            });
                         let values = elements
                             .iter()
                             .map(|temp| temp_value(&temps, *temp))
@@ -1661,13 +1754,13 @@ impl BytecodeVm {
                     } => {
                         let indexed_bound_receiver = if outputs.len() == 1 {
                             match function.instructions.get(pc + 1) {
-                                Some(BytecodeInstruction::LoadField { target: next_target, .. })
-                                    if *next_target == outputs[0] =>
-                                {
-                                    self.try_execute_indexed_receiver_bound_handle_call(
+                                Some(BytecodeInstruction::LoadField {
+                                    target: next_target,
+                                    ..
+                                }) if *next_target == outputs[0] => self
+                                    .try_execute_indexed_receiver_bound_handle_call(
                                         frame, &temps, target, args,
-                                    )?
-                                }
+                                    )?,
                                 _ => None,
                             }
                         } else {
@@ -1702,14 +1795,13 @@ impl BytecodeVm {
                         args,
                     } => {
                         let target_temp = temp(&temps, *target)?.clone();
-                        let next_needs_struct_cell_selection =
-                            matches!(
-                                function.instructions.get(pc + 1),
-                                Some(BytecodeInstruction::LoadField { target, .. }) if *target == *dst
-                            ) || matches!(
-                                function.instructions.get(pc + 1),
-                                Some(BytecodeInstruction::StoreField { target, .. }) if *target == *dst
-                            );
+                        let next_needs_struct_cell_selection = matches!(
+                            function.instructions.get(pc + 1),
+                            Some(BytecodeInstruction::LoadField { target, .. }) if *target == *dst
+                        ) || matches!(
+                            function.instructions.get(pc + 1),
+                            Some(BytecodeInstruction::StoreField { target, .. }) if *target == *dst
+                        );
                         let value = match *kind {
                             "brace" => {
                                 let primary = (|| {
@@ -1741,13 +1833,18 @@ impl BytecodeVm {
                                             args,
                                         )?;
                                         if next_needs_struct_cell_selection {
-                                            if let Some(value) = materialize_default_struct_cell_selection(
-                                                &fallback_target,
-                                                &indices,
-                                            )? {
+                                            if let Some(value) =
+                                                materialize_default_struct_cell_selection(
+                                                    &fallback_target,
+                                                    &indices,
+                                                )?
+                                            {
                                                 value
                                             } else {
-                                                evaluate_cell_content_index(&fallback_target, &indices)?
+                                                evaluate_cell_content_index(
+                                                    &fallback_target,
+                                                    &indices,
+                                                )?
                                             }
                                         } else {
                                             evaluate_cell_content_index(&fallback_target, &indices)?
@@ -1757,8 +1854,11 @@ impl BytecodeVm {
                                 }
                             }
                             "paren" => {
-                                if let Some(field) = target_temp.multi_struct_field_origin.as_ref() {
-                                    return Err(unsupported_multi_struct_field_subindexing_error(field));
+                                if let Some(field) = target_temp.multi_struct_field_origin.as_ref()
+                                {
+                                    return Err(unsupported_multi_struct_field_subindexing_error(
+                                        field,
+                                    ));
                                 }
                                 let indices = evaluate_index_arguments_from_strings(
                                     &temps,
@@ -1773,26 +1873,22 @@ impl BytecodeVm {
                                 )))
                             }
                         };
-                        set_temp(
-                            &mut temps,
-                            *dst,
-                            {
-                                let mut temp_value = VmTemp::with_lvalue(
-                                    value,
-                                    append_temp_lvalue_projection(
-                                        target_temp.lvalue,
-                                        match *kind {
-                                            "brace" => TempLValueProjection::Brace(args.clone()),
-                                            "paren" => TempLValueProjection::Paren(args.clone()),
-                                            _ => unreachable!("kind already matched"),
-                                        },
-                                    ),
-                                );
-                                temp_value.method_result_origin =
-                                    target_temp.method_result_origin.clone();
-                                temp_value
-                            },
-                        )?;
+                        set_temp(&mut temps, *dst, {
+                            let mut temp_value = VmTemp::with_lvalue(
+                                value,
+                                append_temp_lvalue_projection(
+                                    target_temp.lvalue,
+                                    match *kind {
+                                        "brace" => TempLValueProjection::Brace(args.clone()),
+                                        "paren" => TempLValueProjection::Paren(args.clone()),
+                                        _ => unreachable!("kind already matched"),
+                                    },
+                                ),
+                            );
+                            temp_value.method_result_origin =
+                                target_temp.method_result_origin.clone();
+                            temp_value
+                        })?;
                         pc += 1;
                     }
                     BytecodeInstruction::LoadIndexList {
@@ -1828,8 +1924,11 @@ impl BytecodeVm {
                                 }
                             }
                             "paren" => {
-                                if let Some(field) = target_temp.multi_struct_field_origin.as_ref() {
-                                    return Err(unsupported_multi_struct_field_subindexing_error(field));
+                                if let Some(field) = target_temp.multi_struct_field_origin.as_ref()
+                                {
+                                    return Err(unsupported_multi_struct_field_subindexing_error(
+                                        field,
+                                    ));
                                 }
                                 if let Some(spread) = target_temp.spread.as_ref() {
                                     let mut values = Vec::new();
@@ -1905,12 +2004,13 @@ impl BytecodeVm {
                                 TempLValueProjection::Field(field.clone()),
                             );
                             let mut temp_value = VmTemp::with_lvalue(value, lvalue);
-                            temp_value.method_result_origin = target_temp
-                                .method_result_origin
-                                .clone()
-                                .or_else(|| {
+                            temp_value.method_result_origin =
+                                target_temp.method_result_origin.clone().or_else(|| {
                                     (target_had_lvalue
-                                        && field_resolves_to_object_method(&target_temp.value, field))
+                                        && field_resolves_to_object_method(
+                                            &target_temp.value,
+                                            field,
+                                        ))
                                     .then(|| field.clone())
                                 });
                             if target_had_lvalue
@@ -2099,22 +2199,15 @@ impl BytecodeVm {
         let args = self.evaluate_function_arguments_with_frame(frame, temps, args)?;
         if parsed.super_constructor && parsed.resolved_class {
             if let Some(path) = parsed.resolved_path.as_ref() {
-                if let Some(values) =
-                    self.try_construct_superclass_into_existing_object(
-                        frame,
-                        Some(path),
-                        parsed.bundle_module_id.as_deref(),
-                        &args,
-                    )?
-                {
+                if let Some(values) = self.try_construct_superclass_into_existing_object(
+                    frame,
+                    Some(path),
+                    parsed.bundle_module_id.as_deref(),
+                    &args,
+                )? {
                     return Ok(wrap_vm_values(values));
                 }
             }
-        }
-        if parsed.bundle_module_id.is_some() || parsed.resolved_path.is_some() {
-            return self
-                .load_and_invoke_external_target(&parsed, &args)
-                .map(wrap_vm_values);
         }
         if let Some(receiver) = args.first() {
             if value_has_object_method(receiver, &parsed.display_name) {
@@ -2122,6 +2215,17 @@ impl BytecodeVm {
                     .invoke_object_method_outputs(receiver, &parsed.display_name, &args[1..])
                     .map(wrap_vm_values);
             }
+        }
+        if parsed.bundle_module_id.is_some()
+            || parsed.resolved_path.is_some()
+            || matches!(
+                parsed.semantic_resolution.as_deref(),
+                Some("ExternalFunctionCandidate")
+            ) && !is_builtin_function_name(&parsed.display_name)
+        {
+            return self
+                .load_and_invoke_external_target(&parsed, &args)
+                .map(wrap_vm_values);
         }
         if matches!(
             parsed.semantic_resolution.as_deref(),
@@ -2178,6 +2282,47 @@ impl BytecodeVm {
             if parsed.display_name == "help" {
                 return self
                     .invoke_help_builtin_outputs(Some(frame), &args, requested_outputs)
+                    .map(wrap_vm_values);
+            }
+            if parsed.display_name == "doc" {
+                return self
+                    .invoke_doc_builtin_outputs(Some(frame), &args, requested_outputs)
+                    .map(wrap_vm_values);
+            }
+            if parsed.display_name == "methods" {
+                return super::invoke_methods_builtin_outputs(
+                    &self.shared_state,
+                    self.resolution_source_path.as_deref(),
+                    &args,
+                    requested_outputs,
+                )
+                .map(wrap_vm_values);
+            }
+            if parsed.display_name == "properties" {
+                return super::invoke_properties_builtin_outputs(
+                    &self.shared_state,
+                    self.resolution_source_path.as_deref(),
+                    &args,
+                    requested_outputs,
+                )
+                .map(wrap_vm_values);
+            }
+            if parsed.display_name == "superclasses" {
+                return super::invoke_superclasses_builtin_outputs(
+                    &self.shared_state,
+                    self.resolution_source_path.as_deref(),
+                    &args,
+                    requested_outputs,
+                )
+                .map(wrap_vm_values);
+            }
+            if parsed.display_name == "events" {
+                return super::invoke_events_builtin_outputs(
+                    &self.shared_state,
+                    self.resolution_source_path.as_deref(),
+                    &args,
+                    requested_outputs,
+                )
                 .map(wrap_vm_values);
             }
             if parsed.display_name == "lookfor" {
@@ -2222,6 +2367,45 @@ impl BytecodeVm {
                 )
                 .map(wrap_vm_values);
             }
+            if parsed.display_name == "colfilt" {
+                return super::execute_colfilt_builtin_outputs(
+                    &args,
+                    requested_outputs,
+                    |callback, call_args, requested| {
+                        let Value::FunctionHandle(handle) = callback else {
+                            unreachable!("colfilt callback parser produces function handles");
+                        };
+                        self.call_function_value_outputs(frame, handle, call_args, requested)
+                    },
+                )
+                .map(wrap_vm_values);
+            }
+            if parsed.display_name == "blockproc" {
+                return super::execute_blockproc_builtin_outputs(
+                    &args,
+                    requested_outputs,
+                    |callback, call_args, requested| {
+                        let Value::FunctionHandle(handle) = callback else {
+                            unreachable!("blockproc callback parser produces function handles");
+                        };
+                        self.call_function_value_outputs(frame, handle, call_args, requested)
+                    },
+                )
+                .map(wrap_vm_values);
+            }
+            if parsed.display_name == "nlfilter" {
+                return super::execute_nlfilter_builtin_outputs(
+                    &args,
+                    requested_outputs,
+                    |callback, call_args, requested| {
+                        let Value::FunctionHandle(handle) = callback else {
+                            unreachable!("nlfilter callback parser produces function handles");
+                        };
+                        self.call_function_value_outputs(frame, handle, call_args, requested)
+                    },
+                )
+                .map(wrap_vm_values);
+            }
             if parsed.display_name == "what" {
                 return self
                     .invoke_what_builtin_outputs(&args, requested_outputs)
@@ -2230,6 +2414,7 @@ impl BytecodeVm {
             if parsed.display_name == "exist" {
                 let (item, search_type) = super::parse_exist_args(&args)?;
                 return Ok(wrap_vm_values(vec![exist_value_result_vm(
+                    &self.shared_state,
                     frame,
                     self.resolution_source_path.as_deref(),
                     &item,
@@ -2239,6 +2424,7 @@ impl BytecodeVm {
             if parsed.display_name == "which" {
                 let (item, mode) = super::parse_which_args(&args)?;
                 return Ok(wrap_vm_values(vec![which_value_result_vm(
+                    &self.shared_state,
                     frame,
                     self.resolution_source_path.as_deref(),
                     &item,
@@ -2291,13 +2477,14 @@ impl BytecodeVm {
             return invoke_runtime_builtin_outputs(
                 &self.shared_state,
                 None,
+                self.resolution_source_path.as_deref(),
                 &parsed.display_name,
                 &args,
                 requested_outputs,
             )
             .map(wrap_vm_values)
-            .or_else(|error| match error {
-                RuntimeError::Unsupported(_) => {
+            .or_else(|error| {
+                if runtime_builtin_can_fallback(&error, &parsed.display_name) {
                     let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
                     invoke_bundle_named_callable_from_registry(
                         &parsed.display_name,
@@ -2316,8 +2503,9 @@ impl BytecodeVm {
                             ))
                         })
                     })
+                } else {
+                    Err(error)
                 }
-                other => Err(other),
             });
         }
         if let Some(function_name) = frame
@@ -2379,6 +2567,45 @@ impl BytecodeVm {
             )
             .map(wrap_vm_values);
         }
+        if parsed.display_name == "colfilt" {
+            return super::execute_colfilt_builtin_outputs(
+                &args,
+                requested_outputs,
+                |callback, call_args, requested| {
+                    let Value::FunctionHandle(handle) = callback else {
+                        unreachable!("colfilt callback parser produces function handles");
+                    };
+                    self.call_function_value_outputs(frame, handle, call_args, requested)
+                },
+            )
+            .map(wrap_vm_values);
+        }
+        if parsed.display_name == "blockproc" {
+            return super::execute_blockproc_builtin_outputs(
+                &args,
+                requested_outputs,
+                |callback, call_args, requested| {
+                    let Value::FunctionHandle(handle) = callback else {
+                        unreachable!("blockproc callback parser produces function handles");
+                    };
+                    self.call_function_value_outputs(frame, handle, call_args, requested)
+                },
+            )
+            .map(wrap_vm_values);
+        }
+        if parsed.display_name == "nlfilter" {
+            return super::execute_nlfilter_builtin_outputs(
+                &args,
+                requested_outputs,
+                |callback, call_args, requested| {
+                    let Value::FunctionHandle(handle) = callback else {
+                        unreachable!("nlfilter callback parser produces function handles");
+                    };
+                    self.call_function_value_outputs(frame, handle, call_args, requested)
+                },
+            )
+            .map(wrap_vm_values);
+        }
         if parsed.display_name == "cellfun" {
             return super::execute_cellfun_builtin_outputs(
                 &args,
@@ -2423,6 +2650,47 @@ impl BytecodeVm {
                 .invoke_help_builtin_outputs(Some(frame), &args, requested_outputs)
                 .map(wrap_vm_values);
         }
+        if parsed.display_name == "doc" {
+            return self
+                .invoke_doc_builtin_outputs(Some(frame), &args, requested_outputs)
+                .map(wrap_vm_values);
+        }
+        if parsed.display_name == "methods" {
+            return super::invoke_methods_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &args,
+                requested_outputs,
+            )
+            .map(wrap_vm_values);
+        }
+        if parsed.display_name == "properties" {
+            return super::invoke_properties_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &args,
+                requested_outputs,
+            )
+            .map(wrap_vm_values);
+        }
+        if parsed.display_name == "superclasses" {
+            return super::invoke_superclasses_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &args,
+                requested_outputs,
+            )
+            .map(wrap_vm_values);
+        }
+        if parsed.display_name == "events" {
+            return super::invoke_events_builtin_outputs(
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                &args,
+                requested_outputs,
+            )
+            .map(wrap_vm_values);
+        }
         if parsed.display_name == "lookfor" {
             return super::invoke_lookfor_builtin_outputs(
                 &self.shared_state,
@@ -2456,13 +2724,14 @@ impl BytecodeVm {
         invoke_runtime_builtin_outputs(
             &self.shared_state,
             None,
+            self.resolution_source_path.as_deref(),
             &parsed.display_name,
             &args,
             requested_outputs,
         )
         .map(wrap_vm_values)
-        .or_else(|error| match error {
-            RuntimeError::Unsupported(_) => {
+        .or_else(|error| {
+            if runtime_builtin_can_fallback(&error, &parsed.display_name) {
                 let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
                 invoke_bundle_named_callable_from_registry(
                     &parsed.display_name,
@@ -2481,8 +2750,9 @@ impl BytecodeVm {
                         ))
                     })
                 })
+            } else {
+                Err(error)
             }
-            other => Err(other),
         })
     }
 
@@ -2514,6 +2784,7 @@ impl BytecodeVm {
             return invoke_runtime_builtin_outputs(
                 &self.shared_state,
                 None,
+                self.resolution_source_path.as_deref(),
                 &method.builtin_name,
                 &evaluated_args,
                 requested_outputs,
@@ -2593,12 +2864,6 @@ impl BytecodeVm {
         let mut values = Vec::new();
         let dummy_target = empty_matrix_value();
         for arg in args {
-            if matches!(arg.as_str(), ":" | "end") {
-                return Err(RuntimeError::Unsupported(
-                    "`end` and slice selectors are not implemented for function-call arguments in the current bytecode VM"
-                        .to_string(),
-                ));
-            }
             if is_encoded_index_expression(arg) {
                 values.push(self.evaluate_encoded_index_expression_with_frame(
                     frame,
@@ -2635,9 +2900,7 @@ impl BytecodeVm {
         total_arguments: usize,
     ) -> Result<Value, RuntimeError> {
         let expression = text.strip_prefix("idx:").ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "index bytecode argument `{text}` is not supported"
-            ))
+            RuntimeError::Unsupported(format!("index bytecode argument `{text}` is not supported"))
         })?;
         if let Some(inner) = expression
             .strip_prefix("call(")
@@ -2665,9 +2928,9 @@ impl BytecodeVm {
                         position,
                         total_arguments,
                     )?;
-                    return Ok(first_output_or_unit(self.call_function_value_outputs(
-                        frame, handle, &args, 1,
-                    )?));
+                    return Ok(first_output_or_unit(
+                        self.call_function_value_outputs(frame, handle, &args, 1)?,
+                    ));
                 }
                 let evaluated_args =
                     evaluate_index_arguments_from_strings(temps, &target_temp.value, arg_specs)?;
@@ -2690,9 +2953,9 @@ impl BytecodeVm {
                         position,
                         total_arguments,
                     )?;
-                    return Ok(first_output_or_unit(self.call_function_value_outputs(
-                        frame, handle, &args, 1,
-                    )?));
+                    return Ok(first_output_or_unit(
+                        self.call_function_value_outputs(frame, handle, &args, 1)?,
+                    ));
                 }
                 let evaluated_args =
                     evaluate_index_arguments_from_strings(temps, &target_value, arg_specs)?;
@@ -2804,7 +3067,9 @@ impl BytecodeVm {
                             )?;
                             match vm.invoke_static_class_method_from_bytecode(method_name, args) {
                                 Ok(values) => return Ok(values),
-                                Err(error) if is_missing_static_method_error(&error, method_name) => {
+                                Err(error)
+                                    if is_missing_static_method_error(&error, method_name) =>
+                                {
                                     if let Some(receiver) = args.first() {
                                         if value_has_object_method(receiver, method_name) {
                                             return self.invoke_object_method_outputs(
@@ -2826,25 +3091,26 @@ impl BytecodeVm {
                 }
                 self.load_and_invoke_bundled_module(module_id, args)
             }
-                FunctionHandleTarget::Named(name) => {
-                    if let Some(closure) = self.handle_closures.get(name).cloned() {
-                        return match closure.target {
-                            ClosureTarget::Function(function_name) => self
-                                .invoke_function_with_frame(
+            FunctionHandleTarget::Named(name) => {
+                if let Some(closure) = self.handle_closures.get(name).cloned() {
+                    return match closure.target {
+                        ClosureTarget::Function(function_name) => self
+                            .invoke_function_with_frame(
                                 &function_name,
                                 args,
                                 None,
                                 Some(&closure.captured_cells),
                             )
                             .map(|(values, _)| values),
-                        };
-                    }
-                    if let Some((path, function_name)) = super::parse_scoped_function_handle_name(name) {
-                        return self.invoke_scoped_function_handle(&path, &function_name, args);
-                    }
-                    if let Some(function_name) = frame
-                        .visible_functions
-                        .get(name)
+                    };
+                }
+                if let Some((path, function_name)) = super::parse_scoped_function_handle_name(name)
+                {
+                    return self.invoke_scoped_function_handle(&path, &function_name, args);
+                }
+                if let Some(function_name) = frame
+                    .visible_functions
+                    .get(name)
                     .or_else(|| self.visible_functions.get(name))
                     .cloned()
                 {
@@ -2867,9 +3133,46 @@ impl BytecodeVm {
                         },
                     );
                 }
+                if name == "nlfilter" {
+                    return super::execute_nlfilter_builtin_outputs(
+                        args,
+                        requested_outputs,
+                        |callback, call_args, requested| {
+                            let Value::FunctionHandle(handle) = callback else {
+                                unreachable!("nlfilter callback parser produces function handles");
+                            };
+                            self.call_function_value_outputs(frame, handle, call_args, requested)
+                        },
+                    );
+                }
+                if name == "colfilt" {
+                    return super::execute_colfilt_builtin_outputs(
+                        args,
+                        requested_outputs,
+                        |callback, call_args, requested| {
+                            let Value::FunctionHandle(handle) = callback else {
+                                unreachable!("colfilt callback parser produces function handles");
+                            };
+                            self.call_function_value_outputs(frame, handle, call_args, requested)
+                        },
+                    );
+                }
+                if name == "blockproc" {
+                    return super::execute_blockproc_builtin_outputs(
+                        args,
+                        requested_outputs,
+                        |callback, call_args, requested| {
+                            let Value::FunctionHandle(handle) = callback else {
+                                unreachable!("blockproc callback parser produces function handles");
+                            };
+                            self.call_function_value_outputs(frame, handle, call_args, requested)
+                        },
+                    );
+                }
                 if name == "exist" {
                     let (item, search_type) = super::parse_exist_args(args)?;
                     return Ok(vec![exist_value_result_vm(
+                        &self.shared_state,
                         frame,
                         self.resolution_source_path.as_deref(),
                         &item,
@@ -2878,6 +3181,41 @@ impl BytecodeVm {
                 }
                 if name == "help" {
                     return self.invoke_help_builtin_outputs(Some(frame), args, requested_outputs);
+                }
+                if name == "doc" {
+                    return self.invoke_doc_builtin_outputs(Some(frame), args, requested_outputs);
+                }
+                if name == "methods" {
+                    return super::invoke_methods_builtin_outputs(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        requested_outputs,
+                    );
+                }
+                if name == "properties" {
+                    return super::invoke_properties_builtin_outputs(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        requested_outputs,
+                    );
+                }
+                if name == "superclasses" {
+                    return super::invoke_superclasses_builtin_outputs(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        requested_outputs,
+                    );
+                }
+                if name == "events" {
+                    return super::invoke_events_builtin_outputs(
+                        &self.shared_state,
+                        self.resolution_source_path.as_deref(),
+                        args,
+                        requested_outputs,
+                    );
                 }
                 if name == "lookfor" {
                     return super::invoke_lookfor_builtin_outputs(
@@ -2893,6 +3231,7 @@ impl BytecodeVm {
                 if name == "which" {
                     let (item, mode) = super::parse_which_args(args)?;
                     return Ok(vec![which_value_result_vm(
+                        &self.shared_state,
                         frame,
                         self.resolution_source_path.as_deref(),
                         &item,
@@ -2900,7 +3239,11 @@ impl BytecodeVm {
                     )?]);
                 }
                 if name == "localfunctions" {
-                    return self.invoke_localfunctions_builtin_outputs(frame, args, requested_outputs);
+                    return self.invoke_localfunctions_builtin_outputs(
+                        frame,
+                        args,
+                        requested_outputs,
+                    );
                 }
                 if name == "functions" {
                     return self.invoke_functions_builtin_outputs(args, requested_outputs);
@@ -2919,6 +3262,42 @@ impl BytecodeVm {
                         |callback, call_args, requested| {
                             let Value::FunctionHandle(handle) = callback else {
                                 unreachable!("cellfun callback parser produces function handles");
+                            };
+                            self.call_function_value_outputs(frame, handle, call_args, requested)
+                        },
+                    );
+                }
+                if name == "colfilt" {
+                    return super::execute_colfilt_builtin_outputs(
+                        args,
+                        requested_outputs,
+                        |callback, call_args, requested| {
+                            let Value::FunctionHandle(handle) = callback else {
+                                unreachable!("colfilt callback parser produces function handles");
+                            };
+                            self.call_function_value_outputs(frame, handle, call_args, requested)
+                        },
+                    );
+                }
+                if name == "blockproc" {
+                    return super::execute_blockproc_builtin_outputs(
+                        args,
+                        requested_outputs,
+                        |callback, call_args, requested| {
+                            let Value::FunctionHandle(handle) = callback else {
+                                unreachable!("blockproc callback parser produces function handles");
+                            };
+                            self.call_function_value_outputs(frame, handle, call_args, requested)
+                        },
+                    );
+                }
+                if name == "nlfilter" {
+                    return super::execute_nlfilter_builtin_outputs(
+                        args,
+                        requested_outputs,
+                        |callback, call_args, requested| {
+                            let Value::FunctionHandle(handle) = callback else {
+                                unreachable!("nlfilter callback parser produces function handles");
                             };
                             self.call_function_value_outputs(frame, handle, call_args, requested)
                         },
@@ -2987,12 +3366,13 @@ impl BytecodeVm {
                 match invoke_runtime_builtin_outputs(
                     &self.shared_state,
                     None,
+                    self.resolution_source_path.as_deref(),
                     name,
                     args,
                     requested_outputs,
                 ) {
                     Ok(values) => Ok(values),
-                    Err(RuntimeError::Unsupported(_)) => {
+                    Err(error) if runtime_builtin_can_fallback(&error, name) => {
                         let (bundled_modules, bundled_modules_by_id) =
                             self.current_bundle_registries();
                         if let Some(values) = invoke_bundle_named_callable_from_registry(
@@ -3015,9 +3395,11 @@ impl BytecodeVm {
                             }
                         }
                         if let Some(source_path) = self.resolution_source_path.as_deref() {
-                            if let Some(path) =
-                                super::resolve_named_callable_path_from_source_path(source_path, name)
-                            {
+                            if let Some(path) = super::resolve_named_callable_path(
+                                &self.shared_state,
+                                Some(source_path),
+                                name,
+                            ) {
                                 return self.load_and_invoke_external_function(&path, args);
                             }
                         }
@@ -3029,7 +3411,11 @@ impl BytecodeVm {
                     Err(error) => Err(error),
                 }
             }
-            FunctionHandleTarget::BoundMethod { receiver, method_name, .. } => {
+            FunctionHandleTarget::BoundMethod {
+                receiver,
+                method_name,
+                ..
+            } => {
                 if !matches!(receiver.as_ref(), Value::Object(_) | Value::Matrix(_)) {
                     return Err(RuntimeError::Unsupported(format!(
                         "bound method handle `{}` does not carry an object receiver",
@@ -3041,7 +3427,11 @@ impl BytecodeVm {
         }
     }
 
-    fn find_module_function<'b>(&self, module: &'b HirModule, name: &str) -> Option<&'b HirFunction> {
+    fn find_module_function<'b>(
+        &self,
+        module: &'b HirModule,
+        name: &str,
+    ) -> Option<&'b HirFunction> {
         module.items.iter().find_map(|item| match item {
             HirItem::Function(function) if function.name == name => Some(function),
             HirItem::Statement(_) | HirItem::Function(_) => None,
@@ -3069,10 +3459,7 @@ impl BytecodeVm {
         } else {
             ObjectStorageKind::Value
         };
-        let module_target = class
-            .source_path
-            .clone()
-            .map(ObjectMethodTarget::Path);
+        let module_target = class.source_path.clone().map(ObjectMethodTarget::Path);
         let mut external_methods = BTreeMap::new();
         let mut private_property_owners = BTreeMap::new();
         let mut private_instance_method_owners = BTreeMap::new();
@@ -3114,7 +3501,9 @@ impl BytecodeVm {
                     }
                 }
                 for (name, target) in &parent_object.class.external_methods {
-                    external_methods.entry(name.clone()).or_insert(target.clone());
+                    external_methods
+                        .entry(name.clone())
+                        .or_insert(target.clone());
                 }
             }
         }
@@ -3226,7 +3615,9 @@ impl BytecodeVm {
                         Some(ObjectMethodTarget::BundleModule(module_id.clone())),
                     )?
                     else {
-                        unreachable!("parent bytecode class default construction should yield object");
+                        unreachable!(
+                            "parent bytecode class default construction should yield object"
+                        );
                     };
                     object
                 } else if let Some(path) = &class.superclass_path {
@@ -3241,17 +3632,20 @@ impl BytecodeVm {
                             Rc::clone(&self.shared_state),
                             self.call_stack.clone(),
                         )?;
-                        let parent_class = vm.bytecode.classes.first().cloned().ok_or_else(|| {
-                            RuntimeError::Unsupported(format!(
-                                "bundled superclass `{path}` does not carry class metadata"
-                            ))
-                        })?;
+                        let parent_class =
+                            vm.bytecode.classes.first().cloned().ok_or_else(|| {
+                                RuntimeError::Unsupported(format!(
+                                    "bundled superclass `{path}` does not carry class metadata"
+                                ))
+                            })?;
                         let Value::Object(object) = vm.build_default_object_from_bytecode_class(
                             &parent_class,
                             Some(ObjectMethodTarget::Path(PathBuf::from(path))),
                         )?
                         else {
-                            unreachable!("parent bundled class default construction should yield object");
+                            unreachable!(
+                                "parent bundled class default construction should yield object"
+                            );
                         };
                         object
                     } else {
@@ -3262,7 +3656,9 @@ impl BytecodeVm {
                             loaded.source_path.display().to_string(),
                         )?
                         else {
-                            unreachable!("parent source class default construction should yield object");
+                            unreachable!(
+                                "parent source class default construction should yield object"
+                            );
                         };
                         object
                     }
@@ -3291,7 +3687,9 @@ impl BytecodeVm {
                     }
                 }
                 for (name, target) in &parent_object.class.external_methods {
-                    external_methods.entry(name.clone()).or_insert(target.clone());
+                    external_methods
+                        .entry(name.clone())
+                        .or_insert(target.clone());
                 }
             }
         }
@@ -3302,7 +3700,10 @@ impl BytecodeVm {
             }
             fields.insert(
                 property_name.clone(),
-                defaults.get(index).cloned().unwrap_or_else(empty_matrix_value),
+                defaults
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(empty_matrix_value),
             );
         }
         let qualified_class_name =
@@ -3353,12 +3754,14 @@ impl BytecodeVm {
             loaded.source_path.display().to_string(),
         )?;
         if let Some(constructor_name) = &loaded.class.constructor {
-            let constructor = self.find_module_function(&loaded.module, constructor_name).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "constructor `{constructor_name}` is not available in class `{}`",
-                    loaded.class.name
-                ))
-            })?;
+            let constructor = self
+                .find_module_function(&loaded.module, constructor_name)
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "constructor `{constructor_name}` is not available in class `{}`",
+                        loaded.class.name
+                    ))
+                })?;
             let prebound_outputs = constructor
                 .outputs
                 .first()
@@ -3391,12 +3794,14 @@ impl BytecodeVm {
         existing_object: Value,
     ) -> Result<Vec<Value>, RuntimeError> {
         if let Some(constructor_name) = &loaded.class.constructor {
-            let constructor = self.find_module_function(&loaded.module, constructor_name).ok_or_else(|| {
-                RuntimeError::Unsupported(format!(
-                    "constructor `{constructor_name}` is not available in class `{}`",
-                    loaded.class.name
-                ))
-            })?;
+            let constructor = self
+                .find_module_function(&loaded.module, constructor_name)
+                .ok_or_else(|| {
+                    RuntimeError::Unsupported(format!(
+                        "constructor `{constructor_name}` is not available in class `{}`",
+                        loaded.class.name
+                    ))
+                })?;
             let prebound_outputs = constructor
                 .outputs
                 .first()
@@ -3542,7 +3947,12 @@ impl BytecodeVm {
         args: &[Value],
     ) -> Result<Vec<Value>, RuntimeError> {
         let loaded = super::load_class_module_from_path(path)?;
-        if !loaded.class.static_inline_methods.iter().any(|name| name == method_name) {
+        if !loaded
+            .class
+            .static_inline_methods
+            .iter()
+            .any(|name| name == method_name)
+        {
             if let Some(superclass_name) = &loaded.class.superclass_name {
                 if !superclass_name.eq_ignore_ascii_case("handle") {
                     let superclass_path =
@@ -3577,12 +3987,14 @@ impl BytecodeVm {
                 qualified_class_name
             )));
         }
-        let method = self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
-            RuntimeError::Unsupported(format!(
-                "static method `{method_name}` is not available in class `{}`",
-                loaded.class.name
-            ))
-        })?;
+        let method = self
+            .find_module_function(&loaded.module, method_name)
+            .ok_or_else(|| {
+                RuntimeError::Unsupported(format!(
+                    "static method `{method_name}` is not available in class `{}`",
+                    loaded.class.name
+                ))
+            })?;
         let mut interpreter = Interpreter::with_shared_state(
             &loaded.module,
             loaded.source_path.display().to_string(),
@@ -3653,8 +4065,9 @@ impl BytecodeVm {
                 }
                 Some(ObjectMethodTarget::Path(source_path)) => {
                     let loaded = super::load_class_module_from_path(source_path)?;
-                    let method =
-                        self.find_module_function(&loaded.module, method_name).ok_or_else(|| {
+                    let method = self
+                        .find_module_function(&loaded.module, method_name)
+                        .ok_or_else(|| {
                             RuntimeError::Unsupported(format!(
                                 "inline method `{method_name}` is not available in class `{}`",
                                 class.class_name
@@ -3767,12 +4180,15 @@ impl BytecodeVm {
                 }
                 let hir = lower_to_hir(&unit, &analysis);
                 let method = if unit.kind == CompilationUnitKind::ClassFile {
-                    Some(self.find_module_function(&hir, method_name).ok_or_else(|| {
-                        RuntimeError::Unsupported(format!(
-                            "method `{method_name}` is not available in class module `{}`",
-                            path.display()
-                        ))
-                    })?)
+                    Some(
+                        self.find_module_function(&hir, method_name)
+                            .ok_or_else(|| {
+                                RuntimeError::Unsupported(format!(
+                                    "method `{method_name}` is not available in class module `{}`",
+                                    path.display()
+                                ))
+                            })?,
+                    )
                 } else {
                     None
                 };
@@ -3789,9 +4205,9 @@ impl BytecodeVm {
                         None,
                     )
                 } else {
-                    interpreter.invoke_primary_function(&method_args).map(|values| {
-                        values.into_iter().map(|(_, value)| value).collect()
-                    })
+                    interpreter
+                        .invoke_primary_function(&method_args)
+                        .map(|values| values.into_iter().map(|(_, value)| value).collect())
                 }
             }
         }
@@ -3943,7 +4359,10 @@ impl BytecodeVm {
         }
     }
 
-    fn construct_object_value_from_bundled_path(&mut self, path: &Path) -> Result<Value, RuntimeError> {
+    fn construct_object_value_from_bundled_path(
+        &mut self,
+        path: &Path,
+    ) -> Result<Value, RuntimeError> {
         let module = self.lookup_bundle_module_by_path(path).ok_or_else(|| {
             RuntimeError::Unsupported(format!(
                 "bundled class module `{}` is not available for default object construction",
@@ -4045,16 +4464,20 @@ impl BytecodeVm {
                     && updated.cols == 1
                     && matches!(updated.elements.first(), Some(Value::Object(_)))
                 {
-                    Ok(updated.elements.into_iter().next().expect("single object element"))
+                    Ok(updated
+                        .elements
+                        .into_iter()
+                        .next()
+                        .expect("single object element"))
                 } else {
                     Ok(Value::Matrix(updated))
                 }
             }
             (IndexAssignmentKind::Paren, Value::Matrix(matrix)) => {
                 if let Some(class) = object_assignment_target_class(&matrix, &value)? {
-                    Ok(Value::Matrix(
-                        self.assign_object_matrix_index(matrix, indices, value, class)?,
-                    ))
+                    Ok(Value::Matrix(self.assign_object_matrix_index(
+                        matrix, indices, value, class,
+                    )?))
                 } else {
                     apply_index_update(
                         Value::Matrix(matrix),
@@ -4078,7 +4501,11 @@ impl BytecodeVm {
                 "class bytecode module does not carry class metadata".to_string(),
             )
         })?;
-        if !class.static_inline_methods.iter().any(|name| name == method_name) {
+        if !class
+            .static_inline_methods
+            .iter()
+            .any(|name| name == method_name)
+        {
             if let Some(superclass_name) = &class.superclass_name {
                 if !superclass_name.eq_ignore_ascii_case("handle") {
                     if let Some(module_id) = &class.superclass_bundle_module_id {
@@ -4135,7 +4562,11 @@ impl BytecodeVm {
             .collect::<BTreeSet<_>>();
         let qualified_class_name =
             qualified_object_class_name(&class.name, class.package.as_deref());
-        if !private_static_method_access_allowed(&qualified_class_name, &private_static, method_name) {
+        if !private_static_method_access_allowed(
+            &qualified_class_name,
+            &private_static,
+            method_name,
+        ) {
             return Err(RuntimeError::MissingVariable(format!(
                 "static method `{method_name}` has private access for class `{}`",
                 qualified_class_name
@@ -4168,10 +4599,34 @@ impl BytecodeVm {
                 invoke_clear_builtin_outputs_vm(frame, &self.shared_state, args, output_arity)
             }
             "clearvars" => invoke_clearvars_builtin_outputs_vm(frame, args, output_arity),
-            "save" => invoke_save_builtin_outputs_vm(frame, &self.shared_state, args, output_arity),
-            "load" => invoke_load_builtin_outputs_vm(frame, &self.shared_state, args, output_arity),
-            "who" => invoke_who_builtin_outputs_vm(frame, &self.shared_state, args, output_arity),
-            "whos" => invoke_whos_builtin_outputs_vm(frame, &self.shared_state, args, output_arity),
+            "save" => invoke_save_builtin_outputs_vm(
+                frame,
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                args,
+                output_arity,
+            ),
+            "load" => invoke_load_builtin_outputs_vm(
+                frame,
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                args,
+                output_arity,
+            ),
+            "who" => invoke_who_builtin_outputs_vm(
+                frame,
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                args,
+                output_arity,
+            ),
+            "whos" => invoke_whos_builtin_outputs_vm(
+                frame,
+                &self.shared_state,
+                self.resolution_source_path.as_deref(),
+                args,
+                output_arity,
+            ),
             "tic" => invoke_tic_builtin_outputs(&self.shared_state, args, output_arity),
             "toc" => invoke_toc_builtin_outputs(&self.shared_state, args, output_arity),
             "format" => invoke_format_builtin_outputs(&self.shared_state, args, output_arity),
@@ -4719,9 +5174,9 @@ impl BytecodeVm {
             if let Some(root_name) = segments.first().copied() {
                 match frame.read_reference(parsed.binding_id, root_name) {
                     Ok(receiver) => {
-                        if let Some(handle) =
-                            super::try_build_bound_method_handle_from_dotted_name(receiver, &segments)?
-                        {
+                        if let Some(handle) = super::try_build_bound_method_handle_from_dotted_name(
+                            receiver, &segments,
+                        )? {
                             return Ok(handle);
                         }
                     }
@@ -4855,8 +5310,45 @@ impl BytecodeVm {
             }
             return self.load_and_invoke_external_function(path, args);
         }
+        let (bundled_modules, bundled_modules_by_id) = self.current_bundle_registries();
+        if let Some(values) = invoke_bundle_named_callable_from_registry(
+            &parsed.display_name,
+            args,
+            bundled_modules,
+            bundled_modules_by_id,
+            Rc::clone(&self.shared_state),
+            self.call_stack.clone(),
+        )? {
+            return Ok(values);
+        }
+        let context =
+            resolution_context_with_env(&self.shared_state, self.resolution_source_path.as_deref());
+        if let Some(resolved) = resolve_callable(&parsed.display_name, &context) {
+            match resolved {
+                ResolvedCallable::Function(function) => {
+                    return self.load_and_invoke_external_function(&function.path, args);
+                }
+                ResolvedCallable::Class(class_def) => {
+                    if let Some((_, method_name)) = parsed.display_name.rsplit_once('.') {
+                        let is_static = class_def
+                            .path
+                            .file_stem()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|class_name| class_name != method_name);
+                        if is_static {
+                            return self.invoke_static_class_method_from_path(
+                                &class_def.path,
+                                method_name,
+                                args,
+                            );
+                        }
+                    }
+                    return self.construct_class_from_path(&class_def.path, args);
+                }
+            }
+        }
         Err(RuntimeError::Unsupported(format!(
-            "external call target `{}` has no resolvable module identity",
+            "call target `{}` is not executable in the current bytecode VM",
             parsed.display_name
         )))
     }
@@ -4882,7 +5374,10 @@ impl BytecodeVm {
         )?;
         vm.resolution_source_path = self.bundle_module_source_path(module_id);
         if vm.bytecode.unit_kind == "ClassFile" {
-            vm.construct_class_from_bytecode(args, Some(ObjectMethodTarget::BundleModule(module_id.to_string())))
+            vm.construct_class_from_bytecode(
+                args,
+                Some(ObjectMethodTarget::BundleModule(module_id.to_string())),
+            )
         } else {
             Ok(vm
                 .invoke_primary_function(args)?
@@ -5063,11 +5558,10 @@ impl BytecodeVm {
             && source.list_origin
             && (list_assignment || temp_field_target_requires_list_assignment(&projections))
         {
-            if let Some(updated) =
-                list_assignment
-                    .then(|| default_temp_struct_csl_root_value(&projections, field, source))
-                    .transpose()?
-                    .flatten()
+            if let Some(updated) = list_assignment
+                .then(|| default_temp_struct_csl_root_value(&projections, field, source))
+                .transpose()?
+                .flatten()
             {
                 *cell.borrow_mut() = Some(updated);
                 return Ok(());
@@ -5095,11 +5589,10 @@ impl BytecodeVm {
             }
         }
         if cell.borrow().is_none() {
-            if let Some(updated) =
-                list_assignment
-                    .then(|| default_temp_struct_direct_root_value(&projections, field, source))
-                    .transpose()?
-                    .flatten()
+            if let Some(updated) = list_assignment
+                .then(|| default_temp_struct_direct_root_value(&projections, field, source))
+                .transpose()?
+                .flatten()
             {
                 *cell.borrow_mut() = Some(updated);
                 return Ok(());
@@ -5181,23 +5674,21 @@ impl BytecodeVm {
         let current_value = cell.borrow().clone();
         let current = match current_value {
             Some(current) => current,
-            None
-                if matches!(
-                    leaf,
-                    TempLValueLeaf::Index {
-                        kind: IndexAssignmentKind::Brace,
-                        ..
-                    }
-                )
-                    && projections.iter().any(|projection| {
-                        matches!(projection, TempLValueProjection::Brace(_))
-                    })
-                    && projections.iter().all(|projection| {
-                        matches!(
-                            projection,
-                            TempLValueProjection::Field(_) | TempLValueProjection::Brace(_)
-                        )
-                    }) =>
+            None if matches!(
+                leaf,
+                TempLValueLeaf::Index {
+                    kind: IndexAssignmentKind::Brace,
+                    ..
+                }
+            ) && projections
+                .iter()
+                .any(|projection| matches!(projection, TempLValueProjection::Brace(_)))
+                && projections.iter().all(|projection| {
+                    matches!(
+                        projection,
+                        TempLValueProjection::Field(_) | TempLValueProjection::Brace(_)
+                    )
+                }) =>
             {
                 if let Some(updated) =
                     try_materialize_undefined_cell_receiver_struct_field_brace_csl_assignment(
@@ -5217,20 +5708,21 @@ impl BytecodeVm {
                     ))
                 })?
             }
-            None
-                if matches!(
-                    leaf,
-                    TempLValueLeaf::Index {
-                        kind: IndexAssignmentKind::Brace,
-                        ..
-                    }
-                )
-                    && projections
-                        .iter()
-                        .any(|projection| matches!(projection, TempLValueProjection::Paren(_)))
-                    && projections.iter().all(|projection| {
-                        matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Paren(_))
-                    }) =>
+            None if matches!(
+                leaf,
+                TempLValueLeaf::Index {
+                    kind: IndexAssignmentKind::Brace,
+                    ..
+                }
+            ) && projections
+                .iter()
+                .any(|projection| matches!(projection, TempLValueProjection::Paren(_)))
+                && projections.iter().all(|projection| {
+                    matches!(
+                        projection,
+                        TempLValueProjection::Field(_) | TempLValueProjection::Paren(_)
+                    )
+                }) =>
             {
                 if let Some(updated) =
                     try_materialize_undefined_indexed_struct_field_brace_csl_assignment(
@@ -5250,17 +5742,15 @@ impl BytecodeVm {
                     ))
                 })?
             }
-            None
-                if matches!(
-                    leaf,
-                    TempLValueLeaf::Index {
-                        kind: IndexAssignmentKind::Brace,
-                        ..
-                    }
-                )
-                    && projections
-                        .iter()
-                        .all(|projection| matches!(projection, TempLValueProjection::Field(_))) =>
+            None if matches!(
+                leaf,
+                TempLValueLeaf::Index {
+                    kind: IndexAssignmentKind::Brace,
+                    ..
+                }
+            ) && projections
+                .iter()
+                .all(|projection| matches!(projection, TempLValueProjection::Field(_))) =>
             {
                 if let Some(updated) = try_materialize_undefined_struct_field_brace_csl_assignment(
                     &projections,
@@ -5278,15 +5768,13 @@ impl BytecodeVm {
                     ))
                 })?
             }
-            None
-                if matches!(
-                    leaf,
-                    TempLValueLeaf::Index {
-                        kind: IndexAssignmentKind::Brace,
-                        ..
-                    }
-                )
-                    && projections.is_empty() =>
+            None if matches!(
+                leaf,
+                TempLValueLeaf::Index {
+                    kind: IndexAssignmentKind::Brace,
+                    ..
+                }
+            ) && projections.is_empty() =>
             {
                 if let Some(updated) =
                     try_materialize_undefined_root_brace_csl_assignment(temps, args, &value)?
@@ -5756,7 +6244,8 @@ impl BytecodeVm {
         {
             return Err(RuntimeError::ShapeError(format!(
                 "object-valued property assignment expects shape {:?}, found {:?}",
-                object_matrix.dims, updated_matrix.dims()
+                object_matrix.dims,
+                updated_matrix.dims()
             )));
         }
         if !matrix_is_object_array(&updated_matrix) {
@@ -5837,7 +6326,8 @@ impl BytecodeVm {
         {
             return Err(RuntimeError::ShapeError(format!(
                 "object-array property aggregate assignment expects shape {:?}, found {:?}",
-                object_matrix.dims, updated_matrix.dims()
+                object_matrix.dims,
+                updated_matrix.dims()
             )));
         }
 
@@ -5901,7 +6391,10 @@ impl BytecodeVm {
             object_matrix.rows,
             object_matrix.cols,
             object_matrix.dims.clone(),
-            property_cells.into_iter().map(Value::Cell).collect::<Vec<_>>(),
+            property_cells
+                .into_iter()
+                .map(Value::Cell)
+                .collect::<Vec<_>>(),
         )?);
         let updated_aggregated =
             self.assign_lvalue_path(aggregated, rest, true, leaf.clone(), temps)?;
@@ -5913,7 +6406,8 @@ impl BytecodeVm {
         {
             return Err(RuntimeError::ShapeError(format!(
                 "cell-valued object property assignment expects shape {:?}, found {:?}",
-                object_matrix.dims, updated_cell.dims()
+                object_matrix.dims,
+                updated_cell.dims()
             )));
         }
 
@@ -6233,6 +6727,7 @@ fn invoke_clearvars_builtin_outputs_vm(
 fn invoke_save_builtin_outputs_vm(
     frame: &mut VmFrame,
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
@@ -6241,7 +6736,7 @@ fn invoke_save_builtin_outputs_vm(
             "save currently does not return outputs".to_string(),
         ));
     }
-    let spec = parse_save_spec(args)?;
+    let spec = parse_save_spec(shared_state, resolution_source_path, args)?;
     let workspace = frame.export_workspace()?;
     let selected = if let Some(struct_name) = spec.struct_name {
         let value = workspace.get(&struct_name).cloned().ok_or_else(|| {
@@ -6305,20 +6800,21 @@ fn invoke_save_builtin_outputs_vm(
         filtered
     };
     let (merged, snapshot_bundle_modules) = if spec.append && spec.path.exists() {
-        let (mut existing, mut existing_bundle_modules) = if workspace_snapshot_extension(&spec.path) {
-            let snapshot = read_workspace_snapshot_with_modules(&spec.path)
-                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-            (
-                snapshot.workspace,
-                decode_snapshot_bundle_modules(&snapshot.bundle_modules)?,
-            )
-        } else {
-            (
-                read_mat_file(&spec.path)
-                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
-                Vec::new(),
-            )
-        };
+        let (mut existing, mut existing_bundle_modules) =
+            if workspace_snapshot_extension(&spec.path) {
+                let snapshot = read_workspace_snapshot_with_modules(&spec.path)
+                    .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                (
+                    snapshot.workspace,
+                    decode_snapshot_bundle_modules(&snapshot.bundle_modules)?,
+                )
+            } else {
+                (
+                    read_mat_file(&spec.path)
+                        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?,
+                    Vec::new(),
+                )
+            };
         for (name, value) in selected {
             existing.insert(name, value);
         }
@@ -6355,7 +6851,7 @@ fn invoke_save_builtin_outputs_vm(
             &merged,
             &encode_snapshot_bundle_modules(&snapshot_bundle_modules),
         )
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     } else {
         write_mat_file(&spec.path, &merged)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
@@ -6366,10 +6862,11 @@ fn invoke_save_builtin_outputs_vm(
 fn invoke_load_builtin_outputs_vm(
     frame: &mut VmFrame,
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let spec = parse_load_arguments(args)?;
+    let spec = parse_load_arguments(shared_state, resolution_source_path, args)?;
     let mut workspace = if workspace_snapshot_extension(&spec.path) {
         let snapshot = read_workspace_snapshot_with_modules(&spec.path)
             .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
@@ -6406,10 +6903,11 @@ fn invoke_load_builtin_outputs_vm(
 fn invoke_who_builtin_outputs_vm(
     frame: &VmFrame,
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let entries = workspace_entries_vm(frame, args, "who")?;
+    let entries = workspace_entries_vm(frame, shared_state, resolution_source_path, args, "who")?;
     match output_arity {
         0 => {
             let mut out = String::from("Your variables are:\n\n");
@@ -6445,10 +6943,11 @@ fn invoke_who_builtin_outputs_vm(
 fn invoke_whos_builtin_outputs_vm(
     frame: &VmFrame,
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let entries = workspace_entries_vm(frame, args, "whos")?;
+    let entries = workspace_entries_vm(frame, shared_state, resolution_source_path, args, "whos")?;
     match output_arity {
         0 => {
             let mut out = String::from("  Name      Size            Bytes  Class\n");
@@ -6482,10 +6981,12 @@ fn invoke_whos_builtin_outputs_vm(
 
 fn workspace_entries_vm(
     frame: &VmFrame,
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    resolution_source_path: Option<&Path>,
     args: &[Value],
     builtin_name: &str,
 ) -> Result<Vec<(String, Value)>, RuntimeError> {
-    match parse_workspace_query_spec(args, builtin_name)? {
+    match parse_workspace_query_spec(shared_state, resolution_source_path, args, builtin_name)? {
         WorkspaceQuerySpec::Current { names, regexes } => {
             let visible_names = frame
                 .names
@@ -6836,10 +7337,8 @@ fn is_encoded_index_expression(value: &str) -> bool {
 }
 
 fn is_encoded_index_target_expression(value: &str) -> bool {
-    matches!(
-        value,
-        "end"
-    ) || value.starts_with("unary(")
+    matches!(value, "end")
+        || value.starts_with("unary(")
         || value.starts_with("binary(")
         || value.starts_with("range(")
         || value.starts_with("range3(")
@@ -7363,17 +7862,18 @@ fn default_temp_indexed_struct_csl_root_value(
         .iter()
         .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
         || projections.iter().any(|projection| {
-            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Paren(_))
+            !matches!(
+                projection,
+                TempLValueProjection::Field(_) | TempLValueProjection::Paren(_)
+            )
         })
     {
         return Ok(None);
     }
 
-    let Some(receivers) = materialize_missing_root_indexed_struct_receivers(
-        temps,
-        receiver_args,
-        output_count,
-    )? else {
+    let Some(receivers) =
+        materialize_missing_root_indexed_struct_receivers(temps, receiver_args, output_count)?
+    else {
         return Ok(None);
     };
     let receiver_count = match &receivers {
@@ -7395,8 +7895,11 @@ fn default_temp_indexed_struct_csl_root_value(
     field_path.push(field.to_string());
     let mut updated = assign_struct_path(receivers, &field_path, source.value.clone())?;
     if !prefix_fields.is_empty() {
-        updated =
-            assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+        updated = assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &prefix_fields,
+            updated,
+        )?;
     }
     Ok(Some(updated))
 }
@@ -7435,17 +7938,18 @@ fn default_temp_indexed_struct_direct_root_value(
         .iter()
         .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
         || projections.iter().any(|projection| {
-            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Paren(_))
+            !matches!(
+                projection,
+                TempLValueProjection::Field(_) | TempLValueProjection::Paren(_)
+            )
         })
     {
         return Ok(None);
     }
 
-    let Some(receivers) = materialize_missing_root_indexed_struct_receivers(
-        temps,
-        receiver_args,
-        count,
-    )? else {
+    let Some(receivers) =
+        materialize_missing_root_indexed_struct_receivers(temps, receiver_args, count)?
+    else {
         return Ok(None);
     };
     let receiver_count = match &receivers {
@@ -7467,8 +7971,11 @@ fn default_temp_indexed_struct_direct_root_value(
     field_path.push(field.to_string());
     let mut updated = assign_struct_path(receivers, &field_path, source.value.clone())?;
     if !prefix_fields.is_empty() {
-        updated =
-            assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+        updated = assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &prefix_fields,
+            updated,
+        )?;
     }
     Ok(Some(updated))
 }
@@ -7501,7 +8008,10 @@ fn materialize_missing_root_indexed_struct_receivers(
         }
     }
 
-    if receiver_args.iter().any(|argument| argument.contains("end")) {
+    if receiver_args
+        .iter()
+        .any(|argument| argument.contains("end"))
+    {
         return Ok(None);
     }
 
@@ -7602,7 +8112,8 @@ fn simple_temp_struct_field_assignment_target_count(
     if matches!(&target.value, Value::Matrix(matrix) if matrix_is_object_array(matrix)) {
         return Ok(None);
     }
-    if let Some(count) = nested_struct_assignment_target_count(&target.value).filter(|&count| count > 1)
+    if let Some(count) =
+        nested_struct_assignment_target_count(&target.value).filter(|&count| count > 1)
     {
         return Ok(Some(count));
     }
@@ -7839,7 +8350,10 @@ fn default_temp_cell_struct_csl_root_value(
         .iter()
         .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
         || projections.iter().any(|projection| {
-            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Brace(_))
+            !matches!(
+                projection,
+                TempLValueProjection::Field(_) | TempLValueProjection::Brace(_)
+            )
         })
     {
         return Ok(None);
@@ -7871,13 +8385,14 @@ fn default_temp_cell_struct_csl_root_value(
         })
         .collect::<Vec<_>>();
     field_path.push(field.to_string());
-    let mut updated = assign_struct_path(
-        Value::Cell(receivers),
-        &field_path,
-        source.value.clone(),
-    )?;
+    let mut updated =
+        assign_struct_path(Value::Cell(receivers), &field_path, source.value.clone())?;
     if !prefix_fields.is_empty() {
-        updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+        updated = assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &prefix_fields,
+            updated,
+        )?;
     }
     Ok(Some(updated))
 }
@@ -7916,7 +8431,10 @@ fn default_temp_cell_struct_direct_root_value(
         .iter()
         .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
         || projections.iter().any(|projection| {
-            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Brace(_))
+            !matches!(
+                projection,
+                TempLValueProjection::Field(_) | TempLValueProjection::Brace(_)
+            )
         })
     {
         return Ok(None);
@@ -7941,13 +8459,14 @@ fn default_temp_cell_struct_direct_root_value(
         })
         .collect::<Vec<_>>();
     field_path.push(field.to_string());
-    let mut updated = assign_struct_path(
-        Value::Cell(receivers),
-        &field_path,
-        source.value.clone(),
-    )?;
+    let mut updated =
+        assign_struct_path(Value::Cell(receivers), &field_path, source.value.clone())?;
     if !prefix_fields.is_empty() {
-        updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+        updated = assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &prefix_fields,
+            updated,
+        )?;
     }
     Ok(Some(updated))
 }
@@ -7978,7 +8497,10 @@ fn try_materialize_undefined_indexed_struct_field_brace_csl_assignment(
     let field_projections = &projections[paren_index + 1..];
     if field_projections.is_empty()
         || projections.iter().any(|projection| {
-            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Paren(_))
+            !matches!(
+                projection,
+                TempLValueProjection::Field(_) | TempLValueProjection::Paren(_)
+            )
         })
         || field_projections
             .iter()
@@ -7995,7 +8517,8 @@ fn try_materialize_undefined_indexed_struct_field_brace_csl_assignment(
         receiver_args,
         args,
         rhs_values.len(),
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     let receiver_count = match &receivers {
@@ -8157,12 +8680,17 @@ fn try_materialize_undefined_cell_receiver_struct_field_brace_csl_assignment(
     let field_projections = &projections[brace_index + 1..];
     if field_projections.is_empty()
         || projections.iter().any(|projection| {
-            !matches!(projection, TempLValueProjection::Field(_) | TempLValueProjection::Brace(_))
+            !matches!(
+                projection,
+                TempLValueProjection::Field(_) | TempLValueProjection::Brace(_)
+            )
         })
         || field_projections
             .iter()
             .any(|projection| !matches!(projection, TempLValueProjection::Field(_)))
-        || receiver_args.iter().any(|argument| argument.contains("end"))
+        || receiver_args
+            .iter()
+            .any(|argument| argument.contains("end"))
     {
         return Ok(None);
     }
@@ -8192,8 +8720,11 @@ fn try_materialize_undefined_cell_receiver_struct_field_brace_csl_assignment(
         receiver_count,
         vec![Value::Struct(StructValue::default()); receiver_count],
     )?);
-    let Some(Value::Cell(receivers)) =
-        try_materialize_undefined_root_brace_csl_assignment(temps, receiver_args, &receiver_defaults)?
+    let Some(Value::Cell(receivers)) = try_materialize_undefined_root_brace_csl_assignment(
+        temps,
+        receiver_args,
+        &receiver_defaults,
+    )?
     else {
         return Ok(None);
     };
@@ -8230,7 +8761,11 @@ fn try_materialize_undefined_cell_receiver_struct_field_brace_csl_assignment(
         elements,
     )?);
     if !prefix_fields.is_empty() {
-        updated = assign_struct_path(Value::Struct(StructValue::default()), &prefix_fields, updated)?;
+        updated = assign_struct_path(
+            Value::Struct(StructValue::default()),
+            &prefix_fields,
+            updated,
+        )?;
     }
     Ok(Some(updated))
 }
@@ -8566,23 +9101,18 @@ mod tests {
             Some(VmTemp::value(Value::Scalar(1.0))),
             Some(VmTemp::value(Value::Scalar(2.0))),
         ];
-        let projections =
-            vec![TempLValueProjection::Brace(vec!["idx:range(t0,t1)".to_string()])];
-        let source = VmTemp::value(
-            Value::Matrix(
-                MatrixValue::new(1, 2, vec![Value::Scalar(171.0), Value::Scalar(173.0)])
-                    .expect("matrix rhs"),
-            ),
-        );
+        let projections = vec![TempLValueProjection::Brace(vec![
+            "idx:range(t0,t1)".to_string()
+        ])];
+        let source = VmTemp::value(Value::Matrix(
+            MatrixValue::new(1, 2, vec![Value::Scalar(171.0), Value::Scalar(173.0)])
+                .expect("matrix rhs"),
+        ));
 
-        let updated = default_temp_cell_struct_direct_root_value(
-            &temps,
-            &projections,
-            "score",
-            &source,
-        )
-        .expect("direct root synthesis should not error")
-        .expect("direct root synthesis should materialize a value");
+        let updated =
+            default_temp_cell_struct_direct_root_value(&temps, &projections, "score", &source)
+                .expect("direct root synthesis should not error")
+                .expect("direct root synthesis should materialize a value");
 
         assert_eq!(
             render_value(&updated),
@@ -8593,12 +9123,10 @@ mod tests {
     #[test]
     fn default_temp_struct_direct_root_value_materializes_missing_root() {
         let projections = vec![TempLValueProjection::Field("inner".to_string())];
-        let source = VmTemp::value(
-            Value::Matrix(
-                MatrixValue::new(1, 2, vec![Value::Scalar(41.0), Value::Scalar(42.0)])
-                    .expect("matrix rhs"),
-            ),
-        );
+        let source = VmTemp::value(Value::Matrix(
+            MatrixValue::new(1, 2, vec![Value::Scalar(41.0), Value::Scalar(42.0)])
+                .expect("matrix rhs"),
+        ));
 
         let updated = default_temp_struct_direct_root_value(&projections, "score", &source)
             .expect("direct struct root synthesis should not error")
@@ -8654,7 +9182,9 @@ mod tests {
             ),
             Some(TempLValue::Path {
                 root: spec.clone(),
-                projections: vec![TempLValueProjection::Brace(vec!["idx:range(t0,t1)".to_string()])],
+                projections: vec![TempLValueProjection::Brace(vec![
+                    "idx:range(t0,t1)".to_string()
+                ])],
             }),
         );
         let source = VmTemp::value(Value::Matrix(
@@ -8683,42 +9213,41 @@ mod tests {
             Some(VmTemp::value(Value::Scalar(1.0))),
             Some(VmTemp::value(Value::Scalar(2.0))),
         ];
-        let projections =
-            vec![TempLValueProjection::Paren(vec!["idx:range(t0,t1)".to_string()])];
-        let source = VmTemp::value(
-            Value::Matrix(
-                MatrixValue::new(1, 2, vec![Value::Scalar(141.0), Value::Scalar(143.0)])
-                    .expect("matrix rhs"),
-            ),
+        let projections = vec![TempLValueProjection::Paren(vec![
+            "idx:range(t0,t1)".to_string()
+        ])];
+        let source = VmTemp::value(Value::Matrix(
+            MatrixValue::new(1, 2, vec![Value::Scalar(141.0), Value::Scalar(143.0)])
+                .expect("matrix rhs"),
+        ));
+
+        let updated =
+            default_temp_indexed_struct_direct_root_value(&temps, &projections, "score", &source)
+                .expect("direct indexed root synthesis should not error")
+                .expect("direct indexed root synthesis should materialize a value");
+
+        assert_eq!(
+            render_value(&updated),
+            "[struct{score=141}, struct{score=143}]"
         );
-
-        let updated = default_temp_indexed_struct_direct_root_value(
-            &temps,
-            &projections,
-            "score",
-            &source,
-        )
-        .expect("direct indexed root synthesis should not error")
-        .expect("direct indexed root synthesis should materialize a value");
-
-        assert_eq!(render_value(&updated), "[struct{score=141}, struct{score=143}]");
     }
 
     #[test]
     fn default_temp_indexed_struct_csl_root_value_materializes_missing_colon_root() {
         let projections = vec![TempLValueProjection::Paren(vec![":".to_string()])];
-        let source = VmTemp::list_origin_value(
-            Value::Matrix(
-                MatrixValue::new(1, 2, vec![Value::Scalar(51.0), Value::Scalar(53.0)])
-                    .expect("matrix rhs"),
-            ),
-        );
+        let source = VmTemp::list_origin_value(Value::Matrix(
+            MatrixValue::new(1, 2, vec![Value::Scalar(51.0), Value::Scalar(53.0)])
+                .expect("matrix rhs"),
+        ));
 
         let updated =
             default_temp_indexed_struct_csl_root_value(&[], &projections, "score", &source)
                 .expect("colon indexed root synthesis should not error")
                 .expect("colon indexed root synthesis should materialize a value");
 
-        assert_eq!(render_value(&updated), "[struct{score=51}, struct{score=53}]");
+        assert_eq!(
+            render_value(&updated),
+            "[struct{score=51}, struct{score=53}]"
+        );
     }
 }

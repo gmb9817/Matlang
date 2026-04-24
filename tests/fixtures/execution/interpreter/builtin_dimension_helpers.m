@@ -22,3 +22,6 @@ w = isrow([1 2 3]);
 x = iscolumn([1; 2; 3]);
 y = isrow('abc');
 z = isscalar({1});
+aa = reshape('abcd', 2, 2);
+ab = permute('abcd', [2 1]);
+ac = ipermute(ab, [2 1]);
