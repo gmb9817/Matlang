@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::RenderedFigure;
+use crate::{NumericComplexParts, RenderedFigure};
 use flate2::{write::ZlibEncoder, Compression};
 use matlab_runtime::{CellValue, MatrixValue, RuntimeError, StructValue, Value};
 use matlab_stdlib::invoke_builtin_outputs as invoke_stdlib_builtin_outputs;
@@ -1007,6 +1007,7 @@ pub(crate) fn invoke_graphics_builtin_outputs(
         "xline" => builtin_xline(state, args, output_arity),
         "yline" => builtin_yline(state, args, output_arity),
         "plot" => builtin_plot(state, args, output_arity),
+        "zplane" => builtin_zplane(state, args, output_arity),
         "semilogx" => builtin_semilogx(state, args, output_arity),
         "semilogy" => builtin_semilogy(state, args, output_arity),
         "loglog" => builtin_loglog(state, args, output_arity),
@@ -1959,6 +1960,506 @@ fn builtin_plot(
         true,
         true,
     )
+}
+
+fn builtin_zplane(
+    state: &mut GraphicsState,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "zplane currently supports zero to three outputs".to_string(),
+        ));
+    }
+    if let [filter] = args {
+        if zplane_is_digital_filter_object(filter) {
+            if output_arity == 0 {
+                // Fall through to plotting path below.
+            } else {
+                let zpk = canonicalize_zplane_data_outputs(invoke_stdlib_builtin_outputs(
+                    "zpk",
+                    &[filter.clone()],
+                    3,
+                )?);
+                return Ok(match output_arity {
+                    1 => vec![zpk[0].clone()],
+                    2 => vec![zpk[0].clone(), zpk[1].clone()],
+                    3 => zpk,
+                    _ => unreachable!("checked output arity above"),
+                });
+            }
+        }
+    }
+    let (zero_columns, pole_columns) = parse_zplane_data(args)?;
+    let axes_handle = current_axes_handle(state);
+    let hold_enabled = current_axes_mut(state).hold_enabled;
+    if !hold_enabled {
+        let axes = current_axes_mut(state);
+        axes.series.clear();
+        axes.legend = None;
+    }
+    {
+        let axes = current_axes_mut(state);
+        axes.aspect_mode = AxisAspectMode::Equal;
+        axes.xlabel = "Real Part".to_string();
+        axes.ylabel = "Imaginary Part".to_string();
+    }
+    let multiplicity_offset = zplane_multiplicity_offset(&zero_columns, &pole_columns);
+
+    let unit_circle_handle = next_series_handle(state);
+    {
+        let axes = current_axes_mut(state);
+        let mut series = make_series(unit_circle_handle, SeriesKind::Line, "#999999");
+        series.x = (0..=128)
+            .map(|index| {
+                let angle = 2.0 * std::f64::consts::PI * index as f64 / 128.0;
+                angle.cos()
+            })
+            .collect();
+        series.y = (0..=128)
+            .map(|index| {
+                let angle = 2.0 * std::f64::consts::PI * index as f64 / 128.0;
+                angle.sin()
+            })
+            .collect();
+        series.line_width = 1.0;
+        axes.series.push(series);
+    }
+
+    let column_series_count = zero_columns.len().max(pole_columns.len());
+    let series_start_index = current_axes_mut(state).series.len();
+    let column_colors = (0..column_series_count)
+        .map(|index| SERIES_COLORS[(series_start_index + index) % SERIES_COLORS.len()])
+        .collect::<Vec<_>>();
+    let zero_series = add_zplane_marker_series(
+        state,
+        &zero_columns,
+        MarkerStyle::Circle,
+        Some(&column_colors),
+        "zplane zeros",
+    );
+    let pole_series = add_zplane_marker_series(
+        state,
+        &pole_columns,
+        MarkerStyle::XMark,
+        Some(&column_colors),
+        "zplane poles",
+    );
+    let text_handles =
+        add_zplane_multiplicity_labels(state, &zero_columns, &zero_series, multiplicity_offset);
+    let mut text_handles = text_handles;
+    text_handles.extend(add_zplane_multiplicity_labels(
+        state,
+        &pole_columns,
+        &pole_series,
+        multiplicity_offset,
+    ));
+    let zero_handles = zero_series
+        .iter()
+        .map(|series| series.handle)
+        .collect::<Vec<_>>();
+    let pole_handles = pole_series
+        .iter()
+        .map(|series| series.handle)
+        .collect::<Vec<_>>();
+    if let Some(&handle) = pole_handles
+        .last()
+        .or_else(|| zero_handles.last())
+        .or(Some(&unit_circle_handle))
+    {
+        set_current_object_for_handle(state, handle);
+    }
+
+    match output_arity {
+        0 => Ok(Vec::new()),
+        1 => Ok(vec![graphics_handle_vector_value(zero_handles)?]),
+        2 => Ok(vec![
+            graphics_handle_vector_value(zero_handles)?,
+            graphics_handle_vector_value(pole_handles)?,
+        ]),
+        3 => Ok(vec![
+            graphics_handle_vector_value(zero_handles)?,
+            graphics_handle_vector_value(pole_handles)?,
+            graphics_handle_vector_value(
+                std::iter::once(axes_handle)
+                    .chain(std::iter::once(unit_circle_handle))
+                    .chain(text_handles)
+                    .collect(),
+            )?,
+        ]),
+        _ => unreachable!("checked output arity above"),
+    }
+}
+
+fn canonicalize_zplane_data_outputs(outputs: Vec<Value>) -> Vec<Value> {
+    outputs
+        .into_iter()
+        .map(canonicalize_zplane_data_value)
+        .collect()
+}
+
+fn canonicalize_zplane_data_value(value: Value) -> Value {
+    match value {
+        Value::Scalar(number) => Value::Scalar(canonicalize_zplane_numeric(number)),
+        Value::Complex(number) => {
+            let real = canonicalize_zplane_numeric(number.real);
+            let imag = canonicalize_zplane_numeric(number.imag);
+            if imag == 0.0 {
+                Value::Scalar(real)
+            } else {
+                Value::Complex(matlab_runtime::ComplexValue { real, imag })
+            }
+        }
+        Value::Matrix(matrix) => {
+            let values = matrix
+                .elements()
+                .iter()
+                .cloned()
+                .map(canonicalize_zplane_data_value)
+                .collect::<Vec<_>>();
+            Value::Matrix(
+                MatrixValue::with_dimensions(matrix.rows, matrix.cols, matrix.dims.clone(), values)
+                    .expect("zplane canonicalized matrix"),
+            )
+        }
+        other => other,
+    }
+}
+
+fn canonicalize_zplane_numeric(value: f64) -> f64 {
+    let rounded = (value * 1e12).round() / 1e12;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ZplaneMarkerSeries {
+    handle: u32,
+    color: &'static str,
+}
+
+fn add_zplane_marker_series(
+    state: &mut GraphicsState,
+    columns: &[Vec<ComplexPoint>],
+    marker: MarkerStyle,
+    column_colors: Option<&[&'static str]>,
+    _builtin_name: &str,
+) -> Vec<ZplaneMarkerSeries> {
+    let mut series_handles = Vec::new();
+    for (column_index, column) in columns.iter().enumerate() {
+        if column.is_empty() {
+            continue;
+        }
+        let series_handle = next_series_handle(state);
+        let axes = current_axes_mut(state);
+        let color = column_colors
+            .and_then(|colors| colors.get(column_index).copied())
+            .unwrap_or(SERIES_COLORS[axes.series.len() % SERIES_COLORS.len()]);
+        let mut series = make_series(series_handle, SeriesKind::Line, color);
+        series.x = column.iter().map(|point| point.real).collect();
+        series.y = column.iter().map(|point| point.imag).collect();
+        series.line_style = LineStyle::None;
+        series.marker = marker;
+        series.marker_size = 7.0;
+        axes.series.push(series);
+        series_handles.push(ZplaneMarkerSeries {
+            handle: series_handle,
+            color,
+        });
+    }
+    series_handles
+}
+
+fn add_zplane_multiplicity_labels(
+    state: &mut GraphicsState,
+    columns: &[Vec<ComplexPoint>],
+    series_handles: &[ZplaneMarkerSeries],
+    offset: f64,
+) -> Vec<u32> {
+    let mut handles = Vec::new();
+    for (column, series_handle) in columns.iter().zip(series_handles.iter()) {
+        for label in zplane_multiplicity_labels(column) {
+            let handle = next_series_handle(state);
+            let axes = current_axes_mut(state);
+            let mut series = make_series(handle, SeriesKind::Text, series_handle.color);
+            series.text = Some(TextSeriesData {
+                x: label.point.real + offset,
+                y: label.point.imag + offset,
+                label: label.count.to_string(),
+            });
+            axes.series.push(series);
+            handles.push(handle);
+        }
+    }
+    handles
+}
+
+fn zplane_multiplicity_offset(
+    zero_columns: &[Vec<ComplexPoint>],
+    pole_columns: &[Vec<ComplexPoint>],
+) -> f64 {
+    let extent = zero_columns
+        .iter()
+        .chain(pole_columns.iter())
+        .flat_map(|column| column.iter())
+        .fold(1.0f64, |current, point| {
+            current.max(point.real.abs()).max(point.imag.abs())
+        });
+    0.04 * extent.max(1.0)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ZplaneMultiplicityLabel {
+    point: ComplexPoint,
+    count: usize,
+}
+
+fn zplane_multiplicity_labels(points: &[ComplexPoint]) -> Vec<ZplaneMultiplicityLabel> {
+    let tolerance = zplane_point_tolerance(points);
+    let mut consumed = vec![false; points.len()];
+    let mut labels = Vec::new();
+    for (index, point) in points.iter().copied().enumerate() {
+        if consumed[index] {
+            continue;
+        }
+        consumed[index] = true;
+        let mut count = 1usize;
+        let mut real = point.real;
+        let mut imag = point.imag;
+        for (other_index, other) in points.iter().copied().enumerate().skip(index + 1) {
+            if consumed[other_index] || !zplane_points_match(point, other, tolerance) {
+                continue;
+            }
+            consumed[other_index] = true;
+            count += 1;
+            real += other.real;
+            imag += other.imag;
+        }
+        if count > 1 {
+            labels.push(ZplaneMultiplicityLabel {
+                point: ComplexPoint {
+                    real: real / count as f64,
+                    imag: imag / count as f64,
+                },
+                count,
+            });
+        }
+    }
+    labels
+}
+
+fn zplane_point_tolerance(points: &[ComplexPoint]) -> f64 {
+    let scale = points.iter().fold(1.0f64, |current, point| {
+        current.max(point.real.abs()).max(point.imag.abs())
+    });
+    1e-9 * scale.max(1.0)
+}
+
+fn zplane_points_match(left: ComplexPoint, right: ComplexPoint, tolerance: f64) -> bool {
+    (left.real - right.real).abs() <= tolerance && (left.imag - right.imag).abs() <= tolerance
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComplexPoint {
+    real: f64,
+    imag: f64,
+}
+
+fn parse_zplane_data(
+    args: &[Value],
+) -> Result<(Vec<Vec<ComplexPoint>>, Vec<Vec<ComplexPoint>>), RuntimeError> {
+    match args {
+        [filter] if zplane_is_digital_filter_object(filter) => {
+            let outputs = invoke_stdlib_builtin_outputs(
+                "ctf2zp",
+                &unpack_zplane_digital_filter_args(filter)?,
+                2,
+            )?;
+            Ok((
+                complex_columns_from_value(&outputs[0], "zplane")?,
+                complex_columns_from_value(&outputs[1], "zplane")?,
+            ))
+        }
+        [ctf, mode] if is_text_keyword(mode, "ctf")? => {
+            let ctf_args = unpack_zplane_ctf_args(ctf)?;
+            let outputs = invoke_stdlib_builtin_outputs("ctf2zp", &ctf_args, 2)?;
+            Ok((
+                complex_columns_from_value(&outputs[0], "zplane")?,
+                complex_columns_from_value(&outputs[1], "zplane")?,
+            ))
+        }
+        [zeros, poles] if zplane_direct_root_form(zeros, poles)? => Ok((
+            complex_columns_from_value(zeros, "zplane")?,
+            complex_columns_from_value(poles, "zplane")?,
+        )),
+        [numerator, denominator] => {
+            let outputs =
+                invoke_stdlib_builtin_outputs("tf2zp", &[numerator.clone(), denominator.clone()], 2)?;
+            Ok((
+                complex_columns_from_value(&outputs[0], "zplane")?,
+                complex_columns_from_value(&outputs[1], "zplane")?,
+            ))
+        }
+        [numerators, denominators, mode] if is_text_keyword(mode, "ctf")? => {
+            let outputs = invoke_stdlib_builtin_outputs(
+                "ctf2zp",
+                &[numerators.clone(), denominators.clone()],
+                2,
+            )?;
+            Ok((
+                complex_columns_from_value(&outputs[0], "zplane")?,
+                complex_columns_from_value(&outputs[1], "zplane")?,
+            ))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "zplane currently supports zplane(z, p), zplane(b, a), zplane(B, A, \"ctf\"), zplane({B, A, g}, \"ctf\"), and zplane(digitalFilter)"
+                .to_string(),
+        )),
+    }
+}
+
+fn zplane_is_digital_filter_object(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Object(object)
+            if object.class.qualified_name().eq_ignore_ascii_case("digitalFilter")
+    )
+}
+
+fn zplane_direct_root_form(zeros: &Value, poles: &Value) -> Result<bool, RuntimeError> {
+    let zero_operand = numeric_or_complex_operand_for_graphics(zeros)?;
+    let pole_operand = numeric_or_complex_operand_for_graphics(poles)?;
+    Ok(!(zero_operand.rows <= 1 && pole_operand.rows <= 1))
+}
+
+fn unpack_zplane_ctf_args(value: &Value) -> Result<Vec<Value>, RuntimeError> {
+    let Value::Cell(cell) = value else {
+        return Err(RuntimeError::Unsupported(
+            "zplane currently expects {B, A, g} for CTF cell syntax".to_string(),
+        ));
+    };
+    if cell.element_count() != 3 || (cell.rows != 1 && cell.cols != 1) {
+        return Err(RuntimeError::Unsupported(
+            "zplane currently expects {B, A, g} cell inputs to contain exactly three elements"
+                .to_string(),
+        ));
+    }
+    Ok(cell.elements().to_vec())
+}
+
+fn unpack_zplane_digital_filter_args(value: &Value) -> Result<Vec<Value>, RuntimeError> {
+    if !zplane_is_digital_filter_object(value) {
+        return Err(RuntimeError::TypeError(
+            "zplane currently expects a digitalFilter object".to_string(),
+        ));
+    }
+    invoke_stdlib_builtin_outputs("ctf", &[value.clone()], 3)
+}
+
+fn complex_columns_from_value(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<Vec<Vec<ComplexPoint>>, RuntimeError> {
+    let operand = numeric_or_complex_operand_for_graphics(value)?;
+    if operand.rows == 0 || operand.cols == 0 {
+        return Ok(vec![Vec::new()]);
+    }
+    if operand.rows == 1 || operand.cols == 1 {
+        return Ok(vec![operand
+            .values
+            .into_iter()
+            .map(|value| ComplexPoint {
+                real: value.real,
+                imag: value.imag,
+            })
+            .collect()]);
+    }
+    let mut columns = Vec::with_capacity(operand.cols);
+    for col in 0..operand.cols {
+        let mut values = Vec::with_capacity(operand.rows);
+        for row in 0..operand.rows {
+            let value = operand.values[row * operand.cols + col];
+            values.push(ComplexPoint {
+                real: value.real,
+                imag: value.imag,
+            });
+        }
+        columns.push(values);
+    }
+    let _ = builtin_name;
+    Ok(columns)
+}
+
+#[derive(Debug, Clone)]
+struct NumericOrComplexGraphicsOperand {
+    rows: usize,
+    cols: usize,
+    values: Vec<NumericComplexParts>,
+}
+
+fn numeric_or_complex_operand_for_graphics(
+    value: &Value,
+) -> Result<NumericOrComplexGraphicsOperand, RuntimeError> {
+    match value {
+        Value::Scalar(_)
+        | Value::Int64(_)
+        | Value::UInt64(_)
+        | Value::Logical(_)
+        | Value::Complex(_) => Ok(NumericOrComplexGraphicsOperand {
+            rows: 1,
+            cols: 1,
+            values: vec![numeric_or_complex_scalar_for_graphics(value)?],
+        }),
+        Value::Matrix(matrix) => {
+            let values = matrix
+                .iter()
+                .map(numeric_or_complex_scalar_for_graphics)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(NumericOrComplexGraphicsOperand {
+                rows: matrix.rows,
+                cols: matrix.cols,
+                values,
+            })
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "zplane currently expects numeric or complex inputs, found {:?}",
+            other
+        ))),
+    }
+}
+
+fn numeric_or_complex_scalar_for_graphics(
+    value: &Value,
+) -> Result<NumericComplexParts, RuntimeError> {
+    match value {
+        Value::Scalar(number) => Ok(NumericComplexParts {
+            real: *number,
+            imag: 0.0,
+        }),
+        Value::Int64(number) => Ok(NumericComplexParts {
+            real: *number as f64,
+            imag: 0.0,
+        }),
+        Value::UInt64(number) => Ok(NumericComplexParts {
+            real: *number as f64,
+            imag: 0.0,
+        }),
+        Value::Logical(flag) => Ok(NumericComplexParts {
+            real: if *flag { 1.0 } else { 0.0 },
+            imag: 0.0,
+        }),
+        Value::Complex(number) => Ok(NumericComplexParts {
+            real: number.real,
+            imag: number.imag,
+        }),
+        _ => Err(RuntimeError::TypeError(
+            "zplane currently expects numeric or complex inputs".to_string(),
+        )),
+    }
 }
 
 fn builtin_semilogx(

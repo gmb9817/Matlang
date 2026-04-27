@@ -1570,6 +1570,10 @@ impl<'a> Parser<'a> {
         while !self.at_end() && !self.at_delimiter(closing) {
             if self.match_operator(OperatorKind::Colon) {
                 args.push(IndexArgument::FullSlice);
+            } else if self.at_identifier() && self.peek_operator(OperatorKind::Assign) {
+                let (name, value) = self.parse_name_value_index_arguments();
+                args.push(IndexArgument::Expression(name));
+                args.push(IndexArgument::Expression(value));
             } else if self.at_keyword(Keyword::End) && self.peek_is_index_argument_terminator() {
                 self.advance();
                 args.push(IndexArgument::End);
@@ -1582,6 +1586,23 @@ impl<'a> Parser<'a> {
             }
         }
         args
+    }
+
+    fn parse_name_value_index_arguments(&mut self) -> (Expression, Expression) {
+        let name = self.parse_identifier_or_recover("PAR103", "expected name before `=`");
+        self.expect_operator(
+            OperatorKind::Assign,
+            "PAR104",
+            "expected `=` after name-value argument name",
+        );
+        let value = self.parse_expression();
+        (
+            Expression {
+                span: name.span,
+                kind: ExpressionKind::StringLiteral(format!("\"{}\"", name.name)),
+            },
+            value,
+        )
     }
 
     fn parse_identifier_list(&mut self, closing: DelimiterKind) -> Vec<Identifier> {
@@ -3339,6 +3360,55 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn parses_function_call_name_value_arguments_as_string_value_pairs() {
+        let source =
+            "y = filtfilt(b, a, x, InitialStatesMethod=\"gustafsson\", PaddingPattern=\"none\");\n";
+        let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let unit = parsed.unit.expect("compilation unit");
+        let Item::Statement(statement) = &unit.items[0] else {
+            panic!("expected statement");
+        };
+        let StatementKind::Assignment { value, .. } = &statement.kind else {
+            panic!("expected assignment");
+        };
+        let ExpressionKind::ParenApply { indices, .. } = &value.kind else {
+            panic!("expected call expression");
+        };
+        assert_eq!(indices.len(), 7);
+
+        let IndexArgument::Expression(name1) = &indices[3] else {
+            panic!("expected first name argument");
+        };
+        assert!(matches!(
+            &name1.kind,
+            ExpressionKind::StringLiteral(text) if text == "\"InitialStatesMethod\""
+        ));
+        let IndexArgument::Expression(value1) = &indices[4] else {
+            panic!("expected first name-value payload");
+        };
+        assert!(matches!(
+            &value1.kind,
+            ExpressionKind::StringLiteral(text) if text == "\"gustafsson\""
+        ));
+
+        let IndexArgument::Expression(name2) = &indices[5] else {
+            panic!("expected second name argument");
+        };
+        assert!(matches!(
+            &name2.kind,
+            ExpressionKind::StringLiteral(text) if text == "\"PaddingPattern\""
+        ));
+        let IndexArgument::Expression(value2) = &indices[6] else {
+            panic!("expected second name-value payload");
+        };
+        assert!(matches!(
+            &value2.kind,
+            ExpressionKind::StringLiteral(text) if text == "\"none\""
+        ));
     }
 
     #[test]

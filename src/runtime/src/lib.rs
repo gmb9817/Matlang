@@ -751,6 +751,15 @@ impl ObjectValue {
         }
         Ok(())
     }
+
+    pub fn remove_property_value(&mut self, name: &str) -> Option<Value> {
+        match &mut self.storage {
+            ObjectStorage::Value(instance) => instance.properties.remove_field(name),
+            ObjectStorage::Handle { shared, .. } => {
+                shared.borrow_mut().properties.remove_field(name)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -967,6 +976,10 @@ pub fn render_workspace(workspace: &Workspace) -> String {
     out
 }
 
+pub fn render_special_display_value(value: &Value) -> Option<String> {
+    special_object_display_lines(value).map(|lines| lines.join("\n"))
+}
+
 pub fn render_value(value: &Value) -> String {
     match value {
         Value::Scalar(number) => render_number(*number),
@@ -1007,6 +1020,20 @@ pub fn render_value(value: &Value) -> String {
 }
 
 pub fn render_named_value(out: &mut String, indent: &str, name: &str, value: &Value) {
+    if let Some(lines) = special_object_display_lines(value) {
+        out.push_str(&format!("{indent}{name} = {}", lines[0]));
+        out.push('\n');
+        for line in lines.iter().skip(1) {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(indent);
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        return;
+    }
     match value {
         Value::Matrix(matrix) => {
             if let Some(page_dims) = paged_tail_dimensions(&matrix.dims) {
@@ -1059,6 +1086,90 @@ pub fn render_named_value(out: &mut String, indent: &str, name: &str, value: &Va
             }
         }
         _ => out.push_str(&format!("{indent}{name} = {}\n", render_value(value))),
+    }
+}
+
+fn special_object_display_lines(value: &Value) -> Option<Vec<String>> {
+    let Value::Object(object) = value else {
+        return None;
+    };
+    if !object
+        .class
+        .qualified_name()
+        .eq_ignore_ascii_case("digitalFilter")
+    {
+        return None;
+    }
+    let properties = object.properties();
+    let stage_names = properties
+        .field_order
+        .iter()
+        .filter(|name| name.starts_with("Stage"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if stage_names.is_empty() {
+        let mut lines = vec![
+            "digitalFilter with properties:".to_string(),
+            String::new(),
+            "  Coefficients:".to_string(),
+        ];
+        for name in ["Numerator", "Denominator", "ScaleValues"] {
+            if let Some(value) = properties.fields.get(name) {
+                lines.push(format!("    {name}: {}", render_value(value)));
+            }
+        }
+        lines.push(String::new());
+        lines.push("  Specifications:".to_string());
+        if let Some(value) = properties.fields.get("NormalizedFrequency") {
+            lines.push(format!(
+                "    NormalizedFrequency: {}",
+                render_object_property_value(value)
+            ));
+        }
+        if let Some(value) = properties.fields.get("SampleRate") {
+            lines.push(format!(
+                "    SampleRate: {}",
+                render_object_property_value(value)
+            ));
+        }
+        return Some(lines);
+    }
+
+    let mut lines = vec![
+        "digitalFilter cascade with properties:".to_string(),
+        String::new(),
+        "  Stages:".to_string(),
+    ];
+    for stage_name in stage_names {
+        lines.push(format!("    {stage_name}: [1x1 digitalFilter]"));
+    }
+    lines.push(String::new());
+    lines.push("  Specifications:".to_string());
+    if let Some(value) = properties.fields.get("NormalizedFrequency") {
+        lines.push(format!(
+            "    NormalizedFrequency: {}",
+            render_object_property_value(value)
+        ));
+    }
+    if let Some(value) = properties.fields.get("SampleRate") {
+        lines.push(format!(
+            "    SampleRate: {}",
+            render_object_property_value(value)
+        ));
+    }
+    Some(lines)
+}
+
+fn render_object_property_value(value: &Value) -> String {
+    match value {
+        Value::Logical(flag) => {
+            if *flag {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        _ => render_value(value),
     }
 }
 

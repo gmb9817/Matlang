@@ -1,10 +1,11 @@
 //! Standard library crate for builtin and library-layer functions.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use matlab_runtime::{
     ArrayStorageClass, CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue,
-    MatrixValue, RuntimeError, RuntimeStackFrame, StructValue, Value,
+    MatrixValue, ObjectClassMetadata, ObjectStorageKind, ObjectValue, RuntimeError,
+    RuntimeStackFrame, StructValue, Value,
 };
 use regex::Regex;
 use statrs::distribution::{ContinuousCDF, Normal, StudentsT};
@@ -28,7 +29,12 @@ pub fn invoke_builtin_outputs(
         "true" => Ok(vec![builtin_logical_fill(args, true)?]),
         "false" => Ok(vec![builtin_logical_fill(args, false)?]),
         "logical" => Ok(vec![builtin_logical(args)?]),
+        "single" => Ok(vec![builtin_single(args)?]),
         "double" => Ok(vec![builtin_double(args)?]),
+        "isdouble" => Ok(vec![builtin_isdouble(args)?]),
+        "issingle" => Ok(vec![builtin_issingle(args)?]),
+        "info" => Ok(vec![builtin_info(args)?]),
+        "setSampleRate" => builtin_set_sample_rate(args, output_arity),
         "int64" => Ok(vec![builtin_integer_cast(
             args,
             IntegerClass::Int64,
@@ -406,6 +412,12 @@ pub fn invoke_builtin_outputs(
         "filter" => builtin_filter(args, output_arity),
         "ctffilt" => builtin_ctffilt(args, output_arity),
         "filtfilt" => Ok(vec![builtin_filtfilt(args)?]),
+        "fftfilt" => Ok(vec![builtin_fftfilt(args)?]),
+        "sosfilt" => Ok(vec![builtin_sosfilt(args)?]),
+        "ctf" => builtin_ctf(args, output_arity),
+        "digitalFilter" => Ok(vec![builtin_digital_filter(args)?]),
+        "cascade" => Ok(vec![builtin_cascade(args)?]),
+        "getNumStages" => Ok(vec![builtin_get_num_stages(args)?]),
         "scaleFilterSections" => Ok(vec![builtin_scale_filter_sections(args)?]),
         "fft" => Ok(vec![builtin_fft(args)?]),
         "ifft" => Ok(vec![builtin_ifft(args)?]),
@@ -434,6 +446,8 @@ pub fn invoke_builtin_outputs(
         "freqs" => builtin_freqs(args, output_arity),
         "impz" => builtin_impz(args, output_arity),
         "stepz" => builtin_stepz(args, output_arity),
+        "sos2cell" => Ok(vec![builtin_sos2cell(args)?]),
+        "cell2sos" => builtin_cell2sos(args, output_arity),
         "sos2ctf" => builtin_sos2ctf(args, output_arity),
         "sos2ss" => builtin_sos2ss(args, output_arity),
         "sos2zp" => builtin_sos2zp(args, output_arity),
@@ -442,8 +456,10 @@ pub fn invoke_builtin_outputs(
         "poly" => Ok(vec![builtin_poly(args)?]),
         "roots" => Ok(vec![builtin_roots(args)?]),
         "residue" => builtin_residue(args, output_arity),
+        "residuez" => builtin_residuez(args, output_arity),
         "ss2sos" => builtin_ss2sos(args, output_arity),
         "ss2tf" => builtin_ss2tf(args, output_arity),
+        "tf2ctf" => builtin_tf2ctf(args, output_arity),
         "ss2zp" => builtin_ss2zp(args, output_arity),
         "tf2zp" => builtin_tf2zp(args, output_arity),
         "tf2sos" => builtin_tf2sos(args, output_arity),
@@ -452,6 +468,10 @@ pub fn invoke_builtin_outputs(
         "zp2sos" => builtin_zp2sos(args, output_arity),
         "zp2ss" => builtin_zp2ss(args, output_arity),
         "ctf2zp" => builtin_ctf2zp(args, output_arity),
+        "ctf2sos" => builtin_ctf2sos(args, output_arity),
+        "ss" => builtin_ss(args, output_arity),
+        "tf" => builtin_tf(args, output_arity),
+        "zpk" => builtin_zpk(args, output_arity),
         "polyfit" => builtin_polyfit(args, output_arity),
         "polyder" => builtin_polyder(args, output_arity),
         "polyint" => Ok(vec![builtin_polyint(args)?]),
@@ -690,6 +710,11 @@ fn builtin_double(args: &[Value]) -> Result<Value, RuntimeError> {
             "double currently supports exactly one argument".to_string(),
         ));
     };
+    if is_digital_filter_object(value) {
+        let cloned = digital_filter_detached_clone(value, "double")?;
+        digital_filter_apply_precision(&cloned, DIGITAL_FILTER_DOUBLE_PRECISION, "double")?;
+        return Ok(cloned);
+    }
     match value {
         Value::Scalar(number) => Ok(Value::Scalar(*number)),
         Value::Int64(number) => Ok(Value::Scalar(*number as f64)),
@@ -712,6 +737,75 @@ fn builtin_double(args: &[Value]) -> Result<Value, RuntimeError> {
             "double currently expects numeric, logical, complex, or char array input, found {}",
             other.kind_name()
         ))),
+    }
+}
+
+fn builtin_single(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "single currently supports exactly one argument".to_string(),
+        ));
+    };
+    if is_digital_filter_object(value) {
+        let cloned = digital_filter_detached_clone(value, "single")?;
+        digital_filter_apply_precision(&cloned, DIGITAL_FILTER_SINGLE_PRECISION, "single")?;
+        return Ok(cloned);
+    }
+    Err(RuntimeError::Unsupported(
+        "single currently supports single(digitalFilter)".to_string(),
+    ))
+}
+
+fn builtin_isdouble(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "isdouble currently supports exactly one argument".to_string(),
+        ));
+    };
+    if is_digital_filter_object(value) {
+        return Ok(Value::Logical(digital_filter_is_double_precision(
+            value, "isdouble",
+        )?));
+    }
+    Ok(Value::Logical(value_is_double_precision(value)))
+}
+
+fn builtin_issingle(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "issingle currently supports exactly one argument".to_string(),
+        ));
+    };
+    if is_digital_filter_object(value) {
+        return Ok(Value::Logical(digital_filter_is_single_precision(
+            value, "issingle",
+        )?));
+    }
+    Ok(Value::Logical(false))
+}
+
+fn builtin_info(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "info currently supports exactly one argument".to_string(),
+        ));
+    };
+    if !is_digital_filter_object(value) {
+        return Err(RuntimeError::Unsupported(
+            "info currently supports info(digitalFilter)".to_string(),
+        ));
+    }
+    Ok(Value::CharArray(digital_filter_info_text(value, "info")?))
+}
+
+fn value_is_double_precision(value: &Value) -> bool {
+    match value {
+        Value::Scalar(_) | Value::Complex(_) => true,
+        Value::Matrix(matrix) => matrix
+            .elements()
+            .iter()
+            .all(|element| matches!(element, Value::Scalar(_) | Value::Complex(_))),
+        _ => false,
     }
 }
 
@@ -17229,9 +17323,49 @@ fn builtin_deconv(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
 }
 
 fn builtin_filter(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    match args {
+        [filter, x] if is_digital_filter_object(filter) => {
+            let sections = digital_filter_sections_from_object(filter, "filter")?;
+            return builtin_filter_with_sections(sections, x, None, None, output_arity, "filter");
+        }
+        [filter, x, zi] if is_digital_filter_object(filter) => {
+            let sections = digital_filter_sections_from_object(filter, "filter")?;
+            return builtin_filter_with_sections(
+                sections,
+                x,
+                Some(zi),
+                None,
+                output_arity,
+                "filter",
+            );
+        }
+        [filter, x, zi, dim] if is_digital_filter_object(filter) => {
+            let sections = digital_filter_sections_from_object(filter, "filter")?;
+            return builtin_filter_with_sections(
+                sections,
+                x,
+                Some(zi),
+                Some(positive_dimension(dim, "filter")?),
+                output_arity,
+                "filter",
+            );
+        }
+        _ => {}
+    }
     let (b, a, x, zi, requested_dim) = parse_filter_args(args)?;
     let (b, _b_is_row) = numeric_or_complex_set_vector(b, "filter")?;
     let (a, _a_is_row) = numeric_or_complex_set_vector(a, "filter")?;
+    builtin_filter_with_coefficients(&b, &a, x, zi, requested_dim, output_arity)
+}
+
+fn builtin_filter_with_coefficients(
+    b: &[ComplexParts],
+    a: &[ComplexParts],
+    x: &Value,
+    zi: Option<&Value>,
+    requested_dim: Option<usize>,
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
     if b.is_empty() || a.is_empty() {
         return Err(RuntimeError::ShapeError(
             "filter currently expects nonempty coefficient vectors".to_string(),
@@ -17256,7 +17390,8 @@ fn builtin_filter(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
     let (b, a) = normalized_filter_coefficients(&b, &a);
     let state_len = b.len().max(a.len()).saturating_sub(1);
     let sequence_count = filter_sequence_count(&input_dims, dim);
-    let mut state = parse_filter_initial_conditions(zi, state_len, sequence_count)?;
+    let state_dims = ctffilt_state_dims(state_len, &input_dims, dim);
+    let mut state = parse_filter_initial_conditions(zi, state_len, sequence_count, &state_dims)?;
     let result = filter_numeric_operand(&x, &input_dims, &b, &a, dim, &mut state);
     let mut y = numeric_or_complex_operand_to_value(&result)?;
     if input_dims.len() > 2 {
@@ -17265,14 +17400,317 @@ fn builtin_filter(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
 
     match output_arity {
         0 | 1 => Ok(vec![y]),
-        2 => Ok(vec![
-            y,
-            filter_state_value(&state, state_len, sequence_count)?,
-        ]),
+        2 => Ok(vec![y, filter_state_value(&state, &state_dims)?]),
         _ => Err(RuntimeError::Unsupported(
             "filter currently supports one or two outputs".to_string(),
         )),
     }
+}
+
+fn builtin_filter_with_sections(
+    sections: Vec<FiltfiltSection>,
+    value: &Value,
+    zi: Option<&Value>,
+    requested_dim: Option<usize>,
+    output_arity: usize,
+    builtin_name: &str,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 2 {
+        return Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports one or two outputs"
+        )));
+    }
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let x = numeric_or_complex_operand(value, builtin_name)?;
+    let dim = requested_dim.unwrap_or_else(|| {
+        input_dims
+            .iter()
+            .position(|&size| size != 1)
+            .map(|index| index + 1)
+            .unwrap_or(1)
+    });
+    let sequence_count = filter_sequence_count(&input_dims, dim);
+    let section_state_len = sections
+        .iter()
+        .map(|section| {
+            section
+                .numerator
+                .len()
+                .max(section.denominator.len())
+                .saturating_sub(1)
+        })
+        .max()
+        .unwrap_or(0);
+    let state_dims = ctffilt_state_dims(sections.len() * section_state_len, &input_dims, dim);
+    let mut state = parse_ctffilt_initial_conditions(
+        zi,
+        section_state_len,
+        sections.len(),
+        sequence_count,
+        &state_dims,
+        builtin_name,
+    )?;
+
+    let normalized_sections = sections
+        .into_iter()
+        .map(|mut section| {
+            section
+                .numerator
+                .resize(section_state_len + 1, ComplexParts::zero());
+            section
+                .denominator
+                .resize(section_state_len + 1, ComplexParts::zero());
+            section
+        })
+        .collect::<Vec<_>>();
+
+    let mut current = x;
+    for (section_index, section) in normalized_sections.iter().enumerate() {
+        let start = section_index * section_state_len * sequence_count;
+        let end = start + section_state_len * sequence_count;
+        current = filter_numeric_operand(
+            &current,
+            &input_dims,
+            &section.numerator,
+            &section.denominator,
+            dim,
+            &mut state[start..end],
+        );
+    }
+
+    let mut y = numeric_or_complex_operand_to_value(&current)?;
+    if input_dims.len() > 2 {
+        y = relabel_value_dimensions(&y, input_dims.clone())?;
+    }
+    match output_arity {
+        0 | 1 => Ok(vec![y]),
+        2 => Ok(vec![
+            y,
+            build_numeric_or_complex_matrix_result_with_dimensions(state_dims, state)?,
+        ]),
+        _ => unreachable!("checked output arity above"),
+    }
+}
+
+fn builtin_fftfilt(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (filter, x, requested_nfft) = match args {
+        [filter, x] => (filter, x, None),
+        [filter, x, nfft] => (filter, x, Some(nfft)),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "fftfilt currently supports fftfilt(b, x), fftfilt(b, x, nfft), fftfilt(digitalFilter, x), and fftfilt(digitalFilter, x, nfft)"
+                    .to_string(),
+            ))
+        }
+    };
+
+    let filter_columns = if is_digital_filter_object(filter) {
+        fftfilt_filter_columns_from_digital_filter(filter)?
+    } else {
+        fftfilt_filter_columns_from_value(filter)?
+    };
+    let filter_len = filter_columns
+        .first()
+        .map(|column| column.len())
+        .ok_or_else(|| {
+            RuntimeError::ShapeError(
+                "fftfilt currently expects nonempty FIR coefficients".to_string(),
+            )
+        })?;
+    if let Some(nfft) = requested_nfft {
+        let _effective_nfft = parse_fftfilt_nfft(nfft, filter_len)?;
+    }
+
+    builtin_fftfilt_with_columns(&filter_columns, x)
+}
+
+fn fftfilt_filter_columns_from_value(
+    value: &Value,
+) -> Result<Vec<Vec<ComplexParts>>, RuntimeError> {
+    let operand = numeric_or_complex_operand(value, "fftfilt")?;
+    if operand.rows == 0 || operand.cols == 0 {
+        return Err(RuntimeError::ShapeError(
+            "fftfilt currently expects nonempty FIR coefficients".to_string(),
+        ));
+    }
+    if operand.rows == 1 || operand.cols == 1 {
+        return Ok(vec![operand.values]);
+    }
+
+    Ok((0..operand.cols)
+        .map(|col| {
+            (0..operand.rows)
+                .map(|row| operand.values[row * operand.cols + col])
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>())
+}
+
+fn fftfilt_filter_columns_from_digital_filter(
+    value: &Value,
+) -> Result<Vec<Vec<ComplexParts>>, RuntimeError> {
+    let (numerator, denominator) = digital_filter_transfer_function_from_object(value, "fftfilt")?;
+    if numerator.is_empty() {
+        return Err(RuntimeError::ShapeError(
+            "fftfilt currently expects nonempty FIR coefficients".to_string(),
+        ));
+    }
+
+    let tolerance = default_phase_property_tolerance();
+    let denominator = trim_filter_trailing_zeros(&denominator, tolerance);
+    if denominator.is_empty() || denominator[0].is_approximately_zero() {
+        return Err(RuntimeError::TypeError(
+            "fftfilt currently expects an FIR digitalFilter object".to_string(),
+        ));
+    }
+    if denominator.len() > 1
+        && denominator[1..]
+            .iter()
+            .any(|coefficient| coefficient.magnitude() > tolerance)
+    {
+        return Err(RuntimeError::TypeError(
+            "fftfilt currently expects an FIR digitalFilter object".to_string(),
+        ));
+    }
+
+    let (numerator, _denominator) = normalized_filter_coefficients(&numerator, &denominator);
+    Ok(vec![numerator])
+}
+
+fn parse_fftfilt_nfft(value: &Value, filter_len: usize) -> Result<usize, RuntimeError> {
+    let nfft = real_numeric_scalar(value, "fftfilt")?;
+    if !nfft.is_finite() || nfft <= 0.0 {
+        return Err(RuntimeError::TypeError(
+            "fftfilt currently expects nfft to be a positive finite scalar".to_string(),
+        ));
+    }
+
+    let target = nfft.ceil().max(filter_len as f64) as usize;
+    Ok(target.next_power_of_two())
+}
+
+fn builtin_fftfilt_with_columns(
+    filter_columns: &[Vec<ComplexParts>],
+    x: &Value,
+) -> Result<Value, RuntimeError> {
+    let x = numeric_or_complex_operand(x, "fftfilt")?;
+    let x_is_vector = x.rows == 1 || x.cols == 1;
+    let signal_column_count = if x_is_vector { 1 } else { x.cols };
+    let output_column_count = match (filter_columns.len(), signal_column_count) {
+        (1, count) => count,
+        (count, 1) => count,
+        (filter_count, signal_count) if filter_count == signal_count => signal_count,
+        _ => {
+            return Err(RuntimeError::ShapeError(
+                "fftfilt currently expects b and x to have the same number of columns when both are matrices"
+                    .to_string(),
+            ))
+        }
+    };
+
+    if x_is_vector && filter_columns.len() == 1 {
+        let values = if x.values.is_empty() {
+            Vec::new()
+        } else {
+            full_complex_convolution_vector(&x.values, &filter_columns[0])
+        };
+        return numeric_or_complex_vector_output(values, x.rows == 1 && x.cols != 1);
+    }
+
+    let signal_len = if x_is_vector { x.values.len() } else { x.rows };
+    let filter_len = filter_columns[0].len();
+    let output_rows = if signal_len == 0 {
+        0
+    } else {
+        signal_len + filter_len - 1
+    };
+    let mut output_values = vec![ComplexParts::zero(); output_rows * output_column_count];
+
+    for out_col in 0..output_column_count {
+        let filter = if filter_columns.len() == 1 {
+            &filter_columns[0]
+        } else {
+            &filter_columns[out_col]
+        };
+        let signal = if x_is_vector {
+            x.values.clone()
+        } else {
+            (0..x.rows)
+                .map(|row| {
+                    x.values[row * x.cols + if signal_column_count == 1 { 0 } else { out_col }]
+                })
+                .collect::<Vec<_>>()
+        };
+        let filtered = if signal.is_empty() {
+            Vec::new()
+        } else {
+            full_complex_convolution_vector(&signal, filter)
+        };
+        for (row, value) in filtered.into_iter().enumerate() {
+            output_values[row * output_column_count + out_col] = value;
+        }
+    }
+
+    build_numeric_or_complex_matrix_result(output_rows, output_column_count, output_values)
+}
+
+fn builtin_sosfilt(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (sections, value, requested_dim) = parse_sosfilt_args(args)?;
+    let input_dims = canonical_size_vector(&value_dimensions(value));
+    let x = numeric_or_complex_operand(value, "sosfilt")?;
+    let dim = requested_dim.unwrap_or_else(|| {
+        input_dims
+            .iter()
+            .position(|&size| size != 1)
+            .map(|index| index + 1)
+            .unwrap_or(1)
+    });
+    let sequence_count = filter_sequence_count(&input_dims, dim);
+    let section_state_len = sections
+        .iter()
+        .map(|section| {
+            section
+                .numerator
+                .len()
+                .max(section.denominator.len())
+                .saturating_sub(1)
+        })
+        .max()
+        .unwrap_or(0);
+    let mut state = vec![ComplexParts::zero(); sections.len() * section_state_len * sequence_count];
+
+    let normalized_sections = sections
+        .into_iter()
+        .map(|mut section| {
+            section
+                .numerator
+                .resize(section_state_len + 1, ComplexParts::zero());
+            section
+                .denominator
+                .resize(section_state_len + 1, ComplexParts::zero());
+            section
+        })
+        .collect::<Vec<_>>();
+
+    let mut current = x;
+    for (section_index, section) in normalized_sections.iter().enumerate() {
+        let start = section_index * section_state_len * sequence_count;
+        let end = start + section_state_len * sequence_count;
+        current = filter_numeric_operand(
+            &current,
+            &input_dims,
+            &section.numerator,
+            &section.denominator,
+            dim,
+            &mut state[start..end],
+        );
+    }
+
+    let mut y = numeric_or_complex_operand_to_value(&current)?;
+    if input_dims.len() > 2 {
+        y = relabel_value_dimensions(&y, input_dims)?;
+    }
+    Ok(y)
 }
 
 fn builtin_filtfilt(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -17294,10 +17732,1107 @@ fn builtin_filtfilt(args: &[Value]) -> Result<Value, RuntimeError> {
     build_numeric_or_complex_matrix_result_with_dimensions(input.dims, values)
 }
 
-fn builtin_sos2ctf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+const DIGITAL_FILTER_CLASS_NAME: &str = "digitalFilter";
+const DIGITAL_FILTER_PRECISION_FIELD: &str = "__digitalFilterPrecision";
+const DIGITAL_FILTER_DOUBLE_PRECISION: &str = "double";
+const DIGITAL_FILTER_SINGLE_PRECISION: &str = "single";
+
+#[derive(Debug, Clone, Copy)]
+enum DigitalFilterSampleRate {
+    Normalized,
+    Hertz(f64),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CascadeSampleRateOption {
+    Auto,
+    Explicit(DigitalFilterSampleRate),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigitalFilterPrecisionKind {
+    Double,
+    Single,
+}
+
+fn builtin_digital_filter(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (core_args, sample_rate) = split_trailing_digital_filter_options(args)?;
+    let (numerators, denominators, scale_values) = match core_args {
+        [numerators, denominators] => (numerators, denominators, None),
+        [numerators, denominators, scale_values] => (numerators, denominators, Some(scale_values)),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "digitalFilter currently supports digitalFilter(B, A), digitalFilter(B, A, g), and those forms with trailing \"SampleRate\", Fs"
+                    .to_string(),
+            ))
+        }
+    };
+
+    let sections = parse_ctf_sections(numerators, denominators, None, "digitalFilter")?;
+    if let Some(scale_values) = scale_values {
+        distributed_section_scales(Some(scale_values), sections.len(), "digitalFilter")?;
+    }
+
+    let numerator = digital_filter_property_value_from_sections(&sections, true)?;
+    let denominator = digital_filter_property_value_from_sections(&sections, false)?;
+    let scale_values = digital_filter_scale_property_value(scale_values)?;
+    let normalized_frequency = !matches!(sample_rate, Some(DigitalFilterSampleRate::Hertz(_)));
+
+    let mut fields = BTreeMap::new();
+    fields.insert("Numerator".to_string(), numerator);
+    fields.insert("Denominator".to_string(), denominator);
+    fields.insert("ScaleValues".to_string(), scale_values);
+    fields.insert(
+        "NormalizedFrequency".to_string(),
+        Value::Logical(normalized_frequency),
+    );
+    if let Some(DigitalFilterSampleRate::Hertz(sample_rate)) = sample_rate {
+        fields.insert("SampleRate".to_string(), Value::Scalar(sample_rate));
+    }
+
+    let property_order = if normalized_frequency {
+        vec![
+            "Numerator".to_string(),
+            "Denominator".to_string(),
+            "ScaleValues".to_string(),
+            "NormalizedFrequency".to_string(),
+        ]
+    } else {
+        vec![
+            "Numerator".to_string(),
+            "Denominator".to_string(),
+            "ScaleValues".to_string(),
+            "NormalizedFrequency".to_string(),
+            "SampleRate".to_string(),
+        ]
+    };
+
+    Ok(digital_filter_object_value(fields, property_order))
+}
+
+fn builtin_cascade(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (filters, sample_rate_option) = split_trailing_cascade_options(args)?;
+    if filters.len() < 2 {
+        return Err(RuntimeError::Unsupported(
+            "cascade currently supports cascade(d1, d2, ..., dn) for two or more digitalFilter inputs"
+                .to_string(),
+        ));
+    }
+
+    let mut stage_values = Vec::with_capacity(filters.len());
+    let mut auto_sample_rate = None;
+    let mut cascade_precision = None;
+    for filter in filters {
+        if !is_digital_filter_object(filter) {
+            return Err(RuntimeError::TypeError(
+                "cascade currently expects digitalFilter inputs".to_string(),
+            ));
+        }
+        let filter_precision = digital_filter_precision_kind(filter, "cascade")?;
+        if let Some(existing_precision) = cascade_precision {
+            if existing_precision != filter_precision {
+                return Err(RuntimeError::Unsupported(
+                    "cascade currently expects all digitalFilter inputs to use the same arithmetic format"
+                        .to_string(),
+                ));
+            }
+        } else {
+            cascade_precision = Some(filter_precision);
+        }
+        let filter_sample_rate = digital_filter_sample_rate_from_object(filter, "cascade")?;
+        if let Some(filter_sample_rate) = filter_sample_rate {
+            if matches!(sample_rate_option, CascadeSampleRateOption::Auto) {
+                if let Some(existing_sample_rate) = auto_sample_rate {
+                    if !digital_filter_sample_rates_match(
+                        Some(existing_sample_rate),
+                        Some(filter_sample_rate),
+                    ) {
+                        return Err(RuntimeError::Unsupported(
+                            "cascade currently expects auto SampleRate resolution to see at most one positive sample rate across the input filters"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    auto_sample_rate = Some(filter_sample_rate);
+                }
+            }
+        }
+        stage_values.push(digital_filter_detached_clone(filter, "cascade")?);
+    }
+
+    let resolved_sample_rate = match sample_rate_option {
+        CascadeSampleRateOption::Auto => auto_sample_rate.map(DigitalFilterSampleRate::Hertz),
+        CascadeSampleRateOption::Explicit(DigitalFilterSampleRate::Normalized) => {
+            Some(DigitalFilterSampleRate::Normalized)
+        }
+        CascadeSampleRateOption::Explicit(DigitalFilterSampleRate::Hertz(sample_rate)) => {
+            Some(DigitalFilterSampleRate::Hertz(sample_rate))
+        }
+    };
+    if let Some(sample_rate) = resolved_sample_rate {
+        for stage in &stage_values {
+            digital_filter_apply_sample_rate(stage, sample_rate, "cascade")?;
+        }
+    }
+
+    let top_level_sample_rate = match resolved_sample_rate {
+        Some(DigitalFilterSampleRate::Normalized) => None,
+        Some(DigitalFilterSampleRate::Hertz(sample_rate)) => Some(sample_rate),
+        None => None,
+    };
+
+    let mut fields = BTreeMap::new();
+    let mut property_order = Vec::with_capacity(stage_values.len() + 2);
+    for (index, stage) in stage_values.into_iter().enumerate() {
+        let name = format!("Stage{}", index + 1);
+        property_order.push(name.clone());
+        fields.insert(name, stage);
+    }
+    let normalized_frequency = top_level_sample_rate.is_none();
+    property_order.push("NormalizedFrequency".to_string());
+    fields.insert(
+        "NormalizedFrequency".to_string(),
+        Value::Logical(normalized_frequency),
+    );
+    if let Some(sample_rate) = top_level_sample_rate {
+        property_order.push("SampleRate".to_string());
+        fields.insert("SampleRate".to_string(), Value::Scalar(sample_rate));
+    }
+    let cascade = digital_filter_object_value(fields, property_order);
+    if let Some(precision) = cascade_precision {
+        digital_filter_apply_precision(
+            &cascade,
+            match precision {
+                DigitalFilterPrecisionKind::Double => DIGITAL_FILTER_DOUBLE_PRECISION,
+                DigitalFilterPrecisionKind::Single => DIGITAL_FILTER_SINGLE_PRECISION,
+            },
+            "cascade",
+        )?;
+    }
+    Ok(cascade)
+}
+
+fn split_trailing_cascade_options(
+    args: &[Value],
+) -> Result<(&[Value], CascadeSampleRateOption), RuntimeError> {
+    if matches!(args.last(), Some(value) if is_digital_filter_option_name(value)) {
+        return Err(RuntimeError::Unsupported(
+            "cascade currently expects option/value pairs at the end of the argument list"
+                .to_string(),
+        ));
+    }
+    if args.len() >= 2 && is_digital_filter_option_name(&args[args.len() - 2]) {
+        let name = text_value(&args[args.len() - 2])?;
+        if !name.eq_ignore_ascii_case("SampleRate") {
+            return Err(RuntimeError::Unsupported(format!(
+                "cascade does not support the `{name}` option"
+            )));
+        }
+        return Ok((
+            &args[..args.len() - 2],
+            parse_cascade_sample_rate_option(&args[args.len() - 1], "cascade")?,
+        ));
+    }
+    Ok((args, CascadeSampleRateOption::Auto))
+}
+
+fn parse_cascade_sample_rate_option(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<CascadeSampleRateOption, RuntimeError> {
+    if matches!(value, Value::CharArray(_) | Value::String(_)) {
+        let text = text_value(value)?;
+        if text.eq_ignore_ascii_case("auto") {
+            return Ok(CascadeSampleRateOption::Auto);
+        }
+    }
+    Ok(CascadeSampleRateOption::Explicit(
+        parse_digital_filter_sample_rate(value, builtin_name)?,
+    ))
+}
+
+fn builtin_get_num_stages(args: &[Value]) -> Result<Value, RuntimeError> {
+    let [filter] = args else {
+        return Err(RuntimeError::Unsupported(
+            "getNumStages currently supports getNumStages(digitalFilter)".to_string(),
+        ));
+    };
+    let object = digital_filter_object(filter, "getNumStages")?;
+    let stage_count = digital_filter_direct_stage_property_names(object)
+        .len()
+        .max(1);
+    Ok(Value::Scalar(stage_count as f64))
+}
+
+fn builtin_set_sample_rate(
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 1 {
+        return Err(RuntimeError::Unsupported(
+            "setSampleRate currently supports zero or one output".to_string(),
+        ));
+    }
+    let [filter, sample_rate] = args else {
+        return Err(RuntimeError::Unsupported(
+            "setSampleRate currently supports setSampleRate(d, Fs)".to_string(),
+        ));
+    };
+    let sample_rate = parse_digital_filter_sample_rate(sample_rate, "setSampleRate")?;
+    digital_filter_apply_sample_rate(filter, sample_rate, "setSampleRate")?;
+    if output_arity == 0 {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![filter.clone()])
+    }
+}
+
+fn digital_filter_object_value(
+    fields: BTreeMap<String, Value>,
+    property_order: Vec<String>,
+) -> Value {
+    Value::Object(ObjectValue::new(
+        ObjectClassMetadata {
+            class_name: DIGITAL_FILTER_CLASS_NAME.to_string(),
+            package: None,
+            superclass_name: None,
+            ancestor_class_names: BTreeSet::new(),
+            storage_kind: ObjectStorageKind::Handle,
+            source_path: None,
+            module_target: None,
+            property_order: property_order.clone(),
+            private_properties: BTreeSet::new(),
+            private_property_owners: BTreeMap::new(),
+            inline_methods: BTreeSet::new(),
+            private_inline_methods: BTreeSet::new(),
+            private_instance_method_owners: BTreeMap::new(),
+            private_static_inline_methods: BTreeSet::new(),
+            external_methods: BTreeMap::new(),
+            constructor: None,
+        },
+        StructValue::with_field_order(fields, property_order),
+    ))
+}
+
+fn builtin_ctf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity < 2 || output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "ctf currently supports two or three outputs for ctf(digitalFilter)".to_string(),
+        ));
+    }
+    let [filter] = args else {
+        return Err(RuntimeError::Unsupported(
+            "ctf currently supports ctf(digitalFilter)".to_string(),
+        ));
+    };
+    let (numerator, denominator, scale_values) = digital_filter_ctf_properties(filter, "ctf")?;
+    let mut outputs = vec![numerator, denominator];
+    if output_arity >= 3 {
+        outputs.push(scale_values);
+    }
+    Ok(outputs)
+}
+
+fn builtin_tf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity != 2 {
+        return Err(RuntimeError::Unsupported(
+            "tf currently supports exactly two outputs for tf(digitalFilter)".to_string(),
+        ));
+    }
+    let [filter] = args else {
+        return Err(RuntimeError::Unsupported(
+            "tf currently supports tf(digitalFilter)".to_string(),
+        ));
+    };
+    let (numerator, denominator) = digital_filter_transfer_function_from_object(filter, "tf")?;
+    Ok(vec![
+        complex_polynomial_degree_preserving_output(numerator)?,
+        complex_polynomial_degree_preserving_output(denominator)?,
+    ])
+}
+
+fn builtin_zpk(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity != 3 {
+        return Err(RuntimeError::Unsupported(
+            "zpk currently supports exactly three outputs for zpk(digitalFilter)".to_string(),
+        ));
+    }
+    let [filter] = args else {
+        return Err(RuntimeError::Unsupported(
+            "zpk currently supports zpk(digitalFilter)".to_string(),
+        ));
+    };
+    let sections = digital_filter_sections_from_object(filter, "zpk")?;
+    let (zeros, poles, gain) = zero_pole_gain_from_filter_sections(&sections);
+    Ok(vec![
+        complex_roots_column_output(zeros)?,
+        complex_roots_column_output(poles)?,
+        numeric_or_complex_value(normalize_complex_parts(gain)),
+    ])
+}
+
+fn builtin_ss(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity != 4 {
+        return Err(RuntimeError::Unsupported(
+            "ss currently supports exactly four outputs for ss(digitalFilter)".to_string(),
+        ));
+    }
+    let [filter] = args else {
+        return Err(RuntimeError::Unsupported(
+            "ss currently supports ss(digitalFilter)".to_string(),
+        ));
+    };
+    let (numerator, denominator) = digital_filter_transfer_function_from_object(filter, "ss")?;
+    let tf = vec![
+        complex_polynomial_degree_preserving_output(numerator)?,
+        complex_polynomial_degree_preserving_output(denominator)?,
+    ];
+    builtin_tf2ss(&tf, output_arity)
+}
+
+fn split_trailing_digital_filter_options(
+    args: &[Value],
+) -> Result<(&[Value], Option<DigitalFilterSampleRate>), RuntimeError> {
+    if matches!(args.last(), Some(value) if is_digital_filter_option_name(value)) {
+        return Err(RuntimeError::Unsupported(
+            "digitalFilter currently expects option/value pairs at the end of the argument list"
+                .to_string(),
+        ));
+    }
+    if args.len() >= 2 && is_digital_filter_option_name(&args[args.len() - 2]) {
+        let name = text_value(&args[args.len() - 2])?;
+        if !name.eq_ignore_ascii_case("SampleRate") {
+            return Err(RuntimeError::Unsupported(format!(
+                "digitalFilter does not support the `{name}` option"
+            )));
+        }
+        return Ok((
+            &args[..args.len() - 2],
+            Some(parse_digital_filter_sample_rate(
+                &args[args.len() - 1],
+                "digitalFilter",
+            )?),
+        ));
+    }
+    Ok((args, None))
+}
+
+fn is_digital_filter_option_name(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::CharArray(text) | Value::String(text)
+            if text.eq_ignore_ascii_case("SampleRate")
+    )
+}
+
+fn parse_digital_filter_sample_rate(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<DigitalFilterSampleRate, RuntimeError> {
+    if matches!(value, Value::CharArray(_) | Value::String(_)) {
+        let text = text_value(value)?;
+        if text.eq_ignore_ascii_case("normalized") {
+            return Ok(DigitalFilterSampleRate::Normalized);
+        }
+        return Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently expects SampleRate to be \"normalized\" or a positive finite scalar"
+        )));
+    }
+    let sample_rate = value.as_scalar()?;
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects SampleRate to be \"normalized\" or a positive finite scalar"
+        )));
+    }
+    Ok(DigitalFilterSampleRate::Hertz(sample_rate))
+}
+
+fn digital_filter_property_value_from_sections(
+    sections: &[FiltfiltSection],
+    numerators: bool,
+) -> Result<Value, RuntimeError> {
+    if sections.len() == 1 {
+        let coefficients = if numerators {
+            sections[0].numerator.clone()
+        } else {
+            sections[0].denominator.clone()
+        };
+        return complex_polynomial_degree_preserving_output(coefficients);
+    }
+    let cols = sections
+        .iter()
+        .map(|section| {
+            if numerators {
+                section.numerator.len()
+            } else {
+                section.denominator.len()
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    let mut values = Vec::with_capacity(sections.len() * cols);
+    for section in sections {
+        let mut coefficients = if numerators {
+            section.numerator.clone()
+        } else {
+            section.denominator.clone()
+        };
+        coefficients.resize(cols, ComplexParts::zero());
+        values.extend(coefficients);
+    }
+    build_numeric_or_complex_matrix_result(sections.len(), cols, values)
+}
+
+fn digital_filter_scale_property_value(
+    scale_values: Option<&Value>,
+) -> Result<Value, RuntimeError> {
+    let Some(scale_values) = scale_values else {
+        return Ok(Value::Scalar(1.0));
+    };
+    let (values, _row_output, _logical_output) = numeric_set_vector(scale_values, "digitalFilter")?;
+    if values.len() == 1 {
+        Ok(Value::Scalar(values[0]))
+    } else {
+        numeric_values_to_row_matrix(values)
+    }
+}
+
+fn is_digital_filter_object(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Object(object)
+            if object
+                .class
+                .qualified_name()
+                .eq_ignore_ascii_case(DIGITAL_FILTER_CLASS_NAME)
+    )
+}
+
+fn digital_filter_object<'a>(
+    value: &'a Value,
+    builtin_name: &str,
+) -> Result<&'a ObjectValue, RuntimeError> {
+    let Value::Object(object) = value else {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects a digitalFilter object"
+        )));
+    };
+    if !object
+        .class
+        .qualified_name()
+        .eq_ignore_ascii_case(DIGITAL_FILTER_CLASS_NAME)
+    {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects a digitalFilter object"
+        )));
+    }
+    Ok(object)
+}
+
+fn digital_filter_direct_stage_property_names(object: &ObjectValue) -> Vec<String> {
+    object
+        .properties()
+        .field_order
+        .iter()
+        .filter(|name| name.starts_with("Stage"))
+        .cloned()
+        .collect()
+}
+
+fn digital_filter_detached_clone(value: &Value, builtin_name: &str) -> Result<Value, RuntimeError> {
+    let object = digital_filter_object(value, builtin_name)?;
+    let properties = object.properties();
+    let property_order = properties.field_order.clone();
+    let mut fields = BTreeMap::new();
+    for (name, value) in &properties.fields {
+        fields.insert(
+            name.clone(),
+            if value_is_digital_filter_object(value) {
+                digital_filter_detached_clone(value, builtin_name)?
+            } else {
+                value.clone()
+            },
+        );
+    }
+    Ok(digital_filter_object_value(fields, property_order))
+}
+
+fn value_is_digital_filter_object(value: &Value) -> bool {
+    is_digital_filter_object(value)
+}
+
+fn digital_filter_single_stage_ctf_properties(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(Value, Value, Value), RuntimeError> {
+    let object = digital_filter_object(value, builtin_name)?;
+    let Some(numerator) = object.property_value("Numerator") else {
+        return Err(RuntimeError::MissingVariable(format!(
+            "{builtin_name} currently expects digitalFilter objects to define a Numerator property"
+        )));
+    };
+    let denominator = object
+        .property_value("Denominator")
+        .unwrap_or(Value::Scalar(1.0));
+    let scale_values = object
+        .property_value("ScaleValues")
+        .unwrap_or(Value::Scalar(1.0));
+    Ok((numerator, denominator, scale_values))
+}
+
+fn digital_filter_single_stage_ctf_rows_and_scales(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(Vec<Vec<ComplexParts>>, Vec<Vec<ComplexParts>>, Vec<f64>), RuntimeError> {
+    let (numerator, denominator, scale_values) =
+        digital_filter_single_stage_ctf_properties(value, builtin_name)?;
+    let (numerator_rows, denominator_rows) =
+        numeric_or_complex_ctf_section_rows(&numerator, &denominator, builtin_name)?;
+    let section_scales =
+        distributed_section_scales(Some(&scale_values), numerator_rows.len(), builtin_name)?;
+    Ok((numerator_rows, denominator_rows, section_scales))
+}
+
+fn digital_filter_leaf_stage_objects(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<Vec<Value>, RuntimeError> {
+    let object = digital_filter_object(value, builtin_name)?;
+    let stage_names = digital_filter_direct_stage_property_names(object);
+    if stage_names.is_empty() {
+        return Ok(vec![value.clone()]);
+    }
+
+    let mut leaf_stages = Vec::new();
+    for stage_name in stage_names {
+        let stage = object.property_value(&stage_name).ok_or_else(|| {
+            RuntimeError::MissingVariable(format!(
+                "{builtin_name} currently expects digitalFilter cascades to define the `{stage_name}` property"
+            ))
+        })?;
+        if !is_digital_filter_object(&stage) {
+            return Err(RuntimeError::TypeError(format!(
+                "{builtin_name} currently expects digitalFilter cascade stages to be digitalFilter objects"
+            )));
+        }
+        leaf_stages.extend(digital_filter_leaf_stage_objects(&stage, builtin_name)?);
+    }
+    Ok(leaf_stages)
+}
+
+fn digital_filter_sample_rates_match(lhs: Option<f64>, rhs: Option<f64>) -> bool {
+    match (lhs, rhs) {
+        (None, None) => true,
+        (Some(lhs), Some(rhs)) => {
+            let scale = lhs.abs().max(rhs.abs()).max(1.0);
+            (lhs - rhs).abs() <= f64::EPSILON * 16.0 * scale
+        }
+        _ => false,
+    }
+}
+
+fn digital_filter_is_double_precision(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<bool, RuntimeError> {
+    for stage in digital_filter_leaf_stage_objects(value, builtin_name)? {
+        if matches!(
+            digital_filter_declared_precision(&stage, builtin_name)?,
+            Some(DIGITAL_FILTER_SINGLE_PRECISION)
+        ) {
+            return Ok(false);
+        }
+        let (numerator, denominator, scale_values) =
+            digital_filter_single_stage_ctf_properties(&stage, builtin_name)?;
+        if !value_is_double_precision(&numerator)
+            || !value_is_double_precision(&denominator)
+            || !value_is_double_precision(&scale_values)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn digital_filter_is_single_precision(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<bool, RuntimeError> {
+    let stages = digital_filter_leaf_stage_objects(value, builtin_name)?;
+    if stages.is_empty() {
+        return Ok(false);
+    }
+    for stage in stages {
+        if !matches!(
+            digital_filter_declared_precision(&stage, builtin_name)?,
+            Some(DIGITAL_FILTER_SINGLE_PRECISION)
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn digital_filter_declared_precision(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<Option<&'static str>, RuntimeError> {
+    let object = digital_filter_object(value, builtin_name)?;
+    let Some(precision) = object.property_value(DIGITAL_FILTER_PRECISION_FIELD) else {
+        return Ok(None);
+    };
+    let precision = text_value(&precision)?;
+    if precision.eq_ignore_ascii_case(DIGITAL_FILTER_SINGLE_PRECISION) {
+        Ok(Some(DIGITAL_FILTER_SINGLE_PRECISION))
+    } else if precision.eq_ignore_ascii_case(DIGITAL_FILTER_DOUBLE_PRECISION) {
+        Ok(Some(DIGITAL_FILTER_DOUBLE_PRECISION))
+    } else {
+        Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects digitalFilter precision metadata to be \"single\" or \"double\""
+        )))
+    }
+}
+
+fn digital_filter_precision_kind(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<DigitalFilterPrecisionKind, RuntimeError> {
+    if digital_filter_is_single_precision(value, builtin_name)? {
+        Ok(DigitalFilterPrecisionKind::Single)
+    } else {
+        Ok(DigitalFilterPrecisionKind::Double)
+    }
+}
+
+fn digital_filter_info_text(value: &Value, builtin_name: &str) -> Result<String, RuntimeError> {
+    let object = digital_filter_object(value, builtin_name)?;
+    let sections = digital_filter_sections_from_object(value, builtin_name)?;
+    let stage_count = digital_filter_direct_stage_property_names(object)
+        .len()
+        .max(1);
+    let (numerator, denominator) =
+        digital_filter_transfer_function_from_object(value, builtin_name)?;
+    let tolerance = default_phase_property_tolerance();
+    let numerator = trim_filter_trailing_zeros(&numerator, tolerance);
+    let denominator = trim_filter_trailing_zeros(&denominator, tolerance);
+    let is_fir = denominator.len() <= 1
+        || denominator[1..]
+            .iter()
+            .all(|coefficient| coefficient.magnitude() <= tolerance);
+    let fir_info_coefficients = if is_fir && stage_count == 1 {
+        let (stage_numerator, _stage_denominator, _stage_scale_values) =
+            digital_filter_single_stage_ctf_properties(value, builtin_name)?;
+        numeric_or_complex_set_vector(&stage_numerator, builtin_name)
+            .ok()
+            .map(|(values, _is_row)| values)
+    } else {
+        None
+    };
+    let order = fir_info_coefficients
+        .as_ref()
+        .map(|coefficients| coefficients.len().saturating_sub(1))
+        .unwrap_or_else(|| {
+            transfer_function_order(&numerator).max(transfer_function_order(&denominator))
+        });
+    let precision = if digital_filter_is_double_precision(value, builtin_name)? {
+        "double"
+    } else {
+        "single"
+    };
+    let kind = if stage_count > 1 {
+        "Digital Filter Cascade"
+    } else if is_fir {
+        "FIR Digital Filter"
+    } else {
+        "IIR Digital Filter"
+    };
+    let domain = if numerator
+        .iter()
+        .chain(denominator.iter())
+        .all(|coefficient| coefficient.imag.abs() <= tolerance)
+    {
+        "real"
+    } else {
+        "complex"
+    };
+    let stable = if is_fir {
+        true
+    } else {
+        filter_denominator_roots(&denominator, tolerance, builtin_name)?
+            .into_iter()
+            .all(|pole| pole.magnitude() <= 1.0 + tolerance)
+    };
+    let numerator_roots = filter_numerator_roots(&numerator, tolerance);
+    let minimum_phase = stable
+        && numerator_roots
+            .iter()
+            .all(|zero| zero.magnitude() <= 1.0 + tolerance);
+    let maximum_phase = stable
+        && numerator_roots
+            .iter()
+            .all(|zero| zero.magnitude() >= 1.0 - tolerance);
+    let sample_rate = digital_filter_sample_rate_from_object(value, builtin_name)?;
+
+    let mut lines = vec![
+        format!("{kind} ({domain}, {precision})"),
+        "-".repeat(32),
+        format!("Number of Stages : {stage_count}"),
+        format!("Sections         : {}", sections.len()),
+        format!("Filter Order     : {order}"),
+        format!("Impulse Response : {}", if is_fir { "FIR" } else { "IIR" }),
+        format!("Stable           : {}", if stable { "Yes" } else { "No" }),
+        format!(
+            "Minimum Phase    : {}",
+            if minimum_phase { "Yes" } else { "No" }
+        ),
+        format!(
+            "Maximum Phase    : {}",
+            if maximum_phase { "Yes" } else { "No" }
+        ),
+    ];
+    if is_fir {
+        let fir_length = fir_info_coefficients
+            .as_ref()
+            .map(|coefficients| coefficients.len().max(1))
+            .unwrap_or_else(|| numerator.len().max(1));
+        lines.push(format!("Filter Length    : {fir_length}"));
+        let linear_phase = match fir_info_coefficients
+            .as_ref()
+            .and_then(|coefficients| linear_phase_fir_type(coefficients, tolerance))
+            .or_else(|| linear_phase_fir_type(&numerator, tolerance))
+        {
+            Some(filter_type) => format!("Yes (Type {filter_type})"),
+            None => "No".to_string(),
+        };
+        lines.push(format!("Linear Phase     : {linear_phase}"));
+    }
+    lines.push(match sample_rate {
+        Some(sample_rate) => format!("Sample Rate      : {sample_rate}"),
+        None => "Sample Rate      : N/A (normalized frequency)".to_string(),
+    });
+    Ok(lines.join("\n"))
+}
+
+fn digital_filter_apply_sample_rate(
+    value: &Value,
+    sample_rate: DigitalFilterSampleRate,
+    builtin_name: &str,
+) -> Result<(), RuntimeError> {
+    let object = digital_filter_object(value, builtin_name)?;
+    let mut object = object.clone();
+    let normalized_frequency = matches!(sample_rate, DigitalFilterSampleRate::Normalized);
+    object.set_property_value("NormalizedFrequency", Value::Logical(normalized_frequency))?;
+    match sample_rate {
+        DigitalFilterSampleRate::Normalized => {
+            object.remove_property_value("SampleRate");
+        }
+        DigitalFilterSampleRate::Hertz(sample_rate) => {
+            object.set_property_value("SampleRate", Value::Scalar(sample_rate))?;
+        }
+    }
+    for stage_name in digital_filter_direct_stage_property_names(&object) {
+        let stage = object.property_value(&stage_name).ok_or_else(|| {
+            RuntimeError::MissingVariable(format!(
+                "{builtin_name} currently expects digitalFilter cascades to define the `{stage_name}` property"
+            ))
+        })?;
+        digital_filter_apply_sample_rate(&stage, sample_rate, builtin_name)?;
+    }
+    Ok(())
+}
+
+fn digital_filter_apply_precision(
+    value: &Value,
+    precision: &str,
+    builtin_name: &str,
+) -> Result<(), RuntimeError> {
+    let object = digital_filter_object(value, builtin_name)?;
+    let mut object = object.clone();
+    object.set_property_value(
+        DIGITAL_FILTER_PRECISION_FIELD,
+        Value::CharArray(precision.to_string()),
+    )?;
+    for stage_name in digital_filter_direct_stage_property_names(&object) {
+        let stage = object.property_value(&stage_name).ok_or_else(|| {
+            RuntimeError::MissingVariable(format!(
+                "{builtin_name} currently expects digitalFilter cascades to define the `{stage_name}` property"
+            ))
+        })?;
+        digital_filter_apply_precision(&stage, precision, builtin_name)?;
+    }
+    Ok(())
+}
+
+fn digital_filter_ctf_properties(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(Value, Value, Value), RuntimeError> {
+    let object = digital_filter_object(value, builtin_name)?;
+    if digital_filter_direct_stage_property_names(object).is_empty() {
+        return digital_filter_single_stage_ctf_properties(value, builtin_name);
+    }
+
+    let mut numerator_rows = Vec::new();
+    let mut denominator_rows = Vec::new();
+    let mut section_scales = Vec::new();
+    for stage in digital_filter_leaf_stage_objects(value, builtin_name)? {
+        let (stage_numerator_rows, stage_denominator_rows, stage_section_scales) =
+            digital_filter_single_stage_ctf_rows_and_scales(&stage, builtin_name)?;
+        numerator_rows.extend(stage_numerator_rows);
+        denominator_rows.extend(stage_denominator_rows);
+        section_scales.extend(stage_section_scales);
+    }
+    let sections = digital_filter_sections_from_object(value, builtin_name)?;
+    Ok((
+        digital_filter_property_value_from_section_rows(&numerator_rows)?,
+        digital_filter_property_value_from_section_rows(&denominator_rows)?,
+        digital_filter_cascade_scale_property_value(&section_scales, sections.len())?,
+    ))
+}
+
+fn digital_filter_property_value_from_section_rows(
+    rows: &[Vec<ComplexParts>],
+) -> Result<Value, RuntimeError> {
+    if rows.len() == 1 {
+        return complex_polynomial_degree_preserving_output(rows[0].clone());
+    }
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut values = Vec::with_capacity(rows.len() * cols);
+    for row in rows {
+        let mut padded = row.clone();
+        padded.resize(cols, ComplexParts::zero());
+        values.extend(padded);
+    }
+    build_numeric_or_complex_matrix_result(rows.len(), cols, values)
+}
+
+fn digital_filter_cascade_scale_property_value(
+    section_scales: &[f64],
+    section_count: usize,
+) -> Result<Value, RuntimeError> {
+    if section_count == 0 || section_scales.is_empty() {
+        return Ok(Value::Scalar(1.0));
+    }
+    if section_scales
+        .iter()
+        .all(|scale| (*scale - 1.0).abs() <= f64::EPSILON * 8.0)
+    {
+        return Ok(Value::Scalar(1.0));
+    }
+    let mut values = section_scales.to_vec();
+    values.push(1.0);
+    numeric_values_to_row_matrix(values)
+}
+
+fn digital_filter_sections_from_object(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<Vec<FiltfiltSection>, RuntimeError> {
+    let mut sections = Vec::new();
+    for stage in digital_filter_leaf_stage_objects(value, builtin_name)? {
+        let (numerator, denominator, scale_values) =
+            digital_filter_single_stage_ctf_properties(&stage, builtin_name)?;
+        sections.extend(parse_ctf_sections(
+            &numerator,
+            &denominator,
+            Some(&scale_values),
+            builtin_name,
+        )?);
+    }
+    Ok(sections)
+}
+
+fn digital_filter_sample_rate_from_object(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<Option<f64>, RuntimeError> {
+    let object = digital_filter_object(value, builtin_name)?;
+    if matches!(
+        object.property_value("NormalizedFrequency"),
+        Some(Value::Logical(true))
+    ) {
+        return Ok(None);
+    }
+    let Some(sample_rate) = object.property_value("SampleRate") else {
+        return Ok(None);
+    };
+    let sample_rate = sample_rate.as_scalar()?;
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects digitalFilter objects to define a positive finite SampleRate property"
+        )));
+    }
+    Ok(Some(sample_rate))
+}
+
+fn digital_filter_transfer_function_from_object(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>), RuntimeError> {
+    let sections = digital_filter_sections_from_object(value, builtin_name)?;
+    Ok(equivalent_filter_sections_transfer_function(&sections))
+}
+
+fn builtin_sos2cell(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (sos, gain) = match args {
+        [sos] => (sos, ComplexParts::one()),
+        [sos, gain] => (sos, numeric_or_complex_scalar_operand(gain, "sos2cell")?),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "sos2cell currently supports sos2cell(sos) and sos2cell(sos, g)".to_string(),
+            ))
+        }
+    };
+    let operand = numeric_or_complex_operand(sos, "sos2cell")?;
+    if operand.cols != 6 {
+        return Err(RuntimeError::ShapeError(
+            "sos2cell currently expects sos to be an L-by-6 matrix".to_string(),
+        ));
+    }
+
+    let mut elements = Vec::with_capacity(operand.rows + 1);
+    if !sos2cell_gain_is_unity(gain) {
+        elements.push(Value::Cell(CellValue::new(
+            1,
+            2,
+            vec![numeric_or_complex_value(gain), Value::Scalar(1.0)],
+        )?));
+    }
+    for row in 0..operand.rows {
+        let start = row * operand.cols;
+        let numerator = operand.values[start..start + 3].to_vec();
+        let denominator = operand.values[start + 3..start + 6].to_vec();
+        if denominator[0].is_approximately_zero() {
+            return Err(RuntimeError::TypeError(
+                "sos2cell currently expects each section denominator to have a nonzero leading coefficient"
+                    .to_string(),
+            ));
+        }
+        let (numerator, denominator) = normalized_filter_coefficients(&numerator, &denominator);
+        elements.push(Value::Cell(CellValue::new(
+            1,
+            2,
+            vec![
+                build_numeric_or_complex_matrix_result(1, 3, numerator)?,
+                build_numeric_or_complex_matrix_result(1, 3, denominator)?,
+            ],
+        )?));
+    }
+    Ok(Value::Cell(CellValue::new(1, elements.len(), elements)?))
+}
+
+fn builtin_cell2sos(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
     if output_arity == 0 || output_arity > 2 {
         return Err(RuntimeError::Unsupported(
-            "sos2ctf currently supports one or two outputs".to_string(),
+            "cell2sos currently supports one or two outputs".to_string(),
+        ));
+    }
+    let [value] = args else {
+        return Err(RuntimeError::Unsupported(
+            "cell2sos currently supports cell2sos(cll)".to_string(),
+        ));
+    };
+    let Value::Cell(cell) = value else {
+        return Err(RuntimeError::TypeError(format!(
+            "cell2sos currently expects cell input, found {}",
+            value.kind_name()
+        )));
+    };
+    if cell.rows != 1 && cell.cols != 1 {
+        return Err(RuntimeError::TypeError(
+            "cell2sos currently expects cll to be a cell vector".to_string(),
+        ));
+    }
+
+    let (section_start, gain) = match cell.elements().first() {
+        Some(first) if cell2sos_cell_is_gain(first)? => (1usize, cell2sos_gain(first)?),
+        _ => (0usize, ComplexParts::one()),
+    };
+    let section_count = cell.element_count().saturating_sub(section_start);
+    let mut sos_values = Vec::with_capacity(section_count * 6);
+    for section in &cell.elements()[section_start..] {
+        let (numerator, denominator) = cell2sos_section(section)?;
+        sos_values.extend(numerator);
+        sos_values.extend(denominator);
+    }
+
+    let sos = build_numeric_or_complex_matrix_result(section_count, 6, sos_values)?;
+    match output_arity {
+        1 => Ok(vec![embed_sos_gain_in_first_section(
+            sos, gain, "cell2sos",
+        )?]),
+        2 => Ok(vec![sos, numeric_or_complex_value(gain)]),
+        _ => unreachable!("checked output arity above"),
+    }
+}
+
+fn sos2cell_gain_is_unity(gain: ComplexParts) -> bool {
+    normalize_complex_parts(gain.minus(ComplexParts::one())).is_approximately_zero()
+}
+
+fn cell2sos_cell_is_gain(value: &Value) -> Result<bool, RuntimeError> {
+    let Value::Cell(cell) = value else {
+        return Ok(false);
+    };
+    if cell.element_count() != 2 || (cell.rows != 1 && cell.cols != 1) {
+        return Ok(false);
+    }
+    Ok(cell
+        .elements()
+        .iter()
+        .all(|element| numeric_or_complex_scalar_operand(element, "cell2sos").is_ok()))
+}
+
+fn cell2sos_gain(value: &Value) -> Result<ComplexParts, RuntimeError> {
+    let Value::Cell(cell) = value else {
+        unreachable!("gain cell guard ensures cell input");
+    };
+    let numerator = numeric_or_complex_scalar_operand(&cell.elements()[0], "cell2sos")?;
+    let denominator = numeric_or_complex_scalar_operand(&cell.elements()[1], "cell2sos")?;
+    if denominator.is_approximately_zero() {
+        return Err(RuntimeError::TypeError(
+            "cell2sos currently expects the gain denominator to be nonzero".to_string(),
+        ));
+    }
+    Ok(normalize_complex_parts(numerator.rdivide(denominator)))
+}
+
+fn cell2sos_section(value: &Value) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>), RuntimeError> {
+    let Value::Cell(cell) = value else {
+        return Err(RuntimeError::TypeError(
+            "cell2sos currently expects each cll element to be a 2-element cell array".to_string(),
+        ));
+    };
+    if cell.element_count() != 2 || (cell.rows != 1 && cell.cols != 1) {
+        return Err(RuntimeError::ShapeError(
+            "cell2sos currently expects each section to be a 2-element cell vector".to_string(),
+        ));
+    }
+    let numerator = cell2sos_section_vector(&cell.elements()[0], "numerator")?;
+    let denominator = cell2sos_section_vector(&cell.elements()[1], "denominator")?;
+    if denominator[0].is_approximately_zero() {
+        return Err(RuntimeError::TypeError(
+            "cell2sos currently expects each section denominator to have a nonzero leading coefficient"
+                .to_string(),
+        ));
+    }
+    Ok(normalized_filter_coefficients(&numerator, &denominator))
+}
+
+fn cell2sos_section_vector(value: &Value, label: &str) -> Result<Vec<ComplexParts>, RuntimeError> {
+    let (values, _) = numeric_or_complex_set_vector(value, "cell2sos")?;
+    if values.len() != 3 {
+        return Err(RuntimeError::ShapeError(format!(
+            "cell2sos currently expects each section {label} to have exactly three coefficients"
+        )));
+    }
+    Ok(values)
+}
+
+fn builtin_sos2ctf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity != 2 {
+        return Err(RuntimeError::Unsupported(
+            "sos2ctf currently supports exactly two outputs".to_string(),
         ));
     }
     let (sos, scale_values) = match args {
@@ -17329,17 +18864,13 @@ fn builtin_sos2ctf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Ru
     }
     let b = build_numeric_or_complex_matrix_result(operand.rows, 3, numerator)?;
     let a = build_numeric_or_complex_matrix_result(operand.rows, 3, denominator)?;
-    match output_arity {
-        1 => Ok(vec![b]),
-        2 => Ok(vec![b, a]),
-        _ => unreachable!("checked output arity above"),
-    }
+    Ok(vec![b, a])
 }
 
 fn builtin_sos2zp(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity == 0 || output_arity > 3 {
+    if output_arity != 3 {
         return Err(RuntimeError::Unsupported(
-            "sos2zp currently supports one, two, or three outputs".to_string(),
+            "sos2zp currently supports exactly three outputs".to_string(),
         ));
     }
     let (sos, gain_value) = match args {
@@ -17386,20 +18917,17 @@ fn builtin_sos2zp(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
         gain = normalize_complex_parts(gain.times(numerator[0].rdivide(denominator[0])));
     }
 
-    let mut outputs = vec![complex_roots_column_output(zeros)?];
-    if output_arity >= 2 {
-        outputs.push(complex_roots_column_output(poles)?);
-    }
-    if output_arity >= 3 {
-        outputs.push(numeric_or_complex_value(gain));
-    }
-    Ok(outputs)
+    Ok(vec![
+        complex_roots_column_output(zeros)?,
+        complex_roots_column_output(poles)?,
+        numeric_or_complex_value(gain),
+    ])
 }
 
 fn builtin_sos2tf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity == 0 || output_arity > 2 {
+    if output_arity != 2 {
         return Err(RuntimeError::Unsupported(
-            "sos2tf currently supports one or two outputs".to_string(),
+            "sos2tf currently supports exactly two outputs".to_string(),
         ));
     }
     let (sos, scale_values) = match args {
@@ -17413,21 +18941,16 @@ fn builtin_sos2tf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
     };
     let sections = parse_sos_sections(sos, scale_values.unwrap_or(&Value::Scalar(1.0)), "sos2tf")?;
     let (numerator, denominator) = equivalent_filter_sections_transfer_function(&sections);
-    let b = complex_polynomial_degree_preserving_output(numerator)?;
-    match output_arity {
-        1 => Ok(vec![b]),
-        2 => Ok(vec![
-            b,
-            complex_polynomial_degree_preserving_output(denominator)?,
-        ]),
-        _ => unreachable!("checked output arity above"),
-    }
+    Ok(vec![
+        complex_polynomial_degree_preserving_output(numerator)?,
+        complex_polynomial_degree_preserving_output(denominator)?,
+    ])
 }
 
 fn builtin_sos2ss(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity == 0 || output_arity > 4 {
+    if output_arity != 4 {
         return Err(RuntimeError::Unsupported(
-            "sos2ss currently supports one to four outputs".to_string(),
+            "sos2ss currently supports exactly four outputs".to_string(),
         ));
     }
     let tf = builtin_sos2tf(args, 2)?;
@@ -17435,9 +18958,9 @@ fn builtin_sos2ss(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
 }
 
 fn builtin_tf2ss(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity == 0 || output_arity > 4 {
+    if output_arity != 4 {
         return Err(RuntimeError::Unsupported(
-            "tf2ss currently supports one to four outputs".to_string(),
+            "tf2ss currently supports exactly four outputs".to_string(),
         ));
     }
     let [numerator, denominator] = args else {
@@ -17478,111 +19001,17 @@ fn builtin_tf2ss(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runt
         }
     }
 
-    let mut outputs = vec![build_numeric_or_complex_matrix_result(
-        state_count,
-        state_count,
-        a_values,
-    )?];
-    if output_arity >= 2 {
-        outputs.push(build_numeric_or_complex_matrix_result(
-            state_count,
-            1,
-            b_values,
-        )?);
-    }
-    if output_arity >= 3 {
-        outputs.push(build_numeric_or_complex_matrix_result(
-            output_count,
-            state_count,
-            c_values,
-        )?);
-    }
-    if output_arity >= 4 {
-        outputs.push(build_numeric_or_complex_matrix_result(
-            output_count,
-            1,
-            d_values,
-        )?);
-    }
-    Ok(outputs)
+    Ok(vec![
+        build_numeric_or_complex_matrix_result(state_count, state_count, a_values)?,
+        build_numeric_or_complex_matrix_result(state_count, 1, b_values)?,
+        build_numeric_or_complex_matrix_result(output_count, state_count, c_values)?,
+        build_numeric_or_complex_matrix_result(output_count, 1, d_values)?,
+    ])
 }
 
 fn builtin_ctffilt(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity > 2 {
-        return Err(RuntimeError::Unsupported(
-            "ctffilt currently supports one or two outputs".to_string(),
-        ));
-    }
     let (sections, value, zi, requested_dim) = parse_ctffilt_args(args)?;
-    let input_dims = canonical_size_vector(&value_dimensions(value));
-    let x = numeric_or_complex_operand(value, "ctffilt")?;
-    let dim = requested_dim.unwrap_or_else(|| {
-        input_dims
-            .iter()
-            .position(|&size| size != 1)
-            .map(|index| index + 1)
-            .unwrap_or(1)
-    });
-    let sequence_count = filter_sequence_count(&input_dims, dim);
-    let section_state_len = sections
-        .iter()
-        .map(|section| {
-            section
-                .numerator
-                .len()
-                .max(section.denominator.len())
-                .saturating_sub(1)
-        })
-        .max()
-        .unwrap_or(0);
-    let state_dims = ctffilt_state_dims(sections.len() * section_state_len, &input_dims, dim);
-    let mut state = parse_ctffilt_initial_conditions(
-        zi,
-        section_state_len,
-        sections.len(),
-        sequence_count,
-        &state_dims,
-    )?;
-
-    let normalized_sections = sections
-        .into_iter()
-        .map(|mut section| {
-            section
-                .numerator
-                .resize(section_state_len + 1, ComplexParts::zero());
-            section
-                .denominator
-                .resize(section_state_len + 1, ComplexParts::zero());
-            section
-        })
-        .collect::<Vec<_>>();
-
-    let mut current = x;
-    for (section_index, section) in normalized_sections.iter().enumerate() {
-        let start = section_index * section_state_len * sequence_count;
-        let end = start + section_state_len * sequence_count;
-        current = filter_numeric_operand(
-            &current,
-            &input_dims,
-            &section.numerator,
-            &section.denominator,
-            dim,
-            &mut state[start..end],
-        );
-    }
-
-    let mut y = numeric_or_complex_operand_to_value(&current)?;
-    if input_dims.len() > 2 {
-        y = relabel_value_dimensions(&y, input_dims.clone())?;
-    }
-    match output_arity {
-        0 | 1 => Ok(vec![y]),
-        2 => Ok(vec![
-            y,
-            build_numeric_or_complex_matrix_result_with_dimensions(state_dims, state)?,
-        ]),
-        _ => unreachable!("checked output arity above"),
-    }
+    builtin_filter_with_sections(sections, value, zi, requested_dim, output_arity, "ctffilt")
 }
 
 fn builtin_scale_filter_sections(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -17812,8 +19241,19 @@ fn parse_filtfilt_sections<'a>(
     args: &'a [Value],
 ) -> Result<(Vec<FiltfiltSection>, &'a Value), RuntimeError> {
     match args {
+        [filter, value] if is_digital_filter_object(filter) => {
+            Ok((digital_filter_sections_from_object(filter, "filtfilt")?, value))
+        }
         [sections, scale_values, value] if filtfilt_sos_signature(sections) => {
             Ok((parse_sos_sections(sections, scale_values, "filtfilt")?, value))
+        }
+        [sections, scale_values, value]
+            if filtfilt_sos_row_scalar_gain_signature(sections, scale_values)? =>
+        {
+            Ok((
+                vec![filtfilt_sos_row_scalar_gain_section(sections, scale_values)?],
+                value,
+            ))
         }
         [numerator, denominator, value] => Ok((
             vec![parse_transfer_function_section(
@@ -17834,7 +19274,7 @@ fn parse_filtfilt_sections<'a>(
         [ctf, value] => {
             let Value::Cell(cell) = ctf else {
                 return Err(RuntimeError::Unsupported(
-                    "filtfilt currently supports filtfilt(b, a, x), filtfilt(sos, g, x), filtfilt(B, A, x, \"ctf\"), and filtfilt({B, A, g}, x)".to_string(),
+                    "filtfilt currently supports filtfilt(digitalFilter, x), filtfilt(b, a, x), filtfilt(sos, g, x), filtfilt(B, A, x, \"ctf\"), and filtfilt({B, A, g}, x)".to_string(),
                 ));
             };
             if cell.element_count() != 3 || (cell.rows != 1 && cell.cols != 1) {
@@ -17853,9 +19293,41 @@ fn parse_filtfilt_sections<'a>(
             ))
         }
         _ => Err(RuntimeError::Unsupported(
-            "filtfilt currently supports filtfilt(b, a, x), filtfilt(sos, g, x), filtfilt(B, A, x, \"ctf\"), and filtfilt({B, A, g}, x)".to_string(),
+            "filtfilt currently supports filtfilt(digitalFilter, x), filtfilt(b, a, x), filtfilt(sos, g, x), filtfilt(B, A, x, \"ctf\"), and filtfilt({B, A, g}, x)".to_string(),
         )),
     }
+}
+
+fn filtfilt_sos_row_scalar_gain_signature(
+    sections: &Value,
+    scale_values: &Value,
+) -> Result<bool, RuntimeError> {
+    let Value::Matrix(matrix) = sections else {
+        return Ok(false);
+    };
+    if matrix.rows != 1 || matrix.cols != 6 {
+        return Ok(false);
+    }
+    let (values, _row_output, _logical_output) = numeric_set_vector(scale_values, "filtfilt")?;
+    Ok(values.len() == 1 && values[0].is_finite())
+}
+
+fn filtfilt_sos_row_scalar_gain_section(
+    sections: &Value,
+    scale_values: &Value,
+) -> Result<FiltfiltSection, RuntimeError> {
+    let operand = numeric_or_complex_operand(sections, "filtfilt")?;
+    let scale = distributed_section_scales(Some(scale_values), 1, "filtfilt")?
+        .into_iter()
+        .next()
+        .unwrap_or(1.0);
+    let numerator = operand
+        .values
+        .iter()
+        .copied()
+        .map(|coefficient| normalize_complex_parts(coefficient.scale(scale)))
+        .collect::<Vec<_>>();
+    normalized_filter_section(numerator, vec![ComplexParts::one()], "filtfilt")
 }
 
 fn parse_transfer_function_section(
@@ -17929,6 +19401,45 @@ fn parse_sos_sections(
         .collect()
 }
 
+fn parse_sosfilt_args<'a>(
+    args: &'a [Value],
+) -> Result<(Vec<FiltfiltSection>, &'a Value, Option<usize>), RuntimeError> {
+    match args {
+        [sos, value] => Ok((parse_sosfilt_sections(sos, "sosfilt")?, value, None)),
+        [sos, value, dim] => Ok((
+            parse_sosfilt_sections(sos, "sosfilt")?,
+            value,
+            Some(positive_dimension(dim, "sosfilt")?),
+        )),
+        _ => Err(RuntimeError::Unsupported(
+            "sosfilt currently supports sosfilt(sos, x) and sosfilt(sos, x, dim)".to_string(),
+        )),
+    }
+}
+
+fn parse_sosfilt_sections(
+    sections: &Value,
+    builtin_name: &str,
+) -> Result<Vec<FiltfiltSection>, RuntimeError> {
+    let operand = numeric_or_complex_operand(sections, builtin_name)?;
+    if operand.rows < 1 || operand.cols != 6 {
+        return Err(RuntimeError::ShapeError(format!(
+            "{builtin_name} currently expects sos to be an L-by-6 matrix"
+        )));
+    }
+    (0..operand.rows)
+        .map(|row| {
+            let start = row * operand.cols;
+            let row_values = &operand.values[start..start + operand.cols];
+            normalized_filter_section(
+                row_values[..3].to_vec(),
+                row_values[3..].to_vec(),
+                builtin_name,
+            )
+        })
+        .collect()
+}
+
 fn numeric_or_complex_ctf_section_rows(
     numerators: &Value,
     denominators: &Value,
@@ -17950,6 +19461,20 @@ fn numeric_or_complex_ctf_section_rows(
         ));
     }
 
+    if ctf_operand_is_scalar(&numerator_operand) && denominator_operand.rows > 1 {
+        return Ok((
+            vec![numerator_operand.values.clone(); denominator_operand.rows],
+            ctf_operand_row_sections(&denominator_operand),
+        ));
+    }
+
+    if ctf_operand_is_scalar(&denominator_operand) && numerator_operand.rows > 1 {
+        return Ok((
+            ctf_operand_row_sections(&numerator_operand),
+            vec![denominator_operand.values.clone(); numerator_operand.rows],
+        ));
+    }
+
     if numerator_operand.rows != denominator_operand.rows {
         return Err(RuntimeError::ShapeError(format!(
             "{builtin_name} currently expects CTF numerator and denominator inputs to have matching section counts"
@@ -17964,6 +19489,10 @@ fn numeric_or_complex_ctf_section_rows(
 
 fn ctf_operand_is_vector(operand: &NumericOrComplexOperand) -> bool {
     operand.rows == 1 || operand.cols == 1
+}
+
+fn ctf_operand_is_scalar(operand: &NumericOrComplexOperand) -> bool {
+    operand.rows == 1 && operand.cols == 1
 }
 
 fn ctf_operand_row_sections(operand: &NumericOrComplexOperand) -> Vec<Vec<ComplexParts>> {
@@ -18207,7 +19736,45 @@ enum Ss2SosOrder {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ss2SosScale {
+    None,
+    Inf,
+    Two,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtfDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtfScale {
+    None,
+    Inf,
+    L2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Zp2CtfOptions {
+    section_order: usize,
+    direction: CtfDirection,
+    scale: CtfScale,
+}
+
+impl Default for Zp2CtfOptions {
+    fn default() -> Self {
+        Self {
+            section_order: 2,
+            direction: CtfDirection::Up,
+            scale: CtfScale::None,
+        }
+    }
+}
+
 const DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT: usize = 512;
+const SS2SOS_SCALE_NORM_SAMPLE_COUNT: usize = 8192;
 
 fn builtin_freqz(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
     if output_arity > 2 {
@@ -18346,14 +19913,7 @@ fn builtin_phasedelay(args: &[Value], output_arity: usize) -> Result<Vec<Value>,
 }
 
 fn builtin_isstable(args: &[Value]) -> Result<Value, RuntimeError> {
-    let [numerator, denominator] = args else {
-        return Err(RuntimeError::Unsupported(
-            "isstable currently supports isstable(b, a)".to_string(),
-        ));
-    };
-    let (_numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "isstable")?;
-    let (denominator, _denominator_is_row) =
-        numeric_or_complex_set_vector(denominator, "isstable")?;
+    let (_numerator, denominator) = parse_transfer_function_or_ctf_args(args, "isstable")?;
     let denominator = complex_polynomial_compact_coefficients(&denominator);
     if denominator.is_empty() || denominator[0].is_approximately_zero() {
         return Err(RuntimeError::TypeError(
@@ -18368,14 +19928,8 @@ fn builtin_isstable(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 fn builtin_isfir(args: &[Value]) -> Result<Value, RuntimeError> {
-    let [numerator, denominator] = args else {
-        return Err(RuntimeError::Unsupported(
-            "isfir currently supports isfir(b, a)".to_string(),
-        ));
-    };
     let tolerance = default_phase_property_tolerance();
-    let (_numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "isfir")?;
-    let (denominator, _denominator_is_row) = numeric_or_complex_set_vector(denominator, "isfir")?;
+    let (_numerator, denominator) = parse_transfer_function_or_ctf_args(args, "isfir")?;
     let denominator = trim_filter_trailing_zeros(&denominator, tolerance);
     if denominator.is_empty() || denominator[0].magnitude() <= tolerance {
         return Err(RuntimeError::TypeError(
@@ -18387,14 +19941,8 @@ fn builtin_isfir(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 fn builtin_isiir(args: &[Value]) -> Result<Value, RuntimeError> {
-    let [numerator, denominator] = args else {
-        return Err(RuntimeError::Unsupported(
-            "isiir currently supports isiir(b, a)".to_string(),
-        ));
-    };
     let tolerance = default_phase_property_tolerance();
-    let (_numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "isiir")?;
-    let (denominator, _denominator_is_row) = numeric_or_complex_set_vector(denominator, "isiir")?;
+    let (_numerator, denominator) = parse_transfer_function_or_ctf_args(args, "isiir")?;
     let denominator = trim_filter_trailing_zeros(&denominator, tolerance);
     if denominator.is_empty() || denominator[0].magnitude() <= tolerance {
         return Err(RuntimeError::TypeError(
@@ -18407,9 +19955,6 @@ fn builtin_isiir(args: &[Value]) -> Result<Value, RuntimeError> {
 
 fn builtin_islinphase(args: &[Value]) -> Result<Value, RuntimeError> {
     let (numerator, denominator, tolerance) = parse_islinphase_args(args)?;
-    let (numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "islinphase")?;
-    let (denominator, _denominator_is_row) =
-        numeric_or_complex_set_vector(denominator, "islinphase")?;
     if denominator.is_empty() || denominator[0].is_approximately_zero() {
         return Err(RuntimeError::TypeError(
             "islinphase currently expects a denominator vector with nonzero first coefficient"
@@ -18429,20 +19974,53 @@ fn builtin_islinphase(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 fn builtin_firtype(args: &[Value]) -> Result<Value, RuntimeError> {
-    let [coefficients] = args else {
-        return Err(RuntimeError::Unsupported(
-            "firtype currently supports firtype(b)".to_string(),
-        ));
+    let coefficients = match args {
+        [filter] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, "firtype")?;
+            return firtype_from_transfer_function(&numerator, &denominator);
+        }
+        [coefficients] => coefficients,
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "firtype currently supports firtype(b) and firtype(digitalFilter)".to_string(),
+            ))
+        }
     };
     let tolerance = default_phase_property_tolerance();
     let (coefficients, _is_row, _is_logical) = numeric_set_vector(coefficients, "firtype")?;
-    let coefficients = trim_filter_endpoint_zeros(
+    firtype_from_numerator(
         &coefficients
             .into_iter()
             .map(|real| ComplexParts { real, imag: 0.0 })
             .collect::<Vec<_>>(),
         tolerance,
-    );
+    )
+}
+
+fn firtype_from_transfer_function(
+    numerator: &[ComplexParts],
+    denominator: &[ComplexParts],
+) -> Result<Value, RuntimeError> {
+    let tolerance = default_phase_property_tolerance();
+    let denominator = trim_filter_trailing_zeros(denominator, tolerance);
+    if denominator.len() > 1
+        && denominator[1..]
+            .iter()
+            .any(|coefficient| coefficient.magnitude() > tolerance)
+    {
+        return Err(RuntimeError::TypeError(
+            "firtype currently expects a linear-phase FIR digitalFilter".to_string(),
+        ));
+    }
+    firtype_from_numerator(numerator, tolerance)
+}
+
+fn firtype_from_numerator(
+    numerator: &[ComplexParts],
+    tolerance: f64,
+) -> Result<Value, RuntimeError> {
+    let coefficients = trim_filter_endpoint_zeros(numerator, tolerance);
     let Some(filter_type) = linear_phase_fir_type(&coefficients, tolerance) else {
         return Err(RuntimeError::TypeError(
             "firtype currently expects a real-valued linear-phase FIR coefficient vector"
@@ -18556,14 +20134,14 @@ fn builtin_eqtflength(args: &[Value], output_arity: usize) -> Result<Vec<Value>,
 }
 
 fn builtin_filtord(args: &[Value]) -> Result<Value, RuntimeError> {
-    let [numerator, denominator] = args else {
-        return Err(RuntimeError::Unsupported(
-            "filtord currently supports filtord(b, a)".to_string(),
-        ));
-    };
     let tolerance = default_phase_property_tolerance();
-    let (numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "filtord")?;
-    let (denominator, _denominator_is_row) = numeric_or_complex_set_vector(denominator, "filtord")?;
+    let (numerator, denominator) = match args {
+        [value] if !is_digital_filter_object(value) && !filtfilt_sos_signature(value) => {
+            let (numerator, _is_row) = numeric_or_complex_set_vector(value, "filtord")?;
+            (numerator, vec![ComplexParts::one()])
+        }
+        _ => parse_transfer_function_or_ctf_args(args, "filtord")?,
+    };
     let denominator = trim_filter_trailing_zeros(&denominator, tolerance);
     if denominator.is_empty() || denominator[0].magnitude() <= tolerance {
         return Err(RuntimeError::TypeError(
@@ -18579,6 +20157,16 @@ fn builtin_filtord(args: &[Value]) -> Result<Value, RuntimeError> {
 
 fn builtin_impzlength(args: &[Value]) -> Result<Value, RuntimeError> {
     let (numerator, denominator, tolerance) = parse_impzlength_args(args)?;
+    Ok(Value::Scalar(
+        impzlength_for_transfer_function(&numerator, &denominator, tolerance)? as f64,
+    ))
+}
+
+fn impzlength_for_transfer_function(
+    numerator: &[ComplexParts],
+    denominator: &[ComplexParts],
+    tolerance: f64,
+) -> Result<usize, RuntimeError> {
     let numerator_len = numerator.len().max(1);
     let denominator = trim_filter_trailing_zeros(&denominator, default_phase_property_tolerance());
     if denominator.is_empty() || denominator[0].magnitude() <= default_phase_property_tolerance() {
@@ -18588,7 +20176,7 @@ fn builtin_impzlength(args: &[Value]) -> Result<Value, RuntimeError> {
         ));
     }
     if denominator.len() <= 1 {
-        return Ok(Value::Scalar(numerator_len as f64));
+        return Ok(numerator_len);
     }
 
     let poles = complex_polynomial_roots(&denominator);
@@ -18599,9 +20187,7 @@ fn builtin_impzlength(args: &[Value]) -> Result<Value, RuntimeError> {
         .filter(|radius| *radius > 1.0 + root_tolerance)
         .fold(0.0_f64, f64::max);
     if unstable_radius > 0.0 {
-        return Ok(Value::Scalar(
-            impzlength_growth_length(unstable_radius, 1e6) as f64,
-        ));
+        return Ok(impzlength_growth_length(unstable_radius, 1e6));
     }
 
     let oscillatory_length = impzlength_oscillation_length(&poles, root_tolerance);
@@ -18616,8 +20202,7 @@ fn builtin_impzlength(args: &[Value]) -> Result<Value, RuntimeError> {
         0
     };
 
-    let length = oscillatory_length.max(damped_length).max(1);
-    Ok(Value::Scalar(length as f64))
+    Ok(oscillatory_length.max(damped_length).max(1))
 }
 
 fn builtin_filtic(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -18723,24 +20308,70 @@ fn filtic_state_values(
 fn parse_impzlength_args(
     args: &[Value],
 ) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>, f64), RuntimeError> {
-    let (numerator_value, denominator_value, tolerance) = match args {
-        [numerator, denominator] => (numerator, denominator, 5e-5),
-        [numerator, denominator, tolerance] => (
-            numerator,
-            denominator,
+    let (numerator, denominator, tolerance) = match args {
+        [filter] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, "impzlength")?;
+            (numerator, denominator, 5e-5)
+        }
+        [filter, tolerance] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, "impzlength")?;
+            (numerator, denominator, parse_impzlength_tolerance(tolerance)?)
+        }
+        [sections] if impz_sos_row_fallback_numerator(sections).is_some() => (
+            impz_sos_row_fallback_numerator(sections).expect("matched sos-row fallback"),
+            vec![ComplexParts::one()],
+            5e-5,
+        ),
+        [sections, tolerance] if impz_sos_row_fallback_numerator(sections).is_some() => (
+            impz_sos_row_fallback_numerator(sections).expect("matched sos-row fallback"),
+            vec![ComplexParts::one()],
             parse_impzlength_tolerance(tolerance)?,
         ),
+        [sections] if filtfilt_sos_signature(sections) => {
+            let (numerator, denominator) = sos_transfer_function(sections, "impzlength")?;
+            (numerator, denominator, 5e-5)
+        }
+        [sections, tolerance] if filtfilt_sos_signature(sections) => {
+            let (numerator, denominator) = sos_transfer_function(sections, "impzlength")?;
+            (numerator, denominator, parse_impzlength_tolerance(tolerance)?)
+        }
+        [ctf, mode] if is_ctf_mode(mode) => {
+            let (numerator, denominator) = parse_transfer_function_or_ctf_args(args, "impzlength")?;
+            (numerator, denominator, 5e-5)
+        }
+        [numerator, denominator] => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone()], "impzlength")?;
+            (numerator, denominator, 5e-5)
+        }
+        [numerator, denominator, third] if is_ctf_mode(third) => {
+            let (numerator, denominator) = parse_transfer_function_or_ctf_args(args, "impzlength")?;
+            (numerator, denominator, 5e-5)
+        }
+        [ctf, mode, tolerance] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[ctf.clone(), mode.clone()], "impzlength")?;
+            (numerator, denominator, parse_impzlength_tolerance(tolerance)?)
+        }
+        [numerator, denominator, tolerance] => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone()], "impzlength")?;
+            (numerator, denominator, parse_impzlength_tolerance(tolerance)?)
+        }
+        [numerator, denominator, mode, tolerance] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone(), mode.clone()], "impzlength")?;
+            (numerator, denominator, parse_impzlength_tolerance(tolerance)?)
+        }
         _ => {
             return Err(RuntimeError::Unsupported(
-                "impzlength currently supports impzlength(b, a) and impzlength(b, a, tol)"
+                "impzlength currently supports impzlength(digitalFilter), impzlength(digitalFilter, tol), impzlength(b, a), impzlength(b, a, tol), impzlength(sos), impzlength(sos, tol), impzlength(B, A, \"ctf\"), impzlength(B, A, \"ctf\", tol), impzlength({B, A, g}, \"ctf\"), and impzlength({B, A, g}, \"ctf\", tol)"
                     .to_string(),
             ))
         }
     };
-    let (numerator, _numerator_is_row) =
-        numeric_or_complex_set_vector(numerator_value, "impzlength")?;
-    let (denominator, _denominator_is_row) =
-        numeric_or_complex_set_vector(denominator_value, "impzlength")?;
     Ok((numerator, denominator, tolerance))
 }
 
@@ -18795,18 +20426,78 @@ fn impzlength_oscillation_length(poles: &[ComplexParts], tolerance: f64) -> usiz
         .unwrap_or(0)
 }
 
-fn parse_islinphase_args(args: &[Value]) -> Result<(&Value, &Value, f64), RuntimeError> {
+fn parse_islinphase_args(
+    args: &[Value],
+) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>, f64), RuntimeError> {
     match args {
-        [numerator, denominator] => {
+        [filter] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, "islinphase")?;
             Ok((numerator, denominator, default_phase_property_tolerance()))
         }
-        [numerator, denominator, tolerance] => Ok((
-            numerator,
-            denominator,
-            parse_phase_property_tolerance(tolerance, "islinphase")?,
-        )),
+        [filter, tolerance] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, "islinphase")?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, "islinphase")?,
+            ))
+        }
+        [sections] if filtfilt_sos_signature(sections) => {
+            let (numerator, denominator) = sos_transfer_function(sections, "islinphase")?;
+            Ok((numerator, denominator, default_phase_property_tolerance()))
+        }
+        [sections, tolerance] if filtfilt_sos_signature(sections) => {
+            let (numerator, denominator) = sos_transfer_function(sections, "islinphase")?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, "islinphase")?,
+            ))
+        }
+        [ctf, mode] if is_ctf_mode(mode) => {
+            let (numerator, denominator) = parse_transfer_function_or_ctf_args(args, "islinphase")?;
+            Ok((numerator, denominator, default_phase_property_tolerance()))
+        }
+        [numerator, denominator] => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone()], "islinphase")?;
+            Ok((numerator, denominator, default_phase_property_tolerance()))
+        }
+        [numerator, denominator, mode] if is_ctf_mode(mode) => {
+            let (numerator, denominator) = parse_transfer_function_or_ctf_args(args, "islinphase")?;
+            Ok((numerator, denominator, default_phase_property_tolerance()))
+        }
+        [ctf, mode, tolerance] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[ctf.clone(), mode.clone()], "islinphase")?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, "islinphase")?,
+            ))
+        }
+        [numerator, denominator, tolerance] => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone()], "islinphase")?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, "islinphase")?,
+            ))
+        }
+        [numerator, denominator, mode, tolerance] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone(), mode.clone()], "islinphase")?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, "islinphase")?,
+            ))
+        }
         _ => Err(RuntimeError::Unsupported(
-            "islinphase currently supports islinphase(b, a) and islinphase(b, a, tol)".to_string(),
+            "islinphase currently supports islinphase(digitalFilter), islinphase(digitalFilter, tol), islinphase(b, a), islinphase(b, a, tol), islinphase(sos), islinphase(sos, tol), islinphase(B, A, \"ctf\"), islinphase(B, A, \"ctf\", tol), islinphase({B, A, g}, \"ctf\"), and islinphase({B, A, g}, \"ctf\", tol)".to_string(),
         )),
     }
 }
@@ -18815,24 +20506,121 @@ fn parse_phase_property_filter_args<'a>(
     args: &'a [Value],
     builtin_name: &str,
 ) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>, f64), RuntimeError> {
-    let (numerator_value, denominator_value, tolerance) = match args {
-        [numerator, denominator] => (numerator, denominator, default_phase_property_tolerance()),
-        [numerator, denominator, tolerance] => (
-            numerator,
-            denominator,
-            parse_phase_property_tolerance(tolerance, builtin_name)?,
-        ),
-        _ => {
-            return Err(RuntimeError::Unsupported(format!(
-            "{builtin_name} currently supports {builtin_name}(b, a) and {builtin_name}(b, a, tol)"
-        )))
+    match args {
+        [filter] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, builtin_name)?;
+            Ok((numerator, denominator, default_phase_property_tolerance()))
         }
-    };
-    let (numerator, _numerator_is_row) =
-        numeric_or_complex_set_vector(numerator_value, builtin_name)?;
-    let (denominator, _denominator_is_row) =
-        numeric_or_complex_set_vector(denominator_value, builtin_name)?;
-    Ok((numerator, denominator, tolerance))
+        [filter, tolerance] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, builtin_name)?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, builtin_name)?,
+            ))
+        }
+        [sections] if filtfilt_sos_signature(sections) => {
+            let (numerator, denominator) = sos_transfer_function(sections, builtin_name)?;
+            Ok((numerator, denominator, default_phase_property_tolerance()))
+        }
+        [sections, tolerance] if filtfilt_sos_signature(sections) => {
+            let (numerator, denominator) = sos_transfer_function(sections, builtin_name)?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, builtin_name)?,
+            ))
+        }
+        [ctf, mode] if is_ctf_mode(mode) => {
+            let (numerator, denominator) = parse_transfer_function_or_ctf_args(args, builtin_name)?;
+            Ok((numerator, denominator, default_phase_property_tolerance()))
+        }
+        [numerator, denominator] => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone()], builtin_name)?;
+            Ok((numerator, denominator, default_phase_property_tolerance()))
+        }
+        [numerator, denominator, mode] if is_ctf_mode(mode) => {
+            let (numerator, denominator) = parse_transfer_function_or_ctf_args(args, builtin_name)?;
+            Ok((numerator, denominator, default_phase_property_tolerance()))
+        }
+        [ctf, mode, tolerance] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[ctf.clone(), mode.clone()], builtin_name)?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, builtin_name)?,
+            ))
+        }
+        [numerator, denominator, tolerance] => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone()], builtin_name)?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, builtin_name)?,
+            ))
+        }
+        [numerator, denominator, mode, tolerance] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone(), mode.clone()], builtin_name)?;
+            Ok((
+                numerator,
+                denominator,
+                parse_phase_property_tolerance(tolerance, builtin_name)?,
+            ))
+        }
+        _ => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports {builtin_name}(digitalFilter), {builtin_name}(digitalFilter, tol), {builtin_name}(b, a), {builtin_name}(b, a, tol), {builtin_name}(sos), {builtin_name}(sos, tol), {builtin_name}(B, A, \"ctf\"), {builtin_name}(B, A, \"ctf\", tol), {builtin_name}({{B, A, g}}, \"ctf\"), and {builtin_name}({{B, A, g}}, \"ctf\", tol)"
+        ))),
+    }
+}
+
+fn parse_transfer_function_or_ctf_args(
+    args: &[Value],
+    builtin_name: &str,
+) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>), RuntimeError> {
+    match args {
+        [filter] if is_digital_filter_object(filter) => {
+            digital_filter_transfer_function_from_object(filter, builtin_name)
+        }
+        [sections] if filtfilt_sos_signature(sections) => sos_transfer_function(sections, builtin_name),
+        [ctf, mode] if is_ctf_mode(mode) => ctf_transfer_function_from_cell(ctf, builtin_name),
+        [numerator, denominator] => {
+            let (numerator, _numerator_is_row) =
+                numeric_or_complex_set_vector(numerator, builtin_name)?;
+            let (denominator, _denominator_is_row) =
+                numeric_or_complex_set_vector(denominator, builtin_name)?;
+            Ok((numerator, denominator))
+        }
+        [numerator, denominator, mode] if is_ctf_mode(mode) => {
+            ctf_transfer_function_from_pair(numerator, denominator, None, builtin_name)
+        }
+        _ => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports {builtin_name}(digitalFilter), {builtin_name}(b, a), {builtin_name}(sos), {builtin_name}(B, A, \"ctf\"), and {builtin_name}({{B, A, g}}, \"ctf\")"
+        ))),
+    }
+}
+
+fn ctf_transfer_function_from_pair(
+    numerators: &Value,
+    denominators: &Value,
+    scale_values: Option<&Value>,
+    builtin_name: &str,
+) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>), RuntimeError> {
+    let sections = parse_ctf_sections(numerators, denominators, scale_values, builtin_name)?;
+    Ok(equivalent_filter_sections_transfer_function(&sections))
+}
+
+fn ctf_transfer_function_from_cell(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>), RuntimeError> {
+    let sections = parse_digital_filter_ctf_cell_sections(value, builtin_name)?;
+    Ok(equivalent_filter_sections_transfer_function(&sections))
 }
 
 fn default_phase_property_tolerance() -> f64 {
@@ -18986,9 +20774,71 @@ fn parse_freqz_args<'a>(
     RuntimeError,
 > {
     let (sections, selection) = match args {
+        [filter] if is_digital_filter_object(filter) => {
+            let sample_rate = digital_filter_sample_rate_from_object(filter, builtin_name)?;
+            (
+                digital_filter_sections_from_object(filter, builtin_name)?,
+                apply_default_digital_frequency_sample_rate(
+                    default_digital_frequency_selection(),
+                    sample_rate,
+                ),
+            )
+        }
+        [filter, sample_rate]
+            if builtin_name.eq_ignore_ascii_case("zerophase")
+                && is_digital_filter_object(filter)
+                && is_unambiguous_default_sample_rate_scalar(sample_rate) =>
+        (
+            digital_filter_sections_from_object(filter, builtin_name)?,
+            DigitalFrequencySelection::Grid {
+                count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                whole: false,
+                sample_rate: Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            },
+        ),
+        [filter, tail @ ..] if is_digital_filter_object(filter) => {
+            let sample_rate = digital_filter_sample_rate_from_object(filter, builtin_name)?;
+            (
+                digital_filter_sections_from_object(filter, builtin_name)?,
+                apply_default_digital_frequency_sample_rate(
+                    parse_digital_frequency_selection_tail(tail, builtin_name)?,
+                    sample_rate,
+                ),
+            )
+        }
+        [sections] if digital_response_sos_row_fallback_numerator(sections, builtin_name).is_some() => (
+            vec![FiltfiltSection {
+                numerator: digital_response_sos_row_fallback_numerator(sections, builtin_name)
+                    .expect("matched sos-row fallback"),
+                denominator: vec![ComplexParts::one()],
+            }],
+            default_digital_frequency_selection(),
+        ),
+        [sections, tail @ ..]
+            if digital_response_sos_row_fallback_numerator(sections, builtin_name).is_some() =>
+        (
+            vec![FiltfiltSection {
+                numerator: digital_response_sos_row_fallback_numerator(sections, builtin_name)
+                    .expect("matched sos-row fallback"),
+                denominator: vec![ComplexParts::one()],
+            }],
+            parse_digital_frequency_selection_tail(tail, builtin_name)?,
+        ),
         [ctf, mode] if is_ctf_mode(mode) => (
             parse_digital_filter_ctf_cell_sections(ctf, builtin_name)?,
             default_digital_frequency_selection(),
+        ),
+        [ctf, mode, sample_rate]
+            if builtin_name.eq_ignore_ascii_case("zerophase")
+                && is_ctf_mode(mode)
+                && is_unambiguous_default_sample_rate_scalar(sample_rate) =>
+        (
+            parse_digital_filter_ctf_cell_sections(ctf, builtin_name)?,
+            DigitalFrequencySelection::Grid {
+                count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                whole: false,
+                sample_rate: Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            },
         ),
         [ctf, mode, tail @ ..] if is_ctf_mode(mode) => (
             parse_digital_filter_ctf_cell_sections(ctf, builtin_name)?,
@@ -18998,13 +20848,176 @@ fn parse_freqz_args<'a>(
             parse_sos_sections(sections, &Value::Scalar(1.0), builtin_name)?,
             default_digital_frequency_selection(),
         ),
+        [sections, sample_rate]
+            if builtin_name.eq_ignore_ascii_case("zerophase")
+                && filtfilt_sos_signature(sections)
+                && is_unambiguous_default_sample_rate_scalar(sample_rate) =>
+        (
+            parse_sos_sections(sections, &Value::Scalar(1.0), builtin_name)?,
+            DigitalFrequencySelection::Grid {
+                count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                whole: false,
+                sample_rate: Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            },
+        ),
         [sections, tail @ ..] if filtfilt_sos_signature(sections) => (
             parse_sos_sections(sections, &Value::Scalar(1.0), builtin_name)?,
             parse_digital_frequency_selection_tail(tail, builtin_name)?,
         ),
+        [numerator]
+            if builtin_name.eq_ignore_ascii_case("zerophase")
+                || builtin_name.eq_ignore_ascii_case("freqz")
+                || builtin_name.eq_ignore_ascii_case("phasez")
+                || builtin_name.eq_ignore_ascii_case("phasedelay") =>
+        (
+            vec![parse_transfer_function_numerator_only_section(
+                numerator,
+                builtin_name,
+            )?],
+            default_digital_frequency_selection(),
+        ),
+        [numerator, sample_rate]
+            if builtin_name.eq_ignore_ascii_case("zerophase")
+                && is_unambiguous_default_sample_rate_scalar(sample_rate) =>
+        (
+            vec![parse_transfer_function_numerator_only_section(
+                numerator,
+                builtin_name,
+            )?],
+            DigitalFrequencySelection::Grid {
+                count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                whole: false,
+                sample_rate: Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            },
+        ),
+        [numerator, selection, sample_rate]
+            if (builtin_name.eq_ignore_ascii_case("zerophase")
+                || builtin_name.eq_ignore_ascii_case("freqz")
+                || builtin_name.eq_ignore_ascii_case("phasez")
+                || builtin_name.eq_ignore_ascii_case("phasedelay")
+                || builtin_name.eq_ignore_ascii_case("grpdelay"))
+                && is_empty_matrix_placeholder(selection) =>
+        (
+            vec![parse_transfer_function_numerator_only_section(
+                numerator,
+                builtin_name,
+            )?],
+            DigitalFrequencySelection::Grid {
+                count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                whole: false,
+                sample_rate: Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            },
+        ),
+        [numerator, selection]
+            if builtin_name.eq_ignore_ascii_case("zerophase")
+                && is_zero_based_explicit_digital_frequency_vector_candidate(
+                    selection,
+                    builtin_name,
+                ) =>
+        (
+            vec![parse_transfer_function_numerator_only_section(
+                numerator,
+                builtin_name,
+            )?],
+            parse_digital_frequency_selection(selection, false, None, builtin_name)?,
+        ),
+        [numerator, selection, whole]
+            if (builtin_name.eq_ignore_ascii_case("zerophase")
+                || builtin_name.eq_ignore_ascii_case("freqz")
+                || builtin_name.eq_ignore_ascii_case("phasez")
+                || builtin_name.eq_ignore_ascii_case("phasedelay"))
+                && is_whole_mode(whole) =>
+        (
+            vec![parse_transfer_function_numerator_only_section(
+                numerator,
+                builtin_name,
+            )?],
+            parse_digital_frequency_selection(selection, true, None, builtin_name)?,
+        ),
+        [numerator, selection, sample_rate]
+            if (builtin_name.eq_ignore_ascii_case("zerophase")
+                || builtin_name.eq_ignore_ascii_case("freqz")
+                || builtin_name.eq_ignore_ascii_case("phasez")
+                || builtin_name.eq_ignore_ascii_case("phasedelay")
+                || builtin_name.eq_ignore_ascii_case("grpdelay"))
+                && is_zero_based_explicit_digital_frequency_vector_candidate(
+                    selection,
+                    builtin_name,
+                ) =>
+        (
+            vec![parse_transfer_function_numerator_only_section(
+                numerator,
+                builtin_name,
+            )?],
+            parse_digital_frequency_selection(
+                selection,
+                false,
+                Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+                builtin_name,
+            )?,
+        ),
+        [numerator, whole, sample_rate]
+            if builtin_name.eq_ignore_ascii_case("zerophase") && is_whole_mode(whole) =>
+        (
+            vec![parse_transfer_function_numerator_only_section(
+                numerator,
+                builtin_name,
+            )?],
+            DigitalFrequencySelection::Grid {
+                count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                whole: true,
+                sample_rate: Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            },
+        ),
+        [numerator, selection, whole, sample_rate]
+            if builtin_name.eq_ignore_ascii_case("freqz")
+                && is_whole_mode(whole)
+                && is_empty_matrix_placeholder(selection) =>
+        (
+            vec![parse_transfer_function_numerator_only_section(
+                numerator,
+                builtin_name,
+            )?],
+            parse_digital_frequency_selection(
+                selection,
+                true,
+                Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+                builtin_name,
+            )?,
+        ),
+        [numerator, selection, whole, sample_rate]
+            if (builtin_name.eq_ignore_ascii_case("phasez")
+                || builtin_name.eq_ignore_ascii_case("phasedelay")
+                || builtin_name.eq_ignore_ascii_case("grpdelay"))
+                && is_whole_mode(whole)
+                && is_empty_matrix_placeholder(selection) =>
+        (
+            vec![parse_transfer_function_numerator_only_section(
+                numerator,
+                builtin_name,
+            )?],
+            parse_digital_frequency_selection(
+                selection,
+                true,
+                Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+                builtin_name,
+            )?,
+        ),
         [numerators, denominators, mode] if is_ctf_mode(mode) => (
             parse_ctf_sections(numerators, denominators, None, builtin_name)?,
             default_digital_frequency_selection(),
+        ),
+        [numerators, denominators, mode, sample_rate]
+            if builtin_name.eq_ignore_ascii_case("zerophase")
+                && is_ctf_mode(mode)
+                && is_unambiguous_default_sample_rate_scalar(sample_rate) =>
+        (
+            parse_ctf_sections(numerators, denominators, None, builtin_name)?,
+            DigitalFrequencySelection::Grid {
+                count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                whole: false,
+                sample_rate: Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            },
         ),
         [numerators, denominators, mode, tail @ ..] if is_ctf_mode(mode) => (
             parse_ctf_sections(numerators, denominators, None, builtin_name)?,
@@ -19018,6 +21031,21 @@ fn parse_freqz_args<'a>(
             )?],
             default_digital_frequency_selection(),
         ),
+        [numerator, denominator, sample_rate]
+            if builtin_name.eq_ignore_ascii_case("zerophase")
+                && is_unambiguous_default_sample_rate_scalar(sample_rate) =>
+        (
+            vec![parse_transfer_function_section(
+                numerator,
+                denominator,
+                builtin_name,
+            )?],
+            DigitalFrequencySelection::Grid {
+                count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                whole: false,
+                sample_rate: Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            },
+        ),
         [numerator, denominator, tail @ ..] => (
             vec![parse_transfer_function_section(
                 numerator,
@@ -19028,12 +21056,69 @@ fn parse_freqz_args<'a>(
         ),
         _ => {
             return Err(RuntimeError::Unsupported(format!(
-                "{builtin_name} currently supports transfer-function, CTF, and SOS digital filter forms with optional point-count, frequency-vector, \"whole\", and sample-rate arguments"
+                "{builtin_name} currently supports digitalFilter, transfer-function, CTF, and SOS digital filter forms with optional point-count, frequency-vector, \"whole\", and sample-rate arguments"
             )))
         }
     };
     let (numerator, denominator) = equivalent_filter_sections_transfer_function(&sections);
     Ok((numerator, denominator, selection))
+}
+
+fn parse_transfer_function_numerator_only_section(
+    numerator: &Value,
+    builtin_name: &str,
+) -> Result<FiltfiltSection, RuntimeError> {
+    let (numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, builtin_name)?;
+    normalized_filter_section(numerator, vec![ComplexParts::one()], builtin_name)
+}
+
+fn is_unambiguous_default_sample_rate_scalar(value: &Value) -> bool {
+    let Ok(sample_rate) = value.as_scalar() else {
+        return false;
+    };
+    sample_rate.is_finite() && sample_rate > 0.0 && sample_rate.fract() != 0.0
+}
+
+fn is_zero_based_explicit_digital_frequency_vector_candidate(
+    value: &Value,
+    builtin_name: &str,
+) -> bool {
+    let Ok((frequencies, _row_output, _logical_output)) = numeric_set_vector(value, builtin_name)
+    else {
+        return false;
+    };
+    if frequencies.len() < 2 {
+        return false;
+    }
+    let Some(first) = frequencies.first() else {
+        return false;
+    };
+    if !first.is_finite() || first.abs() > 1e-12 {
+        return false;
+    }
+    frequencies
+        .iter()
+        .all(|frequency| frequency.is_finite() && *frequency >= -1e-12)
+        && frequencies
+            .windows(2)
+            .all(|pair| pair[0] <= pair[1] + 1e-12)
+}
+
+fn digital_response_sos_row_fallback_numerator(
+    value: &Value,
+    builtin_name: &str,
+) -> Option<Vec<ComplexParts>> {
+    let Value::Matrix(matrix) = value else {
+        return None;
+    };
+    if matrix.rows != 1 || matrix.cols != 6 {
+        return None;
+    }
+    matrix
+        .iter()
+        .map(|entry| numeric_or_complex_scalar(entry, builtin_name))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
 }
 
 fn default_digital_frequency_selection() -> DigitalFrequencySelection<'static> {
@@ -19044,20 +21129,60 @@ fn default_digital_frequency_selection() -> DigitalFrequencySelection<'static> {
     }
 }
 
+fn apply_default_digital_frequency_sample_rate<'a>(
+    selection: DigitalFrequencySelection<'a>,
+    sample_rate: Option<f64>,
+) -> DigitalFrequencySelection<'a> {
+    let Some(sample_rate) = sample_rate else {
+        return selection;
+    };
+    match selection {
+        DigitalFrequencySelection::Grid {
+            count,
+            whole,
+            sample_rate: existing_sample_rate,
+        } => DigitalFrequencySelection::Grid {
+            count,
+            whole,
+            sample_rate: existing_sample_rate.or(Some(sample_rate)),
+        },
+        DigitalFrequencySelection::Explicit {
+            frequencies,
+            sample_rate: existing_sample_rate,
+        } => DigitalFrequencySelection::Explicit {
+            frequencies,
+            sample_rate: existing_sample_rate.or(Some(sample_rate)),
+        },
+    }
+}
+
 fn parse_digital_frequency_selection_tail<'a>(
     tail: &'a [Value],
     builtin_name: &str,
 ) -> Result<DigitalFrequencySelection<'a>, RuntimeError> {
     match tail {
         [] => Ok(default_digital_frequency_selection()),
+        [selection]
+            if is_whole_mode(selection) && builtin_name.eq_ignore_ascii_case("grpdelay") =>
+        {
+            Ok(DigitalFrequencySelection::Grid {
+                count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                whole: true,
+                sample_rate: None,
+            })
+        }
         [selection] => parse_digital_frequency_selection(selection, false, None, builtin_name),
         [first, second] => {
             if is_whole_mode(first) {
-                Ok(DigitalFrequencySelection::Grid {
-                    count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
-                    whole: true,
-                    sample_rate: Some(parse_digital_sample_rate(second, builtin_name)?),
-                })
+                if builtin_name.eq_ignore_ascii_case("zerophase") {
+                    Ok(DigitalFrequencySelection::Grid {
+                        count: DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT,
+                        whole: true,
+                        sample_rate: Some(parse_digital_sample_rate(second, builtin_name)?),
+                    })
+                } else {
+                    parse_digital_frequency_selection(second, true, None, builtin_name)
+                }
             } else if is_whole_mode(second) {
                 parse_digital_frequency_selection(first, true, None, builtin_name)
             } else {
@@ -19144,28 +21269,14 @@ fn equivalent_filter_sections_transfer_function(
     (numerator, denominator)
 }
 
-fn zp2ctf_sections_from_roots(
-    zeros: &[ComplexParts],
-    poles: &[ComplexParts],
-) -> Vec<FiltfiltSection> {
-    let zero_sections = pair_roots_into_ctf_sections(zeros);
-    let pole_sections = pair_roots_into_ctf_sections(poles);
-    let section_count = zero_sections.len().max(pole_sections.len());
-    let mut sections = Vec::with_capacity(section_count);
-    for index in 0..section_count {
-        sections.push(FiltfiltSection {
-            numerator: ctf_section_coefficients_from_roots(
-                zero_sections.get(index).map(Vec::as_slice).unwrap_or(&[]),
-            ),
-            denominator: ctf_section_coefficients_from_roots(
-                pole_sections.get(index).map(Vec::as_slice).unwrap_or(&[]),
-            ),
-        });
-    }
-    sections
+fn pair_roots_into_ctf_sections(roots: &[ComplexParts]) -> Vec<Vec<ComplexParts>> {
+    pair_roots_into_sections(roots, false)
 }
 
-fn pair_roots_into_ctf_sections(roots: &[ComplexParts]) -> Vec<Vec<ComplexParts>> {
+fn pair_roots_into_sections(
+    roots: &[ComplexParts],
+    keep_opposite_real_pairs: bool,
+) -> Vec<Vec<ComplexParts>> {
     let tolerance = 1e-9;
     let mut used = vec![false; roots.len()];
     let mut sections = Vec::new();
@@ -19181,8 +21292,22 @@ fn pair_roots_into_ctf_sections(roots: &[ComplexParts]) -> Vec<Vec<ComplexParts>
                     && roots[*candidate].minus(root.conjugate()).magnitude() <= tolerance
             })
         } else {
-            (index + 1..roots.len())
-                .find(|candidate| !used[*candidate] && roots[*candidate].imag.abs() <= tolerance)
+            let opposite_real_partner = if keep_opposite_real_pairs {
+                (index + 1..roots.len()).find(|candidate| {
+                    !used[*candidate]
+                        && roots[*candidate].imag.abs() <= tolerance
+                        && (roots[*candidate].real + root.real).abs()
+                            <= tolerance
+                                * root.magnitude().max(roots[*candidate].magnitude()).max(1.0)
+                })
+            } else {
+                None
+            };
+            opposite_real_partner.or_else(|| {
+                (index + 1..roots.len()).find(|candidate| {
+                    !used[*candidate] && roots[*candidate].imag.abs() <= tolerance
+                })
+            })
         }
         .or_else(|| (index + 1..roots.len()).find(|candidate| !used[*candidate]));
         if let Some(partner) = partner {
@@ -19196,9 +21321,217 @@ fn pair_roots_into_ctf_sections(roots: &[ComplexParts]) -> Vec<Vec<ComplexParts>
 }
 
 fn ctf_section_coefficients_from_roots(roots: &[ComplexParts]) -> Vec<ComplexParts> {
-    let mut coefficients = complex_polynomial_coefficients_from_roots(roots);
-    coefficients.resize(3, ComplexParts::zero());
+    ctf_section_coefficients_from_roots_with_width(roots, 3)
+}
+
+fn ctf_section_coefficients_from_roots_with_width(
+    roots: &[ComplexParts],
+    width: usize,
+) -> Vec<ComplexParts> {
+    let mut coefficients = canonicalize_real_friendly_section_coefficients(
+        &complex_polynomial_coefficients_from_roots(roots),
+    );
+    coefficients.resize(width, ComplexParts::zero());
     coefficients
+}
+
+fn zp2ctf_sections_from_roots_with_options(
+    zeros: &[ComplexParts],
+    poles: &[ComplexParts],
+    options: Zp2CtfOptions,
+) -> Vec<FiltfiltSection> {
+    let mut sections = zp2ctf_root_sections_from_roots(zeros, poles);
+    reorder_ctf_root_sections(&mut sections, options.direction);
+    let sections = combine_ctf_root_sections(sections, options.section_order);
+    sections
+        .into_iter()
+        .map(|(zeros, poles)| FiltfiltSection {
+            numerator: ctf_section_coefficients_from_roots_with_width(
+                &zeros,
+                options.section_order + 1,
+            ),
+            denominator: ctf_section_coefficients_from_roots_with_width(
+                &poles,
+                options.section_order + 1,
+            ),
+        })
+        .collect()
+}
+
+fn zp2sos_sections_from_roots(
+    zeros: &[ComplexParts],
+    poles: &[ComplexParts],
+    keep_opposite_real_zero_pairs: bool,
+) -> Vec<FiltfiltSection> {
+    let zero_sections = pair_roots_into_sections(zeros, keep_opposite_real_zero_pairs);
+    let pole_sections = pair_roots_into_sections(poles, false);
+    let section_count = zero_sections.len().max(pole_sections.len());
+    let mut sections = Vec::with_capacity(section_count);
+    for index in 0..section_count {
+        sections.push(FiltfiltSection {
+            numerator: ctf_section_coefficients_from_roots(
+                zero_sections.get(index).map(Vec::as_slice).unwrap_or(&[]),
+            ),
+            denominator: ctf_section_coefficients_from_roots(
+                pole_sections.get(index).map(Vec::as_slice).unwrap_or(&[]),
+            ),
+        });
+    }
+    sections
+}
+
+fn zp2ctf_root_sections_from_roots(
+    zeros: &[ComplexParts],
+    poles: &[ComplexParts],
+) -> Vec<(Vec<ComplexParts>, Vec<ComplexParts>)> {
+    let zero_sections = pair_roots_into_ctf_sections(zeros);
+    let pole_sections = pair_roots_into_ctf_sections(poles);
+    let section_count = zero_sections.len().max(pole_sections.len());
+    let mut sections = Vec::with_capacity(section_count);
+    for index in 0..section_count {
+        sections.push((
+            zero_sections.get(index).cloned().unwrap_or_default(),
+            pole_sections.get(index).cloned().unwrap_or_default(),
+        ));
+    }
+    sections
+}
+
+fn reorder_ctf_root_sections(
+    sections: &mut [(Vec<ComplexParts>, Vec<ComplexParts>)],
+    direction: CtfDirection,
+) {
+    sections.sort_by(|lhs, rhs| {
+        let lhs_metric = ctf_pole_section_metric(&lhs.1);
+        let rhs_metric = ctf_pole_section_metric(&rhs.1);
+        match direction {
+            CtfDirection::Up => lhs_metric.total_cmp(&rhs_metric),
+            CtfDirection::Down => rhs_metric.total_cmp(&lhs_metric),
+        }
+    });
+}
+
+fn ctf_pole_section_metric(poles: &[ComplexParts]) -> f64 {
+    poles
+        .iter()
+        .map(|pole| pole.magnitude())
+        .fold(0.0_f64, f64::max)
+}
+
+fn combine_ctf_root_sections(
+    sections: Vec<(Vec<ComplexParts>, Vec<ComplexParts>)>,
+    section_order: usize,
+) -> Vec<(Vec<ComplexParts>, Vec<ComplexParts>)> {
+    if section_order == 2 || sections.is_empty() {
+        return sections;
+    }
+    let mut combined = Vec::new();
+    let mut index = 0;
+    if sections.len() % 2 == 1 {
+        combined.push(sections[0].clone());
+        index = 1;
+    }
+    while index < sections.len() {
+        let mut zeros = sections[index].0.clone();
+        let mut poles = sections[index].1.clone();
+        if index + 1 < sections.len() {
+            zeros.extend_from_slice(&sections[index + 1].0);
+            poles.extend_from_slice(&sections[index + 1].1);
+        }
+        combined.push((zeros, poles));
+        index += 2;
+    }
+    combined
+}
+
+fn ctf_section_scaling_values(sections: &[FiltfiltSection], scale: CtfScale) -> (Vec<f64>, f64) {
+    if sections.is_empty() || scale == CtfScale::None {
+        return (vec![1.0; sections.len()], 1.0);
+    }
+    let mut cumulative_numerator = vec![ComplexParts::one()];
+    let mut cumulative_denominator = vec![ComplexParts::one()];
+    let mut cumulative_norms = Vec::with_capacity(sections.len());
+    for section in sections {
+        cumulative_numerator =
+            full_complex_convolution_vector(&cumulative_numerator, &section.numerator);
+        cumulative_denominator =
+            full_complex_convolution_vector(&cumulative_denominator, &section.denominator);
+        cumulative_norms.push(match scale {
+            CtfScale::None => 1.0,
+            CtfScale::Inf => ss2sos_frequency_domain_norm(
+                &cumulative_numerator,
+                &cumulative_denominator,
+                Ss2SosScale::Inf,
+            ),
+            CtfScale::L2 => ss2sos_frequency_domain_norm(
+                &cumulative_numerator,
+                &cumulative_denominator,
+                Ss2SosScale::Two,
+            ),
+        });
+    }
+    if cumulative_norms
+        .iter()
+        .any(|norm| !norm.is_finite() || *norm <= 1e-12)
+    {
+        return (vec![1.0; sections.len()], 1.0);
+    }
+    let mut previous_norm = 1.0;
+    let mut section_scales = Vec::with_capacity(cumulative_norms.len());
+    for &norm in &cumulative_norms {
+        section_scales.push(previous_norm / norm);
+        previous_norm = norm;
+    }
+    (
+        section_scales,
+        cumulative_norms.last().copied().unwrap_or(1.0),
+    )
+}
+
+fn roots_define_nearly_real_section(roots: &[ComplexParts]) -> bool {
+    const ROOT_TOLERANCE: f64 = 1e-8;
+
+    match roots {
+        [] => true,
+        [root] => root.imag.abs() <= ROOT_TOLERANCE * root.magnitude().max(1.0),
+        [lhs, rhs] => {
+            let scale = lhs.magnitude().max(rhs.magnitude()).max(1.0);
+            (lhs.imag.abs() <= ROOT_TOLERANCE * lhs.magnitude().max(1.0)
+                && rhs.imag.abs() <= ROOT_TOLERANCE * rhs.magnitude().max(1.0))
+                || lhs.minus(rhs.conjugate()).magnitude() <= ROOT_TOLERANCE * scale
+        }
+        _ => false,
+    }
+}
+
+fn canonicalize_real_friendly_section_coefficients(
+    coefficients: &[ComplexParts],
+) -> Vec<ComplexParts> {
+    let roots = complex_polynomial_roots(coefficients);
+    if roots_define_nearly_real_section(&roots)
+        || section_coefficients_are_nearly_real(coefficients)
+    {
+        return coefficients
+            .iter()
+            .map(|coefficient| ComplexParts {
+                real: normalize_polynomial_scalar(coefficient.real),
+                imag: 0.0,
+            })
+            .collect();
+    }
+    coefficients
+        .iter()
+        .copied()
+        .map(normalize_complex_parts)
+        .collect()
+}
+
+fn section_coefficients_are_nearly_real(coefficients: &[ComplexParts]) -> bool {
+    const COEFFICIENT_TOLERANCE: f64 = 1e-10;
+
+    coefficients.iter().all(|coefficient| {
+        coefficient.imag.abs() <= COEFFICIENT_TOLERANCE * coefficient.real.abs().max(1.0)
+    })
 }
 
 fn is_whole_mode(value: &Value) -> bool {
@@ -19391,6 +21724,39 @@ fn digital_frequency_grid(count: usize, whole: bool) -> Vec<f64> {
     frequencies
 }
 
+fn analog_frequency_grid_from_transfer_function(
+    numerator: &[ComplexParts],
+    denominator: &[ComplexParts],
+    count: usize,
+) -> Vec<f64> {
+    let mut magnitudes = filter_numerator_roots(numerator, 1e-12)
+        .into_iter()
+        .chain(complex_polynomial_roots(denominator))
+        .map(|root| root.magnitude())
+        .filter(|magnitude| magnitude.is_finite() && *magnitude > 1e-12)
+        .collect::<Vec<_>>();
+    magnitudes.sort_by(|lhs, rhs| lhs.total_cmp(rhs));
+
+    let (start_exp, end_exp) = if let (Some(min_mag), Some(max_mag)) =
+        (magnitudes.first().copied(), magnitudes.last().copied())
+    {
+        (min_mag.log10().floor() - 1.0, max_mag.log10().ceil() + 1.0)
+    } else {
+        (-1.0, 1.0)
+    };
+
+    if count <= 1 {
+        return vec![10f64.powf(start_exp)];
+    }
+
+    (0..count)
+        .map(|index| {
+            let t = index as f64 / (count as f64 - 1.0);
+            10f64.powf(start_exp + (end_exp - start_exp) * t)
+        })
+        .collect()
+}
+
 fn unwrap_phase_values(values: Vec<f64>) -> Vec<f64> {
     unwrap_phase_values_with_tolerance(values, std::f64::consts::PI)
 }
@@ -19467,22 +21833,89 @@ fn builtin_freqs(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runt
             "freqs currently supports one or two outputs".to_string(),
         ));
     }
-    let [numerator, denominator, frequencies] = args else {
-        return Err(RuntimeError::Unsupported(
-            "freqs currently supports freqs(b, a, w) with an explicit frequency vector".to_string(),
-        ));
-    };
+    let (numerator, denominator, frequencies, frequencies_are_row, frequencies_are_logical) =
+        match args {
+            [numerator, denominator] => {
+                let (numerator, _numerator_is_row) =
+                    numeric_or_complex_set_vector(numerator, "freqs")?;
+                let (denominator, _denominator_is_row) =
+                    numeric_or_complex_set_vector(denominator, "freqs")?;
+                if denominator.is_empty() || denominator[0].is_approximately_zero() {
+                    return Err(RuntimeError::TypeError(
+                        "freqs currently expects a denominator vector with nonzero leading coefficient"
+                            .to_string(),
+                    ));
+                }
+                (
+                    numerator.clone(),
+                    denominator.clone(),
+                    analog_frequency_grid_from_transfer_function(&numerator, &denominator, 200),
+                    false,
+                    false,
+                )
+            }
+            [numerator, denominator, frequencies]
+                if matches!(frequencies, Value::Scalar(_) | Value::Logical(_))
+                    || matches!(frequencies, Value::Matrix(matrix) if matrix.rows == 1 && matrix.cols == 1) =>
+            {
+                let count = positive_integer_scalar_with_label(
+                    frequencies,
+                    "freqs",
+                    "a positive integer number of evaluation points",
+                )?;
+                let (numerator, _numerator_is_row) =
+                    numeric_or_complex_set_vector(numerator, "freqs")?;
+                let (denominator, _denominator_is_row) =
+                    numeric_or_complex_set_vector(denominator, "freqs")?;
+                if denominator.is_empty() || denominator[0].is_approximately_zero() {
+                    return Err(RuntimeError::TypeError(
+                        "freqs currently expects a denominator vector with nonzero leading coefficient"
+                            .to_string(),
+                    ));
+                }
+                (
+                    numerator.clone(),
+                    denominator.clone(),
+                    analog_frequency_grid_from_transfer_function(&numerator, &denominator, count),
+                    false,
+                    false,
+                )
+            }
+            [numerator, denominator, frequencies] => {
+                let (numerator, _numerator_is_row) =
+                    numeric_or_complex_set_vector(numerator, "freqs")?;
+                let (denominator, _denominator_is_row) =
+                    numeric_or_complex_set_vector(denominator, "freqs")?;
+                if denominator.is_empty() || denominator[0].is_approximately_zero() {
+                    return Err(RuntimeError::TypeError(
+                        "freqs currently expects a denominator vector with nonzero leading coefficient"
+                            .to_string(),
+                    ));
+                }
+                let (frequencies, frequencies_are_row, frequencies_are_logical) =
+                    numeric_set_vector(frequencies, "freqs")?;
+                (
+                    numerator,
+                    denominator,
+                    frequencies,
+                    frequencies_are_row,
+                    frequencies_are_logical,
+                )
+            }
+            _ => {
+                return Err(RuntimeError::Unsupported(
+                    "freqs currently supports freqs(b, a), freqs(b, a, w), and freqs(b, a, n)"
+                        .to_string(),
+                ))
+            }
+        };
 
-    let (numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "freqs")?;
-    let (denominator, _denominator_is_row) = numeric_or_complex_set_vector(denominator, "freqs")?;
     if denominator.is_empty() || denominator[0].is_approximately_zero() {
         return Err(RuntimeError::TypeError(
             "freqs currently expects a denominator vector with nonzero leading coefficient"
                 .to_string(),
         ));
     }
-    let (frequencies, frequencies_are_row, frequencies_are_logical) =
-        numeric_set_vector(frequencies, "freqs")?;
 
     let responses = frequencies
         .iter()
@@ -19518,25 +21951,20 @@ fn builtin_impz(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runti
             "impz currently supports one or two outputs".to_string(),
         ));
     }
-    let [numerator, denominator, sample_count] = args else {
-        return Err(RuntimeError::Unsupported(
-            "impz currently supports impz(b, a, n)".to_string(),
-        ));
-    };
-
-    let (numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "impz")?;
-    let (denominator, _denominator_is_row) = numeric_or_complex_set_vector(denominator, "impz")?;
+    let (numerator, denominator, sample_count, sample_rate) =
+        parse_impulse_response_args(args, "impz")?;
     if denominator.is_empty() || denominator[0].is_approximately_zero() {
         return Err(RuntimeError::TypeError(
             "impz currently expects a denominator vector with nonzero first coefficient"
                 .to_string(),
         ));
     }
-    let sample_count =
-        positive_integer_scalar_with_label(sample_count, "impz", "a positive sample count")?;
     let response = impulse_response_samples(&numerator, &denominator, sample_count);
     let time = (0..sample_count)
-        .map(|index| index as f64)
+        .map(|index| {
+            let sample = index as f64;
+            sample_rate.map_or(sample, |fs| sample / fs)
+        })
         .collect::<Vec<_>>();
     let mut outputs = vec![complex_column_output(response)?];
     if output_arity >= 2 {
@@ -19551,31 +21979,308 @@ fn builtin_stepz(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runt
             "stepz currently supports one or two outputs".to_string(),
         ));
     }
-    let [numerator, denominator, sample_count] = args else {
-        return Err(RuntimeError::Unsupported(
-            "stepz currently supports stepz(b, a, n)".to_string(),
-        ));
-    };
-
-    let (numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "stepz")?;
-    let (denominator, _denominator_is_row) = numeric_or_complex_set_vector(denominator, "stepz")?;
+    let (numerator, denominator, sample_count, sample_rate) =
+        parse_impulse_response_args(args, "stepz")?;
     if denominator.is_empty() || denominator[0].is_approximately_zero() {
         return Err(RuntimeError::TypeError(
             "stepz currently expects a denominator vector with nonzero first coefficient"
                 .to_string(),
         ));
     }
-    let sample_count =
-        positive_integer_scalar_with_label(sample_count, "stepz", "a positive sample count")?;
     let step_response = step_response_samples(&numerator, &denominator, sample_count);
     let time = (0..sample_count)
-        .map(|index| index as f64)
+        .map(|index| {
+            let sample = index as f64;
+            sample_rate.map_or(sample, |fs| sample / fs)
+        })
         .collect::<Vec<_>>();
     let mut outputs = vec![complex_column_output(step_response)?];
     if output_arity >= 2 {
         outputs.push(numeric_column_output(time)?);
     }
     Ok(outputs)
+}
+
+fn parse_impulse_response_args(
+    args: &[Value],
+    builtin_name: &str,
+) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>, usize, Option<f64>), RuntimeError> {
+    match args {
+        [filter] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, builtin_name)?;
+            let sample_count = impzlength_for_transfer_function(&numerator, &denominator, 5e-5)?;
+            Ok((
+                numerator,
+                denominator,
+                sample_count,
+                digital_filter_sample_rate_from_object(filter, builtin_name)?,
+            ))
+        }
+        [filter, sample_count] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                digital_filter_sample_rate_from_object(filter, builtin_name)?,
+            ))
+        }
+        [filter, sample_count, sample_rate] if is_digital_filter_object(filter) => {
+            let (numerator, denominator) =
+                digital_filter_transfer_function_from_object(filter, builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            ))
+        }
+        [sections] if impz_sos_row_fallback_numerator(sections).is_some() => {
+            let numerator =
+                impz_sos_row_fallback_numerator(sections).expect("matched sos-row fallback");
+            let denominator = vec![ComplexParts::one()];
+            let sample_count = impzlength_for_transfer_function(&numerator, &denominator, 5e-5)?;
+            Ok((numerator, denominator, sample_count, None))
+        }
+        [sections, sample_count] if impz_sos_row_fallback_numerator(sections).is_some() => {
+            let numerator =
+                impz_sos_row_fallback_numerator(sections).expect("matched sos-row fallback");
+            let denominator = vec![ComplexParts::one()];
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                None,
+            ))
+        }
+        [sections, sample_count, sample_rate]
+            if impz_sos_row_fallback_numerator(sections).is_some() =>
+        {
+            let numerator =
+                impz_sos_row_fallback_numerator(sections).expect("matched sos-row fallback");
+            let denominator = vec![ComplexParts::one()];
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                Some(impulse_response_sample_rate(sample_rate, builtin_name)?),
+            ))
+        }
+        [sections] if filtfilt_sos_signature(sections) => {
+            let (numerator, denominator) = sos_transfer_function(sections, builtin_name)?;
+            let sample_count = impzlength_for_transfer_function(&numerator, &denominator, 5e-5)?;
+            Ok((numerator, denominator, sample_count, None))
+        }
+        [sections, sample_count] if filtfilt_sos_signature(sections) => {
+            let (numerator, denominator) = sos_transfer_function(sections, builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                None,
+            ))
+        }
+        [sections, sample_count, sample_rate] if filtfilt_sos_signature(sections) => {
+            let (numerator, denominator) = sos_transfer_function(sections, builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                Some(impulse_response_sample_rate(sample_rate, builtin_name)?),
+            ))
+        }
+        [ctf, mode] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[ctf.clone(), mode.clone()], builtin_name)?;
+            let sample_count = impzlength_for_transfer_function(&numerator, &denominator, 5e-5)?;
+            Ok((numerator, denominator, sample_count, None))
+        }
+        [numerator, denominator] => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone()], builtin_name)?;
+            let sample_count = impzlength_for_transfer_function(&numerator, &denominator, 5e-5)?;
+            Ok((numerator, denominator, sample_count, None))
+        }
+        [numerator, denominator, third] if is_ctf_mode(third) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone(), third.clone()], builtin_name)?;
+            let sample_count = impzlength_for_transfer_function(&numerator, &denominator, 5e-5)?;
+            Ok((numerator, denominator, sample_count, None))
+        }
+        [ctf, mode, sample_count] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[ctf.clone(), mode.clone()], builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                None,
+            ))
+        }
+        [numerator, denominator, sample_count] => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone()], builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                None,
+            ))
+        }
+        [numerator, denominator, mode, sample_count] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone(), mode.clone()], builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                None,
+            ))
+        }
+        [ctf, mode, sample_count, sample_rate] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[ctf.clone(), mode.clone()], builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            ))
+        }
+        [numerator, denominator, sample_count, sample_rate] => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone()], builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            ))
+        }
+        [numerator, denominator, mode, sample_count, sample_rate] if is_ctf_mode(mode) => {
+            let (numerator, denominator) =
+                parse_transfer_function_or_ctf_args(&[numerator.clone(), denominator.clone(), mode.clone()], builtin_name)?;
+            Ok((
+                numerator.clone(),
+                denominator.clone(),
+                impulse_response_sample_count_or_default(
+                    sample_count,
+                    &numerator,
+                    &denominator,
+                    builtin_name,
+                )?,
+                Some(parse_digital_sample_rate(sample_rate, builtin_name)?),
+            ))
+        }
+        _ => Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} currently supports {builtin_name}(digitalFilter), {builtin_name}(digitalFilter, n), {builtin_name}(digitalFilter, n, fs), {builtin_name}(b, a), {builtin_name}(b, a, n), {builtin_name}(b, a, n, fs), {builtin_name}(sos), {builtin_name}(sos, n), {builtin_name}(sos, n, fs), {builtin_name}(B, A, \"ctf\"), {builtin_name}(B, A, \"ctf\", n), {builtin_name}(B, A, \"ctf\", n, fs), {builtin_name}({{B, A, g}}, \"ctf\"), {builtin_name}({{B, A, g}}, \"ctf\", n), and {builtin_name}({{B, A, g}}, \"ctf\", n, fs)"
+        ))),
+    }
+}
+
+fn sos_transfer_function(
+    sections: &Value,
+    builtin_name: &str,
+) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>), RuntimeError> {
+    let sections = parse_sos_sections(sections, &Value::Scalar(1.0), builtin_name)?;
+    Ok(equivalent_filter_sections_transfer_function(&sections))
+}
+
+fn impulse_response_sample_count(value: &Value, builtin_name: &str) -> Result<usize, RuntimeError> {
+    positive_integer_scalar_with_label(value, builtin_name, "a positive sample count")
+}
+
+fn impulse_response_sample_count_or_default(
+    value: &Value,
+    numerator: &[ComplexParts],
+    denominator: &[ComplexParts],
+    builtin_name: &str,
+) -> Result<usize, RuntimeError> {
+    if is_empty_matrix_placeholder(value) {
+        return impzlength_for_transfer_function(numerator, denominator, 5e-5);
+    }
+    impulse_response_sample_count(value, builtin_name)
+}
+
+fn impulse_response_sample_rate(value: &Value, builtin_name: &str) -> Result<f64, RuntimeError> {
+    let sample_rate = value.as_scalar()?;
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects fs to be a positive finite scalar"
+        )));
+    }
+    Ok(sample_rate)
+}
+
+fn impz_sos_row_fallback_numerator(value: &Value) -> Option<Vec<ComplexParts>> {
+    let Value::Matrix(matrix) = value else {
+        return None;
+    };
+    if matrix.rows != 1 || matrix.cols != 6 {
+        return None;
+    }
+    matrix
+        .iter()
+        .map(|entry| numeric_or_complex_scalar(entry, "impz"))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
 }
 
 fn impulse_response_samples(
@@ -19812,6 +22517,25 @@ fn builtin_residue(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Ru
     }
 }
 
+fn builtin_residuez(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    match args {
+        [numerator, denominator] => residuez_expand(numerator, denominator, output_arity),
+        [residues, poles, direct] => residuez_recompose(residues, poles, direct, output_arity),
+        _ => Err(RuntimeError::Unsupported(
+            "residuez currently supports residuez(b, a) or residuez(r, p, k)".to_string(),
+        )),
+    }
+}
+
+const RESIDUE_REPEATED_POLE_TOLERANCE: f64 = 1e-6;
+
+#[derive(Debug, Clone, Copy)]
+struct RepeatedPoleGroup {
+    pole: ComplexParts,
+    start: usize,
+    count: usize,
+}
+
 fn residue_expand(
     numerator: &Value,
     denominator: &Value,
@@ -19850,31 +22574,58 @@ fn residue_expand(
         (Vec::new(), numerator)
     };
     let poles = complex_polynomial_roots(&denominator);
-    for lhs in 0..poles.len() {
-        for rhs in (lhs + 1)..poles.len() {
-            if poles[lhs].minus(poles[rhs]).magnitude() <= 1e-8 {
-                return Err(RuntimeError::Unsupported(
-                    "residue currently supports distinct denominator poles".to_string(),
-                ));
-            }
-        }
+    let groups = repeated_pole_groups(&poles);
+    let mut residues = Vec::with_capacity(poles.len());
+    let mut grouped_poles = Vec::with_capacity(poles.len());
+    for group in &groups {
+        residues.extend(residue_group_residues(
+            &remainder,
+            &denominator,
+            &poles,
+            group,
+        )?);
+        grouped_poles.extend(std::iter::repeat(group.pole).take(group.count));
     }
 
-    let derivative = complex_polynomial_derivative_coefficients(&denominator);
-    let mut residues = Vec::with_capacity(poles.len());
-    for pole in &poles {
-        let denominator_value = evaluate_complex_polynomial(&derivative, *pole);
-        if denominator_value.is_approximately_zero() {
-            return Err(RuntimeError::Unsupported(
-                "residue currently supports distinct denominator poles".to_string(),
-            ));
-        }
-        let numerator_value = evaluate_complex_polynomial(&remainder, *pole);
-        residues.push(normalize_complex_parts(
-            numerator_value.rdivide(denominator_value),
+    residue_outputs(residues, grouped_poles, direct, output_arity)
+}
+
+fn residuez_expand(
+    numerator: &Value,
+    denominator: &Value,
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity == 0 || output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "residuez currently supports one, two, or three outputs for residuez(b, a)".to_string(),
         ));
     }
 
+    let (mut numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "residuez")?;
+    let (mut denominator, _denominator_is_row) =
+        numeric_or_complex_set_vector(denominator, "residuez")?;
+    numerator.reverse();
+    denominator.reverse();
+
+    let expanded = builtin_residue(
+        &[
+            complex_polynomial_degree_preserving_output(numerator)?,
+            complex_polynomial_degree_preserving_output(denominator)?,
+        ],
+        3,
+    )?;
+    let [residue_residues, residue_poles, residue_direct] = expanded.as_slice() else {
+        unreachable!("residue returned unexpected arity");
+    };
+
+    let (residue_residues, _residue_residues_are_row) =
+        numeric_or_complex_set_vector(residue_residues, "residuez")?;
+    let (residue_poles, _residue_poles_are_row) =
+        numeric_or_complex_set_vector(residue_poles, "residuez")?;
+    let residue_direct = residue_direct_vector(residue_direct)?;
+
+    let (residues, poles) = residuez_from_residue_domain(residue_residues, residue_poles)?;
+    let direct = residue_direct.into_iter().rev().collect::<Vec<_>>();
     residue_outputs(residues, poles, direct, output_arity)
 }
 
@@ -19896,34 +22647,34 @@ fn residue_recompose(
             "residue requires r and p to have the same number of elements".to_string(),
         ));
     }
-    for lhs in 0..poles.len() {
-        for rhs in (lhs + 1)..poles.len() {
-            if poles[lhs].minus(poles[rhs]).magnitude() <= 1e-8 {
-                return Err(RuntimeError::Unsupported(
-                    "residue currently supports distinct poles for residue(r, p, k)".to_string(),
-                ));
-            }
-        }
-    }
+    let (residues, poles) = canonicalize_residue_pole_pairs(residues, poles);
 
     let direct = residue_direct_vector(direct)?;
     let denominator = complex_polynomial_coefficients_from_roots(&poles);
+    let groups = repeated_pole_groups(&poles);
     let mut proper = vec![ComplexParts::zero(); residues.len()];
-    for (index, residue) in residues.iter().copied().enumerate() {
-        let remaining_poles = poles
+    for group in &groups {
+        let non_group_roots = poles
             .iter()
             .enumerate()
             .filter_map(|(pole_index, pole)| {
-                if pole_index == index {
-                    None
-                } else {
+                if pole_index < group.start || pole_index >= group.start + group.count {
                     Some(*pole)
+                } else {
+                    None
                 }
             })
             .collect::<Vec<_>>();
-        let factor = complex_polynomial_coefficients_from_roots(&remaining_poles);
-        for (target, coefficient) in proper.iter_mut().zip(factor) {
-            *target = normalize_complex_parts(target.plus(coefficient.times(residue)));
+        for offset in 0..group.count {
+            let power = offset + 1;
+            let residue = residues[group.start + offset];
+            let mut factor_roots = non_group_roots.clone();
+            factor_roots.extend(std::iter::repeat(group.pole).take(group.count - power));
+            let factor = complex_polynomial_coefficients_from_roots(&factor_roots)
+                .into_iter()
+                .map(|coefficient| normalize_complex_parts(coefficient.times(residue)))
+                .collect::<Vec<_>>();
+            proper = complex_polynomial_add(&proper, &factor);
         }
     }
     let direct_product = if direct.is_empty() {
@@ -19941,6 +22692,73 @@ fn residue_recompose(
     Ok(outputs)
 }
 
+fn residuez_recompose(
+    residues: &Value,
+    poles: &Value,
+    direct: &Value,
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity == 0 || output_arity > 2 {
+        return Err(RuntimeError::Unsupported(
+            "residuez currently supports one or two outputs for residuez(r, p, k)".to_string(),
+        ));
+    }
+    let (residues, _residues_are_row) = numeric_or_complex_set_vector(residues, "residuez")?;
+    let (poles, _poles_are_row) = numeric_or_complex_set_vector(poles, "residuez")?;
+    if residues.len() != poles.len() {
+        return Err(RuntimeError::ShapeError(
+            "residuez requires r and p to have the same number of elements".to_string(),
+        ));
+    }
+    let (residues, poles) = canonicalize_residue_pole_pairs_stable(residues, poles);
+    if poles.iter().any(|pole| pole.magnitude() <= 1e-12) {
+        return Err(RuntimeError::Unsupported(
+            "residuez currently expects nonzero finite z-domain poles".to_string(),
+        ));
+    }
+
+    let direct = residue_direct_vector(direct)?;
+    let denominator = residuez_denominator_from_poles(&poles);
+    let groups = repeated_pole_groups(&poles);
+    let mut proper = vec![ComplexParts::zero(); poles.len()];
+    for group in &groups {
+        let non_group_poles = poles
+            .iter()
+            .enumerate()
+            .filter_map(|(pole_index, pole)| {
+                if pole_index < group.start || pole_index >= group.start + group.count {
+                    Some(*pole)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for offset in 0..group.count {
+            let power = offset + 1;
+            let residue = residues[group.start + offset];
+            let mut factor_poles = non_group_poles.clone();
+            factor_poles.extend(std::iter::repeat(group.pole).take(group.count - power));
+            let factor = residuez_denominator_from_poles(&factor_poles)
+                .into_iter()
+                .map(|coefficient| normalize_complex_parts(coefficient.times(residue)))
+                .collect::<Vec<_>>();
+            proper = complex_polynomial_add_ascending(&proper, &factor);
+        }
+    }
+    let numerator = if direct.is_empty() {
+        proper
+    } else {
+        complex_polynomial_add_ascending(
+            &proper,
+            &full_complex_convolution_vector(&direct, &denominator),
+        )
+    };
+    Ok(vec![
+        complex_polynomial_degree_preserving_output(numerator)?,
+        complex_polynomial_degree_preserving_output(denominator)?,
+    ])
+}
+
 fn residue_direct_vector(value: &Value) -> Result<Vec<ComplexParts>, RuntimeError> {
     match value {
         Value::Matrix(matrix) if matrix.element_count() == 0 => Ok(Vec::new()),
@@ -19948,10 +22766,224 @@ fn residue_direct_vector(value: &Value) -> Result<Vec<ComplexParts>, RuntimeErro
     }
 }
 
-fn builtin_tf2zp(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity > 3 {
+fn canonicalize_residue_pole_pairs_stable(
+    residues: Vec<ComplexParts>,
+    poles: Vec<ComplexParts>,
+) -> (Vec<ComplexParts>, Vec<ComplexParts>) {
+    let mut pairs = poles
+        .into_iter()
+        .zip(residues)
+        .enumerate()
+        .map(|(index, (pole, residue))| (index, pole, residue))
+        .collect::<Vec<_>>();
+    pairs.sort_by(|lhs, rhs| {
+        rhs.1
+            .real
+            .total_cmp(&lhs.1.real)
+            .then_with(|| rhs.1.imag.total_cmp(&lhs.1.imag))
+            .then_with(|| lhs.0.cmp(&rhs.0))
+    });
+    let mut canonical_poles = Vec::with_capacity(pairs.len());
+    let mut canonical_residues = Vec::with_capacity(pairs.len());
+    for (_, pole, residue) in pairs {
+        canonical_poles.push(pole);
+        canonical_residues.push(residue);
+    }
+    (canonical_residues, canonical_poles)
+}
+
+fn canonicalize_residue_pole_pairs(
+    residues: Vec<ComplexParts>,
+    poles: Vec<ComplexParts>,
+) -> (Vec<ComplexParts>, Vec<ComplexParts>) {
+    let mut pairs = poles.into_iter().zip(residues).collect::<Vec<_>>();
+    pairs.sort_by(|lhs, rhs| {
+        rhs.0
+            .real
+            .total_cmp(&lhs.0.real)
+            .then_with(|| rhs.0.imag.total_cmp(&lhs.0.imag))
+    });
+    let (poles, residues): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    (residues, poles)
+}
+
+fn residuez_from_residue_domain(
+    residues: Vec<ComplexParts>,
+    poles: Vec<ComplexParts>,
+) -> Result<(Vec<ComplexParts>, Vec<ComplexParts>), RuntimeError> {
+    let groups = repeated_pole_groups(&poles);
+    let mut residuez_residues = Vec::with_capacity(residues.len());
+    let mut residuez_poles = Vec::with_capacity(poles.len());
+    for group in &groups {
+        if group.pole.magnitude() <= 1e-12 {
+            return Err(RuntimeError::Unsupported(
+                "residuez currently does not support infinite z-domain poles from trailing-zero denominator coefficients"
+                    .to_string(),
+            ));
+        }
+        let pole = normalize_complex_parts(ComplexParts::one().rdivide(group.pole));
+        for offset in 0..group.count {
+            let power = offset + 1;
+            residuez_residues.push(normalize_complex_parts(
+                residues[group.start + offset]
+                    .times(complex_integer_power(pole.scale(-1.0), power)),
+            ));
+            residuez_poles.push(pole);
+        }
+    }
+    Ok(canonicalize_residue_pole_pairs_stable(
+        residuez_residues,
+        residuez_poles,
+    ))
+}
+
+fn residuez_denominator_from_poles(poles: &[ComplexParts]) -> Vec<ComplexParts> {
+    poles
+        .iter()
+        .copied()
+        .fold(vec![ComplexParts::one()], |denominator, pole| {
+            full_complex_convolution_vector(
+                &denominator,
+                &[
+                    ComplexParts::one(),
+                    normalize_complex_parts(pole.scale(-1.0)),
+                ],
+            )
+        })
+}
+
+fn complex_polynomial_add_ascending(
+    lhs: &[ComplexParts],
+    rhs: &[ComplexParts],
+) -> Vec<ComplexParts> {
+    let len = lhs.len().max(rhs.len());
+    (0..len)
+        .map(|index| {
+            normalize_complex_parts(
+                lhs.get(index)
+                    .copied()
+                    .unwrap_or_else(ComplexParts::zero)
+                    .plus(rhs.get(index).copied().unwrap_or_else(ComplexParts::zero)),
+            )
+        })
+        .collect::<Vec<_>>()
+}
+
+fn repeated_pole_groups(poles: &[ComplexParts]) -> Vec<RepeatedPoleGroup> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < poles.len() {
+        let reference = poles[start];
+        let tolerance = residue_repeated_pole_tolerance(reference);
+        let mut end = start + 1;
+        while end < poles.len() && poles[end].minus(reference).magnitude() <= tolerance {
+            end += 1;
+        }
+        let pole = poles[start..end]
+            .iter()
+            .copied()
+            .fold(ComplexParts::zero(), |total, value| total.plus(value))
+            .scale(1.0 / (end - start) as f64);
+        groups.push(RepeatedPoleGroup {
+            pole: normalize_complex_parts(pole),
+            start,
+            count: end - start,
+        });
+        start = end;
+    }
+    groups
+}
+
+fn residue_repeated_pole_tolerance(pole: ComplexParts) -> f64 {
+    RESIDUE_REPEATED_POLE_TOLERANCE * pole.magnitude().max(1.0)
+}
+
+fn residue_group_residues(
+    numerator: &[ComplexParts],
+    denominator: &[ComplexParts],
+    poles: &[ComplexParts],
+    group: &RepeatedPoleGroup,
+) -> Result<Vec<ComplexParts>, RuntimeError> {
+    let remaining_roots = poles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pole)| {
+            if index < group.start || index >= group.start + group.count {
+                Some(*pole)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut analytic_denominator = complex_polynomial_coefficients_from_roots(&remaining_roots);
+    for coefficient in &mut analytic_denominator {
+        *coefficient = normalize_complex_parts(coefficient.times(denominator[0]));
+    }
+
+    let numerator_derivatives = polynomial_derivatives_at_point(numerator, group.pole, group.count);
+    let denominator_derivatives =
+        polynomial_derivatives_at_point(&analytic_denominator, group.pole, group.count);
+    if denominator_derivatives
+        .first()
+        .is_some_and(|value| value.magnitude() <= residue_repeated_pole_tolerance(group.pole))
+    {
         return Err(RuntimeError::Unsupported(
-            "tf2zp currently supports one, two, or three outputs".to_string(),
+            "residue currently supports repeated poles only when the reduced denominator remains well-conditioned"
+                .to_string(),
+        ));
+    }
+
+    let mut quotient_derivatives = vec![ComplexParts::zero(); group.count];
+    for order in 0..group.count {
+        let mut total = numerator_derivatives[order];
+        for derivative_order in 0..order {
+            total = normalize_complex_parts(
+                total.minus(
+                    quotient_derivatives[derivative_order]
+                        .times(denominator_derivatives[order - derivative_order])
+                        .scale(binomial_f64(order, derivative_order)),
+                ),
+            );
+        }
+        quotient_derivatives[order] =
+            normalize_complex_parts(total.rdivide(denominator_derivatives[0]));
+    }
+
+    let mut residues = quotient_derivatives
+        .into_iter()
+        .enumerate()
+        .map(|(order, derivative)| {
+            normalize_complex_parts(derivative.scale(1.0 / factorial_f64(order)))
+        })
+        .collect::<Vec<_>>();
+    residues.reverse();
+    Ok(residues)
+}
+
+fn polynomial_derivatives_at_point(
+    coefficients: &[ComplexParts],
+    point: ComplexParts,
+    count: usize,
+) -> Vec<ComplexParts> {
+    let mut derivatives = Vec::with_capacity(count);
+    let mut current = complex_polynomial_compact_coefficients(coefficients);
+    for _ in 0..count {
+        derivatives.push(normalize_complex_parts(evaluate_complex_polynomial(
+            &current, point,
+        )));
+        current = complex_polynomial_derivative_coefficients(&current);
+    }
+    derivatives
+}
+
+fn factorial_f64(value: usize) -> f64 {
+    (1..=value).fold(1.0, |product, next| product * next as f64)
+}
+
+fn builtin_tf2zp(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity != 3 {
+        return Err(RuntimeError::Unsupported(
+            "tf2zp currently supports exactly three outputs".to_string(),
         ));
     }
     let [numerator, denominator] = args else {
@@ -19960,33 +22992,57 @@ fn builtin_tf2zp(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runt
         ));
     };
 
-    let (numerator, _numerator_is_row) = numeric_or_complex_set_vector(numerator, "tf2zp")?;
-    let (denominator, _denominator_is_row) = numeric_or_complex_set_vector(denominator, "tf2zp")?;
-    let numerator = complex_polynomial_compact_coefficients(&numerator);
-    let denominator = complex_polynomial_compact_coefficients(&denominator);
-    if denominator[0].is_approximately_zero() {
-        return Err(RuntimeError::TypeError(
-            "tf2zp currently expects a nonzero denominator polynomial".to_string(),
+    let (numerator_rows, denominator) =
+        normalized_transfer_function_rows(numerator, denominator, "tf2zp")?;
+    let poles = complex_polynomial_roots(&denominator);
+    let output_count = numerator_rows.len();
+    let zero_count = denominator.len().saturating_sub(1);
+    let mut zeros_matrix = vec![
+        ComplexParts {
+            real: f64::INFINITY,
+            imag: 0.0,
+        };
+        zero_count * output_count
+    ];
+    let mut gains = Vec::with_capacity(output_count);
+    for (column, row) in numerator_rows.iter().enumerate() {
+        let compact_row = complex_polynomial_compact_coefficients(row);
+        let zeros = complex_polynomial_roots(&compact_row);
+        for (row_index, zero) in zeros.into_iter().enumerate() {
+            zeros_matrix[row_index * output_count + column] = zero;
+        }
+        gains.push(numeric_or_complex_value(
+            compact_row
+                .first()
+                .copied()
+                .unwrap_or_else(ComplexParts::zero),
         ));
     }
 
-    let zeros = complex_polynomial_roots(&numerator);
-    let poles = complex_polynomial_roots(&denominator);
-    let gain = normalize_complex_parts(numerator[0].rdivide(denominator[0]));
-    let mut outputs = vec![complex_roots_column_output(zeros)?];
-    if output_arity >= 2 {
-        outputs.push(complex_roots_column_output(poles)?);
-    }
-    if output_arity >= 3 {
-        outputs.push(numeric_or_complex_value(gain));
-    }
-    Ok(outputs)
+    Ok(vec![
+        if output_count == 1 {
+            complex_roots_column_output(
+                zeros_matrix
+                    .into_iter()
+                    .filter(|value| !complex_parts_is_infinite_placeholder(*value))
+                    .collect(),
+            )?
+        } else {
+            build_numeric_or_complex_matrix_result(zero_count, output_count, zeros_matrix)?
+        },
+        complex_roots_column_output(poles)?,
+        if output_count == 1 {
+            gains.into_iter().next().expect("single tf2zp gain")
+        } else {
+            Value::Matrix(MatrixValue::new(output_count, 1, gains)?)
+        },
+    ])
 }
 
 fn builtin_zp2tf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity > 2 {
+    if output_arity != 2 {
         return Err(RuntimeError::Unsupported(
-            "zp2tf currently supports one or two outputs".to_string(),
+            "zp2tf currently supports exactly two outputs".to_string(),
         ));
     }
     let [zeros, poles, gain] = args else {
@@ -19995,19 +23051,77 @@ fn builtin_zp2tf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runt
         ));
     };
 
-    let zeros = numeric_or_complex_vector_allow_empty(zeros, "zp2tf")?;
+    let output_count = zp2ss_zero_output_count(zeros);
+    let zeros = parse_zp2ss_zero_columns(zeros, output_count, "zp2tf")?;
     let poles = numeric_or_complex_vector_allow_empty(poles, "zp2tf")?;
-    let gain = numeric_or_complex_scalar(gain, "zp2tf")?;
-    let numerator = complex_polynomial_coefficients_from_roots(&zeros)
-        .into_iter()
-        .map(|coefficient| normalize_complex_parts(coefficient.times(gain)))
-        .collect::<Vec<_>>();
+    let gains = parse_zp2ss_gains(gain, zeros.len(), "zp2tf")?;
     let denominator = complex_polynomial_coefficients_from_roots(&poles);
-    let mut outputs = vec![complex_polynomial_degree_preserving_output(numerator)?];
-    if output_arity >= 2 {
-        outputs.push(complex_polynomial_degree_preserving_output(denominator)?);
+    let numerator_columns = zeros
+        .iter()
+        .zip(gains.iter())
+        .map(|(zeros, gain)| {
+            complex_polynomial_coefficients_from_roots(zeros)
+                .into_iter()
+                .map(|coefficient| normalize_complex_parts(coefficient.times(*gain)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let numerator = if numerator_columns.len() == 1 {
+        complex_polynomial_degree_preserving_output(
+            numerator_columns
+                .into_iter()
+                .next()
+                .expect("single zp2tf numerator"),
+        )?
+    } else {
+        let numerator_rows = numerator_columns
+            .into_iter()
+            .map(|coefficients| {
+                let mut padded = vec![
+                    ComplexParts::zero();
+                    denominator.len().saturating_sub(coefficients.len())
+                ];
+                padded.extend(coefficients);
+                padded
+            })
+            .collect::<Vec<_>>();
+        build_numeric_or_complex_matrix_result(
+            numerator_rows.len(),
+            denominator.len(),
+            numerator_rows.into_iter().flatten().collect(),
+        )?
+    };
+    Ok(vec![
+        numerator,
+        complex_polynomial_degree_preserving_output(denominator)?,
+    ])
+}
+
+fn builtin_tf2ctf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity < 2 || output_arity > 3 {
+        return Err(RuntimeError::Unsupported(
+            "tf2ctf currently supports two or three outputs".to_string(),
+        ));
     }
-    Ok(outputs)
+    let (numerator, denominator, option_args) = match args {
+        [numerator, denominator] => (numerator, denominator, &[][..]),
+        [numerator, denominator, option_args @ ..] => (numerator, denominator, option_args),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "tf2ctf currently supports tf2ctf(b, a) and those forms with trailing name-value options"
+                    .to_string(),
+            ))
+        }
+    };
+    let (zeros, poles, gain) = zpk_from_transfer_function_values(numerator, denominator, "tf2ctf")?;
+    let zpk = vec![
+        complex_roots_column_output(zeros)?,
+        complex_roots_column_output(poles)?,
+        numeric_or_complex_value(gain),
+    ];
+    let mut forwarded_args = zpk;
+    forwarded_args.extend(option_args.iter().cloned());
+    builtin_zp2ctf(&forwarded_args, output_arity)
 }
 
 fn builtin_tf2sos(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
@@ -20016,40 +23130,30 @@ fn builtin_tf2sos(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
             "tf2sos currently supports one or two outputs".to_string(),
         ));
     }
-    let [numerator, denominator] = args else {
-        return Err(RuntimeError::Unsupported(
-            "tf2sos currently supports tf2sos(b, a)".to_string(),
-        ));
-    };
+    let (numerator, denominator, order, scale) = parse_tf2sos_args(args)?;
     let (zeros, poles, gain) = zpk_from_transfer_function_values(numerator, denominator, "tf2sos")?;
-    zp2sos_outputs(zeros, poles, gain, output_arity)
+    let outputs = zp2sos_outputs(zeros, poles, gain, false, 2)?;
+    let [sos, gain] = outputs.as_slice() else {
+        unreachable!("zp2sos returned unexpected arity");
+    };
+    finalize_sos_outputs(
+        sos.clone(),
+        gain.clone(),
+        output_arity,
+        order,
+        scale,
+        "tf2sos",
+    )
 }
 
 fn builtin_zp2ctf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity == 0 || output_arity > 3 {
+    if output_arity < 2 || output_arity > 3 {
         return Err(RuntimeError::Unsupported(
-            "zp2ctf currently supports one, two, or three outputs".to_string(),
+            "zp2ctf currently supports two or three outputs".to_string(),
         ));
     }
-    let (zeros, poles, gain) = match args {
-        [zeros, poles] => (
-            numeric_or_complex_vector_allow_empty(zeros, "zp2ctf")?,
-            numeric_or_complex_vector_allow_empty(poles, "zp2ctf")?,
-            ComplexParts::one(),
-        ),
-        [zeros, poles, gain] => (
-            numeric_or_complex_vector_allow_empty(zeros, "zp2ctf")?,
-            numeric_or_complex_vector_allow_empty(poles, "zp2ctf")?,
-            numeric_or_complex_scalar(gain, "zp2ctf")?,
-        ),
-        _ => {
-            return Err(RuntimeError::Unsupported(
-                "zp2ctf currently supports zp2ctf(z, p) and zp2ctf(z, p, k)".to_string(),
-            ))
-        }
-    };
-
-    let mut sections = zp2ctf_sections_from_roots(&zeros, &poles);
+    let (zeros, poles, gain, options) = parse_zp2ctf_args(args)?;
+    let mut sections = zp2ctf_sections_from_roots_with_options(&zeros, &poles, options);
     if output_arity < 3 {
         if gain.imag.abs() > 1e-12 && !gain.imag.is_nan() {
             return Err(RuntimeError::Unsupported(
@@ -20057,44 +23161,47 @@ fn builtin_zp2ctf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
                     .to_string(),
             ));
         }
-        let section_scales = uniformly_distributed_section_gain(gain.real, sections.len());
-        for (section, scale) in sections.iter_mut().zip(section_scales) {
+        let (section_scales, overall_scale) = ctf_section_scaling_values(&sections, options.scale);
+        let distributed_gain =
+            uniformly_distributed_section_gain(gain.real * overall_scale, sections.len());
+        for ((section, scale), distributed) in sections
+            .iter_mut()
+            .zip(section_scales)
+            .zip(distributed_gain)
+        {
+            let multiplier = scale * distributed;
             for coefficient in &mut section.numerator {
-                *coefficient = normalize_complex_parts(coefficient.scale(scale));
+                *coefficient = normalize_complex_parts(coefficient.scale(multiplier));
             }
         }
     }
 
     let rows = sections.len().max(1);
-    let mut numerator = Vec::with_capacity(rows * 3);
-    let mut denominator = Vec::with_capacity(rows * 3);
+    let width = options.section_order + 1;
+    let mut numerator = Vec::with_capacity(rows * width);
+    let mut denominator = Vec::with_capacity(rows * width);
     if sections.is_empty() {
-        numerator.extend_from_slice(&[gain, ComplexParts::zero(), ComplexParts::zero()]);
-        denominator.extend_from_slice(&[
-            ComplexParts::one(),
-            ComplexParts::zero(),
-            ComplexParts::zero(),
-        ]);
+        numerator.push(gain);
+        numerator.extend(std::iter::repeat(ComplexParts::zero()).take(width - 1));
+        denominator.push(ComplexParts::one());
+        denominator.extend(std::iter::repeat(ComplexParts::zero()).take(width - 1));
     } else {
         for section in &sections {
-            numerator.extend_from_slice(&section.numerator);
-            denominator.extend_from_slice(&section.denominator);
+            let canonical_numerator =
+                canonicalize_real_friendly_section_coefficients(&section.numerator);
+            let canonical_denominator =
+                canonicalize_real_friendly_section_coefficients(&section.denominator);
+            numerator.extend_from_slice(&canonical_numerator);
+            denominator.extend_from_slice(&canonical_denominator);
         }
     }
 
-    let b = build_numeric_or_complex_matrix_result(rows, 3, numerator)?;
-    match output_arity {
-        1 => Ok(vec![b]),
-        2 => Ok(vec![
-            b,
-            build_numeric_or_complex_matrix_result(rows, 3, denominator)?,
-        ]),
-        3 => Ok(vec![
-            b,
-            build_numeric_or_complex_matrix_result(rows, 3, denominator)?,
-            numeric_or_complex_value(gain),
-        ]),
-        _ => unreachable!("checked output arity above"),
+    let b = build_numeric_or_complex_matrix_result(rows, width, numerator)?;
+    let a = build_numeric_or_complex_matrix_result(rows, width, denominator)?;
+    if output_arity == 2 {
+        Ok(vec![b, a])
+    } else {
+        Ok(vec![b, a, numeric_or_complex_value(gain)])
     }
 }
 
@@ -20104,52 +23211,59 @@ fn builtin_zp2sos(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
             "zp2sos currently supports one or two outputs".to_string(),
         ));
     }
-    let (zeros, poles, gain) = match args {
-        [zeros, poles] => (
-            numeric_or_complex_vector_allow_empty(zeros, "zp2sos")?,
-            numeric_or_complex_vector_allow_empty(poles, "zp2sos")?,
-            ComplexParts::one(),
-        ),
-        [zeros, poles, gain] => (
-            numeric_or_complex_vector_allow_empty(zeros, "zp2sos")?,
-            numeric_or_complex_vector_allow_empty(poles, "zp2sos")?,
-            numeric_or_complex_scalar(gain, "zp2sos")?,
-        ),
-        _ => {
-            return Err(RuntimeError::Unsupported(
-                "zp2sos currently supports zp2sos(z, p) and zp2sos(z, p, k)".to_string(),
-            ))
-        }
+    let (zeros, poles, gain, order, scale, zero_flag) = parse_zp2sos_args(args)?;
+    let outputs = zp2sos_outputs(zeros, poles, gain, zero_flag, 2)?;
+    let [sos, gain] = outputs.as_slice() else {
+        unreachable!("zp2sos returned unexpected arity");
     };
-    zp2sos_outputs(zeros, poles, gain, output_arity)
+    finalize_sos_outputs(
+        sos.clone(),
+        gain.clone(),
+        output_arity,
+        order,
+        scale,
+        "zp2sos",
+    )
+}
+
+fn builtin_ctf2sos(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity == 0 || output_arity > 2 {
+        return Err(RuntimeError::Unsupported(
+            "ctf2sos currently supports one or two outputs".to_string(),
+        ));
+    }
+    let (ctf2zp_args, order, scale) = parse_ctf2sos_args(args)?;
+    let mut zpk = builtin_ctf2zp(ctf2zp_args, 3)?;
+    if let Some(order) = order {
+        zpk.push(order.clone());
+    }
+    if let Some(scale) = scale {
+        zpk.push(scale.clone());
+    }
+    builtin_zp2sos(&zpk, output_arity)
 }
 
 fn builtin_ctf2zp(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity == 0 || output_arity > 3 {
+    if output_arity < 2 || output_arity > 3 {
         return Err(RuntimeError::Unsupported(
-            "ctf2zp currently supports one, two, or three outputs".to_string(),
+            "ctf2zp currently supports two or three outputs".to_string(),
         ));
     }
     let sections = match args {
+        [ctf] => parse_digital_filter_ctf_cell_sections(ctf, "ctf2zp")?,
         [numerators, denominators] => parse_ctf_sections(numerators, denominators, None, "ctf2zp")?,
         [numerators, denominators, gain] => {
             parse_ctf_sections(numerators, denominators, Some(gain), "ctf2zp")?
         }
         _ => {
             return Err(RuntimeError::Unsupported(
-                "ctf2zp currently supports ctf2zp(B, A) and ctf2zp(B, A, g)".to_string(),
+                "ctf2zp currently supports ctf2zp(B, A), ctf2zp(B, A, g), and ctf2zp({B, A, g})"
+                    .to_string(),
             ))
         }
     };
 
-    let (numerator, denominator) = equivalent_filter_sections_transfer_function(&sections);
-    let zeros = complex_polynomial_roots(&numerator);
-    let poles = complex_polynomial_roots(&denominator);
-    let gain = if denominator.is_empty() || denominator[0].is_approximately_zero() {
-        ComplexParts::zero()
-    } else {
-        normalize_complex_parts(numerator[0].rdivide(denominator[0]))
-    };
+    let (zeros, poles, gain) = zero_pole_gain_from_filter_sections(&sections);
 
     let mut outputs = vec![complex_roots_column_output(zeros)?];
     if output_arity >= 2 {
@@ -20161,10 +23275,85 @@ fn builtin_ctf2zp(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
     Ok(outputs)
 }
 
+fn zero_pole_gain_from_filter_sections(
+    sections: &[FiltfiltSection],
+) -> (Vec<ComplexParts>, Vec<ComplexParts>, ComplexParts) {
+    let mut zeros = Vec::new();
+    let mut poles = Vec::new();
+    let mut gain = ComplexParts::one();
+    for section in sections {
+        let numerator = complex_polynomial_compact_coefficients(&section.numerator);
+        let denominator = complex_polynomial_compact_coefficients(&section.denominator);
+        if denominator.is_empty() || denominator[0].is_approximately_zero() {
+            return (Vec::new(), Vec::new(), ComplexParts::zero());
+        }
+        gain = normalize_complex_parts(
+            gain.times(
+                numerator
+                    .first()
+                    .copied()
+                    .unwrap_or_else(ComplexParts::zero)
+                    .rdivide(denominator[0]),
+            ),
+        );
+        zeros.extend(complex_polynomial_roots(&numerator));
+        poles.extend(complex_polynomial_roots(&denominator));
+    }
+    sort_complex_roots(&mut zeros);
+    sort_complex_roots(&mut poles);
+    (zeros, poles, gain)
+}
+
+fn sort_complex_roots(values: &mut [ComplexParts]) {
+    values.sort_by(|lhs, rhs| {
+        rhs.real
+            .total_cmp(&lhs.real)
+            .then_with(|| rhs.imag.total_cmp(&lhs.imag))
+    });
+}
+
+fn parse_ctf2sos_args<'a>(
+    args: &'a [Value],
+) -> Result<(&'a [Value], Option<&'a Value>, Option<&'a Value>), RuntimeError> {
+    match args {
+        [ctf] if matches!(ctf, Value::Cell(_)) => Ok((&args[..1], None, None)),
+        [ctf, order] if matches!(ctf, Value::Cell(_)) => Ok((&args[..1], Some(order), None)),
+        [ctf, order, scale] if matches!(ctf, Value::Cell(_)) => {
+            Ok((&args[..1], Some(order), Some(scale)))
+        }
+        [_, _] => Ok((&args[..2], None, None)),
+        [numerators, denominators, third]
+            if matches!(third, Value::CharArray(_) | Value::String(_)) =>
+        {
+            Ok((&args[..2], Some(third), None))
+        }
+        [_, _, _] => Ok((&args[..3], None, None)),
+        [numerators, denominators, order, scale]
+            if matches!(order, Value::CharArray(_) | Value::String(_)) =>
+        {
+            Ok((&args[..2], Some(order), Some(scale)))
+        }
+        [numerators, denominators, gain, order]
+            if matches!(order, Value::CharArray(_) | Value::String(_)) =>
+        {
+            Ok((&args[..3], Some(order), None))
+        }
+        [numerators, denominators, gain, order, scale]
+            if matches!(order, Value::CharArray(_) | Value::String(_)) =>
+        {
+            Ok((&args[..3], Some(order), Some(scale)))
+        }
+        _ => Err(RuntimeError::Unsupported(
+            "ctf2sos currently supports ctf2sos(B, A), ctf2sos(B, A, g), ctf2sos(B, A, order), ctf2sos(B, A, order, scale), ctf2sos(B, A, g, order), ctf2sos(B, A, g, order, scale), ctf2sos({B, A, g}), ctf2sos({B, A, g}, order), and ctf2sos({B, A, g}, order, scale)"
+                .to_string(),
+        )),
+    }
+}
+
 fn builtin_ss2tf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity == 0 || output_arity > 2 {
+    if output_arity != 2 {
         return Err(RuntimeError::Unsupported(
-            "ss2tf currently supports one or two outputs".to_string(),
+            "ss2tf currently supports exactly two outputs".to_string(),
         ));
     }
     let (a, b, c, d, input_index) = match args {
@@ -20251,15 +23440,10 @@ fn builtin_ss2tf(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runt
         }
     }
 
-    let mut outputs = vec![build_numeric_or_complex_matrix_result(
-        output_count,
-        state_count + 1,
-        numerator,
-    )?];
-    if output_arity >= 2 {
-        outputs.push(complex_polynomial_degree_preserving_output(denominator)?);
-    }
-    Ok(outputs)
+    Ok(vec![
+        build_numeric_or_complex_matrix_result(output_count, state_count + 1, numerator)?,
+        complex_polynomial_degree_preserving_output(denominator)?,
+    ])
 }
 
 fn builtin_ss2sos(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
@@ -20268,7 +23452,7 @@ fn builtin_ss2sos(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
             "ss2sos currently supports one or two outputs".to_string(),
         ));
     }
-    let (tf_args, order) = parse_ss2sos_args(args)?;
+    let (tf_args, order, scale) = parse_ss2sos_args(args)?;
     let c = numeric_or_complex_operand(&tf_args[2], "ss2sos")?;
     if c.rows != 1 {
         return Err(RuntimeError::Unsupported(
@@ -20284,22 +23468,149 @@ fn builtin_ss2sos(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Run
     let tf = builtin_ss2tf(&tf_args, 2)?;
     let outputs = builtin_tf2sos(&tf, 2)?;
     let (sos_rows, gain) = match outputs.as_slice() {
-        [sos, gain] => (reordered_ss2sos_value(sos, order, "ss2sos")?, gain.clone()),
+        [sos, gain] => (sos.clone(), gain.clone()),
         _ => unreachable!("tf2sos returned unexpected arity"),
     };
+    finalize_sos_outputs(sos_rows, gain, output_arity, order, scale, "ss2sos")
+}
+
+fn finalize_sos_outputs(
+    sos: Value,
+    gain: Value,
+    output_arity: usize,
+    order: Ss2SosOrder,
+    scale: Ss2SosScale,
+    builtin_name: &str,
+) -> Result<Vec<Value>, RuntimeError> {
+    let sos = reordered_ss2sos_value(&sos, order, builtin_name)?;
+    let (sos, gain) = scaled_ss2sos_outputs(sos, gain, scale, builtin_name)?;
     if output_arity == 1 {
-        let gain_value = numeric_or_complex_scalar(&gain, "ss2sos")?;
+        let gain_value = numeric_or_complex_scalar(&gain, builtin_name)?;
         return Ok(vec![embed_sos_gain_in_first_section(
-            sos_rows, gain_value, "ss2sos",
+            sos,
+            gain_value,
+            builtin_name,
         )?]);
     }
-    Ok(vec![sos_rows, gain])
+    Ok(vec![sos, gain])
+}
+
+fn scaled_ss2sos_outputs(
+    sos: Value,
+    gain: Value,
+    scale: Ss2SosScale,
+    builtin_name: &str,
+) -> Result<(Value, Value), RuntimeError> {
+    if scale == Ss2SosScale::None {
+        return Ok((sos, gain));
+    }
+    let operand = numeric_or_complex_operand(&sos, builtin_name)?;
+    if operand.rows == 0 || operand.cols != 6 {
+        return Ok((sos, gain));
+    }
+    let (section_scales, overall_scale) = ss2sos_scaling_values(&operand, scale);
+    let sos = scale_ss2sos_section_numerators(&operand, &section_scales)?;
+    let gain_value = numeric_or_complex_scalar(&gain, builtin_name)?;
+    Ok((
+        sos,
+        numeric_or_complex_value(normalize_complex_parts(gain_value.scale(overall_scale))),
+    ))
+}
+
+fn ss2sos_scaling_values(operand: &NumericOrComplexOperand, scale: Ss2SosScale) -> (Vec<f64>, f64) {
+    if operand.rows == 0 || scale == Ss2SosScale::None {
+        return (vec![1.0; operand.rows], 1.0);
+    }
+
+    let mut cumulative_numerator = vec![ComplexParts::one()];
+    let mut cumulative_denominator = vec![ComplexParts::one()];
+    let mut cumulative_norms = Vec::with_capacity(operand.rows);
+    for row in 0..operand.rows {
+        let start = row * operand.cols;
+        cumulative_numerator = full_complex_convolution_vector(
+            &cumulative_numerator,
+            &operand.values[start..start + 3],
+        );
+        cumulative_denominator = full_complex_convolution_vector(
+            &cumulative_denominator,
+            &operand.values[start + 3..start + 6],
+        );
+        cumulative_norms.push(ss2sos_frequency_domain_norm(
+            &cumulative_numerator,
+            &cumulative_denominator,
+            scale,
+        ));
+    }
+
+    if cumulative_norms
+        .iter()
+        .any(|norm| !norm.is_finite() || *norm <= 1e-12)
+    {
+        return (vec![1.0; operand.rows], 1.0);
+    }
+
+    let mut previous_norm = 1.0;
+    let mut section_scales = Vec::with_capacity(cumulative_norms.len());
+    for &norm in &cumulative_norms {
+        section_scales.push(previous_norm / norm);
+        previous_norm = norm;
+    }
+    (
+        section_scales,
+        cumulative_norms.last().copied().unwrap_or(1.0),
+    )
+}
+
+fn ss2sos_frequency_domain_norm(
+    numerator: &[ComplexParts],
+    denominator: &[ComplexParts],
+    scale: Ss2SosScale,
+) -> f64 {
+    let frequencies = digital_frequency_grid(SS2SOS_SCALE_NORM_SAMPLE_COUNT, true);
+    let responses = digital_filter_response_at_frequencies(numerator, denominator, &frequencies);
+    match scale {
+        Ss2SosScale::None => 1.0,
+        Ss2SosScale::Inf => responses
+            .into_iter()
+            .map(ComplexParts::magnitude)
+            .fold(0.0_f64, f64::max),
+        Ss2SosScale::Two => {
+            let sample_count = responses.len();
+            if sample_count == 0 {
+                return 0.0;
+            }
+            let mean_square = responses
+                .into_iter()
+                .map(|response| {
+                    let magnitude = response.magnitude();
+                    magnitude * magnitude
+                })
+                .sum::<f64>()
+                / sample_count as f64;
+            mean_square.sqrt()
+        }
+    }
+}
+
+fn scale_ss2sos_section_numerators(
+    operand: &NumericOrComplexOperand,
+    section_scales: &[f64],
+) -> Result<Value, RuntimeError> {
+    let mut values = operand.values.clone();
+    for row in 0..operand.rows {
+        let scale = section_scales.get(row).copied().unwrap_or(1.0);
+        let start = row * operand.cols;
+        for col in 0..3 {
+            values[start + col] = normalize_complex_parts(values[start + col].scale(scale));
+        }
+    }
+    build_numeric_or_complex_matrix_result(operand.rows, operand.cols, values)
 }
 
 fn builtin_ss2zp(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity == 0 || output_arity > 3 {
+    if output_arity != 3 {
         return Err(RuntimeError::Unsupported(
-            "ss2zp currently supports one, two, or three outputs".to_string(),
+            "ss2zp currently supports exactly three outputs".to_string(),
         ));
     }
     let tf = builtin_ss2tf(args, 2)?;
@@ -20329,25 +23640,20 @@ fn builtin_ss2zp(args: &[Value], output_arity: usize) -> Result<Vec<Value>, Runt
         ));
     }
 
-    let mut outputs = vec![build_numeric_or_complex_matrix_result(
-        zero_count,
-        output_count,
-        zeros_matrix,
-    )?];
-    if output_arity >= 2 {
-        outputs.push(complex_roots_column_output(poles)?);
-    }
-    if output_arity >= 3 {
-        outputs.push(if output_count == 1 {
+    Ok(vec![
+        build_numeric_or_complex_matrix_result(zero_count, output_count, zeros_matrix)?,
+        complex_roots_column_output(poles)?,
+        if output_count == 1 {
             gains.into_iter().next().expect("single ss2zp gain")
         } else {
             Value::Matrix(MatrixValue::new(output_count, 1, gains)?)
-        });
-    }
-    Ok(outputs)
+        },
+    ])
 }
 
-fn parse_ss2sos_args(args: &[Value]) -> Result<(Vec<Value>, Ss2SosOrder), RuntimeError> {
+fn parse_ss2sos_args(
+    args: &[Value],
+) -> Result<(Vec<Value>, Ss2SosOrder, Ss2SosScale), RuntimeError> {
     let (a, b, c, d, input_index, order, scale) = match args {
         [a, b, c, d] => (a, b, c, d, None, Ss2SosOrder::Up, None),
         [a, b, c, d, fifth] => {
@@ -20409,15 +23715,224 @@ fn parse_ss2sos_args(args: &[Value]) -> Result<(Vec<Value>, Ss2SosOrder), Runtim
         }
     };
 
-    if let Some(scale) = scale {
-        parse_ss2sos_scale(scale)?;
-    }
+    let scale = scale
+        .map(parse_ss2sos_scale)
+        .transpose()?
+        .unwrap_or(Ss2SosScale::None);
 
     let mut tf_args = vec![a.clone(), b.clone(), c.clone(), d.clone()];
     if let Some(input_index) = input_index {
         tf_args.push(Value::Scalar(input_index as f64));
     }
-    Ok((tf_args, order))
+    Ok((tf_args, order, scale))
+}
+
+fn parse_tf2sos_args(
+    args: &[Value],
+) -> Result<(&Value, &Value, Ss2SosOrder, Ss2SosScale), RuntimeError> {
+    match args {
+        [numerator, denominator] => Ok((
+            numerator,
+            denominator,
+            Ss2SosOrder::Up,
+            Ss2SosScale::None,
+        )),
+        [numerator, denominator, order] => Ok((
+            numerator,
+            denominator,
+            parse_ss2sos_order(order)?,
+            Ss2SosScale::None,
+        )),
+        [numerator, denominator, order, scale] => Ok((
+            numerator,
+            denominator,
+            parse_ss2sos_order(order)?,
+            parse_ss2sos_scale(scale)?,
+        )),
+        _ => Err(RuntimeError::Unsupported(
+            "tf2sos currently supports tf2sos(b, a), tf2sos(b, a, order), and tf2sos(b, a, order, scale)"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_zp2ctf_args(
+    args: &[Value],
+) -> Result<
+    (
+        Vec<ComplexParts>,
+        Vec<ComplexParts>,
+        ComplexParts,
+        Zp2CtfOptions,
+    ),
+    RuntimeError,
+> {
+    let mut options = Zp2CtfOptions::default();
+    let (zeros, poles, gain, option_start) = match args {
+        [zeros, poles] => (zeros, poles, ComplexParts::one(), 2),
+        [zeros, poles, third] if matches!(third, Value::CharArray(_) | Value::String(_)) => {
+            (zeros, poles, ComplexParts::one(), 2)
+        }
+        [zeros, poles, gain] => (zeros, poles, numeric_or_complex_scalar(gain, "zp2ctf")?, 3),
+        _ if args.len() >= 4 && matches!(args[3], Value::CharArray(_) | Value::String(_)) => (
+            &args[0],
+            &args[1],
+            numeric_or_complex_scalar(&args[2], "zp2ctf")?,
+            3,
+        ),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "zp2ctf currently supports zp2ctf(z, p), zp2ctf(z, p, k), and those forms with trailing name-value options"
+                    .to_string(),
+            ))
+        }
+    };
+    let option_args = &args[option_start..];
+    if option_args.len() % 2 != 0 {
+        return Err(RuntimeError::Unsupported(
+            "zp2ctf currently expects name-value options to appear in pairs".to_string(),
+        ));
+    }
+    for pair in option_args.chunks(2) {
+        let name = text_value(&pair[0])?;
+        let value = &pair[1];
+        if name.eq_ignore_ascii_case("SectionOrder") {
+            options.section_order = parse_zp2ctf_section_order(value)?;
+        } else if name.eq_ignore_ascii_case("Direction") {
+            options.direction = parse_zp2ctf_direction(value)?;
+        } else if name.eq_ignore_ascii_case("Scale") {
+            options.scale = parse_zp2ctf_scale(value)?;
+        } else {
+            return Err(RuntimeError::Unsupported(format!(
+                "zp2ctf does not support the `{name}` option"
+            )));
+        }
+    }
+    Ok((
+        numeric_or_complex_vector_allow_empty(zeros, "zp2ctf")?,
+        numeric_or_complex_vector_allow_empty(poles, "zp2ctf")?,
+        gain,
+        options,
+    ))
+}
+
+fn parse_zp2ctf_section_order(value: &Value) -> Result<usize, RuntimeError> {
+    let scalar = value.as_scalar()?;
+    if scalar == 2.0 {
+        Ok(2)
+    } else if scalar == 4.0 {
+        Ok(4)
+    } else {
+        Err(RuntimeError::Unsupported(
+            "zp2ctf currently expects SectionOrder to be 2 or 4".to_string(),
+        ))
+    }
+}
+
+fn parse_zp2ctf_direction(value: &Value) -> Result<CtfDirection, RuntimeError> {
+    match text_value(value)?.to_ascii_lowercase().as_str() {
+        "up" => Ok(CtfDirection::Up),
+        "down" => Ok(CtfDirection::Down),
+        other => Err(RuntimeError::Unsupported(format!(
+            "zp2ctf currently expects Direction to be \"up\" or \"down\", found `{other}`"
+        ))),
+    }
+}
+
+fn parse_zp2ctf_scale(value: &Value) -> Result<CtfScale, RuntimeError> {
+    match text_value(value)?.to_ascii_lowercase().as_str() {
+        "none" => Ok(CtfScale::None),
+        "inf" => Ok(CtfScale::Inf),
+        "l2" => Ok(CtfScale::L2),
+        other => Err(RuntimeError::Unsupported(format!(
+            "zp2ctf currently expects Scale to be \"none\", \"inf\", or \"l2\", found `{other}`"
+        ))),
+    }
+}
+
+fn parse_zp2sos_args(
+    args: &[Value],
+) -> Result<
+    (
+        Vec<ComplexParts>,
+        Vec<ComplexParts>,
+        ComplexParts,
+        Ss2SosOrder,
+        Ss2SosScale,
+        bool,
+    ),
+    RuntimeError,
+> {
+    let (zeros, poles, gain, order, scale, zero_flag) = match args {
+        [zeros, poles] => (
+            zeros,
+            poles,
+            ComplexParts::one(),
+            Ss2SosOrder::Up,
+            Ss2SosScale::None,
+            false,
+        ),
+        [zeros, poles, gain] => (
+            zeros,
+            poles,
+            numeric_or_complex_scalar(gain, "zp2sos")?,
+            Ss2SosOrder::Up,
+            Ss2SosScale::None,
+            false,
+        ),
+        [zeros, poles, gain, order] => (
+            zeros,
+            poles,
+            numeric_or_complex_scalar(gain, "zp2sos")?,
+            parse_ss2sos_order(order)?,
+            Ss2SosScale::None,
+            false,
+        ),
+        [zeros, poles, gain, order, scale] => (
+            zeros,
+            poles,
+            numeric_or_complex_scalar(gain, "zp2sos")?,
+            parse_ss2sos_order(order)?,
+            parse_ss2sos_scale(scale)?,
+            false,
+        ),
+        [zeros, poles, gain, order, scale, zero_flag] => (
+            zeros,
+            poles,
+            numeric_or_complex_scalar(gain, "zp2sos")?,
+            parse_ss2sos_order(order)?,
+            parse_ss2sos_scale(scale)?,
+            parse_zp2sos_zero_flag(zero_flag)?,
+        ),
+        _ => {
+            return Err(RuntimeError::Unsupported(
+                "zp2sos currently supports zp2sos(z, p), zp2sos(z, p, k), zp2sos(z, p, k, order), zp2sos(z, p, k, order, scale), and zp2sos(z, p, k, order, scale, zeroflag)"
+                    .to_string(),
+            ))
+        }
+    };
+    Ok((
+        numeric_or_complex_vector_allow_empty(zeros, "zp2sos")?,
+        numeric_or_complex_vector_allow_empty(poles, "zp2sos")?,
+        gain,
+        order,
+        scale,
+        zero_flag,
+    ))
+}
+
+fn parse_zp2sos_zero_flag(value: &Value) -> Result<bool, RuntimeError> {
+    match value {
+        Value::Logical(flag) => Ok(*flag),
+        Value::Scalar(flag) if flag.is_finite() && (*flag == 0.0 || *flag == 1.0) => {
+            Ok(*flag != 0.0)
+        }
+        Value::Int64(flag) if *flag == 0 || *flag == 1 => Ok(*flag != 0),
+        Value::UInt64(flag) if *flag == 0 || *flag == 1 => Ok(*flag != 0),
+        _ => Err(RuntimeError::TypeError(
+            "zp2sos currently expects zeroflag to be a logical scalar".to_string(),
+        )),
+    }
 }
 
 fn parse_ss2sos_order(value: &Value) -> Result<Ss2SosOrder, RuntimeError> {
@@ -20430,11 +23945,13 @@ fn parse_ss2sos_order(value: &Value) -> Result<Ss2SosOrder, RuntimeError> {
     }
 }
 
-fn parse_ss2sos_scale(value: &Value) -> Result<(), RuntimeError> {
+fn parse_ss2sos_scale(value: &Value) -> Result<Ss2SosScale, RuntimeError> {
     match text_value(value)?.to_ascii_lowercase().as_str() {
-        "none" => Ok(()),
+        "none" => Ok(Ss2SosScale::None),
+        "inf" => Ok(Ss2SosScale::Inf),
+        "two" => Ok(Ss2SosScale::Two),
         other => Err(RuntimeError::Unsupported(format!(
-            "ss2sos currently supports only scale=\"none\", found `{other}`"
+            "ss2sos currently expects scale to be \"none\", \"inf\", or \"two\", found `{other}`"
         ))),
     }
 }
@@ -20598,9 +24115,9 @@ fn matrix_vector_product(
 }
 
 fn builtin_zp2ss(args: &[Value], output_arity: usize) -> Result<Vec<Value>, RuntimeError> {
-    if output_arity == 0 || output_arity > 4 {
+    if output_arity != 4 {
         return Err(RuntimeError::Unsupported(
-            "zp2ss currently supports one to four outputs".to_string(),
+            "zp2ss currently supports exactly four outputs".to_string(),
         ));
     }
     let [zeros, poles, gains] = args else {
@@ -20767,9 +24284,10 @@ fn zp2sos_outputs(
     zeros: Vec<ComplexParts>,
     poles: Vec<ComplexParts>,
     gain: ComplexParts,
+    keep_opposite_real_zero_pairs: bool,
     output_arity: usize,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let mut sections = zp2ctf_sections_from_roots(&zeros, &poles);
+    let mut sections = zp2sos_sections_from_roots(&zeros, &poles, keep_opposite_real_zero_pairs);
     if sections.is_empty() {
         sections.push(FiltfiltSection {
             numerator: vec![
@@ -20791,8 +24309,10 @@ fn zp2sos_outputs(
     }
     let mut sos_values = Vec::with_capacity(sections.len() * 6);
     for section in &sections {
-        sos_values.extend_from_slice(&section.numerator[..3]);
-        sos_values.extend_from_slice(&section.denominator[..3]);
+        let numerator = canonicalize_real_friendly_section_coefficients(&section.numerator);
+        let denominator = canonicalize_real_friendly_section_coefficients(&section.denominator);
+        sos_values.extend_from_slice(&numerator[..3]);
+        sos_values.extend_from_slice(&denominator[..3]);
     }
     let sos = build_numeric_or_complex_matrix_result(sections.len(), 6, sos_values)?;
     match output_arity {
@@ -24137,13 +27657,22 @@ fn complex_polynomial_roots(coefficients: &[ComplexParts]) -> Vec<ComplexParts> 
         return Vec::new();
     }
 
-    let mut roots = match coefficients.len() - 1 {
+    let trailing_zero_count = coefficients
+        .iter()
+        .rev()
+        .take_while(|value| value.is_approximately_zero())
+        .count();
+    let active_len = coefficients.len().saturating_sub(trailing_zero_count);
+
+    let mut roots = match active_len.saturating_sub(1) {
+        0 => Vec::new(),
         1 => vec![ComplexParts::zero()
             .minus(coefficients[1])
             .rdivide(coefficients[0])],
-        2 => quadratic_polynomial_roots(&coefficients),
-        _ => durand_kerner_polynomial_roots(&coefficients),
+        2 => quadratic_polynomial_roots(&coefficients[..active_len]),
+        _ => durand_kerner_polynomial_roots(&coefficients[..active_len]),
     };
+    roots.extend(std::iter::repeat(ComplexParts::zero()).take(trailing_zero_count));
     roots.sort_by(|lhs, rhs| {
         rhs.real
             .total_cmp(&lhs.real)
@@ -28311,6 +31840,7 @@ fn parse_filter_initial_conditions(
     zi: Option<&Value>,
     state_len: usize,
     sequence_count: usize,
+    state_dims: &[usize],
 ) -> Result<Vec<ComplexParts>, RuntimeError> {
     let zero_state = || vec![ComplexParts::zero(); state_len * sequence_count];
     let Some(zi) = zi else {
@@ -28331,25 +31861,37 @@ fn parse_filter_initial_conditions(
         ));
     }
 
-    let operand = numeric_or_complex_operand(zi, "filter")?;
-    if sequence_count == 1 && (operand.rows == 1 || operand.cols == 1) {
-        if operand.values.len() != state_len {
-            return Err(RuntimeError::ShapeError(format!(
-                "filter requires zi to have {} element(s) for the current coefficient lengths",
-                state_len
-            )));
+    let operand = numeric_or_complex_nd_operand(zi, "filter")?;
+    if operand.values.len() == state_len {
+        let mut state = zero_state();
+        for delay in 0..state_len {
+            for sequence in 0..sequence_count {
+                state[delay * sequence_count + sequence] = operand.values[delay];
+            }
         }
-        return Ok(operand.values);
+        return Ok(state);
     }
 
-    if operand.rows != state_len || operand.cols != sequence_count {
+    if canonical_size_vector(&operand.dims) != state_dims {
         return Err(RuntimeError::ShapeError(format!(
-            "filter requires zi to have size {}x{} for the current input shape and dimension",
-            state_len, sequence_count
+            "filter requires zi to have size {:?}, or a vector of length {}",
+            state_dims, state_len
         )));
     }
 
-    Ok(operand.values)
+    let reduced_dims = state_dims[1..].to_vec();
+    let mut state = zero_state();
+    for delay in 0..state_len {
+        for sequence in 0..sequence_count {
+            let reduced_index = row_major_multi_index(sequence, &reduced_dims);
+            let mut full_index = Vec::with_capacity(state_dims.len());
+            full_index.push(delay);
+            full_index.extend(reduced_index);
+            let linear = row_major_linear_index(&full_index, state_dims);
+            state[delay * sequence_count + sequence] = operand.values[linear];
+        }
+    }
+    Ok(state)
 }
 
 fn parse_ctffilt_initial_conditions(
@@ -28358,6 +31900,7 @@ fn parse_ctffilt_initial_conditions(
     section_count: usize,
     sequence_count: usize,
     state_dims: &[usize],
+    builtin_name: &str,
 ) -> Result<Vec<ComplexParts>, RuntimeError> {
     let total_state_len = section_state_len * section_count;
     let zero_state = || vec![ComplexParts::zero(); total_state_len * sequence_count];
@@ -28368,17 +31911,18 @@ fn parse_ctffilt_initial_conditions(
         return Ok(zero_state());
     }
     if total_state_len == 0 {
-        let operand = numeric_or_complex_operand(zi, "ctffilt")?;
+        let operand = numeric_or_complex_operand(zi, builtin_name)?;
         if operand.values.is_empty() {
             return Ok(Vec::new());
         }
         return Err(RuntimeError::ShapeError(
-            "ctffilt does not accept nonempty zi when the cascaded filter has zero state order"
-                .to_string(),
+            format!(
+                "{builtin_name} does not accept nonempty zi when the cascaded filter has zero state order"
+            ),
         ));
     }
 
-    let operand = numeric_or_complex_nd_operand(zi, "ctffilt")?;
+    let operand = numeric_or_complex_nd_operand(zi, builtin_name)?;
     if operand.values.len() == section_state_len {
         let mut state = zero_state();
         for section in 0..section_count {
@@ -28402,7 +31946,7 @@ fn parse_ctffilt_initial_conditions(
     }
     if canonical_size_vector(&operand.dims) != state_dims {
         return Err(RuntimeError::ShapeError(format!(
-            "ctffilt requires zi to have size {:?}, or a vector of length {} or {}",
+            "{builtin_name} requires zi to have size {:?}, or a vector of length {} or {}",
             state_dims, section_state_len, total_state_len
         )));
     }
@@ -28460,6 +32004,44 @@ fn filter_numeric_operand(
     }
     let sequence_count = filter_sequence_count(&normalized_dims, dim);
     let mut values = vec![ComplexParts::zero(); value.values.len()];
+    if normalized_dims.len() > 2 {
+        let sequence_dims = normalized_dims
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, &size)| (axis + 1 != dim).then_some(size))
+            .collect::<Vec<_>>();
+        let axis_len = normalized_dims[dim - 1];
+        for sequence_index in 0..sequence_count {
+            let reduced_index = row_major_multi_index(sequence_index, &sequence_dims);
+            for axis_value in 0..axis_len {
+                let mut full_index = Vec::with_capacity(normalized_dims.len());
+                let mut reduced_offset = 0usize;
+                for axis in 0..normalized_dims.len() {
+                    if axis + 1 == dim {
+                        full_index.push(axis_value);
+                    } else {
+                        full_index.push(reduced_index[reduced_offset]);
+                        reduced_offset += 1;
+                    }
+                }
+                let linear = row_major_linear_index(&full_index, &normalized_dims);
+                values[linear] = filter_step(
+                    value.values[linear],
+                    &b_padded,
+                    &a_padded,
+                    state,
+                    state_len,
+                    sequence_count,
+                    sequence_index,
+                );
+            }
+        }
+        return NumericOrComplexOperand {
+            rows: value.rows,
+            cols: value.cols,
+            values,
+        };
+    }
     match dim {
         1 => {
             for col in 0..value.cols {
@@ -28563,12 +32145,8 @@ fn filter_step(
     output
 }
 
-fn filter_state_value(
-    state: &[ComplexParts],
-    state_len: usize,
-    sequence_count: usize,
-) -> Result<Value, RuntimeError> {
-    build_numeric_or_complex_matrix_result(state_len, sequence_count, state.to_vec())
+fn filter_state_value(state: &[ComplexParts], state_dims: &[usize]) -> Result<Value, RuntimeError> {
+    build_numeric_or_complex_matrix_result_with_dimensions(state_dims.to_vec(), state.to_vec())
 }
 
 fn filtfilt_numeric_or_complex_nd(
@@ -48604,6 +52182,19 @@ fn numeric_or_complex_scalar(
             "{builtin_name} currently expects numeric, logical, or complex scalar/matrix input"
         ))),
     }
+}
+
+fn numeric_or_complex_scalar_operand(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<ComplexParts, RuntimeError> {
+    let operand = numeric_or_complex_operand(value, builtin_name)?;
+    if operand.values.len() != 1 {
+        return Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects a numeric or complex scalar input"
+        )));
+    }
+    Ok(operand.values[0])
 }
 
 #[derive(Debug, Clone)]
@@ -85611,9 +89202,10 @@ mod tests {
                     .expect("page filter output"),
                 ),
                 Value::Matrix(
-                    MatrixValue::new(
+                    MatrixValue::with_dimensions(
                         1,
                         6,
+                        vec![1, 2, 3],
                         vec![
                             Value::Scalar(1.0),
                             Value::Scalar(2.0),
@@ -85626,6 +89218,413 @@ mod tests {
                     .expect("page filter state"),
                 ),
             ]
+        );
+        let nd_input = Value::Matrix(
+            MatrixValue::with_dimensions(
+                2,
+                6,
+                vec![2, 3, 2],
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(2.0),
+                    Value::Scalar(3.0),
+                    Value::Scalar(4.0),
+                    Value::Scalar(5.0),
+                    Value::Scalar(6.0),
+                    Value::Scalar(7.0),
+                    Value::Scalar(8.0),
+                    Value::Scalar(9.0),
+                    Value::Scalar(10.0),
+                    Value::Scalar(11.0),
+                    Value::Scalar(12.0),
+                ],
+            )
+            .expect("nd filter input"),
+        );
+        let nd_filter = builtin_filter(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("nd filter b"),
+                ),
+                Value::Scalar(1.0),
+                nd_input,
+                Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("nd filter empty zi")),
+                Value::Scalar(2.0),
+            ],
+            2,
+        )
+        .expect("nd filter");
+        let Value::Matrix(nd_filter_state) = &nd_filter[1] else {
+            panic!("expected nd filter state matrix");
+        };
+        assert_eq!(nd_filter_state.dims(), &[1, 2, 2]);
+        assert_eq!(
+            nd_filter_state.elements(),
+            &[
+                Value::Scalar(5.0),
+                Value::Scalar(6.0),
+                Value::Scalar(11.0),
+                Value::Scalar(12.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn fftfilt_supports_current_numeric_forms() {
+        let fir = Value::Matrix(
+            MatrixValue::new(
+                1,
+                3,
+                vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(1.0)],
+            )
+            .expect("fftfilt fir"),
+        );
+        let signal = Value::Matrix(
+            MatrixValue::new(
+                3,
+                1,
+                vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(3.0)],
+            )
+            .expect("fftfilt signal"),
+        );
+        assert_eq!(
+            builtin_fftfilt(&[fir.clone(), signal.clone()]).expect("fftfilt vector"),
+            builtin_conv(&[fir.clone(), signal.clone()]).expect("conv vector")
+        );
+        assert_eq!(
+            builtin_fftfilt(&[fir.clone(), signal.clone(), Value::Scalar(3.0)])
+                .expect("fftfilt vector nfft"),
+            builtin_conv(&[fir.clone(), signal.clone()]).expect("conv vector nfft")
+        );
+
+        let fir_matrix = Value::Matrix(
+            MatrixValue::new(
+                2,
+                2,
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(1.0),
+                    Value::Scalar(1.0),
+                    Value::Scalar(-1.0),
+                ],
+            )
+            .expect("fftfilt fir matrix"),
+        );
+        assert_eq!(
+            builtin_fftfilt(&[fir_matrix, signal.clone()]).expect("fftfilt matrix filters"),
+            Value::Matrix(
+                MatrixValue::new(
+                    4,
+                    2,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(5.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(-3.0),
+                    ],
+                )
+                .expect("fftfilt matrix output"),
+            )
+        );
+
+        let matrix_signal = Value::Matrix(
+            MatrixValue::new(
+                3,
+                2,
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(2.0),
+                    Value::Scalar(3.0),
+                    Value::Scalar(4.0),
+                    Value::Scalar(5.0),
+                    Value::Scalar(6.0),
+                ],
+            )
+            .expect("fftfilt matrix signal"),
+        );
+        assert_eq!(
+            builtin_fftfilt(&[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("fftfilt shared fir"),
+                ),
+                matrix_signal,
+            ])
+            .expect("fftfilt shared fir matrix"),
+            Value::Matrix(
+                MatrixValue::new(
+                    4,
+                    2,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(4.0),
+                        Value::Scalar(6.0),
+                        Value::Scalar(8.0),
+                        Value::Scalar(10.0),
+                        Value::Scalar(5.0),
+                        Value::Scalar(6.0),
+                    ],
+                )
+                .expect("fftfilt shared fir output"),
+            )
+        );
+
+        let fir_filter = builtin_digital_filter(&[
+            Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    3,
+                    vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(0.0)],
+                )
+                .expect("fftfilt digitalFilter numerator"),
+            ),
+            Value::Scalar(1.0),
+        ])
+        .expect("fftfilt digitalFilter");
+        assert_eq!(
+            builtin_fftfilt(&[
+                fir_filter.clone(),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                        ],
+                    )
+                    .expect("fftfilt digitalFilter x"),
+                ),
+            ])
+            .expect("fftfilt digitalFilter"),
+            Value::Matrix(
+                MatrixValue::new(
+                    6,
+                    1,
+                    vec![
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(4.0),
+                        Value::Scalar(0.0),
+                    ],
+                )
+                .expect("fftfilt digitalFilter y"),
+            )
+        );
+        let fir_cascade_filter =
+            builtin_cascade(&[fir_filter.clone(), fir_filter]).expect("fftfilt fir cascade");
+        assert_eq!(
+            builtin_fftfilt(&[
+                fir_cascade_filter,
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                        ],
+                    )
+                    .expect("fftfilt fir cascade x"),
+                ),
+            ])
+            .expect("fftfilt fir cascade"),
+            Value::Matrix(
+                MatrixValue::new(
+                    8,
+                    1,
+                    vec![
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(3.0),
+                        Value::Scalar(4.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                    ],
+                )
+                .expect("fftfilt fir cascade y"),
+            )
+        );
+
+        let iir_filter = builtin_digital_filter(&[
+            Value::Scalar(0.5),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                    .expect("fftfilt iir denominator"),
+            ),
+        ])
+        .expect("fftfilt iir digitalFilter");
+        assert!(matches!(
+            builtin_fftfilt(&[iir_filter, signal]),
+            Err(RuntimeError::TypeError(message))
+                if message.contains("FIR digitalFilter object")
+        ));
+    }
+
+    #[test]
+    fn sosfilt_supports_current_numeric_forms() {
+        assert_eq!(
+            builtin_sosfilt(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.5),
+                            Value::Scalar(0.0),
+                        ],
+                    )
+                    .expect("sosfilt sos"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                        ],
+                    )
+                    .expect("sosfilt x"),
+                ),
+            ])
+            .expect("sosfilt basic"),
+            Value::Matrix(
+                MatrixValue::new(
+                    4,
+                    1,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(3.5),
+                        Value::Scalar(6.75),
+                        Value::Scalar(10.375),
+                    ],
+                )
+                .expect("sosfilt y"),
+            )
+        );
+        assert_eq!(
+            builtin_sosfilt(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.5),
+                            Value::Scalar(0.0),
+                        ],
+                    )
+                    .expect("sosfilt single sos"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(1.0), Value::Scalar(0.0), Value::Scalar(0.0)],
+                    )
+                    .expect("sosfilt single x"),
+                ),
+            ])
+            .expect("sosfilt single section"),
+            Value::Matrix(
+                MatrixValue::new(
+                    3,
+                    1,
+                    vec![Value::Scalar(1.0), Value::Scalar(0.5), Value::Scalar(0.25)],
+                )
+                .expect("sosfilt single y"),
+            )
+        );
+        assert_eq!(
+            builtin_sosfilt(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.5),
+                            Value::Scalar(0.0),
+                        ],
+                    )
+                    .expect("sosfilt dim sos"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        4,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(4.0),
+                            Value::Scalar(10.0),
+                            Value::Scalar(20.0),
+                            Value::Scalar(30.0),
+                            Value::Scalar(40.0),
+                        ],
+                    )
+                    .expect("sosfilt dim x"),
+                ),
+                Value::Scalar(2.0),
+            ])
+            .expect("sosfilt dim"),
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    4,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(3.5),
+                        Value::Scalar(6.75),
+                        Value::Scalar(10.375),
+                        Value::Scalar(10.0),
+                        Value::Scalar(35.0),
+                        Value::Scalar(67.5),
+                        Value::Scalar(103.75),
+                    ],
+                )
+                .expect("sosfilt dim y"),
+            )
         );
     }
 
@@ -85678,6 +89677,54 @@ mod tests {
             Value::Matrix(
                 MatrixValue::new(1, 7, vec![Value::Scalar(1.0); 7]).expect("filtfilt row y"),
             )
+        );
+        assert_eq!(
+            builtin_filtfilt(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.5),
+                            Value::Scalar(0.0),
+                        ],
+                    )
+                    .expect("filtfilt sos-row numerator"),
+                ),
+                Value::Scalar(2.0),
+                Value::Matrix(
+                    MatrixValue::new(31, 1, vec![Value::Scalar(1.0); 31])
+                        .expect("filtfilt sos-row x"),
+                ),
+            ])
+            .expect("filtfilt sos-row"),
+            builtin_filtfilt(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        6,
+                        vec![
+                            Value::Scalar(2.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(-1.0),
+                            Value::Scalar(0.0),
+                        ],
+                    )
+                    .expect("filtfilt sos-row explicit b"),
+                ),
+                Value::Scalar(1.0),
+                Value::Matrix(
+                    MatrixValue::new(31, 1, vec![Value::Scalar(1.0); 31])
+                        .expect("filtfilt sos-row explicit x"),
+                ),
+            ])
+            .expect("filtfilt sos-row explicit"),
         );
         assert_eq!(
             builtin_filtfilt(&[
@@ -85960,6 +90007,96 @@ mod tests {
             )
         );
         assert_eq!(
+            builtin_ctffilt(
+                &[
+                    Value::Scalar(2.0),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            2,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(-0.5),
+                                Value::Scalar(1.0),
+                                Value::Scalar(-0.25),
+                            ],
+                        )
+                        .expect("ctffilt scalar B A"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(4, 1, vec![Value::Scalar(1.0); 4])
+                            .expect("ctffilt scalar B x"),
+                    ),
+                ],
+                1
+            )
+            .expect("ctffilt scalar B"),
+            vec![Value::Matrix(
+                MatrixValue::new(
+                    4,
+                    1,
+                    vec![
+                        Value::Scalar(4.0),
+                        Value::Scalar(7.0),
+                        Value::Scalar(8.75),
+                        Value::Scalar(9.6875),
+                    ],
+                )
+                .expect("ctffilt scalar B y"),
+            )]
+        );
+        assert_eq!(
+            builtin_freqz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            2,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(1.0),
+                            ],
+                        )
+                        .expect("freqz scalar A B"),
+                    ),
+                    Value::Scalar(2.0),
+                    Value::String("ctf".to_string()),
+                    Value::Scalar(2.0),
+                ],
+                2,
+            )
+            .expect("freqz scalar A"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Complex(ComplexValue {
+                                real: 0.0,
+                                imag: -0.5,
+                            }),
+                        ],
+                    )
+                    .expect("freqz scalar A h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(std::f64::consts::FRAC_PI_2)
+                        ],
+                    )
+                    .expect("freqz scalar A w"),
+                ),
+            ]
+        );
+        assert_eq!(
             builtin_sos2tf(
                 &[Value::Matrix(
                     MatrixValue::new(
@@ -86016,6 +90153,34 @@ mod tests {
                 ),
             ]
         );
+        assert!(matches!(
+            builtin_sos2tf(
+                &[Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(-1.0),
+                            Value::Scalar(-2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(10.0),
+                            Value::Scalar(1.0),
+                        ],
+                    )
+                    .expect("sos2tf arity sos"),
+                )],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly two outputs")
+        ));
         assert_eq!(
             builtin_sos2ctf(
                 &[Value::Matrix(
@@ -86075,6 +90240,34 @@ mod tests {
                 ),
             ]
         );
+        assert!(matches!(
+            builtin_sos2ctf(
+                &[Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        6,
+                        vec![
+                            Value::Scalar(2.0),
+                            Value::Scalar(4.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                        ],
+                    )
+                    .expect("sos2ctf arity sos"),
+                )],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly two outputs")
+        ));
         assert_eq!(
             builtin_ctffilt(
                 &[
@@ -86153,6 +90346,103 @@ mod tests {
                     .expect("ctffilt zf"),
                 ),
             ]
+        );
+        assert_eq!(
+            builtin_ctffilt(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(0.0),],
+                        )
+                        .expect("ctffilt nd b"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(0.0), Value::Scalar(0.0),],
+                        )
+                        .expect("ctffilt nd a"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::with_dimensions(
+                            2,
+                            6,
+                            vec![2, 3, 2],
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                                Value::Scalar(5.0),
+                                Value::Scalar(6.0),
+                                Value::Scalar(7.0),
+                                Value::Scalar(8.0),
+                                Value::Scalar(9.0),
+                                Value::Scalar(10.0),
+                                Value::Scalar(11.0),
+                                Value::Scalar(12.0),
+                            ],
+                        )
+                        .expect("ctffilt nd x"),
+                    ),
+                    Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("ctffilt nd empty zi")),
+                    Value::String("Dimension".to_string()),
+                    Value::Scalar(2.0),
+                ],
+                2,
+            )
+            .expect("ctffilt nd"),
+            builtin_filter(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(0.0),],
+                        )
+                        .expect("ctffilt nd filter b"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(0.0), Value::Scalar(0.0),],
+                        )
+                        .expect("ctffilt nd filter a"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::with_dimensions(
+                            2,
+                            6,
+                            vec![2, 3, 2],
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                                Value::Scalar(5.0),
+                                Value::Scalar(6.0),
+                                Value::Scalar(7.0),
+                                Value::Scalar(8.0),
+                                Value::Scalar(9.0),
+                                Value::Scalar(10.0),
+                                Value::Scalar(11.0),
+                                Value::Scalar(12.0),
+                            ],
+                        )
+                        .expect("ctffilt nd filter x"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(0, 0, Vec::new()).expect("ctffilt nd filter empty zi"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                2,
+            )
+            .expect("ctffilt nd filter"),
         );
         assert_eq!(
             builtin_zp2ctf(
@@ -86249,6 +90539,1535 @@ mod tests {
                 Value::Scalar(2.0),
             ]
         );
+        assert!(matches!(
+            builtin_ctf2zp(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(0.0),],
+                        )
+                        .expect("ctf2zp arity b"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5),],
+                        )
+                        .expect("ctf2zp arity a"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("two or three outputs")
+        ));
+        assert_eq!(
+            builtin_ctf2zp(
+                &[Value::Cell(
+                    CellValue::new(
+                        1,
+                        3,
+                        vec![
+                            Value::Matrix(
+                                MatrixValue::new(
+                                    1,
+                                    3,
+                                    vec![
+                                        Value::Scalar(1.0),
+                                        Value::Scalar(1.0),
+                                        Value::Scalar(0.0),
+                                    ],
+                                )
+                                .expect("ctf2zp cell b"),
+                            ),
+                            Value::Matrix(
+                                MatrixValue::new(
+                                    1,
+                                    3,
+                                    vec![
+                                        Value::Scalar(1.0),
+                                        Value::Scalar(-1.0),
+                                        Value::Scalar(0.5),
+                                    ],
+                                )
+                                .expect("ctf2zp cell a"),
+                            ),
+                            Value::Scalar(2.0),
+                        ],
+                    )
+                    .expect("ctf2zp cell"),
+                )],
+                3,
+            )
+            .expect("ctf2zp cell"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(0.0), Value::Scalar(-1.0)],)
+                        .expect("ctf2zp cell z"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        1,
+                        vec![
+                            Value::Complex(ComplexValue {
+                                real: 0.5,
+                                imag: 0.5,
+                            }),
+                            Value::Complex(ComplexValue {
+                                real: 0.5,
+                                imag: -0.5,
+                            }),
+                        ],
+                    )
+                    .expect("ctf2zp cell p"),
+                ),
+                Value::Scalar(2.0),
+            ]
+        );
+        assert_eq!(
+            builtin_ctf2sos(
+                &[Value::Cell(
+                    CellValue::new(
+                        1,
+                        3,
+                        vec![
+                            Value::Matrix(
+                                MatrixValue::new(
+                                    1,
+                                    3,
+                                    vec![
+                                        Value::Scalar(1.0),
+                                        Value::Scalar(1.0),
+                                        Value::Scalar(0.0),
+                                    ],
+                                )
+                                .expect("ctf2sos cell b"),
+                            ),
+                            Value::Matrix(
+                                MatrixValue::new(
+                                    1,
+                                    3,
+                                    vec![
+                                        Value::Scalar(1.0),
+                                        Value::Scalar(-1.0),
+                                        Value::Scalar(0.5),
+                                    ],
+                                )
+                                .expect("ctf2sos cell a"),
+                            ),
+                            Value::Scalar(2.0),
+                        ],
+                    )
+                    .expect("ctf2sos cell"),
+                )],
+                2,
+            )
+            .expect("ctf2sos cell"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.0),
+                            Value::Scalar(0.5),
+                        ],
+                    )
+                    .expect("ctf2sos cell sos"),
+                ),
+                Value::Scalar(2.0),
+            ]
+        );
+        let digital_filter = builtin_digital_filter(&[
+            Value::Scalar(0.5),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                    .expect("digitalFilter denominator"),
+            ),
+        ])
+        .expect("digitalFilter");
+        let Value::Object(digital_filter_object) = &digital_filter else {
+            panic!("expected digitalFilter object");
+        };
+        assert_eq!(
+            digital_filter_object.class.qualified_name(),
+            "digitalFilter"
+        );
+        assert_eq!(
+            digital_filter_object.property_value("NormalizedFrequency"),
+            Some(Value::Logical(true))
+        );
+        assert_eq!(
+            builtin_isstable(&[digital_filter.clone()]).expect("isstable digitalFilter"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_filtord(&[digital_filter.clone()]).expect("filtord digitalFilter"),
+            Value::Scalar(1.0)
+        );
+        assert_eq!(
+            builtin_impzlength(&[digital_filter.clone()]).expect("impzlength digitalFilter"),
+            Value::Scalar(14.0)
+        );
+        let digital_filter_minphase = builtin_digital_filter(&[
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.25)])
+                    .expect("digitalFilter minphase numerator"),
+            ),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                    .expect("digitalFilter minphase denominator"),
+            ),
+        ])
+        .expect("digitalFilter minphase");
+        let digital_filter_maxphase = builtin_digital_filter(&[
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-2.0)])
+                    .expect("digitalFilter maxphase numerator"),
+            ),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                    .expect("digitalFilter maxphase denominator"),
+            ),
+        ])
+        .expect("digitalFilter maxphase");
+        let digital_filter_allpass = builtin_digital_filter(&[
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                    .expect("digitalFilter allpass numerator"),
+            ),
+            Value::Scalar(1.0),
+        ])
+        .expect("digitalFilter allpass");
+        assert_eq!(
+            builtin_isminphase(&[digital_filter_minphase.clone()])
+                .expect("isminphase minphase digitalFilter"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_ismaxphase(&[digital_filter_minphase])
+                .expect("ismaxphase minphase digitalFilter"),
+            Value::Logical(false)
+        );
+        assert_eq!(
+            builtin_isminphase(&[digital_filter_maxphase.clone()])
+                .expect("isminphase maxphase digitalFilter"),
+            Value::Logical(false)
+        );
+        assert_eq!(
+            builtin_ismaxphase(&[digital_filter_maxphase])
+                .expect("ismaxphase maxphase digitalFilter"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_isallpass(&[digital_filter_allpass]).expect("isallpass digitalFilter"),
+            Value::Logical(true)
+        );
+        let digital_filter_freqz = builtin_freqz(&[digital_filter.clone(), Value::Scalar(4.0)], 2)
+            .expect("freqz digitalFilter");
+        let ctf_cell = Value::Cell(
+            CellValue::new(
+                1,
+                3,
+                vec![
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("digitalFilter cell denominator"),
+                    ),
+                    Value::Scalar(1.0),
+                ],
+            )
+            .expect("digitalFilter ctf cell"),
+        );
+        assert_eq!(
+            digital_filter_freqz,
+            builtin_freqz(
+                &[
+                    ctf_cell.clone(),
+                    Value::String("ctf".to_string()),
+                    Value::Scalar(4.0)
+                ],
+                2,
+            )
+            .expect("freqz ctf cell")
+        );
+        assert_eq!(
+            builtin_impz(&[digital_filter.clone(), Value::Scalar(4.0)], 2)
+                .expect("impz digitalFilter"),
+            builtin_impz(
+                &[
+                    ctf_cell.clone(),
+                    Value::String("ctf".to_string()),
+                    Value::Scalar(4.0)
+                ],
+                2,
+            )
+            .expect("impz ctf cell")
+        );
+        assert_eq!(
+            builtin_filtfilt(&[
+                digital_filter.clone(),
+                Value::Matrix(
+                    MatrixValue::new(7, 1, vec![Value::Scalar(1.0); 7])
+                        .expect("digitalFilter filtfilt x"),
+                ),
+            ])
+            .expect("filtfilt digitalFilter"),
+            builtin_filtfilt(&[
+                ctf_cell.clone(),
+                Value::Matrix(
+                    MatrixValue::new(7, 1, vec![Value::Scalar(1.0); 7])
+                        .expect("ctf cell filtfilt x"),
+                ),
+            ])
+            .expect("filtfilt ctf cell")
+        );
+        let digital_filter_cascade_for_filtfilt =
+            builtin_cascade(&[digital_filter.clone(), digital_filter.clone()])
+                .expect("cascade digitalFilter filtfilt");
+        let cascade_ctf_for_filtfilt =
+            builtin_ctf(&[digital_filter_cascade_for_filtfilt.clone()], 3)
+                .expect("ctf cascade digitalFilter filtfilt");
+        let cascade_ctf_cell_for_filtfilt = Value::Cell(
+            CellValue::new(
+                1,
+                3,
+                vec![
+                    cascade_ctf_for_filtfilt[0].clone(),
+                    cascade_ctf_for_filtfilt[1].clone(),
+                    cascade_ctf_for_filtfilt[2].clone(),
+                ],
+            )
+            .expect("cascade filtfilt ctf cell"),
+        );
+        assert_eq!(
+            builtin_filtfilt(&[
+                digital_filter_cascade_for_filtfilt,
+                Value::Matrix(
+                    MatrixValue::new(7, 1, vec![Value::Scalar(1.0); 7])
+                        .expect("cascade digitalFilter filtfilt x"),
+                ),
+            ])
+            .expect("filtfilt cascade digitalFilter"),
+            builtin_filtfilt(&[
+                cascade_ctf_cell_for_filtfilt,
+                Value::Matrix(
+                    MatrixValue::new(7, 1, vec![Value::Scalar(1.0); 7])
+                        .expect("cascade ctf cell filtfilt x"),
+                ),
+            ])
+            .expect("filtfilt cascade ctf cell")
+        );
+        assert_eq!(
+            builtin_filter(
+                &[
+                    digital_filter.clone(),
+                    Value::Matrix(
+                        MatrixValue::with_dimensions(
+                            2,
+                            6,
+                            vec![2, 3, 2],
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                                Value::Scalar(5.0),
+                                Value::Scalar(6.0),
+                                Value::Scalar(7.0),
+                                Value::Scalar(8.0),
+                                Value::Scalar(9.0),
+                                Value::Scalar(10.0),
+                                Value::Scalar(11.0),
+                                Value::Scalar(12.0),
+                            ],
+                        )
+                        .expect("digitalFilter nd x"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(0, 0, Vec::new()).expect("digitalFilter nd empty zi"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                2,
+            )
+            .expect("filter digitalFilter nd"),
+            builtin_filter(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("digitalFilter nd denominator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::with_dimensions(
+                            2,
+                            6,
+                            vec![2, 3, 2],
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                                Value::Scalar(5.0),
+                                Value::Scalar(6.0),
+                                Value::Scalar(7.0),
+                                Value::Scalar(8.0),
+                                Value::Scalar(9.0),
+                                Value::Scalar(10.0),
+                                Value::Scalar(11.0),
+                                Value::Scalar(12.0),
+                            ],
+                        )
+                        .expect("digitalFilter nd tf x"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(0, 0, Vec::new()).expect("digitalFilter nd tf empty zi"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                2,
+            )
+            .expect("filter transfer function nd")
+        );
+        assert_eq!(
+            builtin_filter(
+                &[
+                    digital_filter.clone(),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            4,
+                            1,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                            ],
+                        )
+                        .expect("digitalFilter filter x"),
+                    ),
+                ],
+                2,
+            )
+            .expect("filter digitalFilter"),
+            builtin_filter(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("digitalFilter filter denominator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            4,
+                            1,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                            ],
+                        )
+                        .expect("digitalFilter filter tf x"),
+                    ),
+                ],
+                2,
+            )
+            .expect("filter transfer function")
+        );
+        assert_eq!(
+            builtin_filter(
+                &[
+                    digital_filter.clone(),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            4,
+                            1,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                            ],
+                        )
+                        .expect("digitalFilter filter zi x"),
+                    ),
+                    Value::Scalar(0.25),
+                ],
+                2,
+            )
+            .expect("filter digitalFilter zi"),
+            builtin_filter(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("digitalFilter filter zi denominator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            4,
+                            1,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                            ],
+                        )
+                        .expect("digitalFilter filter zi tf x"),
+                    ),
+                    Value::Scalar(0.25),
+                ],
+                2,
+            )
+            .expect("filter transfer function zi")
+        );
+        assert_eq!(
+            builtin_ctf(&[digital_filter.clone()], 2).expect("ctf digitalFilter"),
+            vec![
+                Value::Scalar(0.5),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                        .expect("ctf digitalFilter denominator"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_ctf(&[digital_filter.clone()], 3).expect("ctf digitalFilter sv"),
+            vec![
+                Value::Scalar(0.5),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                        .expect("ctf digitalFilter denominator with sv"),
+                ),
+                Value::Scalar(1.0),
+            ]
+        );
+        assert!(matches!(
+            builtin_ctf(&[digital_filter.clone()], 1),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("two or three outputs")
+        ));
+        assert_eq!(
+            builtin_tf(&[digital_filter.clone()], 2).expect("tf digitalFilter"),
+            vec![
+                Value::Scalar(0.5),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                        .expect("tf digitalFilter denominator"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_zpk(&[digital_filter.clone()], 3).expect("zpk digitalFilter"),
+            vec![
+                Value::Matrix(MatrixValue::new(0, 1, Vec::new()).expect("zpk digitalFilter z")),
+                Value::Matrix(
+                    MatrixValue::new(1, 1, vec![Value::Scalar(0.5)]).expect("zpk digitalFilter p"),
+                ),
+                Value::Scalar(0.5),
+            ]
+        );
+        assert!(matches!(
+            builtin_zpk(&[digital_filter.clone()], 1),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly three outputs")
+        ));
+        assert_eq!(
+            builtin_isdouble(&[digital_filter.clone()]).expect("isdouble digitalFilter"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_issingle(&[digital_filter.clone()]).expect("issingle digitalFilter"),
+            Value::Logical(false)
+        );
+        let digital_filter_double =
+            builtin_double(&[digital_filter.clone()]).expect("double digitalFilter");
+        assert_eq!(
+            builtin_ctf(&[digital_filter_double.clone()], 3).expect("ctf double digitalFilter"),
+            builtin_ctf(&[digital_filter.clone()], 3).expect("ctf original digitalFilter")
+        );
+        assert_eq!(
+            builtin_isdouble(&[digital_filter_double]).expect("isdouble double digitalFilter"),
+            Value::Logical(true)
+        );
+        let digital_filter_single =
+            builtin_single(&[digital_filter.clone()]).expect("single digitalFilter");
+        assert_eq!(
+            builtin_isdouble(&[digital_filter_single.clone()])
+                .expect("isdouble single digitalFilter"),
+            Value::Logical(false)
+        );
+        assert_eq!(
+            builtin_issingle(&[digital_filter_single.clone()])
+                .expect("issingle single digitalFilter"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_ctf(&[digital_filter_single], 3).expect("ctf single digitalFilter"),
+            vec![
+                Value::Scalar(0.5),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                        .expect("ctf single digitalFilter denominator"),
+                ),
+                Value::Scalar(1.0),
+            ]
+        );
+        let digital_filter_fir = builtin_digital_filter(&[
+            Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    3,
+                    vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(0.0)],
+                )
+                .expect("digitalFilter fir numerator"),
+            ),
+            Value::Scalar(1.0),
+        ])
+        .expect("digitalFilter fir");
+        let Value::CharArray(digital_filter_fir_info) =
+            builtin_info(&[digital_filter_fir.clone()]).expect("info fir digitalFilter")
+        else {
+            panic!("expected FIR digitalFilter info text");
+        };
+        assert_eq!(
+            builtin_isfir(&[digital_filter_fir.clone()]).expect("isfir fir digitalFilter"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_islinphase(&[digital_filter_fir.clone()])
+                .expect("islinphase fir digitalFilter"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_firtype(&[digital_filter_fir.clone()]).expect("firtype fir digitalFilter"),
+            Value::Scalar(1.0)
+        );
+        assert_eq!(
+            builtin_filtord(&[digital_filter_fir.clone()]).expect("filtord fir digitalFilter"),
+            Value::Scalar(1.0)
+        );
+        assert_eq!(
+            builtin_impzlength(&[digital_filter_fir.clone()])
+                .expect("impzlength fir digitalFilter"),
+            Value::Scalar(3.0)
+        );
+        assert_eq!(
+            builtin_impz(&[digital_filter_fir.clone(), Value::Scalar(3.0)], 2)
+                .expect("impz fir digitalFilter"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(0.0)],
+                    )
+                    .expect("impz fir digitalFilter h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(2.0)],
+                    )
+                    .expect("impz fir digitalFilter t"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_stepz(&[digital_filter_fir.clone(), Value::Scalar(3.0)], 2)
+                .expect("stepz fir digitalFilter"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(1.0)],
+                    )
+                    .expect("stepz fir digitalFilter h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(2.0)],
+                    )
+                    .expect("stepz fir digitalFilter t"),
+                ),
+            ]
+        );
+        assert!(digital_filter_fir_info.contains("Filter Order     : 2"));
+        assert!(digital_filter_fir_info.contains("Filter Length    : 3"));
+        assert!(digital_filter_fir_info.contains("Linear Phase     : Yes (Type 1)"));
+        assert!(digital_filter_fir_info.contains("Minimum Phase    : Yes"));
+        assert!(digital_filter_fir_info.contains("Maximum Phase    : Yes"));
+        assert_eq!(
+            builtin_ss(&[digital_filter.clone()], 4).expect("ss digitalFilter"),
+            builtin_tf2ss(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("ss digitalFilter denominator"),
+                    ),
+                ],
+                4,
+            )
+            .expect("tf2ss digitalFilter equivalent")
+        );
+        assert!(matches!(
+            builtin_ss(&[digital_filter.clone()], 1),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly four outputs")
+        ));
+        let digital_filter_fs = builtin_digital_filter(&[
+            Value::Scalar(0.5),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                    .expect("digitalFilter fs denominator"),
+            ),
+            Value::String("SampleRate".to_string()),
+            Value::Scalar(8.0),
+        ])
+        .expect("digitalFilter SampleRate");
+        let Value::Object(digital_filter_fs_object) = &digital_filter_fs else {
+            panic!("expected digitalFilter object with sample rate");
+        };
+        assert_eq!(
+            digital_filter_fs_object.property_value("NormalizedFrequency"),
+            Some(Value::Logical(false))
+        );
+        assert_eq!(
+            digital_filter_fs_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        assert_eq!(
+            builtin_freqz(&[digital_filter_fs.clone(), Value::Scalar(4.0)], 2)
+                .expect("freqz digitalFilter SampleRate"),
+            builtin_freqz(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("freqz digitalFilter SampleRate denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("freqz transfer function SampleRate")
+        );
+        assert_eq!(
+            builtin_phasez(&[digital_filter_fs.clone(), Value::Scalar(4.0)], 2)
+                .expect("phasez digitalFilter SampleRate"),
+            builtin_phasez(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("phasez digitalFilter SampleRate denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("phasez transfer function SampleRate")
+        );
+        assert_eq!(
+            builtin_grpdelay(&[digital_filter_fs.clone(), Value::Scalar(4.0)], 2)
+                .expect("grpdelay digitalFilter SampleRate"),
+            builtin_grpdelay(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("grpdelay digitalFilter SampleRate denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("grpdelay transfer function SampleRate")
+        );
+        assert_eq!(
+            builtin_phasedelay(&[digital_filter_fs.clone(), Value::Scalar(4.0)], 2)
+                .expect("phasedelay digitalFilter SampleRate"),
+            builtin_phasedelay(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("phasedelay digitalFilter SampleRate denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("phasedelay transfer function SampleRate")
+        );
+        assert_eq!(
+            builtin_zerophase(&[digital_filter_fs.clone(), Value::Scalar(4.0)], 3)
+                .expect("zerophase digitalFilter SampleRate"),
+            builtin_zerophase(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("zerophase digitalFilter SampleRate denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                3,
+            )
+            .expect("zerophase transfer function SampleRate")
+        );
+        assert_eq!(
+            builtin_impz(&[digital_filter_fs.clone(), Value::Scalar(4.0)], 2)
+                .expect("impz digitalFilter SampleRate"),
+            builtin_impz(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("impz digitalFilter SampleRate denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("impz transfer function SampleRate")
+        );
+        assert_eq!(
+            builtin_stepz(&[digital_filter_fs.clone(), Value::Scalar(4.0)], 2)
+                .expect("stepz digitalFilter SampleRate"),
+            builtin_stepz(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("stepz digitalFilter SampleRate denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("stepz transfer function SampleRate")
+        );
+        let digital_filter_cascade_auto =
+            builtin_cascade(&[digital_filter.clone(), digital_filter_fs.clone()])
+                .expect("cascade auto digitalFilter");
+        let Value::Object(digital_filter_cascade_auto_object) = &digital_filter_cascade_auto else {
+            panic!("expected auto cascade digitalFilter");
+        };
+        assert_eq!(
+            digital_filter_cascade_auto_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        let cascade_auto_stage1 = digital_filter_cascade_auto_object
+            .property_value("Stage1")
+            .expect("auto cascade stage1");
+        let cascade_auto_stage2 = digital_filter_cascade_auto_object
+            .property_value("Stage2")
+            .expect("auto cascade stage2");
+        let Value::Object(cascade_auto_stage1_object) = &cascade_auto_stage1 else {
+            panic!("expected auto cascade stage1 digitalFilter");
+        };
+        let Value::Object(cascade_auto_stage2_object) = &cascade_auto_stage2 else {
+            panic!("expected auto cascade stage2 digitalFilter");
+        };
+        assert_eq!(
+            cascade_auto_stage1_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        assert_eq!(
+            cascade_auto_stage2_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        let digital_filter_fs_alt = builtin_digital_filter(&[
+            Value::Scalar(0.5),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                    .expect("digitalFilter alt fs denominator"),
+            ),
+            Value::String("SampleRate".to_string()),
+            Value::Scalar(16.0),
+        ])
+        .expect("digitalFilter alt SampleRate");
+        assert!(matches!(
+            builtin_cascade(&[digital_filter_fs.clone(), digital_filter_fs_alt.clone()]),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("auto SampleRate resolution")
+        ));
+        let digital_filter_cascade_explicit = builtin_cascade(&[
+            digital_filter_fs.clone(),
+            digital_filter_fs_alt,
+            Value::String("SampleRate".to_string()),
+            Value::Scalar(4.0),
+        ])
+        .expect("cascade explicit SampleRate");
+        let Value::Object(digital_filter_cascade_explicit_object) =
+            &digital_filter_cascade_explicit
+        else {
+            panic!("expected explicit cascade digitalFilter");
+        };
+        assert_eq!(
+            digital_filter_cascade_explicit_object.property_value("SampleRate"),
+            Some(Value::Scalar(4.0))
+        );
+        let digital_filter_cascade_normalized = builtin_cascade(&[
+            digital_filter_fs.clone(),
+            digital_filter.clone(),
+            Value::String("SampleRate".to_string()),
+            Value::String("normalized".to_string()),
+        ])
+        .expect("cascade normalized SampleRate");
+        let Value::Object(digital_filter_cascade_normalized_object) =
+            &digital_filter_cascade_normalized
+        else {
+            panic!("expected normalized cascade digitalFilter");
+        };
+        assert_eq!(
+            digital_filter_cascade_normalized_object.property_value("NormalizedFrequency"),
+            Some(Value::Logical(true))
+        );
+        assert_eq!(
+            digital_filter_cascade_normalized_object.property_value("SampleRate"),
+            None
+        );
+        let digital_filter_set = builtin_digital_filter(&[
+            Value::Scalar(0.5),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                    .expect("digitalFilter setSampleRate denominator"),
+            ),
+        ])
+        .expect("digitalFilter setSampleRate");
+        builtin_set_sample_rate(&[digital_filter_set.clone(), Value::Scalar(8.0)], 0)
+            .expect("setSampleRate digitalFilter");
+        let Value::Object(digital_filter_set_object) = &digital_filter_set else {
+            panic!("expected digitalFilter setSampleRate handle");
+        };
+        assert_eq!(
+            digital_filter_set_object.property_value("NormalizedFrequency"),
+            Some(Value::Logical(false))
+        );
+        assert_eq!(
+            digital_filter_set_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        assert_eq!(
+            builtin_freqz(&[digital_filter_set.clone(), Value::Scalar(4.0)], 2)
+                .expect("freqz setSampleRate digitalFilter"),
+            builtin_freqz(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("freqz setSampleRate denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("freqz setSampleRate transfer function")
+        );
+        builtin_set_sample_rate(
+            &[
+                digital_filter_set.clone(),
+                Value::String("normalized".to_string()),
+            ],
+            0,
+        )
+        .expect("setSampleRate renormalize digitalFilter");
+        assert_eq!(
+            builtin_freqz(&[digital_filter_set.clone(), Value::Scalar(4.0)], 2)
+                .expect("freqz renormalized digitalFilter"),
+            builtin_freqz(
+                &[
+                    Value::Scalar(0.5),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("freqz renormalized denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                ],
+                2,
+            )
+            .expect("freqz renormalized transfer function")
+        );
+        let digital_filter_cascade =
+            builtin_cascade(&[digital_filter.clone(), digital_filter.clone()])
+                .expect("cascade digitalFilter");
+        let digital_filter_nested_stage =
+            builtin_cascade(&[digital_filter.clone(), digital_filter.clone()])
+                .expect("nested stage cascade digitalFilter");
+        let digital_filter_nested_cascade =
+            builtin_cascade(&[digital_filter.clone(), digital_filter_nested_stage.clone()])
+                .expect("nested cascade digitalFilter");
+        assert_eq!(
+            builtin_get_num_stages(&[digital_filter.clone()]).expect("getNumStages digitalFilter"),
+            Value::Scalar(1.0)
+        );
+        assert_eq!(
+            builtin_get_num_stages(&[digital_filter_cascade.clone()])
+                .expect("getNumStages cascade digitalFilter"),
+            Value::Scalar(2.0)
+        );
+        assert_eq!(
+            builtin_get_num_stages(&[digital_filter_nested_cascade.clone()])
+                .expect("getNumStages nested cascade digitalFilter"),
+            Value::Scalar(2.0)
+        );
+        let Value::Object(digital_filter_nested_cascade_object) = &digital_filter_nested_cascade
+        else {
+            panic!("expected nested cascade digitalFilter");
+        };
+        let nested_stage2 = digital_filter_nested_cascade_object
+            .property_value("Stage2")
+            .expect("nested cascade stage2");
+        assert_eq!(
+            builtin_get_num_stages(&[nested_stage2.clone()])
+                .expect("getNumStages nested cascade stage2"),
+            Value::Scalar(2.0)
+        );
+        let digital_filter_many_stage_inputs = vec![digital_filter.clone(); 16];
+        let digital_filter_cascade_many = builtin_cascade(&digital_filter_many_stage_inputs)
+            .expect("16-stage cascade digitalFilter");
+        assert_eq!(
+            builtin_get_num_stages(&[digital_filter_cascade_many.clone()])
+                .expect("getNumStages 16-stage cascade digitalFilter"),
+            Value::Scalar(16.0)
+        );
+        let Value::Object(digital_filter_cascade_many_object) = &digital_filter_cascade_many else {
+            panic!("expected 16-stage cascade digitalFilter");
+        };
+        assert!(digital_filter_cascade_many_object
+            .property_value("Stage16")
+            .is_some());
+        assert_eq!(
+            builtin_isdouble(&[digital_filter_cascade.clone()])
+                .expect("isdouble cascade digitalFilter"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_issingle(&[digital_filter_cascade.clone()])
+                .expect("issingle cascade digitalFilter"),
+            Value::Logical(false)
+        );
+        let digital_filter_cascade_single = builtin_single(&[digital_filter_cascade.clone()])
+            .expect("single cascade digitalFilter");
+        assert_eq!(
+            builtin_isdouble(&[digital_filter_cascade_single.clone()])
+                .expect("isdouble single cascade digitalFilter"),
+            Value::Logical(false)
+        );
+        assert_eq!(
+            builtin_issingle(&[digital_filter_cascade_single.clone()])
+                .expect("issingle single cascade digitalFilter"),
+            Value::Logical(true)
+        );
+        let Value::Object(digital_filter_cascade_single_object) = &digital_filter_cascade_single
+        else {
+            panic!("expected single cascade digitalFilter object");
+        };
+        let cascade_single_stage1 = digital_filter_cascade_single_object
+            .property_value("Stage1")
+            .expect("single cascade stage1");
+        assert_eq!(
+            builtin_issingle(&[cascade_single_stage1]).expect("issingle single cascade stage1"),
+            Value::Logical(true)
+        );
+        let digital_filter_single_mixed =
+            builtin_single(&[digital_filter.clone()]).expect("single mixed digitalFilter");
+        assert!(matches!(
+            builtin_cascade(&[digital_filter.clone(), digital_filter_single_mixed]),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("same arithmetic format")
+        ));
+        builtin_set_sample_rate(&[digital_filter_cascade.clone(), Value::Scalar(8.0)], 0)
+            .expect("setSampleRate cascade digitalFilter");
+        let Value::Object(digital_filter_cascade_object) = &digital_filter_cascade else {
+            panic!("expected cascade digitalFilter handle");
+        };
+        assert_eq!(
+            digital_filter_cascade_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        let cascade_stage1 = digital_filter_cascade_object
+            .property_value("Stage1")
+            .expect("cascade stage1");
+        let cascade_stage2 = digital_filter_cascade_object
+            .property_value("Stage2")
+            .expect("cascade stage2");
+        let Value::Object(cascade_stage1_object) = &cascade_stage1 else {
+            panic!("expected cascade stage1 digitalFilter");
+        };
+        let Value::Object(cascade_stage2_object) = &cascade_stage2 else {
+            panic!("expected cascade stage2 digitalFilter");
+        };
+        assert_eq!(
+            cascade_stage1_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        assert_eq!(
+            cascade_stage2_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        let Value::Object(original_digital_filter_object) = &digital_filter else {
+            panic!("expected original digitalFilter object");
+        };
+        assert_eq!(
+            original_digital_filter_object.property_value("SampleRate"),
+            None
+        );
+        assert_eq!(
+            builtin_ctf(&[digital_filter_cascade.clone()], 3).expect("ctf cascade digitalFilter"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(0.5), Value::Scalar(0.5)])
+                        .expect("ctf cascade digitalFilter numerator"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        2,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.5),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.5),
+                        ],
+                    )
+                    .expect("ctf cascade digitalFilter denominator"),
+                ),
+                Value::Scalar(1.0),
+            ]
+        );
+        assert_eq!(
+            builtin_ctf(&[digital_filter_nested_cascade.clone()], 3)
+                .expect("ctf nested cascade digitalFilter"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(0.5), Value::Scalar(0.5), Value::Scalar(0.5)],
+                    )
+                    .expect("ctf nested cascade digitalFilter numerator"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        2,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.5),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.5),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.5),
+                        ],
+                    )
+                    .expect("ctf nested cascade digitalFilter denominator"),
+                ),
+                Value::Scalar(1.0),
+            ]
+        );
+        assert_eq!(
+            builtin_tf(&[digital_filter_cascade.clone()], 2).expect("tf cascade digitalFilter"),
+            vec![
+                Value::Scalar(0.25),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.25),],
+                    )
+                    .expect("tf cascade digitalFilter denominator"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_tf(&[digital_filter_nested_cascade.clone()], 2)
+                .expect("tf nested cascade digitalFilter"),
+            vec![
+                Value::Scalar(0.125),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        4,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.5),
+                            Value::Scalar(0.75),
+                            Value::Scalar(-0.125),
+                        ],
+                    )
+                    .expect("tf nested cascade digitalFilter denominator"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_zpk(&[digital_filter_cascade.clone()], 3).expect("zpk cascade digitalFilter"),
+            vec![
+                Value::Matrix(MatrixValue::new(0, 1, Vec::new()).expect("zpk cascade zeros"),),
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(0.5), Value::Scalar(0.5)],)
+                        .expect("zpk cascade poles"),
+                ),
+                Value::Scalar(0.25),
+            ]
+        );
+        assert_eq!(
+            builtin_zpk(&[digital_filter_nested_cascade.clone()], 3)
+                .expect("zpk nested cascade digitalFilter"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(0, 1, Vec::new()).expect("zpk nested cascade zeros"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(0.5), Value::Scalar(0.5), Value::Scalar(0.5)],
+                    )
+                    .expect("zpk nested cascade poles"),
+                ),
+                Value::Scalar(0.125),
+            ]
+        );
+        assert_eq!(
+            builtin_filter(
+                &[
+                    digital_filter_cascade,
+                    Value::Matrix(
+                        MatrixValue::new(
+                            4,
+                            1,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                            ],
+                        )
+                        .expect("cascade digitalFilter filter x"),
+                    ),
+                ],
+                1,
+            )
+            .expect("filter cascade digitalFilter"),
+            vec![Value::Matrix(
+                MatrixValue::new(
+                    4,
+                    1,
+                    vec![
+                        Value::Scalar(0.25),
+                        Value::Scalar(0.75),
+                        Value::Scalar(1.4375),
+                        Value::Scalar(2.25),
+                    ],
+                )
+                .expect("cascade digitalFilter filter y"),
+            )]
+        );
+        assert_eq!(
+            builtin_filter(
+                &[
+                    digital_filter_nested_cascade.clone(),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            4,
+                            1,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(4.0),
+                            ],
+                        )
+                        .expect("nested cascade digitalFilter filter x"),
+                    ),
+                ],
+                2,
+            )
+            .expect("filter nested cascade digitalFilter"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.125),
+                            Value::Scalar(0.4375),
+                            Value::Scalar(0.9375),
+                            Value::Scalar(1.59375),
+                        ],
+                    )
+                    .expect("nested cascade digitalFilter filter y"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![
+                            Value::Scalar(1.53125),
+                            Value::Scalar(1.125),
+                            Value::Scalar(0.796875),
+                        ],
+                    )
+                    .expect("nested cascade digitalFilter filter zf"),
+                ),
+            ]
+        );
+        let nested_cascade_ctf_outputs = builtin_ctf(&[digital_filter_nested_cascade.clone()], 3)
+            .expect("ctf nested cascade digitalFilter states");
+        let nested_cascade_ctf_cell = Value::Cell(
+            CellValue::new(
+                1,
+                3,
+                vec![
+                    nested_cascade_ctf_outputs[0].clone(),
+                    nested_cascade_ctf_outputs[1].clone(),
+                    nested_cascade_ctf_outputs[2].clone(),
+                ],
+            )
+            .expect("nested cascade digitalFilter states cell"),
+        );
+        let nested_cascade_state_input = Value::Matrix(
+            MatrixValue::new(
+                4,
+                1,
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(2.0),
+                    Value::Scalar(3.0),
+                    Value::Scalar(4.0),
+                ],
+            )
+            .expect("nested cascade digitalFilter states x"),
+        );
+        let nested_cascade_state_zi = Value::Matrix(
+            MatrixValue::new(
+                3,
+                1,
+                vec![Value::Scalar(0.25), Value::Scalar(0.5), Value::Scalar(0.75)],
+            )
+            .expect("nested cascade digitalFilter states zi"),
+        );
+        assert_eq!(
+            builtin_filter(
+                &[
+                    digital_filter_nested_cascade.clone(),
+                    nested_cascade_state_input.clone(),
+                    nested_cascade_state_zi.clone(),
+                ],
+                2,
+            )
+            .expect("filter nested cascade digitalFilter states zi"),
+            builtin_ctffilt(
+                &[
+                    nested_cascade_ctf_cell,
+                    nested_cascade_state_input,
+                    nested_cascade_state_zi,
+                ],
+                2,
+            )
+            .expect("ctffilt nested cascade digitalFilter states zi"),
+        );
+        builtin_set_sample_rate(
+            &[digital_filter_nested_cascade.clone(), Value::Scalar(8.0)],
+            0,
+        )
+        .expect("setSampleRate nested cascade digitalFilter");
+        let Value::Object(digital_filter_nested_cascade_fs_object) = &digital_filter_nested_cascade
+        else {
+            panic!("expected nested cascade digitalFilter handle");
+        };
+        assert_eq!(
+            digital_filter_nested_cascade_fs_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        let nested_stage2_fs = digital_filter_nested_cascade_fs_object
+            .property_value("Stage2")
+            .expect("nested cascade stage2 after sample rate");
+        let Value::Object(nested_stage2_fs_object) = &nested_stage2_fs else {
+            panic!("expected nested cascade stage2 digitalFilter");
+        };
+        assert_eq!(
+            nested_stage2_fs_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        let nested_stage21_fs = nested_stage2_fs_object
+            .property_value("Stage1")
+            .expect("nested cascade stage2 stage1");
+        let nested_stage22_fs = nested_stage2_fs_object
+            .property_value("Stage2")
+            .expect("nested cascade stage2 stage2");
+        let Value::Object(nested_stage21_fs_object) = &nested_stage21_fs else {
+            panic!("expected nested cascade stage2 stage1 digitalFilter");
+        };
+        let Value::Object(nested_stage22_fs_object) = &nested_stage22_fs else {
+            panic!("expected nested cascade stage2 stage2 digitalFilter");
+        };
+        assert_eq!(
+            nested_stage21_fs_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        assert_eq!(
+            nested_stage22_fs_object.property_value("SampleRate"),
+            Some(Value::Scalar(8.0))
+        );
+        let digital_filter_cascade_for_states =
+            builtin_cascade(&[digital_filter.clone(), digital_filter.clone()])
+                .expect("cascade digitalFilter states");
+        let cascade_ctf_outputs = builtin_ctf(&[digital_filter_cascade_for_states.clone()], 3)
+            .expect("ctf cascade digitalFilter states");
+        let cascade_ctf_cell = Value::Cell(
+            CellValue::new(
+                1,
+                3,
+                vec![
+                    cascade_ctf_outputs[0].clone(),
+                    cascade_ctf_outputs[1].clone(),
+                    cascade_ctf_outputs[2].clone(),
+                ],
+            )
+            .expect("cascade digitalFilter states cell"),
+        );
+        let cascade_state_input = Value::Matrix(
+            MatrixValue::new(
+                4,
+                1,
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(2.0),
+                    Value::Scalar(3.0),
+                    Value::Scalar(4.0),
+                ],
+            )
+            .expect("cascade digitalFilter states x"),
+        );
+        assert_eq!(
+            builtin_filter(
+                &[
+                    digital_filter_cascade_for_states,
+                    cascade_state_input.clone()
+                ],
+                2,
+            )
+            .expect("filter cascade digitalFilter states"),
+            builtin_ctffilt(&[cascade_ctf_cell, cascade_state_input.clone()], 2)
+                .expect("ctffilt cascade digitalFilter states"),
+        );
+        let cascade_state_zi = Value::Matrix(
+            MatrixValue::new(2, 1, vec![Value::Scalar(0.25), Value::Scalar(0.5)])
+                .expect("cascade digitalFilter states zi"),
+        );
+        let digital_filter_cascade_for_states_zi =
+            builtin_cascade(&[digital_filter.clone(), digital_filter.clone()])
+                .expect("cascade digitalFilter states zi");
+        let cascade_ctf_outputs_zi =
+            builtin_ctf(&[digital_filter_cascade_for_states_zi.clone()], 3)
+                .expect("ctf cascade digitalFilter states zi");
+        let cascade_ctf_cell_zi = Value::Cell(
+            CellValue::new(
+                1,
+                3,
+                vec![
+                    cascade_ctf_outputs_zi[0].clone(),
+                    cascade_ctf_outputs_zi[1].clone(),
+                    cascade_ctf_outputs_zi[2].clone(),
+                ],
+            )
+            .expect("cascade digitalFilter states zi cell"),
+        );
+        assert_eq!(
+            builtin_filter(
+                &[
+                    digital_filter_cascade_for_states_zi.clone(),
+                    cascade_state_input.clone(),
+                    cascade_state_zi.clone(),
+                ],
+                2,
+            )
+            .expect("filter cascade digitalFilter states zi"),
+            builtin_ctffilt(
+                &[
+                    cascade_ctf_cell_zi.clone(),
+                    cascade_state_input.clone(),
+                    cascade_state_zi.clone(),
+                ],
+                2,
+            )
+            .expect("ctffilt cascade digitalFilter states zi"),
+        );
+        let cascade_state_input_nd = Value::Matrix(
+            MatrixValue::with_dimensions(
+                2,
+                6,
+                vec![2, 3, 2],
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(2.0),
+                    Value::Scalar(3.0),
+                    Value::Scalar(4.0),
+                    Value::Scalar(5.0),
+                    Value::Scalar(6.0),
+                    Value::Scalar(7.0),
+                    Value::Scalar(8.0),
+                    Value::Scalar(9.0),
+                    Value::Scalar(10.0),
+                    Value::Scalar(11.0),
+                    Value::Scalar(12.0),
+                ],
+            )
+            .expect("cascade digitalFilter states nd x"),
+        );
+        assert_eq!(
+            builtin_filter(
+                &[
+                    digital_filter_cascade_for_states_zi,
+                    cascade_state_input_nd.clone(),
+                    cascade_state_zi.clone(),
+                    Value::Scalar(2.0),
+                ],
+                2,
+            )
+            .expect("filter cascade digitalFilter states zi nd"),
+            builtin_ctffilt(
+                &[
+                    cascade_ctf_cell_zi,
+                    cascade_state_input_nd,
+                    cascade_state_zi,
+                    Value::String("Dimension".to_string()),
+                    Value::Scalar(2.0),
+                ],
+                2,
+            )
+            .expect("ctffilt cascade digitalFilter states zi nd"),
+        );
         assert_eq!(
             builtin_sos2ss(
                 &[
@@ -86333,6 +92152,34 @@ mod tests {
                 Value::Scalar(-4.0),
             ]
         );
+        assert!(matches!(
+            builtin_sos2ss(
+                &[Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(-1.0),
+                            Value::Scalar(-2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(10.0),
+                            Value::Scalar(1.0),
+                        ],
+                    )
+                    .expect("sos2ss arity sos"),
+                )],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly four outputs")
+        ));
         assert_eq!(
             builtin_zp2ss(
                 &[
@@ -86384,6 +92231,34 @@ mod tests {
                 Value::Scalar(0.0),
             ]
         );
+        assert!(matches!(
+            builtin_zp2ss(
+                &[
+                    Value::Scalar(-1.0),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            2,
+                            vec![
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: 0.5,
+                                }),
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: -0.5,
+                                }),
+                            ],
+                        )
+                        .expect("zp2ss arity poles"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly four outputs")
+        ));
         assert_eq!(
             builtin_zp2ss(
                 &[
@@ -86510,6 +92385,28 @@ mod tests {
                 Value::Scalar(2.0),
             ]
         );
+        assert!(matches!(
+            builtin_sos2zp(
+                &[Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.0),
+                            Value::Scalar(0.5),
+                        ],
+                    )
+                    .expect("sos2zp arity sos"),
+                )],
+                2,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly three outputs")
+        ));
         assert_eq!(
             builtin_ss2zp(
                 &[
@@ -86564,6 +92461,37 @@ mod tests {
                 Value::Scalar(2.0),
             ]
         );
+        assert!(matches!(
+            builtin_ss2zp(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            2,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(-0.5),
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("ss2zp arity A"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(0.0)],)
+                            .expect("ss2zp arity B"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(4.0), Value::Scalar(-1.0)],)
+                            .expect("ss2zp arity C"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                2,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly three outputs")
+        ));
         assert_eq!(
             builtin_ss2zp(
                 &[
@@ -86724,38 +92652,17 @@ mod tests {
                         6,
                         vec![
                             Value::Scalar(1.0),
-                            Value::Complex(ComplexValue {
-                                real: 0.0009832454375326542,
-                                imag: -0.00040727352285056616,
-                            }),
-                            Value::Complex(ComplexValue {
-                                real: 4.004499340005735e-7,
-                                imag: -4.00449833202707e-7,
-                            }),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
                             Value::Scalar(1.0),
-                            Value::Complex(ComplexValue {
-                                real: -0.20000000000332535,
-                                imag: 1.1117597438794382e-12,
-                            }),
+                            Value::Scalar(-0.20000000000332535),
                             Value::Scalar(0.009999999999771986),
                             Value::Scalar(1.0),
-                            Value::Complex(ComplexValue {
-                                real: -0.0009832454376699957,
-                                imag: 0.00040727352272919716,
-                            }),
-                            Value::Complex(ComplexValue {
-                                real: 4.0044993414410046e-7,
-                                imag: -4.004498330217669e-7,
-                            }),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
                             Value::Scalar(1.0),
-                            Value::Complex(ComplexValue {
-                                real: -1.7999999999682799,
-                                imag: -2.1975296851048014e-11,
-                            }),
-                            Value::Complex(ComplexValue {
-                                real: 0.8099999999708883,
-                                imag: 1.924641869462016e-11,
-                            }),
+                            Value::Scalar(-1.7999999999682799),
+                            Value::Scalar(0.8099999999708883),
                         ],
                     )
                     .expect("ss2sos up sos"),
@@ -86774,37 +92681,16 @@ mod tests {
                         6,
                         vec![
                             Value::Scalar(1.0),
-                            Value::Complex(ComplexValue {
-                                real: -0.0009832454376699957,
-                                imag: 0.00040727352272919716,
-                            }),
-                            Value::Complex(ComplexValue {
-                                real: 4.0044993414410046e-7,
-                                imag: -4.004498330217669e-7,
-                            }),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
                             Value::Scalar(1.0),
-                            Value::Complex(ComplexValue {
-                                real: -1.7999999999682799,
-                                imag: -2.1975296851048014e-11,
-                            }),
-                            Value::Complex(ComplexValue {
-                                real: 0.8099999999708883,
-                                imag: 1.924641869462016e-11,
-                            }),
+                            Value::Scalar(-1.7999999999682799),
+                            Value::Scalar(0.8099999999708883),
                             Value::Scalar(1.0),
-                            Value::Complex(ComplexValue {
-                                real: 0.0009832454375326542,
-                                imag: -0.00040727352285056616,
-                            }),
-                            Value::Complex(ComplexValue {
-                                real: 4.004499340005735e-7,
-                                imag: -4.00449833202707e-7,
-                            }),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
                             Value::Scalar(1.0),
-                            Value::Complex(ComplexValue {
-                                real: -0.20000000000332535,
-                                imag: 1.1117597438794382e-12,
-                            }),
+                            Value::Scalar(-0.20000000000332535),
                             Value::Scalar(0.009999999999771986),
                         ],
                     )
@@ -86812,6 +92698,345 @@ mod tests {
                 ),
                 Value::Scalar(1.0),
             ]
+        );
+        let mut order_state_space_inf = order_state_space.clone();
+        order_state_space_inf.push(Value::String("up".to_string()));
+        order_state_space_inf.push(Value::String("inf".to_string()));
+        let scaled_inf = builtin_ss2sos(&order_state_space_inf, 2).expect("ss2sos inf");
+        let scaled_inf_sos =
+            numeric_or_complex_operand(&scaled_inf[0], "ss2sos inf sos").expect("scaled inf sos");
+        let scaled_inf_tf = builtin_sos2tf(&scaled_inf, 2).expect("scaled inf tf");
+        let original_tf = builtin_ss2tf(&order_state_space, 2).expect("original ss2tf");
+        let assert_transfer_function_close = |actual: &[Value], expected: &[Value]| {
+            assert_eq!(actual.len(), expected.len());
+            for (actual_value, expected_value) in actual.iter().zip(expected.iter()) {
+                let actual_operand =
+                    numeric_or_complex_operand(actual_value, "transfer function compare")
+                        .expect("actual transfer function operand");
+                let expected_operand =
+                    numeric_or_complex_operand(expected_value, "transfer function compare")
+                        .expect("expected transfer function operand");
+                assert_eq!(actual_operand.rows, expected_operand.rows);
+                assert_eq!(actual_operand.cols, expected_operand.cols);
+                for (actual_entry, expected_entry) in actual_operand
+                    .values
+                    .iter()
+                    .zip(expected_operand.values.iter())
+                {
+                    assert!(
+                        actual_entry.minus(*expected_entry).magnitude() <= 1e-9,
+                        "expected transfer functions to match within tolerance: actual={actual_entry:?}, expected={expected_entry:?}",
+                    );
+                }
+            }
+        };
+        assert_transfer_function_close(&scaled_inf_tf, &original_tf);
+        let mut cumulative_numerator = vec![ComplexParts::one()];
+        let mut cumulative_denominator = vec![ComplexParts::one()];
+        for row in 0..scaled_inf_sos.rows {
+            let start = row * scaled_inf_sos.cols;
+            cumulative_numerator = full_complex_convolution_vector(
+                &cumulative_numerator,
+                &scaled_inf_sos.values[start..start + 3],
+            );
+            cumulative_denominator = full_complex_convolution_vector(
+                &cumulative_denominator,
+                &scaled_inf_sos.values[start + 3..start + 6],
+            );
+            let norm = ss2sos_frequency_domain_norm(
+                &cumulative_numerator,
+                &cumulative_denominator,
+                Ss2SosScale::Inf,
+            );
+            assert!(
+                (norm - 1.0).abs() <= 5e-3,
+                "expected inf-scaled cumulative norm near 1, got {norm}"
+            );
+        }
+        let mut order_state_space_two = order_state_space.clone();
+        order_state_space_two.push(Value::String("down".to_string()));
+        order_state_space_two.push(Value::String("two".to_string()));
+        let scaled_two = builtin_ss2sos(&order_state_space_two, 2).expect("ss2sos two");
+        let scaled_two_sos =
+            numeric_or_complex_operand(&scaled_two[0], "ss2sos two sos").expect("scaled two sos");
+        let scaled_two_tf = builtin_sos2tf(&scaled_two, 2).expect("scaled two tf");
+        assert_transfer_function_close(&scaled_two_tf, &original_tf);
+        let mut cumulative_numerator = vec![ComplexParts::one()];
+        let mut cumulative_denominator = vec![ComplexParts::one()];
+        for row in 0..scaled_two_sos.rows {
+            let start = row * scaled_two_sos.cols;
+            cumulative_numerator = full_complex_convolution_vector(
+                &cumulative_numerator,
+                &scaled_two_sos.values[start..start + 3],
+            );
+            cumulative_denominator = full_complex_convolution_vector(
+                &cumulative_denominator,
+                &scaled_two_sos.values[start + 3..start + 6],
+            );
+            let norm = ss2sos_frequency_domain_norm(
+                &cumulative_numerator,
+                &cumulative_denominator,
+                Ss2SosScale::Two,
+            );
+            assert!(
+                (norm - 1.0).abs() <= 5e-3,
+                "expected two-scaled cumulative norm near 1, got {norm}"
+            );
+        }
+        let assert_sos_outputs_close = |actual: Vec<Value>,
+                                        expected: Vec<Value>,
+                                        tolerance: f64| {
+            assert_eq!(actual.len(), expected.len());
+            for (actual_value, expected_value) in actual.iter().zip(expected.iter()) {
+                match (actual_value, expected_value) {
+                    (Value::Scalar(actual_scalar), Value::Scalar(expected_scalar)) => {
+                        assert!(
+                            (actual_scalar - expected_scalar).abs() <= tolerance,
+                            "expected scalar outputs to match within tolerance: actual={actual_scalar}, expected={expected_scalar}",
+                        );
+                    }
+                    _ => {
+                        let actual_operand =
+                            numeric_or_complex_operand(actual_value, "sos output compare")
+                                .expect("actual sos operand");
+                        let expected_operand =
+                            numeric_or_complex_operand(expected_value, "sos output compare")
+                                .expect("expected sos operand");
+                        assert_eq!(actual_operand.rows, expected_operand.rows);
+                        assert_eq!(actual_operand.cols, expected_operand.cols);
+                        for (actual_entry, expected_entry) in actual_operand
+                            .values
+                            .iter()
+                            .zip(expected_operand.values.iter())
+                        {
+                            assert!(
+                                actual_entry.minus(*expected_entry).magnitude() <= tolerance,
+                                "expected outputs to match within tolerance: actual={actual_entry:?}, expected={expected_entry:?}",
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        let ss2sos_input_select_args = vec![
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Scalar(0.5),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.25),
+                    ],
+                )
+                .expect("ss2sos ni A"),
+            ),
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                    ],
+                )
+                .expect("ss2sos ni B"),
+            ),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(0.0)])
+                    .expect("ss2sos ni C"),
+            ),
+            Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                    .expect("ss2sos ni D"),
+            ),
+            Value::Scalar(2.0),
+            Value::String("down".to_string()),
+            Value::String("two".to_string()),
+        ];
+        let ss2tf_input_select =
+            builtin_ss2tf(&ss2sos_input_select_args[..5], 2).expect("ss2tf input-select");
+        let expected_ss2sos_input_select = builtin_tf2sos(
+            &[
+                ss2tf_input_select[0].clone(),
+                ss2tf_input_select[1].clone(),
+                Value::String("down".to_string()),
+                Value::String("two".to_string()),
+            ],
+            2,
+        )
+        .expect("tf2sos input-select");
+        assert_sos_outputs_close(
+            builtin_ss2sos(&ss2sos_input_select_args, 2).expect("ss2sos input-select"),
+            expected_ss2sos_input_select,
+            1e-9,
+        );
+        let expected_ss2sos_input_select_one = builtin_tf2sos(
+            &[
+                ss2tf_input_select[0].clone(),
+                ss2tf_input_select[1].clone(),
+                Value::String("down".to_string()),
+                Value::String("two".to_string()),
+            ],
+            1,
+        )
+        .expect("tf2sos input-select one-output");
+        assert_sos_outputs_close(
+            builtin_ss2sos(&ss2sos_input_select_args, 1).expect("ss2sos input-select one-output"),
+            expected_ss2sos_input_select_one,
+            1e-9,
+        );
+        assert_eq!(
+            builtin_ctf2sos(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(0.0),],
+                        )
+                        .expect("ctf2sos B"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5),],
+                        )
+                        .expect("ctf2sos A"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                2,
+            )
+            .expect("ctf2sos"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.0),
+                            Value::Scalar(0.5),
+                        ],
+                    )
+                    .expect("ctf2sos sos"),
+                ),
+                Value::Scalar(2.0),
+            ]
+        );
+        assert_eq!(
+            builtin_ctf2sos(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(0.0),],
+                        )
+                        .expect("ctf2sos embedded B"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5),],
+                        )
+                        .expect("ctf2sos embedded A"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                1,
+            )
+            .expect("ctf2sos embedded"),
+            vec![Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    6,
+                    vec![
+                        Value::Scalar(2.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(-1.0),
+                        Value::Scalar(0.5),
+                    ],
+                )
+                .expect("ctf2sos embedded sos"),
+            )]
+        );
+        let ctf2sos_order_args = vec![
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    3,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                    ],
+                )
+                .expect("ctf2sos order B"),
+            ),
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    3,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(-0.2),
+                        Value::Scalar(0.01),
+                        Value::Scalar(1.0),
+                        Value::Scalar(-1.8),
+                        Value::Scalar(0.81),
+                    ],
+                )
+                .expect("ctf2sos order A"),
+            ),
+            Value::Scalar(1.0),
+            Value::String("down".to_string()),
+            Value::String("two".to_string()),
+        ];
+        let ctf2sos_order_zpk =
+            builtin_ctf2zp(&ctf2sos_order_args[..3], 3).expect("ctf2zp order for ctf2sos");
+        let mut ctf2sos_order_expected_args = ctf2sos_order_zpk.clone();
+        ctf2sos_order_expected_args.push(Value::String("down".to_string()));
+        ctf2sos_order_expected_args.push(Value::String("two".to_string()));
+        let ctf2sos_order_expected =
+            builtin_zp2sos(&ctf2sos_order_expected_args, 2).expect("expected ctf2sos order");
+        assert_eq!(
+            builtin_ctf2sos(&ctf2sos_order_args, 2).expect("ctf2sos order"),
+            ctf2sos_order_expected
+        );
+        let ctf2sos_order_cell_args = vec![
+            Value::Cell(
+                CellValue::new(
+                    1,
+                    3,
+                    vec![
+                        ctf2sos_order_args[0].clone(),
+                        ctf2sos_order_args[1].clone(),
+                        ctf2sos_order_args[2].clone(),
+                    ],
+                )
+                .expect("ctf2sos order cell"),
+            ),
+            Value::String("down".to_string()),
+            Value::String("two".to_string()),
+        ];
+        assert_eq!(
+            builtin_ctf2sos(&ctf2sos_order_cell_args, 2).expect("ctf2sos order cell"),
+            ctf2sos_order_expected
         );
         assert_eq!(
             builtin_zp2sos(
@@ -86857,6 +93082,1249 @@ mod tests {
                 ),
                 Value::Scalar(2.0),
             ]
+        );
+        assert_eq!(
+            builtin_zp2sos(
+                &[
+                    Value::Scalar(-1.0),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            2,
+                            vec![
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: 0.5,
+                                }),
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: -0.5,
+                                }),
+                            ],
+                        )
+                        .expect("zp2sos embedded poles"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                1,
+            )
+            .expect("zp2sos embedded"),
+            vec![Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    6,
+                    vec![
+                        Value::Scalar(2.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(-1.0),
+                        Value::Scalar(0.5),
+                    ],
+                )
+                .expect("zp2sos embedded sos"),
+            )]
+        );
+        assert!(matches!(
+            builtin_zp2sos(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(0.0), Value::Scalar(-1.0)])
+                            .expect("zp2sos arity-like z"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            1,
+                            vec![
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: 0.5,
+                                }),
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: -0.5,
+                                }),
+                            ],
+                        )
+                        .expect("zp2sos arity-like p"),
+                    ),
+                    Value::String("down".to_string()),
+                ],
+                2,
+            ),
+            Err(RuntimeError::TypeError(_))
+        ));
+        assert!(matches!(
+            builtin_zp2sos(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(0.0), Value::Scalar(-1.0)])
+                            .expect("zp2sos no-k-scale z"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            1,
+                            vec![
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: 0.5,
+                                }),
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: -0.5,
+                                }),
+                            ],
+                        )
+                        .expect("zp2sos no-k-scale p"),
+                    ),
+                    Value::String("down".to_string()),
+                    Value::String("two".to_string()),
+                ],
+                2,
+            ),
+            Err(RuntimeError::TypeError(_))
+        ));
+        assert_eq!(
+            builtin_zp2sos(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            4,
+                            1,
+                            vec![
+                                Value::Scalar(0.5),
+                                Value::Scalar(0.1),
+                                Value::Scalar(-0.5),
+                                Value::Scalar(0.2),
+                            ],
+                        )
+                        .expect("zp2sos zeroflag zeros"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            4,
+                            1,
+                            vec![
+                                Value::Scalar(0.9),
+                                Value::Scalar(0.8),
+                                Value::Scalar(0.3),
+                                Value::Scalar(0.25),
+                            ],
+                        )
+                        .expect("zp2sos zeroflag poles"),
+                    ),
+                    Value::Scalar(1.0),
+                    Value::String("up".to_string()),
+                    Value::String("none".to_string()),
+                    Value::Logical(true),
+                ],
+                2,
+            )
+            .expect("zp2sos zeroflag"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.30000000000000004),
+                            Value::Scalar(0.020000000000000004),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.55),
+                            Value::Scalar(0.075),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(-0.25),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.7000000000000002),
+                            Value::Scalar(0.7200000000000001),
+                        ],
+                    )
+                    .expect("zp2sos zeroflag sos"),
+                ),
+                Value::Scalar(1.0),
+            ]
+        );
+        assert_eq!(
+            builtin_tf2ctf(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(2.0), Value::Scalar(2.0), Value::Scalar(0.0)],
+                        )
+                        .expect("tf2ctf b"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5)],
+                        )
+                        .expect("tf2ctf a"),
+                    ),
+                ],
+                3,
+            )
+            .expect("tf2ctf"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(0.0)],
+                    )
+                    .expect("tf2ctf B"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5)],
+                    )
+                    .expect("tf2ctf A"),
+                ),
+                Value::Scalar(2.0),
+            ]
+        );
+        assert_eq!(
+            builtin_tf2sos(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(2.0), Value::Scalar(2.0), Value::Scalar(0.0)],
+                        )
+                        .expect("tf2sos embedded b"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5)],
+                        )
+                        .expect("tf2sos embedded a"),
+                    ),
+                ],
+                1,
+            )
+            .expect("tf2sos embedded"),
+            vec![Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    6,
+                    vec![
+                        Value::Scalar(2.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(-1.0),
+                        Value::Scalar(0.5),
+                    ],
+                )
+                .expect("tf2sos embedded sos"),
+            )]
+        );
+        assert!(matches!(
+            builtin_tf2ctf(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(2.0), Value::Scalar(2.0), Value::Scalar(0.0)],
+                        )
+                        .expect("tf2ctf arity b"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5)],
+                        )
+                        .expect("tf2ctf arity a"),
+                    ),
+                ],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("two or three outputs")
+        ));
+        let tf2ctf_section_order = builtin_tf2ctf(
+            &{
+                let tf = builtin_zp2tf(
+                    &[
+                        Value::Matrix(
+                            MatrixValue::new(
+                                6,
+                                1,
+                                vec![
+                                    Value::Scalar(0.0),
+                                    Value::Scalar(0.0),
+                                    Value::Scalar(0.0),
+                                    Value::Scalar(0.0),
+                                    Value::Scalar(0.0),
+                                    Value::Scalar(0.0),
+                                ],
+                            )
+                            .expect("tf2ctf section-order z"),
+                        ),
+                        Value::Matrix(
+                            MatrixValue::new(
+                                6,
+                                1,
+                                vec![
+                                    Value::Scalar(0.1),
+                                    Value::Scalar(0.1),
+                                    Value::Scalar(0.5),
+                                    Value::Scalar(0.5),
+                                    Value::Scalar(0.9),
+                                    Value::Scalar(0.9),
+                                ],
+                            )
+                            .expect("tf2ctf section-order p"),
+                        ),
+                        Value::Scalar(2.0),
+                    ],
+                    2,
+                )
+                .expect("tf2ctf section-order tf");
+                vec![
+                    tf[0].clone(),
+                    tf[1].clone(),
+                    Value::String("SectionOrder".to_string()),
+                    Value::Scalar(4.0),
+                    Value::String("Direction".to_string()),
+                    Value::String("down".to_string()),
+                ]
+            },
+            3,
+        )
+        .expect("tf2ctf section-order");
+        let expected_tf2ctf_section_order = vec![
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    5,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                    ],
+                )
+                .expect("tf2ctf section-order B"),
+            ),
+            Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    5,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(-1.8),
+                        Value::Scalar(0.81),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(-1.2000000000000002),
+                        Value::Scalar(0.45999999999999996),
+                        Value::Scalar(-0.06),
+                        Value::Scalar(0.0025000000000000005),
+                    ],
+                )
+                .expect("tf2ctf section-order A"),
+            ),
+            Value::Scalar(2.0),
+        ];
+        for (actual, expected) in tf2ctf_section_order
+            .iter()
+            .zip(expected_tf2ctf_section_order.iter())
+        {
+            match (actual, expected) {
+                (Value::Scalar(actual_scalar), Value::Scalar(expected_scalar)) => {
+                    assert!((actual_scalar - expected_scalar).abs() <= 1e-9);
+                }
+                _ => {
+                    let actual_operand =
+                        numeric_or_complex_operand(actual, "tf2ctf section-order compare")
+                            .expect("actual tf2ctf section-order operand");
+                    let expected_operand =
+                        numeric_or_complex_operand(expected, "tf2ctf section-order compare")
+                            .expect("expected tf2ctf section-order operand");
+                    assert_eq!(actual_operand.rows, expected_operand.rows);
+                    assert_eq!(actual_operand.cols, expected_operand.cols);
+                    for (actual_entry, expected_entry) in actual_operand
+                        .values
+                        .iter()
+                        .zip(expected_operand.values.iter())
+                    {
+                        assert!(actual_entry.minus(*expected_entry).magnitude() <= 1e-6);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            builtin_zp2ctf(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            6,
+                            1,
+                            vec![
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("zp2ctf section-order zeros"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            6,
+                            1,
+                            vec![
+                                Value::Scalar(0.1),
+                                Value::Scalar(0.1),
+                                Value::Scalar(0.5),
+                                Value::Scalar(0.5),
+                                Value::Scalar(0.9),
+                                Value::Scalar(0.9),
+                            ],
+                        )
+                        .expect("zp2ctf section-order poles"),
+                    ),
+                    Value::Scalar(2.0),
+                    Value::String("SectionOrder".to_string()),
+                    Value::Scalar(4.0),
+                    Value::String("Direction".to_string()),
+                    Value::String("down".to_string()),
+                ],
+                3,
+            )
+            .expect("zp2ctf section-order"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        5,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                        ],
+                    )
+                    .expect("zp2ctf section-order B"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        5,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.8),
+                            Value::Scalar(0.81),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.2000000000000002),
+                            Value::Scalar(0.45999999999999996),
+                            Value::Scalar(-0.06),
+                            Value::Scalar(0.0025000000000000005),
+                        ],
+                    )
+                    .expect("zp2ctf section-order A"),
+                ),
+                Value::Scalar(2.0),
+            ]
+        );
+        assert!(matches!(
+            builtin_zp2ctf(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            6,
+                            1,
+                            vec![
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("zp2ctf arity zeros"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            6,
+                            1,
+                            vec![
+                                Value::Scalar(0.1),
+                                Value::Scalar(0.1),
+                                Value::Scalar(0.5),
+                                Value::Scalar(0.5),
+                                Value::Scalar(0.9),
+                                Value::Scalar(0.9),
+                            ],
+                        )
+                        .expect("zp2ctf arity poles"),
+                    ),
+                    Value::Scalar(2.0),
+                ],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("two or three outputs")
+        ));
+        let scaled_ctf = builtin_zp2ctf(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(
+                        6,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                        ],
+                    )
+                    .expect("zp2ctf scale zeros"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        6,
+                        1,
+                        vec![
+                            Value::Scalar(0.1),
+                            Value::Scalar(0.1),
+                            Value::Scalar(0.5),
+                            Value::Scalar(0.5),
+                            Value::Scalar(0.9),
+                            Value::Scalar(0.9),
+                        ],
+                    )
+                    .expect("zp2ctf scale poles"),
+                ),
+                Value::Scalar(2.0),
+                Value::String("Direction".to_string()),
+                Value::String("down".to_string()),
+                Value::String("Scale".to_string()),
+                Value::String("inf".to_string()),
+            ],
+            2,
+        )
+        .expect("zp2ctf scale");
+        let zpk_roundtrip = builtin_ctf2zp(&scaled_ctf, 3).expect("zp2ctf scale roundtrip");
+        let expected_zpk_roundtrip = vec![
+            Value::Matrix(
+                MatrixValue::new(
+                    6,
+                    1,
+                    vec![
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                    ],
+                )
+                .expect("zp2ctf scale z"),
+            ),
+            Value::Matrix(
+                MatrixValue::new(
+                    6,
+                    1,
+                    vec![
+                        Value::Scalar(0.9),
+                        Value::Scalar(0.9),
+                        Value::Scalar(0.5),
+                        Value::Scalar(0.5),
+                        Value::Scalar(0.1),
+                        Value::Scalar(0.1),
+                    ],
+                )
+                .expect("zp2ctf scale p"),
+            ),
+            Value::Scalar(2.0),
+        ];
+        for (actual, expected) in zpk_roundtrip.iter().zip(expected_zpk_roundtrip.iter()) {
+            match (actual, expected) {
+                (Value::Scalar(actual_scalar), Value::Scalar(expected_scalar)) => {
+                    assert!((actual_scalar - expected_scalar).abs() <= 1e-9);
+                }
+                _ => {
+                    let actual_operand = numeric_or_complex_operand(actual, "zp2ctf scale compare")
+                        .expect("actual zp2ctf scale operand");
+                    let expected_operand =
+                        numeric_or_complex_operand(expected, "zp2ctf scale compare")
+                            .expect("expected zp2ctf scale operand");
+                    assert_eq!(actual_operand.rows, expected_operand.rows);
+                    assert_eq!(actual_operand.cols, expected_operand.cols);
+                    for (actual_entry, expected_entry) in actual_operand
+                        .values
+                        .iter()
+                        .zip(expected_operand.values.iter())
+                    {
+                        assert!(actual_entry.minus(*expected_entry).magnitude() <= 1e-4);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            builtin_isstable(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(0.0)],
+                    )
+                    .expect("isstable ctf B"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5)],
+                    )
+                    .expect("isstable ctf A"),
+                ),
+                Value::String("ctf".to_string()),
+            ])
+            .expect("isstable ctf"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_islinphase(&[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("islinphase ctf B"),
+                ),
+                Value::Scalar(1.0),
+                Value::String("ctf".to_string()),
+            ])
+            .expect("islinphase ctf"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_isminphase(&[
+                Value::Scalar(1.0),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                        .expect("isminphase ctf A"),
+                ),
+                Value::String("ctf".to_string()),
+            ])
+            .expect("isminphase ctf"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_ismaxphase(&[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-2.0)])
+                        .expect("ismaxphase ctf B"),
+                ),
+                Value::Scalar(1.0),
+                Value::String("ctf".to_string()),
+            ])
+            .expect("ismaxphase ctf"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_isallpass(&[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("isallpass ctf B"),
+                ),
+                Value::Scalar(1.0),
+                Value::String("ctf".to_string()),
+            ])
+            .expect("isallpass ctf"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_filtord(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(0.0)],
+                    )
+                    .expect("filtord ctf B"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5)],
+                    )
+                    .expect("filtord ctf A"),
+                ),
+                Value::String("ctf".to_string()),
+            ])
+            .expect("filtord ctf"),
+            Value::Scalar(2.0)
+        );
+        assert_eq!(
+            builtin_filtord(&[Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    3,
+                    vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(0.0)],
+                )
+                .expect("filtord fir-only numerator"),
+            )])
+            .expect("filtord fir-only"),
+            Value::Scalar(1.0)
+        );
+        assert_eq!(
+            builtin_impzlength(&[
+                Value::Scalar(1.0),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.9)])
+                        .expect("impzlength ctf A"),
+                ),
+                Value::String("ctf".to_string()),
+            ])
+            .expect("impzlength ctf"),
+            Value::Scalar(93.0)
+        );
+        assert_eq!(
+            builtin_impzlength(&[Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    6,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                    ],
+                )
+                .expect("impzlength sos"),
+            )])
+            .expect("impzlength sos"),
+            Value::Scalar(5.0)
+        );
+        assert_eq!(
+            builtin_impzlength(&[Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    6,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(-0.5),
+                        Value::Scalar(0.0),
+                    ],
+                )
+                .expect("impzlength sos row fallback"),
+            )])
+            .expect("impzlength sos row fallback"),
+            Value::Scalar(6.0)
+        );
+        let stable_sos = Value::Matrix(
+            MatrixValue::new(
+                2,
+                6,
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(0.0),
+                    Value::Scalar(0.0),
+                    Value::Scalar(1.0),
+                    Value::Scalar(-0.5),
+                    Value::Scalar(0.0),
+                    Value::Scalar(1.0),
+                    Value::Scalar(0.0),
+                    Value::Scalar(0.0),
+                    Value::Scalar(1.0),
+                    Value::Scalar(-0.25),
+                    Value::Scalar(0.0),
+                ],
+            )
+            .expect("stable sos"),
+        );
+        assert_eq!(
+            builtin_isstable(&[stable_sos.clone()]).expect("isstable sos"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_isfir(&[stable_sos.clone()]).expect("isfir sos"),
+            Value::Logical(false)
+        );
+        assert_eq!(
+            builtin_isiir(&[stable_sos.clone()]).expect("isiir sos"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_islinphase(&[stable_sos.clone()]).expect("islinphase sos"),
+            Value::Logical(false)
+        );
+        assert_eq!(
+            builtin_isminphase(&[stable_sos.clone()]).expect("isminphase sos"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_ismaxphase(&[stable_sos.clone()]).expect("ismaxphase sos"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_filtord(&[stable_sos]).expect("filtord sos"),
+            Value::Scalar(2.0)
+        );
+        assert_eq!(
+            builtin_isallpass(&[Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    6,
+                    vec![
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(0.0),
+                    ],
+                )
+                .expect("allpass sos"),
+            )])
+            .expect("isallpass sos"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_impz(
+                &[
+                    Value::Scalar(1.0),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                            .expect("impz ctf A"),
+                    ),
+                    Value::String("ctf".to_string()),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("impz ctf"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.5),
+                            Value::Scalar(0.25),
+                            Value::Scalar(0.125),
+                        ],
+                    )
+                    .expect("impz ctf h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.125),
+                            Value::Scalar(0.25),
+                            Value::Scalar(0.375),
+                        ],
+                    )
+                    .expect("impz ctf t"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_impz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                            .expect("impz empty n b"),
+                    ),
+                    Value::Scalar(1.0),
+                    Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("impz empty n")),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("impz empty n fs"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(2.0)],)
+                        .expect("impz empty n h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(0.0), Value::Scalar(0.125)],)
+                        .expect("impz empty n t"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_impz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            6,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("impz sos"),
+                    ),
+                    Value::Scalar(3.0)
+                ],
+                2,
+            )
+            .expect("impz sos"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(0.0),],
+                    )
+                    .expect("impz sos h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(2.0),],
+                    )
+                    .expect("impz sos t"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_impz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            6,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(-0.5),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("impz sos row fallback"),
+                    ),
+                    Value::Scalar(4.0)
+                ],
+                2,
+            )
+            .expect("impz sos row fallback"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                        ],
+                    )
+                    .expect("impz sos row fallback h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                        ],
+                    )
+                    .expect("impz sos row fallback t"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_stepz(
+                &[
+                    Value::Cell(
+                        CellValue::new(
+                            1,
+                            3,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Matrix(
+                                    MatrixValue::new(
+                                        1,
+                                        2,
+                                        vec![Value::Scalar(1.0), Value::Scalar(-0.5)],
+                                    )
+                                    .expect("stepz ctf cell A"),
+                                ),
+                                Value::Scalar(2.0),
+                            ],
+                        )
+                        .expect("stepz ctf cell")
+                    ),
+                    Value::String("ctf".to_string()),
+                    Value::Scalar(4.0),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("stepz ctf"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                            Value::Scalar(3.5),
+                            Value::Scalar(3.75),
+                        ],
+                    )
+                    .expect("stepz ctf h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.125),
+                            Value::Scalar(0.25),
+                            Value::Scalar(0.375),
+                        ],
+                    )
+                    .expect("stepz ctf t"),
+                ),
+            ]
+        );
+        let order_sos = Value::Matrix(
+            MatrixValue::new(
+                2,
+                6,
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(0.0),
+                    Value::Scalar(0.0),
+                    Value::Scalar(1.0),
+                    Value::Scalar(-0.2),
+                    Value::Scalar(0.01),
+                    Value::Scalar(1.0),
+                    Value::Scalar(0.0),
+                    Value::Scalar(0.0),
+                    Value::Scalar(1.0),
+                    Value::Scalar(-1.8),
+                    Value::Scalar(0.81),
+                ],
+            )
+            .expect("order sos"),
+        );
+        let order_tf = builtin_sos2tf(&[order_sos.clone()], 2).expect("order tf");
+        let assert_outputs_close = |actual: Vec<Value>, expected: Vec<Value>, tolerance: f64| {
+            assert_eq!(actual.len(), expected.len());
+            for (actual_value, expected_value) in actual.iter().zip(expected.iter()) {
+                match (actual_value, expected_value) {
+                    (Value::Scalar(actual_scalar), Value::Scalar(expected_scalar)) => {
+                        assert!(
+                            (actual_scalar - expected_scalar).abs() <= tolerance,
+                            "expected scalar outputs to match within tolerance: actual={actual_scalar}, expected={expected_scalar}",
+                        );
+                    }
+                    _ => {
+                        let actual_operand =
+                            numeric_or_complex_operand(actual_value, "sos output compare")
+                                .expect("actual sos operand");
+                        let expected_operand =
+                            numeric_or_complex_operand(expected_value, "sos output compare")
+                                .expect("expected sos operand");
+                        assert_eq!(actual_operand.rows, expected_operand.rows);
+                        assert_eq!(actual_operand.cols, expected_operand.cols);
+                        for (actual_entry, expected_entry) in actual_operand
+                            .values
+                            .iter()
+                            .zip(expected_operand.values.iter())
+                        {
+                            assert!(
+                                actual_entry.minus(*expected_entry).magnitude() <= tolerance,
+                                "expected outputs to match within tolerance: actual={actual_entry:?}, expected={expected_entry:?}",
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        assert_outputs_close(
+            builtin_tf2sos(
+                &[
+                    order_tf[0].clone(),
+                    order_tf[1].clone(),
+                    Value::String("down".to_string()),
+                ],
+                2,
+            )
+            .expect("tf2sos down"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.8),
+                            Value::Scalar(0.81),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.2),
+                            Value::Scalar(0.01),
+                        ],
+                    )
+                    .expect("tf2sos down sos"),
+                ),
+                Value::Scalar(1.0),
+            ],
+            1e-9,
+        );
+        assert_outputs_close(
+            builtin_tf2sos(
+                &[
+                    order_tf[0].clone(),
+                    order_tf[1].clone(),
+                    Value::String("up".to_string()),
+                    Value::String("inf".to_string()),
+                ],
+                2,
+            )
+            .expect("tf2sos inf"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        6,
+                        vec![
+                            Value::Scalar(0.81),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.2),
+                            Value::Scalar(0.01),
+                            Value::Scalar(0.01),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.8),
+                            Value::Scalar(0.81),
+                        ],
+                    )
+                    .expect("tf2sos inf sos"),
+                ),
+                Value::Scalar(123.45679012345678),
+            ],
+            1e-7,
+        );
+        let order_zpk = builtin_sos2zp(&[order_sos], 3).expect("order zpk");
+        assert_outputs_close(
+            builtin_zp2sos(
+                &[
+                    order_zpk[0].clone(),
+                    order_zpk[1].clone(),
+                    order_zpk[2].clone(),
+                    Value::String("down".to_string()),
+                    Value::String("two".to_string()),
+                ],
+                2,
+            )
+            .expect("zp2sos two"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        6,
+                        vec![
+                            Value::Scalar(0.06155893732023901),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.8),
+                            Value::Scalar(0.81),
+                            Value::Scalar(0.8110466232235969),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.2),
+                            Value::Scalar(0.01),
+                        ],
+                    )
+                    .expect("zp2sos two sos"),
+                ),
+                Value::Scalar(20.029175200497174),
+            ],
+            1e-7,
         );
         assert_eq!(
             builtin_tf2ss(
@@ -86992,6 +94460,49 @@ mod tests {
                 ),
             ]
         );
+        assert!(matches!(
+            builtin_ss2tf(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            2,
+                            vec![
+                                Value::Scalar(-0.4),
+                                Value::Scalar(-1.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("ss2tf arity A"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(0.0)],)
+                            .expect("ss2tf arity B"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            2,
+                            vec![
+                                Value::Scalar(2.0),
+                                Value::Scalar(3.0),
+                                Value::Scalar(1.6),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("ss2tf arity C"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(0.0), Value::Scalar(1.0)],)
+                            .expect("ss2tf arity D"),
+                    ),
+                ],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly two outputs")
+        ));
         assert_eq!(
             builtin_ss2tf(
                 &[
@@ -87119,6 +94630,218 @@ mod tests {
                 ),
                 Value::Scalar(2.0),
             ]
+        );
+        let sos_cell_plain = builtin_sos2cell(&[Value::Matrix(
+            MatrixValue::new(
+                1,
+                6,
+                vec![
+                    Value::Scalar(1.0),
+                    Value::Scalar(1.0),
+                    Value::Scalar(0.0),
+                    Value::Scalar(1.0),
+                    Value::Scalar(-1.0),
+                    Value::Scalar(0.5),
+                ],
+            )
+            .expect("sos2cell plain sos"),
+        )])
+        .expect("sos2cell plain");
+        assert_eq!(
+            sos_cell_plain,
+            Value::Cell(
+                CellValue::new(
+                    1,
+                    1,
+                    vec![Value::Cell(
+                        CellValue::new(
+                            1,
+                            2,
+                            vec![
+                                Value::Matrix(
+                                    MatrixValue::new(
+                                        1,
+                                        3,
+                                        vec![
+                                            Value::Scalar(1.0),
+                                            Value::Scalar(1.0),
+                                            Value::Scalar(0.0),
+                                        ],
+                                    )
+                                    .expect("sos2cell plain b"),
+                                ),
+                                Value::Matrix(
+                                    MatrixValue::new(
+                                        1,
+                                        3,
+                                        vec![
+                                            Value::Scalar(1.0),
+                                            Value::Scalar(-1.0),
+                                            Value::Scalar(0.5),
+                                        ],
+                                    )
+                                    .expect("sos2cell plain a"),
+                                ),
+                            ],
+                        )
+                        .expect("sos2cell plain section"),
+                    )],
+                )
+                .expect("sos2cell plain output"),
+            )
+        );
+        assert_eq!(
+            builtin_cell2sos(&[sos_cell_plain], 2).expect("cell2sos plain"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.0),
+                            Value::Scalar(0.5),
+                        ],
+                    )
+                    .expect("cell2sos plain sos"),
+                ),
+                Value::Scalar(1.0),
+            ]
+        );
+        assert!(matches!(
+            builtin_tf2ss(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            3,
+                            vec![Value::Scalar(0.0), Value::Scalar(2.0), Value::Scalar(3.0), Value::Scalar(1.0), Value::Scalar(2.0), Value::Scalar(1.0)],
+                        )
+                        .expect("tf2ss arity b"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(0.4), Value::Scalar(1.0),],
+                        )
+                        .expect("tf2ss arity a"),
+                    ),
+                ],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly four outputs")
+        ));
+        let sos_cell_gain = builtin_sos2cell(&[
+            Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    6,
+                    vec![
+                        Value::Scalar(1.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(-1.0),
+                        Value::Scalar(0.5),
+                    ],
+                )
+                .expect("sos2cell gain sos"),
+            ),
+            Value::Scalar(2.0),
+        ])
+        .expect("sos2cell gain");
+        assert_eq!(
+            builtin_cell2sos(&[sos_cell_gain], 2).expect("cell2sos gain"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        6,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(-1.0),
+                            Value::Scalar(0.5),
+                        ],
+                    )
+                    .expect("cell2sos gain sos"),
+                ),
+                Value::Scalar(2.0),
+            ]
+        );
+        assert_eq!(
+            builtin_cell2sos(
+                &[Value::Cell(
+                    CellValue::new(
+                        1,
+                        2,
+                        vec![
+                            Value::Cell(
+                                CellValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(1.0)],)
+                                    .expect("cell2sos embedded gain cell"),
+                            ),
+                            Value::Cell(
+                                CellValue::new(
+                                    1,
+                                    2,
+                                    vec![
+                                        Value::Matrix(
+                                            MatrixValue::new(
+                                                1,
+                                                3,
+                                                vec![
+                                                    Value::Scalar(1.0),
+                                                    Value::Scalar(1.0),
+                                                    Value::Scalar(0.0),
+                                                ],
+                                            )
+                                            .expect("cell2sos embedded gain b"),
+                                        ),
+                                        Value::Matrix(
+                                            MatrixValue::new(
+                                                1,
+                                                3,
+                                                vec![
+                                                    Value::Scalar(1.0),
+                                                    Value::Scalar(-1.0),
+                                                    Value::Scalar(0.5),
+                                                ],
+                                            )
+                                            .expect("cell2sos embedded gain a"),
+                                        ),
+                                    ],
+                                )
+                                .expect("cell2sos embedded gain section"),
+                            ),
+                        ],
+                    )
+                    .expect("cell2sos embedded gain outer"),
+                )],
+                1,
+            )
+            .expect("cell2sos embedded gain"),
+            vec![Value::Matrix(
+                MatrixValue::new(
+                    1,
+                    6,
+                    vec![
+                        Value::Scalar(2.0),
+                        Value::Scalar(2.0),
+                        Value::Scalar(0.0),
+                        Value::Scalar(1.0),
+                        Value::Scalar(-1.0),
+                        Value::Scalar(0.5),
+                    ],
+                )
+                .expect("cell2sos embedded gain sos"),
+            )]
         );
     }
 
@@ -87272,6 +94995,167 @@ mod tests {
                 .expect("freqz constant output")
             )]
         );
+        let freqz_fir = builtin_freqz(
+            &[Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                    .expect("freqz fir numerator"),
+            )],
+            2,
+        )
+        .expect("freqz fir shorthand");
+        let Value::Matrix(freqz_fir_h) = &freqz_fir[0] else {
+            panic!("expected freqz fir response matrix");
+        };
+        assert_eq!(freqz_fir_h.dims(), &[512, 1]);
+        let Value::Matrix(freqz_fir_w) = &freqz_fir[1] else {
+            panic!("expected freqz fir frequency matrix");
+        };
+        let Some(Value::Scalar(freqz_fir_last_w)) = freqz_fir_w.elements().last() else {
+            panic!("expected scalar freqz fir endpoint");
+        };
+        let Some(Value::Complex(freqz_fir_last_h)) = freqz_fir_h.elements().last() else {
+            panic!("expected complex freqz fir endpoint");
+        };
+        assert!((freqz_fir_last_h.real - freqz_fir_last_w.cos()).abs() <= 1e-12);
+        assert!((freqz_fir_last_h.imag + freqz_fir_last_w.sin()).abs() <= 1e-12);
+        assert!(
+            (*freqz_fir_last_w
+                - std::f64::consts::PI * (DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT as f64 - 1.0)
+                    / DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT as f64)
+                .abs()
+                <= 1e-12
+        );
+        assert_eq!(
+            builtin_freqz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("freqz fir whole numerator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::String("whole".to_string()),
+                ],
+                2,
+            )
+            .expect("freqz fir whole shorthand"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Complex(ComplexValue {
+                                real: 0.0,
+                                imag: -1.0,
+                            }),
+                            Value::Scalar(-1.0),
+                            Value::Complex(ComplexValue {
+                                real: 0.0,
+                                imag: 1.0,
+                            }),
+                        ],
+                    )
+                    .expect("freqz fir whole h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(std::f64::consts::PI),
+                            Value::Scalar(3.0 * std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("freqz fir whole w"),
+                ),
+            ]
+        );
+        let freqz_fir_fs_empty = builtin_freqz(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("freqz fir fs-empty numerator"),
+                ),
+                Value::Matrix(MatrixValue::new(0, 0, vec![]).expect("freqz fs-empty n")),
+                Value::Scalar(8.0),
+            ],
+            2,
+        )
+        .expect("freqz fir fs-empty shorthand");
+        let Value::Matrix(freqz_fir_fs_empty_h) = &freqz_fir_fs_empty[0] else {
+            panic!("expected freqz fir fs-empty response matrix");
+        };
+        assert_eq!(freqz_fir_fs_empty_h.dims(), &[512, 1]);
+        let Value::Matrix(freqz_fir_fs_empty_f) = &freqz_fir_fs_empty[1] else {
+            panic!("expected freqz fir fs-empty frequency matrix");
+        };
+        let Some(Value::Scalar(freqz_fir_fs_empty_last_f)) = freqz_fir_fs_empty_f.elements().last()
+        else {
+            panic!("expected scalar freqz fir fs-empty endpoint");
+        };
+        assert!((*freqz_fir_fs_empty_last_f - 3.9921875).abs() <= 1e-12);
+        let freqz_fir_whole_fs_empty = builtin_freqz(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("freqz fir whole-fs-empty numerator"),
+                ),
+                Value::Matrix(MatrixValue::new(0, 0, vec![]).expect("freqz whole-fs-empty n")),
+                Value::String("whole".to_string()),
+                Value::Scalar(8.0),
+            ],
+            2,
+        )
+        .expect("freqz fir whole-fs-empty shorthand");
+        let Value::Matrix(freqz_fir_whole_fs_empty_h) = &freqz_fir_whole_fs_empty[0] else {
+            panic!("expected freqz fir whole-fs-empty response matrix");
+        };
+        assert_eq!(freqz_fir_whole_fs_empty_h.dims(), &[512, 1]);
+        let Value::Matrix(freqz_fir_whole_fs_empty_f) = &freqz_fir_whole_fs_empty[1] else {
+            panic!("expected freqz fir whole-fs-empty frequency matrix");
+        };
+        let Some(Value::Scalar(freqz_fir_whole_fs_empty_last_f)) =
+            freqz_fir_whole_fs_empty_f.elements().last()
+        else {
+            panic!("expected scalar freqz fir whole-fs-empty endpoint");
+        };
+        assert!((*freqz_fir_whole_fs_empty_last_f - 7.984375).abs() <= 1e-12);
+        assert_eq!(
+            builtin_freqz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("freqz fir explicit-fs numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                            .expect("freqz fir explicit-fs frequencies"),
+                    ),
+                    Value::Scalar(8.0),
+                ],
+                1,
+            )
+            .expect("freqz fir explicit-fs shorthand"),
+            builtin_freqz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("freqz explicit-fs numerator"),
+                    ),
+                    Value::Scalar(1.0),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                            .expect("freqz explicit-fs frequencies"),
+                    ),
+                    Value::Scalar(8.0),
+                ],
+                1,
+            )
+            .expect("freqz explicit-fs denominator form")
+        );
         assert_eq!(
             builtin_phasez(
                 &[Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(4.0),],
@@ -87291,6 +95175,145 @@ mod tests {
                 )
                 .expect("phasez constant output")
             )]
+        );
+        let phasez_fir = builtin_phasez(
+            &[Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                    .expect("phasez fir numerator"),
+            )],
+            2,
+        )
+        .expect("phasez fir shorthand");
+        let Value::Matrix(phasez_fir_phi) = &phasez_fir[0] else {
+            panic!("expected phasez fir phase matrix");
+        };
+        assert_eq!(phasez_fir_phi.dims(), &[512, 1]);
+        let Value::Matrix(phasez_fir_w) = &phasez_fir[1] else {
+            panic!("expected phasez fir frequency matrix");
+        };
+        let Some(Value::Scalar(phasez_fir_last_w)) = phasez_fir_w.elements().last() else {
+            panic!("expected scalar phasez fir endpoint");
+        };
+        let Some(Value::Scalar(phasez_fir_last_phi)) = phasez_fir_phi.elements().last() else {
+            panic!("expected scalar phasez fir phase endpoint");
+        };
+        assert!((*phasez_fir_last_phi + *phasez_fir_last_w).abs() <= 1e-12);
+        let phasez_fir_fs_empty = builtin_phasez(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("phasez fir fs-empty numerator"),
+                ),
+                Value::Matrix(MatrixValue::new(0, 0, vec![]).expect("phasez fs-empty n")),
+                Value::Scalar(8.0),
+            ],
+            1,
+        )
+        .expect("phasez fir fs-empty shorthand");
+        let Value::Matrix(phasez_fir_fs_empty) = &phasez_fir_fs_empty[0] else {
+            panic!("expected phasez fir fs-empty phase matrix");
+        };
+        assert_eq!(phasez_fir_fs_empty.dims(), &[512, 1]);
+        assert_eq!(
+            builtin_phasez(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("phasez fir whole numerator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::String("whole".to_string()),
+                ],
+                2,
+            )
+            .expect("phasez fir whole shorthand"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(-std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(-std::f64::consts::PI),
+                            Value::Scalar(-3.0 * std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("phasez fir whole phi"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(std::f64::consts::PI),
+                            Value::Scalar(3.0 * std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("phasez fir whole w"),
+                ),
+            ]
+        );
+        let phasez_fir_whole_fs_empty = builtin_phasez(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("phasez fir whole-fs-empty numerator"),
+                ),
+                Value::Matrix(MatrixValue::new(0, 0, vec![]).expect("phasez whole-fs-empty n")),
+                Value::String("whole".to_string()),
+                Value::Scalar(8.0),
+            ],
+            2,
+        )
+        .expect("phasez fir whole-fs-empty shorthand");
+        let Value::Matrix(phasez_fir_whole_fs_empty_phi) = &phasez_fir_whole_fs_empty[0] else {
+            panic!("expected phasez fir whole-fs-empty phase matrix");
+        };
+        assert_eq!(phasez_fir_whole_fs_empty_phi.dims(), &[512, 1]);
+        let Value::Matrix(phasez_fir_whole_fs_empty_f) = &phasez_fir_whole_fs_empty[1] else {
+            panic!("expected phasez fir whole-fs-empty frequency matrix");
+        };
+        let Some(Value::Scalar(phasez_fir_whole_fs_empty_last_f)) =
+            phasez_fir_whole_fs_empty_f.elements().last()
+        else {
+            panic!("expected scalar phasez fir whole-fs-empty endpoint");
+        };
+        assert!((*phasez_fir_whole_fs_empty_last_f - 7.984375).abs() <= 1e-12);
+        assert_eq!(
+            builtin_phasez(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("phasez fir explicit-fs numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                            .expect("phasez fir explicit-fs frequencies"),
+                    ),
+                    Value::Scalar(8.0),
+                ],
+                1,
+            )
+            .expect("phasez fir explicit-fs shorthand"),
+            builtin_phasez(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("phasez explicit-fs numerator"),
+                    ),
+                    Value::Scalar(1.0),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                            .expect("phasez explicit-fs frequencies"),
+                    ),
+                    Value::Scalar(8.0),
+                ],
+                1,
+            )
+            .expect("phasez explicit-fs denominator form")
         );
         assert_eq!(
             builtin_freqz(
@@ -87344,6 +95367,186 @@ mod tests {
                 ),
             ]
         );
+        let empty_frequency_selection =
+            Value::Matrix(MatrixValue::new(0, 0, vec![]).expect("empty frequency selection"));
+        let freqz_empty = builtin_freqz(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("freqz empty-n numerator"),
+                ),
+                Value::Scalar(1.0),
+                empty_frequency_selection.clone(),
+                Value::Scalar(8.0),
+            ],
+            2,
+        )
+        .expect("freqz empty n");
+        let Value::Matrix(freqz_empty_h) = &freqz_empty[0] else {
+            panic!("expected freqz empty-n response matrix");
+        };
+        assert_eq!(freqz_empty_h.dims(), &[512, 1]);
+        let Value::Matrix(freqz_empty_f) = &freqz_empty[1] else {
+            panic!("expected freqz empty-n frequency matrix");
+        };
+        assert_eq!(freqz_empty_f.dims(), &[512, 1]);
+        let Some(Value::Scalar(freqz_empty_last_f)) = freqz_empty_f.elements().last() else {
+            panic!("expected scalar freqz empty-n endpoint");
+        };
+        assert!((*freqz_empty_last_f - 3.9921875).abs() <= 1e-12);
+        assert_eq!(
+            builtin_freqz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("freqz whole-first numerator"),
+                    ),
+                    Value::Scalar(1.0),
+                    Value::String("whole".to_string()),
+                    Value::Scalar(4.0),
+                ],
+                2,
+            )
+            .expect("freqz whole-first"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Complex(ComplexValue {
+                                real: 0.0,
+                                imag: -1.0
+                            }),
+                            Value::Scalar(-1.0),
+                            Value::Complex(ComplexValue {
+                                real: 0.0,
+                                imag: 1.0
+                            }),
+                        ],
+                    )
+                    .expect("freqz whole-first h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(std::f64::consts::PI),
+                            Value::Scalar(3.0 * std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("freqz whole-first w"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_phasez(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("phasez whole-first numerator"),
+                    ),
+                    Value::Scalar(1.0),
+                    Value::String("whole".to_string()),
+                    Value::Scalar(4.0),
+                ],
+                2,
+            )
+            .expect("phasez whole-first"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(-std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(-std::f64::consts::PI),
+                            Value::Scalar(-3.0 * std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("phasez whole-first phi"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(std::f64::consts::PI),
+                            Value::Scalar(3.0 * std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("phasez whole-first w"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_freqz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            6,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(-0.5),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("freqz sos row fallback"),
+                    ),
+                    Value::Scalar(4.0),
+                ],
+                2,
+            )
+            .expect("freqz sos row fallback"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.5),
+                            Value::Complex(ComplexValue {
+                                real: 0.7928932188134524,
+                                imag: -0.7071067811865476,
+                            }),
+                            Value::Complex(ComplexValue {
+                                real: 0.5,
+                                imag: 1.0,
+                            }),
+                            Value::Complex(ComplexValue {
+                                real: 2.2071067811865475,
+                                imag: -0.7071067811865475,
+                            }),
+                        ],
+                    )
+                    .expect("freqz sos row fallback h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(std::f64::consts::FRAC_PI_4),
+                            Value::Scalar(std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(3.0 * std::f64::consts::FRAC_PI_4),
+                        ],
+                    )
+                    .expect("freqz sos row fallback w"),
+                ),
+            ],
+        );
         assert_eq!(
             builtin_zerophase(
                 &[
@@ -87370,6 +95573,295 @@ mod tests {
                 )
                 .expect("zerophase delay output")
             )]
+        );
+        let zerophase_empty = builtin_zerophase(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("zerophase empty-n numerator"),
+                ),
+                Value::Scalar(1.0),
+                empty_frequency_selection,
+                Value::Scalar(8.0),
+            ],
+            3,
+        )
+        .expect("zerophase empty n");
+        let Value::Matrix(zerophase_empty_hr) = &zerophase_empty[0] else {
+            panic!("expected zerophase empty-n response matrix");
+        };
+        assert_eq!(zerophase_empty_hr.dims(), &[512, 1]);
+        let Value::Matrix(zerophase_empty_f) = &zerophase_empty[1] else {
+            panic!("expected zerophase empty-n frequency matrix");
+        };
+        assert_eq!(zerophase_empty_f.dims(), &[512, 1]);
+        let Value::Matrix(zerophase_empty_phi) = &zerophase_empty[2] else {
+            panic!("expected zerophase empty-n phase matrix");
+        };
+        assert_eq!(zerophase_empty_phi.dims(), &[512, 1]);
+        let Some(Value::Scalar(zerophase_empty_last_f)) = zerophase_empty_f.elements().last()
+        else {
+            panic!("expected scalar zerophase empty-n endpoint");
+        };
+        assert!((*zerophase_empty_last_f - 3.9921875).abs() <= 1e-12);
+        let zerophase_fir = builtin_zerophase(
+            &[Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                    .expect("zerophase fir numerator"),
+            )],
+            3,
+        )
+        .expect("zerophase fir shorthand");
+        let Value::Matrix(zerophase_fir_hr) = &zerophase_fir[0] else {
+            panic!("expected zerophase fir response matrix");
+        };
+        assert_eq!(zerophase_fir_hr.dims(), &[512, 1]);
+        assert!(zerophase_fir_hr
+            .elements()
+            .iter()
+            .all(|value| matches!(value, Value::Scalar(scalar) if (*scalar - 1.0).abs() <= 1e-12)));
+        let Value::Matrix(zerophase_fir_w) = &zerophase_fir[1] else {
+            panic!("expected zerophase fir frequency matrix");
+        };
+        let Some(Value::Scalar(zerophase_fir_last_w)) = zerophase_fir_w.elements().last() else {
+            panic!("expected scalar zerophase fir endpoint");
+        };
+        assert!(
+            (*zerophase_fir_last_w
+                - std::f64::consts::PI * (DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT as f64 - 1.0)
+                    / DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT as f64)
+                .abs()
+                <= 1e-12
+        );
+        let Value::Matrix(zerophase_fir_phi) = &zerophase_fir[2] else {
+            panic!("expected zerophase fir phase matrix");
+        };
+        let Some(Value::Scalar(zerophase_fir_last_phi)) = zerophase_fir_phi.elements().last()
+        else {
+            panic!("expected scalar zerophase fir phase endpoint");
+        };
+        assert!((*zerophase_fir_last_phi + *zerophase_fir_last_w).abs() <= 1e-12);
+        assert_eq!(
+            builtin_zerophase(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("zerophase fir explicit numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            2,
+                            vec![
+                                Value::Scalar(0.0),
+                                Value::Scalar(std::f64::consts::FRAC_PI_2),
+                            ],
+                        )
+                        .expect("zerophase fir explicit frequencies"),
+                    ),
+                ],
+                3,
+            )
+            .expect("zerophase fir explicit shorthand"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("zerophase fir explicit hr"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        2,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("zerophase fir explicit w"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        2,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(-std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("zerophase fir explicit phi"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_zerophase(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("zerophase fir explicit-fs numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                            .expect("zerophase fir explicit-fs frequencies"),
+                    ),
+                    Value::Scalar(8.0),
+                ],
+                3,
+            )
+            .expect("zerophase fir explicit-fs shorthand"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("zerophase fir explicit-fs hr"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                        .expect("zerophase fir explicit-fs f"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        2,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(-std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("zerophase fir explicit-fs phi"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_zerophase(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("zerophase fir whole numerator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::String("whole".to_string()),
+                ],
+                3,
+            )
+            .expect("zerophase fir whole shorthand"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                        ],
+                    )
+                    .expect("zerophase fir whole shorthand hr"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(std::f64::consts::PI),
+                            Value::Scalar(3.0 * std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("zerophase fir whole shorthand w"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(-std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(-std::f64::consts::PI),
+                            Value::Scalar(-3.0 * std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("zerophase fir whole shorthand phi"),
+                ),
+            ]
+        );
+        let zerophase_fir_whole_fs = builtin_zerophase(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("zerophase fir whole-fs numerator"),
+                ),
+                Value::String("whole".to_string()),
+                Value::Scalar(8.0),
+            ],
+            3,
+        )
+        .expect("zerophase fir whole-fs shorthand");
+        let Value::Matrix(zerophase_fir_whole_fs_hr) = &zerophase_fir_whole_fs[0] else {
+            panic!("expected zerophase fir whole-fs response matrix");
+        };
+        assert_eq!(zerophase_fir_whole_fs_hr.dims(), &[512, 1]);
+        let Value::Matrix(zerophase_fir_whole_fs_f) = &zerophase_fir_whole_fs[1] else {
+            panic!("expected zerophase fir whole-fs frequency matrix");
+        };
+        let Some(Value::Scalar(zerophase_fir_whole_fs_last_f)) =
+            zerophase_fir_whole_fs_f.elements().last()
+        else {
+            panic!("expected scalar zerophase fir whole-fs endpoint");
+        };
+        assert!((*zerophase_fir_whole_fs_last_f - 7.984375).abs() <= 1e-12);
+        let Value::Matrix(zerophase_fir_whole_fs_phi) = &zerophase_fir_whole_fs[2] else {
+            panic!("expected zerophase fir whole-fs phase matrix");
+        };
+        assert_eq!(zerophase_fir_whole_fs_phi.dims(), &[512, 1]);
+        let zerophase_fs_only = builtin_zerophase(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("zerophase fs-only numerator"),
+                ),
+                Value::Scalar(1.0),
+                Value::Scalar(8.5),
+            ],
+            3,
+        )
+        .expect("zerophase fs-only");
+        let Value::Matrix(zerophase_fs_only_hr) = &zerophase_fs_only[0] else {
+            panic!("expected zerophase fs-only response matrix");
+        };
+        assert_eq!(zerophase_fs_only_hr.dims(), &[512, 1]);
+        let Value::Matrix(zerophase_fs_only_f) = &zerophase_fs_only[1] else {
+            panic!("expected zerophase fs-only frequency matrix");
+        };
+        let Some(Value::Scalar(zerophase_fs_only_last_f)) = zerophase_fs_only_f.elements().last()
+        else {
+            panic!("expected scalar zerophase fs-only endpoint");
+        };
+        assert!((*zerophase_fs_only_last_f - 4.24169921875).abs() <= 1e-12);
+        let Value::Matrix(zerophase_fs_only_phi) = &zerophase_fs_only[2] else {
+            panic!("expected zerophase fs-only phase matrix");
+        };
+        let Some(Value::Scalar(zerophase_fs_only_last_phi)) =
+            zerophase_fs_only_phi.elements().last()
+        else {
+            panic!("expected scalar zerophase fs-only phase endpoint");
+        };
+        assert!(
+            (*zerophase_fs_only_last_phi + std::f64::consts::PI * 511.0 / 512.0).abs() <= 1e-12
+        );
+        assert_eq!(
+            builtin_zerophase(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("zerophase fir fs-only numerator"),
+                    ),
+                    Value::Scalar(8.5),
+                ],
+                3,
+            )
+            .expect("zerophase fir fs-only shorthand"),
+            zerophase_fs_only
         );
         assert_eq!(
             builtin_zerophase(
@@ -87469,6 +95961,126 @@ mod tests {
                 ),
             ]
         );
+        let grpdelay_whole = builtin_grpdelay(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("grpdelay whole numerator"),
+                ),
+                Value::Scalar(1.0),
+                Value::String("whole".to_string()),
+            ],
+            2,
+        )
+        .expect("grpdelay whole");
+        let whole_delay = numeric_operand(&grpdelay_whole[0], "grpdelay whole delay")
+            .expect("grpdelay whole delay operand");
+        let whole_freq = numeric_operand(&grpdelay_whole[1], "grpdelay whole frequency")
+            .expect("grpdelay whole freq operand");
+        assert_eq!(whole_delay.rows, 512);
+        assert_eq!(whole_delay.cols, 1);
+        assert!(whole_delay
+            .values
+            .iter()
+            .all(|value| (*value - 1.0).abs() <= 1e-12));
+        assert_eq!(whole_freq.rows, 512);
+        assert_eq!(whole_freq.cols, 1);
+        assert!((whole_freq.values[0] - 0.0).abs() <= 1e-12);
+        assert!(
+            (whole_freq.values[511] - (2.0 * std::f64::consts::PI * 511.0 / 512.0)).abs() <= 1e-12
+        );
+        let grpdelay_fir_fs_empty = builtin_grpdelay(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("grpdelay fir fs-empty numerator"),
+                ),
+                Value::Matrix(MatrixValue::new(0, 0, vec![]).expect("grpdelay fs-empty n")),
+                Value::Scalar(8.0),
+            ],
+            2,
+        )
+        .expect("grpdelay fir fs-empty shorthand");
+        let grpdelay_fir_fs_empty_delay =
+            numeric_operand(&grpdelay_fir_fs_empty[0], "grpdelay fir fs-empty delay")
+                .expect("grpdelay fir fs-empty delay operand");
+        let grpdelay_fir_fs_empty_f =
+            numeric_operand(&grpdelay_fir_fs_empty[1], "grpdelay fir fs-empty frequency")
+                .expect("grpdelay fir fs-empty frequency operand");
+        assert_eq!(grpdelay_fir_fs_empty_delay.rows, 512);
+        assert_eq!(grpdelay_fir_fs_empty_delay.cols, 1);
+        assert!(grpdelay_fir_fs_empty_delay
+            .values
+            .iter()
+            .all(|value| (*value - 1.0).abs() <= 1e-12));
+        assert_eq!(grpdelay_fir_fs_empty_f.rows, 512);
+        assert_eq!(grpdelay_fir_fs_empty_f.cols, 1);
+        assert!((grpdelay_fir_fs_empty_f.values[511] - 3.9921875).abs() <= 1e-12);
+        let grpdelay_fir_whole_fs_empty = builtin_grpdelay(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("grpdelay fir whole-fs-empty numerator"),
+                ),
+                Value::Matrix(MatrixValue::new(0, 0, vec![]).expect("grpdelay whole-fs-empty n")),
+                Value::String("whole".to_string()),
+                Value::Scalar(8.0),
+            ],
+            2,
+        )
+        .expect("grpdelay fir whole-fs-empty shorthand");
+        let grpdelay_fir_whole_fs_empty_delay = numeric_operand(
+            &grpdelay_fir_whole_fs_empty[0],
+            "grpdelay fir whole-fs-empty delay",
+        )
+        .expect("grpdelay fir whole-fs-empty delay operand");
+        let grpdelay_fir_whole_fs_empty_f = numeric_operand(
+            &grpdelay_fir_whole_fs_empty[1],
+            "grpdelay fir whole-fs-empty frequency",
+        )
+        .expect("grpdelay fir whole-fs-empty frequency operand");
+        assert_eq!(grpdelay_fir_whole_fs_empty_delay.rows, 512);
+        assert_eq!(grpdelay_fir_whole_fs_empty_delay.cols, 1);
+        assert!(grpdelay_fir_whole_fs_empty_delay
+            .values
+            .iter()
+            .all(|value| (*value - 1.0).abs() <= 1e-12));
+        assert_eq!(grpdelay_fir_whole_fs_empty_f.rows, 512);
+        assert_eq!(grpdelay_fir_whole_fs_empty_f.cols, 1);
+        assert!((grpdelay_fir_whole_fs_empty_f.values[511] - 7.984375).abs() <= 1e-12);
+        assert_eq!(
+            builtin_grpdelay(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("grpdelay fir explicit-fs numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                            .expect("grpdelay fir explicit-fs frequencies"),
+                    ),
+                    Value::Scalar(8.0),
+                ],
+                1,
+            )
+            .expect("grpdelay fir explicit-fs shorthand"),
+            builtin_grpdelay(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("grpdelay explicit-fs numerator"),
+                    ),
+                    Value::Scalar(1.0),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                            .expect("grpdelay explicit-fs frequencies"),
+                    ),
+                    Value::Scalar(8.0),
+                ],
+                1,
+            )
+            .expect("grpdelay explicit-fs denominator form")
+        );
         assert_eq!(
             builtin_phasedelay(
                 &[
@@ -87510,6 +96122,154 @@ mod tests {
                     .expect("phasedelay frequencies")
                 ),
             ]
+        );
+        let phasedelay_fir = builtin_phasedelay(
+            &[Value::Matrix(
+                MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                    .expect("phasedelay fir numerator"),
+            )],
+            2,
+        )
+        .expect("phasedelay fir shorthand");
+        let Value::Matrix(phasedelay_fir_delay) = &phasedelay_fir[0] else {
+            panic!("expected phasedelay fir delay matrix");
+        };
+        assert_eq!(phasedelay_fir_delay.dims(), &[512, 1]);
+        assert!(phasedelay_fir_delay
+            .elements()
+            .iter()
+            .all(|value| matches!(value, Value::Scalar(scalar) if (*scalar - 1.0).abs() <= 1e-12)));
+        let Value::Matrix(phasedelay_fir_w) = &phasedelay_fir[1] else {
+            panic!("expected phasedelay fir frequency matrix");
+        };
+        let Some(Value::Scalar(phasedelay_fir_last_w)) = phasedelay_fir_w.elements().last() else {
+            panic!("expected scalar phasedelay fir endpoint");
+        };
+        assert!(
+            (*phasedelay_fir_last_w
+                - std::f64::consts::PI * (DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT as f64 - 1.0)
+                    / DEFAULT_DIGITAL_FREQUENCY_POINT_COUNT as f64)
+                .abs()
+                <= 1e-12
+        );
+        let phasedelay_fir_fs_empty = builtin_phasedelay(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("phasedelay fir fs-empty numerator"),
+                ),
+                Value::Matrix(MatrixValue::new(0, 0, vec![]).expect("phasedelay fs-empty n")),
+                Value::Scalar(8.0),
+            ],
+            1,
+        )
+        .expect("phasedelay fir fs-empty shorthand");
+        let Value::Matrix(phasedelay_fir_fs_empty) = &phasedelay_fir_fs_empty[0] else {
+            panic!("expected phasedelay fir fs-empty delay matrix");
+        };
+        assert_eq!(phasedelay_fir_fs_empty.dims(), &[512, 1]);
+        assert_eq!(
+            builtin_phasedelay(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("phasedelay fir whole numerator"),
+                    ),
+                    Value::Scalar(4.0),
+                    Value::String("whole".to_string()),
+                ],
+                2,
+            )
+            .expect("phasedelay fir whole shorthand"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                        ],
+                    )
+                    .expect("phasedelay fir whole delay"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(std::f64::consts::FRAC_PI_2),
+                            Value::Scalar(std::f64::consts::PI),
+                            Value::Scalar(3.0 * std::f64::consts::FRAC_PI_2),
+                        ],
+                    )
+                    .expect("phasedelay fir whole w"),
+                ),
+            ]
+        );
+        let phasedelay_fir_whole_fs_empty = builtin_phasedelay(
+            &[
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                        .expect("phasedelay fir whole-fs-empty numerator"),
+                ),
+                Value::Matrix(MatrixValue::new(0, 0, vec![]).expect("phasedelay whole-fs-empty n")),
+                Value::String("whole".to_string()),
+                Value::Scalar(8.0),
+            ],
+            2,
+        )
+        .expect("phasedelay fir whole-fs-empty shorthand");
+        let Value::Matrix(phasedelay_fir_whole_fs_empty_delay) = &phasedelay_fir_whole_fs_empty[0]
+        else {
+            panic!("expected phasedelay fir whole-fs-empty delay matrix");
+        };
+        assert_eq!(phasedelay_fir_whole_fs_empty_delay.dims(), &[512, 1]);
+        let Value::Matrix(phasedelay_fir_whole_fs_empty_f) = &phasedelay_fir_whole_fs_empty[1]
+        else {
+            panic!("expected phasedelay fir whole-fs-empty frequency matrix");
+        };
+        let Some(Value::Scalar(phasedelay_fir_whole_fs_empty_last_f)) =
+            phasedelay_fir_whole_fs_empty_f.elements().last()
+        else {
+            panic!("expected scalar phasedelay fir whole-fs-empty endpoint");
+        };
+        assert!((*phasedelay_fir_whole_fs_empty_last_f - 7.984375).abs() <= 1e-12);
+        assert_eq!(
+            builtin_phasedelay(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("phasedelay fir explicit-fs numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                            .expect("phasedelay fir explicit-fs frequencies"),
+                    ),
+                    Value::Scalar(8.0),
+                ],
+                1,
+            )
+            .expect("phasedelay fir explicit-fs shorthand"),
+            builtin_phasedelay(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(1.0)])
+                            .expect("phasedelay explicit-fs numerator"),
+                    ),
+                    Value::Scalar(1.0),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(0.0), Value::Scalar(2.0)])
+                            .expect("phasedelay explicit-fs frequencies"),
+                    ),
+                    Value::Scalar(8.0),
+                ],
+                1,
+            )
+            .expect("phasedelay explicit-fs denominator form")
         );
         assert_eq!(
             builtin_isstable(&[
@@ -87567,6 +96327,22 @@ mod tests {
             Value::Logical(false)
         );
         assert_eq!(
+            builtin_isfir(&[
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(1.0), Value::Scalar(0.0)],
+                    )
+                    .expect("isfir ctf B"),
+                ),
+                Value::Scalar(1.0),
+                Value::String("ctf".to_string()),
+            ])
+            .expect("isfir ctf"),
+            Value::Logical(true)
+        );
+        assert_eq!(
             builtin_isiir(&[
                 Value::Matrix(
                     MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
@@ -87586,6 +96362,47 @@ mod tests {
                 ),
             ])
             .expect("isiir iir"),
+            Value::Logical(true)
+        );
+        assert_eq!(
+            builtin_isiir(&[
+                Value::Cell(
+                    CellValue::new(
+                        1,
+                        3,
+                        vec![
+                            Value::Matrix(
+                                MatrixValue::new(
+                                    1,
+                                    3,
+                                    vec![
+                                        Value::Scalar(1.0),
+                                        Value::Scalar(1.0),
+                                        Value::Scalar(0.0)
+                                    ],
+                                )
+                                .expect("isiir ctf cell B"),
+                            ),
+                            Value::Matrix(
+                                MatrixValue::new(
+                                    1,
+                                    3,
+                                    vec![
+                                        Value::Scalar(1.0),
+                                        Value::Scalar(-1.0),
+                                        Value::Scalar(0.5)
+                                    ],
+                                )
+                                .expect("isiir ctf cell A"),
+                            ),
+                            Value::Scalar(2.0),
+                        ],
+                    )
+                    .expect("isiir ctf cell")
+                ),
+                Value::String("ctf".to_string()),
+            ])
+            .expect("isiir ctf"),
             Value::Logical(true)
         );
         assert_eq!(
@@ -87931,6 +96748,82 @@ mod tests {
                 ),
             ]
         );
+        assert_eq!(
+            builtin_freqs(
+                &[
+                    Value::Scalar(1.0),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                            .expect("freqs n denominator"),
+                    ),
+                    Value::Scalar(4.0),
+                ],
+                2,
+            )
+            .expect("freqs n lowpass"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Complex(ComplexValue {
+                                real: 0.9900990099009901,
+                                imag: -0.09900990099009901,
+                            }),
+                            Value::Complex(ComplexValue {
+                                real: 0.8227449696365737,
+                                imag: -0.3818843863976205,
+                            }),
+                            Value::Complex(ComplexValue {
+                                real: 0.17725503036342635,
+                                imag: -0.38188438639762057,
+                            }),
+                            Value::Complex(ComplexValue {
+                                real: 0.009900990099009901,
+                                imag: -0.09900990099009901,
+                            }),
+                        ],
+                    )
+                    .expect("freqs n response"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.1),
+                            Value::Scalar(0.46415888336127786),
+                            Value::Scalar(2.1544346900318834),
+                            Value::Scalar(10.0),
+                        ],
+                    )
+                    .expect("freqs n frequencies"),
+                ),
+            ]
+        );
+        let freqs_default = builtin_freqs(
+            &[
+                Value::Scalar(1.0),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("freqs default denominator"),
+                ),
+            ],
+            2,
+        )
+        .expect("freqs default lowpass");
+        let Value::Matrix(freqs_default_h) = &freqs_default[0] else {
+            panic!("expected freqs default response matrix");
+        };
+        assert_eq!(freqs_default_h.dims(), &[200, 1]);
+        let Value::Matrix(freqs_default_w) = &freqs_default[1] else {
+            panic!("expected freqs default frequency matrix");
+        };
+        let Some(Value::Scalar(freqs_default_last_w)) = freqs_default_w.elements().last() else {
+            panic!("expected scalar freqs default endpoint");
+        };
+        assert!((*freqs_default_last_w - 10.0).abs() <= 1e-12);
         assert_eq!(
             builtin_impz(
                 &[
@@ -88865,6 +97758,38 @@ mod tests {
             builtin_residue(
                 &[
                     Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(3.0)])
+                            .expect("repeated residue numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-2.0), Value::Scalar(1.0)]
+                        )
+                        .expect("repeated residue denominator"),
+                    ),
+                ],
+                3
+            )
+            .expect("residue repeated"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(2.0), Value::Scalar(5.0)])
+                        .expect("repeated residue values")
+                ),
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("repeated residue poles")
+                ),
+                Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("repeated residue direct")),
+            ]
+        );
+
+        assert_eq!(
+            builtin_residue(
+                &[
+                    Value::Matrix(
                         MatrixValue::new(
                             1,
                             3,
@@ -88930,6 +97855,40 @@ mod tests {
             builtin_residue(
                 &[
                     Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(2.0), Value::Scalar(5.0)])
+                            .expect("repeated roundtrip residues"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                            .expect("repeated roundtrip poles"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 0, Vec::new()).expect("repeated roundtrip direct"),
+                    ),
+                ],
+                2
+            )
+            .expect("residue recomposes repeated form"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(3.0)])
+                        .expect("repeated roundtrip numerator")
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(-2.0), Value::Scalar(1.0)]
+                    )
+                    .expect("repeated roundtrip denominator")
+                ),
+            ]
+        );
+
+        assert_eq!(
+            builtin_residue(
+                &[
+                    Value::Matrix(
                         MatrixValue::new(1, 1, vec![Value::Scalar(2.0)])
                             .expect("improper roundtrip residues")
                     ),
@@ -88957,6 +97916,149 @@ mod tests {
                 Value::Matrix(
                     MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
                         .expect("improper roundtrip denominator")
+                ),
+            ]
+        );
+
+        assert_eq!(
+            builtin_residuez(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(0.0)])
+                            .expect("residuez numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(-0.75),
+                                Value::Scalar(0.125)
+                            ],
+                        )
+                        .expect("residuez denominator"),
+                    ),
+                ],
+                3,
+            )
+            .expect("residuez proper"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(2.0), Value::Scalar(-1.0)])
+                        .expect("residuez values"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(0.5), Value::Scalar(0.25)])
+                        .expect("residuez poles"),
+                ),
+                Value::Matrix(MatrixValue::new(1, 0, Vec::new()).expect("residuez direct")),
+            ]
+        );
+
+        assert_eq!(
+            builtin_residuez(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(2.0), Value::Scalar(3.0)])
+                            .expect("residuez repeated numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-2.0), Value::Scalar(1.0)],
+                        )
+                        .expect("residuez repeated denominator"),
+                    ),
+                ],
+                3,
+            )
+            .expect("residuez repeated"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(-3.0), Value::Scalar(5.0)])
+                        .expect("residuez repeated values"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("residuez repeated poles"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 0, Vec::new()).expect("residuez repeated direct"),
+                ),
+            ]
+        );
+
+        assert_eq!(
+            builtin_residuez(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(2.0), Value::Scalar(-1.0)],)
+                            .expect("residuez roundtrip residues"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(0.5), Value::Scalar(0.25)],)
+                            .expect("residuez roundtrip poles"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 0, Vec::new()).expect("residuez roundtrip direct"),
+                    ),
+                ],
+                2,
+            )
+            .expect("residuez recomposes proper form"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(0.0)])
+                        .expect("residuez roundtrip numerator"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(-0.75),
+                            Value::Scalar(0.125)
+                        ],
+                    )
+                    .expect("residuez roundtrip denominator"),
+                ),
+            ]
+        );
+
+        assert_eq!(
+            builtin_residuez(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 1, vec![Value::Scalar(2.0)])
+                            .expect("residuez improper residues"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 1, vec![Value::Scalar(-1.0)])
+                            .expect("residuez improper poles"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                            .expect("residuez improper direct"),
+                    ),
+                ],
+                2,
+            )
+            .expect("residuez recomposes improper form"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(3.0), Value::Scalar(2.0), Value::Scalar(1.0)],
+                    )
+                    .expect("residuez improper numerator"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(1.0)])
+                        .expect("residuez improper denominator"),
                 ),
             ]
         );
@@ -88991,6 +98093,31 @@ mod tests {
                 Value::Scalar(1.0),
             ]
         );
+        assert!(matches!(
+            builtin_tf2zp(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            2,
+                            vec![Value::Scalar(1.0), Value::Scalar(0.0)],
+                        )
+                        .expect("tf2zp arity numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-3.0), Value::Scalar(2.0)],
+                        )
+                        .expect("tf2zp arity denominator"),
+                    ),
+                ],
+                2,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly three outputs")
+        ));
 
         assert_eq!(
             builtin_zp2tf(
@@ -89019,6 +98146,159 @@ mod tests {
                         vec![Value::Scalar(1.0), Value::Scalar(-3.0), Value::Scalar(2.0)]
                     )
                     .expect("zp2tf denominator")
+                ),
+            ]
+        );
+        assert!(matches!(
+            builtin_zp2tf(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 1, vec![Value::Scalar(0.0)]).expect("zp2tf arity zeros")
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(2.0), Value::Scalar(1.0)])
+                            .expect("zp2tf arity poles"),
+                    ),
+                    Value::Scalar(1.0),
+                ],
+                1,
+            ),
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("exactly two outputs")
+        ));
+
+        assert_eq!(
+            builtin_tf2zp(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            3,
+                            vec![
+                                Value::Scalar(2.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(3.0),
+                            ],
+                        )
+                        .expect("tf2zp multi numerator"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            3,
+                            vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5)],
+                        )
+                        .expect("tf2zp multi denominator"),
+                    ),
+                ],
+                3,
+            )
+            .expect("tf2zp multi"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        2,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(f64::INFINITY),
+                            Value::Scalar(-1.0),
+                            Value::Scalar(f64::INFINITY),
+                        ],
+                    )
+                    .expect("tf2zp multi zeros"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        1,
+                        vec![
+                            Value::Complex(ComplexValue {
+                                real: 0.5,
+                                imag: 0.5,
+                            }),
+                            Value::Complex(ComplexValue {
+                                real: 0.5,
+                                imag: -0.5,
+                            }),
+                        ],
+                    )
+                    .expect("tf2zp multi poles"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(2.0), Value::Scalar(3.0)])
+                        .expect("tf2zp multi gains"),
+                ),
+            ]
+        );
+
+        assert_eq!(
+            builtin_zp2tf(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            2,
+                            vec![
+                                Value::Scalar(0.0),
+                                Value::Scalar(f64::INFINITY),
+                                Value::Scalar(-1.0),
+                                Value::Scalar(f64::INFINITY),
+                            ],
+                        )
+                        .expect("zp2tf multi zeros"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            1,
+                            vec![
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: 0.5,
+                                }),
+                                Value::Complex(ComplexValue {
+                                    real: 0.5,
+                                    imag: -0.5,
+                                }),
+                            ],
+                        )
+                        .expect("zp2tf multi poles"),
+                    ),
+                    Value::Matrix(
+                        MatrixValue::new(2, 1, vec![Value::Scalar(2.0), Value::Scalar(3.0)])
+                            .expect("zp2tf multi gains"),
+                    ),
+                ],
+                2,
+            )
+            .expect("zp2tf multi"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        2,
+                        3,
+                        vec![
+                            Value::Scalar(2.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(0.0),
+                            Value::Scalar(3.0),
+                        ],
+                    )
+                    .expect("zp2tf multi numerator"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        1,
+                        3,
+                        vec![Value::Scalar(1.0), Value::Scalar(-1.0), Value::Scalar(0.5)],
+                    )
+                    .expect("zp2tf multi denominator"),
                 ),
             ]
         );
@@ -92030,6 +101310,131 @@ mod tests {
                 Value::Scalar(0.0),
                 Value::Matrix(
                     MatrixValue::new(0, 0, Vec::new()).expect("empty dividend remainder")
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_stepz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            2,
+                            6,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(2.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("stepz sos"),
+                    ),
+                    Value::Scalar(3.0)
+                ],
+                2,
+            )
+            .expect("stepz sos"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(1.0), Value::Scalar(3.0), Value::Scalar(3.0),],
+                    )
+                    .expect("stepz sos h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        3,
+                        1,
+                        vec![Value::Scalar(0.0), Value::Scalar(1.0), Value::Scalar(2.0),],
+                    )
+                    .expect("stepz sos t"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_stepz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(
+                            1,
+                            6,
+                            vec![
+                                Value::Scalar(1.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(0.0),
+                                Value::Scalar(1.0),
+                                Value::Scalar(-0.5),
+                                Value::Scalar(0.0),
+                            ],
+                        )
+                        .expect("stepz sos row fallback"),
+                    ),
+                    Value::Scalar(4.0)
+                ],
+                2,
+            )
+            .expect("stepz sos row fallback"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                        ],
+                    )
+                    .expect("stepz sos row fallback h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(
+                        4,
+                        1,
+                        vec![
+                            Value::Scalar(0.0),
+                            Value::Scalar(1.0),
+                            Value::Scalar(2.0),
+                            Value::Scalar(3.0),
+                        ],
+                    )
+                    .expect("stepz sos row fallback t"),
+                ),
+            ]
+        );
+        assert_eq!(
+            builtin_stepz(
+                &[
+                    Value::Matrix(
+                        MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(2.0)])
+                            .expect("stepz empty n b"),
+                    ),
+                    Value::Scalar(1.0),
+                    Value::Matrix(MatrixValue::new(0, 0, Vec::new()).expect("stepz empty n")),
+                    Value::Scalar(8.0),
+                ],
+                2,
+            )
+            .expect("stepz empty n fs"),
+            vec![
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(1.0), Value::Scalar(3.0)],)
+                        .expect("stepz empty n h"),
+                ),
+                Value::Matrix(
+                    MatrixValue::new(2, 1, vec![Value::Scalar(0.0), Value::Scalar(0.125)],)
+                        .expect("stepz empty n t"),
                 ),
             ]
         );

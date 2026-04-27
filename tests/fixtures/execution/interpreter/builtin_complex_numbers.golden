@@ -63,6 +63,11 @@ workspace
   cconv_trunc = [3, 3]
   cd = 1.2909944487358056
   ce = [0, 1, 1]
+  cell2sos_embedded = [2, 2, 0, 1, -1, 0.5]
+  cell2sos_gain_g = 2
+  cell2sos_gain_sos = [1, 1, 0, 1, -1, 0.5]
+  cell2sos_plain_g = 1
+  cell2sos_plain_sos = [1, 1, 0, 1, -1, 0.5]
   cf = [0, 1, 1]
   cg = [2, -1 - 1i ; -1 + 1i, 1.3333333333333335]
   ch = [2, 2 + 2i ; 2 - 2i, 4.333333333333333]
@@ -94,11 +99,26 @@ workspace
   cr = [1, 0.6123724356957945 - 0.6123724356957945i, 0.6149186938124421 + 0.39131189606246314i ; 0.6123724356957945 + 0.6123724356957945i, 1, 1 ; 0.6149186938124421 - 0.39131189606246314i, 1, 1]
   cs = [1, 1 ; 1, 1]
   ct = [1, 0 ; 0, 1]
+  ctf2sos_cell_down_g = 20.02917520455607
+  ctf2sos_cell_down_sos = [0.0615589373075181, 0, 0, 1, -1.8, 0.81 ; 0.81104662322684, 0, 0, 1, -0.2, 0.01]
+  ctf2sos_cell_g = 2
+  ctf2sos_cell_sos = [1, 1, 0, 1, -1, 0.5]
+  ctf2sos_down_g = 20.02917520455607
+  ctf2sos_down_sos = [0.0615589373075181, 0, 0, 1, -1.8, 0.81 ; 0.81104662322684, 0, 0, 1, -0.2, 0.01]
+  ctf2sos_embedded = [2, 2, 0, 1, -1, 0.5]
+  ctf2sos_g = 2
+  ctf2sos_sos = [1, 1, 0, 1, -1, 0.5]
+  ctf2zp_cell_k = 2
+  ctf2zp_cell_p = [0.5 + 0.5i ; 0.5 - 0.5i]
+  ctf2zp_cell_z = [0 ; -1]
   ctf2zp_k = 2
   ctf2zp_p = [0.5 + 0.5i ; 0.5 - 0.5i]
   ctf2zp_z = [0 ; -1]
   ctffilt_cell = [1 ; 3 ; 5 ; 7]
   ctffilt_dim = [1, 3, 5, 7 ; 10, 30, 50, 70]
+  ctffilt_nd_zf_size = [2, 2, 2]
+  ctffilt_nd_zf_vals = [5, 0, 6, 0, 11, 0, 12, 0]
+  ctffilt_scalar_b = [4 ; 7 ; 8.75 ; 9.6875]
   ctffilt_y = [1 ; 3 ; 5 ; 7]
   ctffilt_zf = [4 ; 0 ; 0 ; 0]
   cu = [1, 1 ; 1, 1]
@@ -114,8 +134,217 @@ workspace
   d = 4
   db2mag_vec = [1, 10, 100]
   db2pow_vec = [1, 10, 100]
+  df_cascade16 = digitalFilter cascade with properties:
+
+    Stages:
+      Stage1: [1x1 digitalFilter]
+      Stage2: [1x1 digitalFilter]
+      Stage3: [1x1 digitalFilter]
+      Stage4: [1x1 digitalFilter]
+      Stage5: [1x1 digitalFilter]
+      Stage6: [1x1 digitalFilter]
+      Stage7: [1x1 digitalFilter]
+      Stage8: [1x1 digitalFilter]
+      Stage9: [1x1 digitalFilter]
+      Stage10: [1x1 digitalFilter]
+      Stage11: [1x1 digitalFilter]
+      Stage12: [1x1 digitalFilter]
+      Stage13: [1x1 digitalFilter]
+      Stage14: [1x1 digitalFilter]
+      Stage15: [1x1 digitalFilter]
+      Stage16: [1x1 digitalFilter]
+
+    Specifications:
+      NormalizedFrequency: 1
   dft2 = [1, 1 ; 1, -1]
   dft4 = [1, 1, 1, 1 ; 1, -1i, -1, 1i ; 1, -1, 1, -1 ; 1, 1i, -1, -1i]
+  digitalfilter_allpass = true
+  digitalfilter_allpass_tol = true
+  digitalfilter_cascade16_numstages = 16
+  digitalfilter_cascade16_stage16_norm = true
+  digitalfilter_cascade_auto_fs = 8
+  digitalfilter_cascade_auto_norm = false
+  digitalfilter_cascade_auto_stage1_fs = 8
+  digitalfilter_cascade_auto_stage2_fs = 8
+  digitalfilter_cascade_ctf_a = [1, -0.5 ; 1, -0.5]
+  digitalfilter_cascade_ctf_b = [0.5 ; 0.5]
+  digitalfilter_cascade_ctf_sv = 1
+  digitalfilter_cascade_explicit_fs = 8
+  digitalfilter_cascade_filter = [0.25 ; 0.75 ; 1.4375 ; 2.25]
+  digitalfilter_cascade_filter_dim_nd_zf_size = [2, 2, 2]
+  digitalfilter_cascade_filter_dim_nd_zf_vals = [1.71875, 1.203125, 2.15625, 1.546875, 4.34375, 3.265625, 4.78125, 3.609375]
+  digitalfilter_cascade_filter_zf = [1.53125 ; 1.125]
+  digitalfilter_cascade_filter_zf_size = [2, 1]
+  digitalfilter_cascade_filter_zf_vals = [1.53125, 1.125]
+  digitalfilter_cascade_filter_zi_y = [0.875 ; 1.125 ; 1.65625 ; 2.375]
+  digitalfilter_cascade_filter_zi_zf = [1.546875 ; 1.1875]
+  digitalfilter_cascade_filter_zi_zf_size = [2, 1]
+  digitalfilter_cascade_filter_zi_zf_vals = [1.546875, 1.1875]
+  digitalfilter_cascade_filtfilt = [1 ; 1 ; 1 ; 1 ; 1 ; 1 ; 1]
+  digitalfilter_cascade_info = 'Digital Filter Cascade (real, double)
+--------------------------------
+Number of Stages : 2
+Sections         : 2
+Filter Order     : 2
+Impulse Response : IIR
+Stable           : Yes
+Minimum Phase    : Yes
+Maximum Phase    : Yes
+Sample Rate      : N/A (normalized frequency)'
+  digitalfilter_cascade_isdouble = true
+  digitalfilter_cascade_issingle = false
+  digitalfilter_cascade_norm_norm = true
+  digitalfilter_cascade_norm_stage1_norm = true
+  digitalfilter_cascade_numstages = 2
+  digitalfilter_cascade_setsample_fs = 8
+  digitalfilter_cascade_setsample_norm = false
+  digitalfilter_cascade_setsample_stage1_fs = 8
+  digitalfilter_cascade_setsample_stage2_fs = 8
+  digitalfilter_cascade_single_isdouble = false
+  digitalfilter_cascade_single_issingle = true
+  digitalfilter_cascade_single_stage1_issingle = true
+  digitalfilter_cascade_tf_a = [1, -1, 0.25]
+  digitalfilter_cascade_tf_b = 0.25
+  digitalfilter_cascade_zpk_k = 0.25
+  digitalfilter_cascade_zpk_p = [0.5 ; 0.5]
+  digitalfilter_cascade_zpk_z = []
+  digitalfilter_cascade_zplane_k = 0.25
+  digitalfilter_cascade_zplane_p = [0.5 ; 0.5]
+  digitalfilter_cascade_zplane_z = []
+  digitalfilter_ctf_a = [1, -0.5]
+  digitalfilter_ctf_b = 0.5
+  digitalfilter_ctf_sv = 1
+  digitalfilter_double_a = [1, -0.5]
+  digitalfilter_double_b = 0.5
+  digitalfilter_double_sv = 1
+  digitalfilter_fftfilt = [0 ; 1 ; 2 ; 3 ; 4 ; 0]
+  digitalfilter_fftfilt_cascade = [0 ; 0 ; 1 ; 2 ; 3 ; 4 ; 0 ; 0]
+  digitalfilter_filter_dim_nd_zf_size = [1, 2, 2]
+  digitalfilter_filter_dim_nd_zf_vals = [1.6875, 2.125, 4.3125, 4.75]
+  digitalfilter_filter_y = [0.5 ; 1.25 ; 2.125 ; 3.0625]
+  digitalfilter_filter_zf = 1.53125
+  digitalfilter_filter_zi_y = [0.75 ; 1.375 ; 2.1875 ; 3.09375]
+  digitalfilter_filter_zi_zf = 1.546875
+  digitalfilter_filtfilt = [1 ; 1 ; 1 ; 1 ; 1 ; 1 ; 1]
+  digitalfilter_filtord = 1
+  digitalfilter_fir_filtord = 1
+  digitalfilter_fir_firtype = 1
+  digitalfilter_fir_impz_h = [0 ; 1 ; 0]
+  digitalfilter_fir_impz_t = [0 ; 1 ; 2]
+  digitalfilter_fir_impzlength = 3
+  digitalfilter_fir_info = 'FIR Digital Filter (real, double)
+--------------------------------
+Number of Stages : 1
+Sections         : 1
+Filter Order     : 2
+Impulse Response : FIR
+Stable           : Yes
+Minimum Phase    : Yes
+Maximum Phase    : Yes
+Filter Length    : 3
+Linear Phase     : Yes (Type 1)
+Sample Rate      : N/A (normalized frequency)'
+  digitalfilter_fir_isfir = true
+  digitalfilter_fir_islinphase = true
+  digitalfilter_fir_islinphase_tol = true
+  digitalfilter_fir_stepz_h = [0 ; 1 ; 1]
+  digitalfilter_fir_stepz_t = [0 ; 1 ; 2]
+  digitalfilter_freqz_h = [1 ; 0.5953717849152731 - 0.32561964152545514i ; 0.4 - 0.2i ; 0.3458046856729622 - 0.09032552387839635i]
+  digitalfilter_freqz_w = [0 ; 0.7853981633974483 ; 1.5707963267948966 ; 2.356194490192345]
+  digitalfilter_fs_freqz_f = [0 ; 1 ; 2 ; 3]
+  digitalfilter_fs_freqz_h = [1 ; 0.5953717849152731 - 0.32561964152545514i ; 0.4 - 0.2i ; 0.3458046856729622 - 0.09032552387839635i]
+  digitalfilter_fs_grpdelay_f = [0 ; 1 ; 2 ; 3]
+  digitalfilter_fs_grpdelay_g = [1 ; 0.19074356983054616 ; -0.2 ; -0.30839062865407557]
+  digitalfilter_fs_impz_h = [0.5 ; 0.25 ; 0.125 ; 0.0625]
+  digitalfilter_fs_impz_t = [0 ; 0.125 ; 0.25 ; 0.375]
+  digitalfilter_fs_normalized = false
+  digitalfilter_fs_phasedelay_f = [0 ; 1 ; 2 ; 3]
+  digitalfilter_fs_phasedelay_p = [1 ; 0.6372233347356615 ; 0.2951672353008665 ; 0.10843560440872807]
+  digitalfilter_fs_phasez_f = [0 ; 1 ; 2 ; 3]
+  digitalfilter_fs_phasez_phi = [0 ; -0.5004740367753859 ; -0.4636476090008061 ; -0.2554953736485218]
+  digitalfilter_fs_sample_rate = 8
+  digitalfilter_fs_stepz_h = [0.5 ; 0.75 ; 0.875 ; 0.9375]
+  digitalfilter_fs_stepz_t = [0 ; 0.125 ; 0.25 ; 0.375]
+  digitalfilter_fs_zerophase_f = [0 ; 1 ; 2 ; 3]
+  digitalfilter_fs_zerophase_hr = [1 ; 0.678598344545847 ; 0.4472135954999579 ; 0.35740674433659325]
+  digitalfilter_fs_zerophase_phi = [0 ; -0.5004740367753859 ; -0.4636476090008061 ; -0.2554953736485218]
+  digitalfilter_gain_cascade_a = [1, -1, 0.5 ; 1, -0.5, 0]
+  digitalfilter_gain_cascade_b = [1, 1, 0 ; 0.5, 0, 0]
+  digitalfilter_gain_cascade_sv = [2, 1, 1]
+  digitalfilter_impz_h = [0.5 ; 0.25 ; 0.125 ; 0.0625]
+  digitalfilter_impz_t = [0 ; 1 ; 2 ; 3]
+  digitalfilter_impzlength = 14
+  digitalfilter_impzlength_tol = 13
+  digitalfilter_info = 'IIR Digital Filter (real, double)
+--------------------------------
+Number of Stages : 1
+Sections         : 1
+Filter Order     : 1
+Impulse Response : IIR
+Stable           : Yes
+Minimum Phase    : Yes
+Maximum Phase    : Yes
+Sample Rate      : N/A (normalized frequency)'
+  digitalfilter_isdouble = true
+  digitalfilter_issingle = false
+  digitalfilter_isstable = true
+  digitalfilter_maxphase_ismax = true
+  digitalfilter_maxphase_ismax_tol = true
+  digitalfilter_maxphase_ismin = false
+  digitalfilter_minphase_ismax = false
+  digitalfilter_minphase_ismin = true
+  digitalfilter_minphase_ismin_tol = true
+  digitalfilter_nested_ctf_a = [1, -0.5 ; 1, -0.5 ; 1, -0.5]
+  digitalfilter_nested_ctf_b = [0.5 ; 0.5 ; 0.5]
+  digitalfilter_nested_ctf_sv = 1
+  digitalfilter_nested_filter = [0.125 ; 0.4375 ; 0.9375 ; 1.59375]
+  digitalfilter_nested_filter_zf = [1.53125 ; 1.125 ; 0.796875]
+  digitalfilter_nested_filter_zf_size = [3, 1]
+  digitalfilter_nested_filter_zf_vals = [1.53125, 1.125, 0.796875]
+  digitalfilter_nested_filter_zi_y = [1.1875 ; 1.15625 ; 1.40625 ; 1.890625]
+  digitalfilter_nested_filter_zi_zf = [1.546875 ; 1.1875 ; 0.9453125]
+  digitalfilter_nested_filter_zi_zf_size = [3, 1]
+  digitalfilter_nested_filter_zi_zf_vals = [1.546875, 1.1875, 0.9453125]
+  digitalfilter_nested_numstages = 2
+  digitalfilter_nested_setsample_fs = 8
+  digitalfilter_nested_setsample_norm = false
+  digitalfilter_nested_setsample_stage21_fs = 8
+  digitalfilter_nested_setsample_stage22_fs = 8
+  digitalfilter_nested_setsample_stage2_fs = 8
+  digitalfilter_nested_stage2_numstages = 2
+  digitalfilter_nested_tf_a = [1, -1.5, 0.75, -0.125]
+  digitalfilter_nested_tf_b = 0.125
+  digitalfilter_nested_zpk_k = 0.125
+  digitalfilter_nested_zpk_p = [0.5 ; 0.5 ; 0.5]
+  digitalfilter_nested_zpk_z = []
+  digitalfilter_nested_zplane_k = 0.125
+  digitalfilter_nested_zplane_p = [0.5 ; 0.5 ; 0.5]
+  digitalfilter_nested_zplane_z = []
+  digitalfilter_setsample_f = [0 ; 1 ; 2 ; 3]
+  digitalfilter_setsample_fs = 8
+  digitalfilter_setsample_h = [1 ; 0.5953717849152731 - 0.32561964152545514i ; 0.4 - 0.2i ; 0.3458046856729622 - 0.09032552387839635i]
+  digitalfilter_setsample_norm = false
+  digitalfilter_setsample_renorm = true
+  digitalfilter_single_a = [1, -0.5]
+  digitalfilter_single_b = 0.5
+  digitalfilter_single_isdouble = false
+  digitalfilter_single_issingle = true
+  digitalfilter_single_sv = 1
+  digitalfilter_ss_A = 0.5
+  digitalfilter_ss_B = 1
+  digitalfilter_ss_C = 0.5
+  digitalfilter_ss_D = 0
+  digitalfilter_tf_a = [1, -0.5]
+  digitalfilter_tf_b = 0.5
+  digitalfilter_zpk_k = 0.5
+  digitalfilter_zpk_p = [0.5]
+  digitalfilter_zpk_z = []
+  digitalfilter_zplane_k3 = 0.5
+  digitalfilter_zplane_p2 = [0.5]
+  digitalfilter_zplane_p3 = [0.5]
+  digitalfilter_zplane_z = []
+  digitalfilter_zplane_z2 = []
+  digitalfilter_zplane_z3 = []
   e = 3 - 4i
   eqtf_a = [4, 0, 3, -1]
   eqtf_b = [0, 0, 2, 0]
@@ -130,10 +359,15 @@ workspace
   fft_dim2 = [1, 1 ; 0, 0]
   fft_pad = [0, 1 + 1i, 2, 1 - 1i]
   fft_pair = [0, 2]
+  fftfilt_basic = [1 ; 4 ; 8 ; 8 ; 3]
+  fftfilt_matrix = [1, 1 ; 3, 1 ; 5, 1 ; 3, -3]
+  fftfilt_nfft = [1 ; 4 ; 8 ; 8 ; 3]
+  fftfilt_row = [1, 3, 5, 3]
   fftn_page = [0, 2]
   filtfilt_ctf = [1 ; 1 ; 1 ; 1 ; 1 ; 1 ; 1]
   filtfilt_ctf_cell = [1 ; 1 ; 1 ; 1 ; 1 ; 1 ; 1]
   filtfilt_gust_iir = [1.9767441860463437 ; 2.4651162790696874 ; 3.186046511627875 ; 4 ; 4.813953488372147 ; 5.534883720930356 ; 6.023255813953742]
+  filtfilt_gust_nameeq = [1.9767441860463437 ; 2.4651162790696874 ; 3.186046511627875 ; 4 ; 4.813953488372147 ; 5.534883720930356 ; 6.023255813953742]
   filtfilt_gust_row = [1.25, 2, 3, 4, 5, 6, 6.75]
   filtfilt_iir_ones = [1 ; 1 ; 1 ; 1 ; 1 ; 1 ; 1]
   filtfilt_matrix = [1, 10 ; 2, 20 ; 3, 30 ; 4, 40 ; 5, 50 ; 6, 60 ; 7, 70]
@@ -141,33 +375,78 @@ workspace
   filtfilt_reflect = [1.5, 2, 3, 4, 5, 6, 6.5]
   filtfilt_row = [1, 2, 3, 4, 5, 6, 7]
   filtfilt_sos = [1 ; 1 ; 1 ; 1 ; 1 ; 1 ; 1]
+  filtfilt_sos_row = [9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9 ; 9]
   filtfilt_stepzlen = [1 ; 1 ; 1 ; 1 ; 1 ; 1 ; 1]
   filtfilt_zero_ic = [1, 2, 3, 4, 5, 6, 7]
   filtic_full = [30 ; 15]
   filtic_zero_input = [-1.12]
+  filtord_ctf = 2
+  filtord_fir_only = 1
   filtord_main = 3
+  filtord_sos = 2
   filtord_trim = 1
   firtype_1 = 1
   firtype_2 = 2
   firtype_3 = 3
   firtype_4 = 4
   firtype_delay = 1
+  freqs_default = []
+  freqs_default_last = 0.009900990099009901 - 0.09900990099009901i
+  freqs_default_len = 200
   freqs_h = [1, 0.5 - 0.5i]
+  freqs_n_h = [0.9900990099009901 - 0.09900990099009901i ; 0.8227449696365737 - 0.3818843863976205i ; 0.17725503036342635 - 0.38188438639762057i ; 0.009900990099009901 - 0.09900990099009901i]
+  freqs_n_w = [0.1 ; 0.46415888336127786 ; 2.1544346900318834 ; 10]
   freqs_s = [0, 2i]
   freqs_w = [0, 1]
   freqz_ctf_f = [0 ; 1 ; 2 ; 3]
   freqz_ctf_h = [1 ; 1 ; 1 ; 1]
+  freqz_ctf_scalar_a_h = [1 ; -0.5i]
+  freqz_ctf_scalar_a_w = [0 ; 1.5707963267948966]
   freqz_delay = [1 ; 0.7071067811865476 - 0.7071067811865476i ; -1i ; -0.7071067811865475 - 0.7071067811865476i]
+  freqz_empty_n_f = []
+  freqz_empty_n_h = []
+  freqz_empty_n_last_f = 3.9921874999999996
+  freqz_empty_n_len = 512
   freqz_exp_h = [1, -1i]
   freqz_exp_w = [0, 1.5707963267948966]
+  freqz_fir_fs_empty_f = []
+  freqz_fir_fs_empty_h = []
+  freqz_fir_fs_empty_last_f = 3.9921874999999996
+  freqz_fir_fs_empty_len = 512
+  freqz_fir_fs_exp = [1, -1i]
+  freqz_fir_only = []
+  freqz_fir_only_last = -0.9999811752826011 - 0.006135884649154799i
+  freqz_fir_only_len = 512
+  freqz_fir_whole = [1 ; -1i ; -1 ; 1i]
+  freqz_fir_whole_fs_empty_f = []
+  freqz_fir_whole_fs_empty_h = []
+  freqz_fir_whole_fs_empty_last_f = 7.984374999999999
+  freqz_fir_whole_fs_empty_len = 512
   freqz_fs_exp_f = [0, 2]
   freqz_fs_exp_h = [1, -1i]
   freqz_fs_f = [0 ; 1 ; 2 ; 3]
   freqz_fs_h = [1 ; 0.7071067811865476 - 0.7071067811865476i ; -1i ; -0.7071067811865475 - 0.7071067811865476i]
   freqz_h = [1 ; 1 ; 1 ; 1]
+  freqz_sos_row_h = [1.5 ; 0.7928932188134524 - 0.7071067811865476i ; 0.5 + 1i ; 2.2071067811865475 - 0.7071067811865475i]
+  freqz_sos_row_w = [0 ; 0.7853981633974483 ; 1.5707963267948966 ; 2.356194490192345]
   freqz_w = [0 ; 0.7853981633974483 ; 1.5707963267948966 ; 2.356194490192345]
+  freqz_whole_first_h = [1 ; -1i ; -1 ; 1i]
+  freqz_whole_first_w = [0 ; 1.5707963267948966 ; 3.141592653589793 ; 4.71238898038469]
   g = 0.9272952180016122
+  grpdelay_empty_n_f = []
+  grpdelay_empty_n_gd = []
+  grpdelay_empty_n_last_f = 3.9921874999999996
+  grpdelay_empty_n_len = 512
   grpdelay_exp = [1, 1]
+  grpdelay_fir_fs_empty_f = []
+  grpdelay_fir_fs_empty_gd = []
+  grpdelay_fir_fs_empty_last_f = 3.9921874999999996
+  grpdelay_fir_fs_empty_len = 512
+  grpdelay_fir_fs_exp = [1, 1]
+  grpdelay_fir_whole_fs_empty_f = []
+  grpdelay_fir_whole_fs_empty_gd = []
+  grpdelay_fir_whole_fs_empty_last_f = 7.984374999999999
+  grpdelay_fir_whole_fs_empty_len = 512
   grpdelay_fs = [1 ; 1 ; 1 ; 1]
   grpdelay_fs_f = [0 ; 1 ; 2 ; 3]
   grpdelay_gd = [1 ; 1 ; 1 ; 1]
@@ -175,6 +454,10 @@ workspace
   grpdelay_sos = [0 ; 0 ; 0 ; 0]
   grpdelay_sos_f = [0 ; 1 ; 2 ; 3]
   grpdelay_w = [0 ; 0.7853981633974483 ; 1.5707963267948966 ; 2.356194490192345]
+  grpdelay_whole_last = 6.270913460876501
+  grpdelay_whole_len = 512
+  grpdelay_whole_resp = []
+  grpdelay_whole_w = []
   h = false
   hankel_complex = [1, 2 ; 2, 3 + 1i]
   hankel_explicit = [1, 2, 3, 5 ; 2, 3, 5, 7 ; 3, 5, 7, 9]
@@ -185,28 +468,54 @@ workspace
   ifft2_delta = [1, 0 ; 0, 0]
   ifft_pair = [1, -1]
   ifftn_page = [1, -1]
+  impz_ctf_h = [1 ; 0.5 ; 0.25 ; 0.125]
+  impz_ctf_t = [0 ; 0.125 ; 0.25 ; 0.375]
+  impz_empty_n_h = [1 ; 2]
+  impz_empty_n_t = [0 ; 0.125]
   impz_fir = [1 ; 2 ; 0]
   impz_h = [1 ; 0.5 ; 0.25 ; 0.125]
+  impz_sos_h = [1 ; 2 ; 0]
+  impz_sos_row_h = [1 ; 0 ; 0 ; 1]
+  impz_sos_row_t = [0 ; 1 ; 2 ; 3]
+  impz_sos_t = [0 ; 1 ; 2]
   impz_t = [0 ; 1 ; 2 ; 3]
+  impzlength_ctf = 93
   impzlength_fir = 2
   impzlength_iir = 93
   impzlength_osc = 20
+  impzlength_sos = 5
+  impzlength_sos_row = 6
   impzlength_unstable = 20
   invhilb2 = [4, -6 ; -6, 12]
   invhilb3 = [9, -36, 30 ; -36, 192, -180 ; 30, -180, 180]
+  isallpass_ctf = true
   isallpass_delay = true
   isallpass_doc = true
   isallpass_false = false
+  isallpass_sos = true
+  isfir_ctf = true
   isfir_fir = true
   isfir_iir = false
+  isfir_sos = false
+  isiir_ctf = true
   isiir_fir = false
   isiir_iir = true
+  isiir_sos = true
   islinphase_complex = true
+  islinphase_ctf = true
   islinphase_delay = true
   islinphase_false = false
   islinphase_iir = false
+  islinphase_sos = false
+  ismaxphase_ctf = true
+  ismaxphase_sos = true
+  isminphase_ctf = true
+  isminphase_sos = true
+  isstable_ctf = true
+  isstable_ctf_cell = true
   isstable_fir = true
   isstable_iir = true
+  isstable_sos = true
   isstable_unstable = false
   j = [1, 2]
   k = [5, 5]
@@ -224,7 +533,23 @@ workspace
   pascal4_kind2 = [-1, -1, -1, -1 ; 3, 2, 1, 0 ; -3, -1, 0, 0 ; 1, 0, 0, 0]
   phasedelay_ctf = [0 ; 0 ; 0 ; 0]
   phasedelay_ctf_f = [0 ; 1 ; 2 ; 3]
+  phasedelay_empty_n_f = []
+  phasedelay_empty_n_last_f = 3.9921874999999996
+  phasedelay_empty_n_len = 512
+  phasedelay_empty_n_pd = []
   phasedelay_exp = [1, 1]
+  phasedelay_fir_fs_empty = []
+  phasedelay_fir_fs_empty_last = 1
+  phasedelay_fir_fs_empty_len = 512
+  phasedelay_fir_fs_exp = [1, 1]
+  phasedelay_fir_only = []
+  phasedelay_fir_only_last = 1
+  phasedelay_fir_only_len = 512
+  phasedelay_fir_whole = [1 ; 1 ; 1 ; 1]
+  phasedelay_fir_whole_fs_empty_f = []
+  phasedelay_fir_whole_fs_empty_last_f = 7.984374999999999
+  phasedelay_fir_whole_fs_empty_len = 512
+  phasedelay_fir_whole_fs_empty_phi = []
   phasedelay_fs = [1 ; 1 ; 1 ; 1]
   phasedelay_fs_f = [0 ; 1 ; 2 ; 3]
   phasedelay_iir = [1 ; 0.6372233347356615 ; 0.2951672353008665 ; 0.10843560440872807]
@@ -233,11 +558,29 @@ workspace
   phasez_ctf = [0 ; 0 ; 0 ; 0]
   phasez_ctf_f = [0 ; 1 ; 2 ; 3]
   phasez_delay = [0 ; -0.7853981633974483 ; -1.5707963267948966 ; -2.356194490192345]
+  phasez_empty_n_f = []
+  phasez_empty_n_last_f = 3.9921874999999996
+  phasez_empty_n_len = 512
+  phasez_empty_n_phi = []
   phasez_exp = [0, -1.5707963267948966]
+  phasez_fir_fs_empty = []
+  phasez_fir_fs_empty_last = -3.1354567304382504
+  phasez_fir_fs_empty_len = 512
+  phasez_fir_fs_exp = [0, -1.5707963267948966]
+  phasez_fir_only = []
+  phasez_fir_only_last = -3.1354567304382504
+  phasez_fir_only_len = 512
+  phasez_fir_whole = [0 ; -1.5707963267948966 ; -3.141592653589793 ; -4.71238898038469]
+  phasez_fir_whole_fs_empty_f = []
+  phasez_fir_whole_fs_empty_last_f = 7.984374999999999
+  phasez_fir_whole_fs_empty_len = 512
+  phasez_fir_whole_fs_empty_phi = []
   phasez_fs = [0 ; -0.7853981633974483 ; -1.5707963267948966 ; -2.356194490192345]
   phasez_fs_f = [0 ; 1 ; 2 ; 3]
   phasez_phi = [0 ; 0 ; 0 ; 0]
   phasez_w = [0 ; 0.7853981633974483 ; 1.5707963267948966 ; 2.356194490192345]
+  phasez_whole_first = [0 ; -1.5707963267948966 ; -3.141592653589793 ; -4.71238898038469]
+  phasez_whole_first_w = [0 ; 1.5707963267948966 ; 3.141592653589793 ; 4.71238898038469]
   pow2db_vec = [0, 10, 20]
   q = [3, 4]
   r = [0, 0]
@@ -249,13 +592,35 @@ workspace
   residue_k = []
   residue_p = [2 ; 1]
   residue_r = [2 ; -1]
+  residue_repeated_k = []
+  residue_repeated_p = [1 ; 1]
+  residue_repeated_r = [2 ; 5]
+  residue_repeated_round_a = [1, -2, 1]
+  residue_repeated_round_b = [2, 3]
   residue_round_a = [1, -3, 2]
   residue_round_b = [1, 0]
+  residuez_improper_k = [1, 1]
+  residuez_improper_p = [-1]
+  residuez_improper_r = [2]
+  residuez_improper_round_a = [1, 1]
+  residuez_improper_round_b = [3, 2, 1]
+  residuez_k = []
+  residuez_p = [0.5 ; 0.25]
+  residuez_r = [2 ; -1]
+  residuez_repeated_k = []
+  residuez_repeated_p = [1 ; 1]
+  residuez_repeated_r = [-3 ; 5]
+  residuez_repeated_round_a = [1, -2, 1]
+  residuez_repeated_round_b = [2, 3]
+  residuez_round_a = [1, -0.75, 0.125]
+  residuez_round_b = [1, 0]
   roots_complex = [1i ; -1i]
   roots_doc = [2 ; 1 ; -3]
   roots_nonmonic = [1 + 1.7320508075688772i ; 1 - 1.7320508075688772i]
   s = 'double'
   scaled_ctf_b = [0.5, 1, 0.5 ; 2, 1, 0]
+  sos2cell_gain = {{2, 1}, {[1, 1, 0], [1, -1, 0.5]}}
+  sos2cell_plain = {{[1, 1, 0], [1, -1, 0.5]}}
   sos2ctf_a = [1, 0, 0 ; 1, 1, 0]
   sos2ctf_b = [2, 4, 2 ; 3, 2, 0]
   sos2ss_A = [-10, 0, 10, 1 ; 1, 0, 0, 0 ; 0, 1, 0, 0 ; 0, 0, 1, 0]
@@ -267,16 +632,27 @@ workspace
   sos2zp_k = 2
   sos2zp_p = [0.5 + 0.5i ; 0.5 - 0.5i]
   sos2zp_z = [0 ; -1]
+  sosfilt_basic = [1 ; 3.5 ; 6.75 ; 10.375]
+  sosfilt_dim = [1, 3.5, 6.75, 10.375 ; 10, 35, 67.5, 103.75]
+  sosfilt_single = [1 ; 0.5 ; 0.25]
   ss2sos_down_g = 1
-  ss2sos_down_sos = [1, -0.0009832454376699957 + 0.00040727352272919716i, 0.00000040044993414410046 - 0.0000004004498330217669i, 1, -1.7999999999682799 - 0.000000000021975296851048014i, 0.8099999999708883 + 0.00000000001924641869462016i ; 1, 0.0009832454375326542 - 0.00040727352285056616i, 0.0000004004499340005735 - 0.000000400449833202707i, 1, -0.20000000000332535 + 0.0000000000011117597438794382i, 0.009999999999771986]
+  ss2sos_down_sos = [1, 0, 0, 1, -1.7999999999682799, 0.8099999999708883 ; 1, 0, 0, 1, -0.20000000000332535, 0.009999999999771986]
   ss2sos_g = 2
+  ss2sos_inf_g = 123.45679009179435
+  ss2sos_inf_sos = [0.8099999999964467, 0, 0, 1, -0.20000000000332535, 0.009999999999771986 ; 0.010000000002608526, 0, 0, 1, -1.7999999999682799, 0.8099999999708883]
+  ss2sos_ni_embedded = [1, 1.25, -0.375, 1, -0.75, 0.125]
+  ss2sos_ni_g = 2.5166114784235787
+  ss2sos_ni_sos = [0.39735970711951385, 0.4966996338993923, -0.1490098901698177, 1, -0.75, 0.125]
   ss2sos_order_A = [2, -1.1800000000000002, 0.18000000000000005, -0.008100000000000001 ; 1, 0, 0, 0 ; 0, 1, 0, 0 ; 0, 0, 1, 0]
   ss2sos_order_B = [1 ; 0 ; 0 ; 0]
   ss2sos_order_C = [2, -1.1800000000000002, 0.18000000000000005, -0.008100000000000001]
   ss2sos_order_D = 1
   ss2sos_sos = [1, 1, 0, 1, -1, 0.5]
+  ss2sos_two_g = 20.029175200497157
+  ss2sos_two_sos = [0.06155893732023912, 0, 0, 1, -1.7999999999682799, 0.8099999999708883 ; 0.8110466232235976, 0, 0, 1, -0.20000000000332535, 0.009999999999771986]
+  ss2sos_up_embedded = [1, 0, 0, 1, -0.20000000000332535, 0.009999999999771986 ; 1, 0, 0, 1, -1.7999999999682799, 0.8099999999708883]
   ss2sos_up_g = 1
-  ss2sos_up_sos = [1, 0.0009832454375326542 - 0.00040727352285056616i, 0.0000004004499340005735 - 0.000000400449833202707i, 1, -0.20000000000332535 + 0.0000000000011117597438794382i, 0.009999999999771986 ; 1, -0.0009832454376699957 + 0.00040727352272919716i, 0.00000040044993414410046 - 0.0000004004498330217669i, 1, -1.7999999999682799 - 0.000000000021975296851048014i, 0.8099999999708883 + 0.00000000001924641869462016i]
+  ss2sos_up_sos = [1, 0, 0, 1, -0.20000000000332535, 0.009999999999771986 ; 1, 0, 0, 1, -1.7999999999682799, 0.8099999999708883]
   ss2tf_a_multi = [1, -1, 0.5]
   ss2tf_a_ni = [1, 0, 1]
   ss2tf_a_round = [1, 0.4, 1]
@@ -289,17 +665,41 @@ workspace
   ss2zp_multi_z = [0, inf ; -1, inf]
   ss2zp_p = [0.5 + 0.5i ; 0.5 - 0.5i]
   ss2zp_z = [-1 ; inf]
+  stepz_ctf_h = [2 ; 3 ; 3.5 ; 3.75]
+  stepz_ctf_t = [0 ; 0.125 ; 0.25 ; 0.375]
+  stepz_empty_n_h = [1 ; 3]
+  stepz_empty_n_t = [0 ; 0.125]
   stepz_fir = [1 ; 3 ; 3]
   stepz_h = [1 ; 1.5 ; 1.75 ; 1.875]
+  stepz_sos_h = [1 ; 3 ; 3]
+  stepz_sos_row_h = [1 ; 1 ; 1 ; 2]
+  stepz_sos_row_t = [0 ; 1 ; 2 ; 3]
+  stepz_sos_t = [0 ; 1 ; 2]
   stepz_t = [0 ; 1 ; 2 ; 3]
   t = true
+  tf2ctf_a = [1, -1, 0.5]
+  tf2ctf_b = [1, 1, 0]
+  tf2ctf_g = 2
+  tf2ctf_section4_a = [1, -1.7999999998476712, 0.8099999998559331, 0, 0 ; 1, -1.2000000000769055, 0.46000000005490693, -0.06000000001715214, 0.0025000000001289065]
+  tf2ctf_section4_b = [1, -1.7999999998476712, 0.8099999998559331, 0, 0 ; 1, -1.2000000000769055, 0.46000000005490693, -0.06000000001715214, 0.0025000000001289065]
+  tf2ctf_section4_g = 2
+  tf2sos_down_g = 1
+  tf2sos_down_sos = [1, 0, 0, 1, -1.7999999999682799, 0.8099999999708883 ; 1, 0, 0, 1, -0.20000000000332535, 0.009999999999771986]
+  tf2sos_embedded = [2, 2, 0, 1, -1, 0.5]
   tf2sos_g = 2
+  tf2sos_inf_g = 123.45679009179435
+  tf2sos_inf_sos = [0.8099999999964467, 0, 0, 1, -0.20000000000332535, 0.009999999999771986 ; 0.010000000002608526, 0, 0, 1, -1.7999999999682799, 0.8099999999708883]
+  tf2sos_order_a = [1, -2, 1.1800000000000002, -0.18000000000000005, 0.008100000000000001]
+  tf2sos_order_b = [1, 0, 0, 0, 0]
   tf2sos_sos = [1, 1, 0, 1, -1, 0.5]
   tf2ss_A = [-0.4, -1 ; 1, 0]
   tf2ss_B = [1 ; 0]
   tf2ss_C = [2, 3 ; 1.6, 0]
   tf2ss_D = [0 ; 1]
   tf2zp_k = 1
+  tf2zp_multi_k = [2 ; 3]
+  tf2zp_multi_p = [0.5 + 0.5i ; 0.5 - 0.5i]
+  tf2zp_multi_z = [0, inf ; -1, inf]
   tf2zp_p = [2 ; 1]
   tf2zp_z = [0]
   toeplitz_complex = [1, 2 ; 2, 1]
@@ -350,11 +750,45 @@ workspace
   y = [1, 2 - 5i ; 3, 4 + 1i]
   z = [1, 5.385164807134504 ; 3, 4.123105625617661]
   zerophase_delay = [1 ; 1 ; 1 ; 1]
+  zerophase_empty_n_f = []
+  zerophase_empty_n_hr = []
+  zerophase_empty_n_last_f = 3.9921874999999996
+  zerophase_empty_n_len = 512
+  zerophase_empty_n_phi = []
   zerophase_exp = [1, 1]
   zerophase_exp_phi = [0, -1.5707963267948966]
   zerophase_exp_w = [0, 1.5707963267948966]
+  zerophase_fir_exp = [1, 1]
+  zerophase_fir_exp_phi = [0, -1.5707963267948966]
+  zerophase_fir_exp_w = [0, 1.5707963267948966]
+  zerophase_fir_fs_exp = [1, 1]
+  zerophase_fir_fs_exp_f = [0, 2]
+  zerophase_fir_fs_exp_phi = [0, -1.5707963267948966]
+  zerophase_fir_fs_only = []
+  zerophase_fir_fs_only_last = 1
+  zerophase_fir_fs_only_len = 512
+  zerophase_fir_only_hr = []
+  zerophase_fir_only_last_phi = -3.1354567304382504
+  zerophase_fir_only_last_w = 3.1354567304382504
+  zerophase_fir_only_len = 512
+  zerophase_fir_only_phi = []
+  zerophase_fir_only_w = []
+  zerophase_fir_whole_fs_f = []
+  zerophase_fir_whole_fs_hr = []
+  zerophase_fir_whole_fs_last_f = 7.984374999999999
+  zerophase_fir_whole_fs_len = 512
+  zerophase_fir_whole_fs_phi = []
+  zerophase_fir_whole_hr = [1 ; 1 ; 1 ; 1]
+  zerophase_fir_whole_phi = [0 ; -1.5707963267948966 ; -3.141592653589793 ; -4.71238898038469]
+  zerophase_fir_whole_w = [0 ; 1.5707963267948966 ; 3.141592653589793 ; 4.71238898038469]
   zerophase_fs_f = [0 ; 2 ; 4 ; 6]
   zerophase_fs_hr = [1 ; 1 ; 1 ; 1]
+  zerophase_fs_only_f = []
+  zerophase_fs_only_hr = []
+  zerophase_fs_only_last_f = 4.24169921875
+  zerophase_fs_only_last_phi = -3.1354567304382504
+  zerophase_fs_only_len = 512
+  zerophase_fs_only_phi = []
   zerophase_fs_phi = [0 ; -1.5707963267948966 ; -3.141592653589793 ; -4.71238898038469]
   zerophase_hr = [1 ; 1 ; 1 ; 1]
   zerophase_phi = [0 ; -1.5707963267948966 ; -3.141592653589793 ; -4.71238898038469]
@@ -365,9 +799,23 @@ workspace
   zp2ctf_a = [1, -1, 0.5]
   zp2ctf_b = [1, 1, 0]
   zp2ctf_ba = [2, 2, 0]
+  zp2ctf_ba_a = [1, -1, 0.5]
   zp2ctf_g = 2
+  zp2ctf_scale_a = [1, -1.8, 0.81 ; 1, -1, 0.25 ; 1, -0.2, 0.010000000000000002]
+  zp2ctf_scale_b = [0.09958677214571475, 0, 0 ; 2.489669303642926, 0, 0 ; 8.06652854380271, 0, 0]
+  zp2ctf_section4_a = [1, -1.8, 0.81, 0, 0 ; 1, -1.2000000000000002, 0.45999999999999996, -0.06, 0.0025000000000000005]
+  zp2ctf_section4_b = [1, 0, 0, 0, 0 ; 1, 0, 0, 0, 0]
+  zp2ctf_section4_g = 2
+  zp2sos_embedded = [2, 2, 0, 1, -1, 0.5]
   zp2sos_g = 2
+  zp2sos_order_k = 1
+  zp2sos_order_p = [0.10000000131708903 ; 0.09999999868291098 ; 0.9 ; 0.9]
+  zp2sos_order_z = [0 ; 0 ; 0 ; 0]
   zp2sos_sos = [1, 1, 0, 1, -1, 0.5]
+  zp2sos_two_g = 20.02917520455607
+  zp2sos_two_sos = [0.0615589373075181, 0, 0, 1, -1.8, 0.81 ; 0.81104662322684, 0, 0, 1, -0.2, 0.01]
+  zp2sos_zeroflag_g = 1
+  zp2sos_zeroflag_sos = [1, -0.30000000000000004, 0.020000000000000004, 1, -0.55, 0.075 ; 1, 0, -0.25, 1, -1.7000000000000002, 0.7200000000000001]
   zp2ss_A = [1, -0.5 ; 1, 0]
   zp2ss_B = [1 ; 0]
   zp2ss_C = [2, 2]
@@ -378,3 +826,5 @@ workspace
   zp2ss_multi_D = [2 ; 0]
   zp2tf_a = [1, -3, 2]
   zp2tf_b = [1, 0]
+  zp2tf_multi_a = [1, -1, 0.5]
+  zp2tf_multi_b = [2, 2, 0 ; 0, 0, 3]

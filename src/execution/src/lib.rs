@@ -49,10 +49,10 @@ use matlab_resolver::{
     ResolvedCallable, ResolverContext,
 };
 use matlab_runtime::{
-    qualified_object_class_name, render_named_value, render_value, render_workspace,
-    ArrayStorageClass, CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue,
-    MatrixValue, ObjectClassMetadata, ObjectMethodTarget, ObjectStorageKind, ObjectValue,
-    RuntimeError, RuntimeStackFrame, StructValue, Value, Workspace,
+    qualified_object_class_name, render_named_value, render_special_display_value, render_value,
+    render_workspace, ArrayStorageClass, CellValue, ComplexValue, FunctionHandleTarget,
+    FunctionHandleValue, MatrixValue, ObjectClassMetadata, ObjectMethodTarget, ObjectStorageKind,
+    ObjectValue, RuntimeError, RuntimeStackFrame, StructValue, Value, Workspace,
 };
 use matlab_semantics::{
     analyze_compilation_unit_with_context, builtin_function_names, is_builtin_function_name,
@@ -1809,9 +1809,11 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
         name,
         "disp"
             | "display"
+            | "info"
             | "fclose"
             | "frewind"
             | "fprintf"
+            | "setSampleRate"
             | "drawnow"
             | "clc"
             | "format"
@@ -1872,6 +1874,7 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
             | "xline"
             | "yline"
             | "plot"
+            | "zplane"
             | "fplot"
             | "fsurf"
             | "fmesh"
@@ -1929,6 +1932,14 @@ fn statement_builtin_suppresses_ans(name: &str, arg_count: usize) -> bool {
             | "subtitle"
             | "xlabel"
             | "ylabel"
+            | "freqz"
+            | "freqs"
+            | "impz"
+            | "phasez"
+            | "zerophase"
+            | "grpdelay"
+            | "stepz"
+            | "phasedelay"
             | "yyaxis"
             | "zlabel"
             | "rotate3d"
@@ -1986,6 +1997,14 @@ fn invoke_runtime_builtin_outputs(
             output_arity,
         );
     }
+    if let Some(result) =
+        invoke_response_plot_builtin_outputs(shared_state, name, args, output_arity)
+    {
+        return result.map(|values| {
+            flush_figure_backend(shared_state);
+            values
+        });
+    }
     let graphics_result = {
         let mut state = shared_state.borrow_mut();
         invoke_graphics_builtin_outputs(&mut state.graphics, name, args, output_arity)
@@ -2001,6 +2020,7 @@ fn invoke_runtime_builtin_outputs(
         "disp" | "display" => {
             invoke_display_builtin_outputs(shared_state, name, args, output_arity)
         }
+        "info" => invoke_info_builtin_outputs(shared_state, args, output_arity),
         "im2col" => execute_im2col_builtin_outputs(args, output_arity),
         "col2im" => execute_col2im_builtin_outputs(args, output_arity),
         "inmem" => invoke_inmem_builtin_outputs(shared_state, args, output_arity),
@@ -2176,6 +2196,516 @@ fn invoke_runtime_builtin_outputs(
         "str2num" => invoke_str2num_builtin_outputs(args, output_arity),
         _ => invoke_stdlib_builtin_outputs(name, args, output_arity),
     }
+}
+
+fn invoke_response_plot_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    name: &str,
+    args: &[Value],
+    output_arity: usize,
+) -> Option<Result<Vec<Value>, RuntimeError>> {
+    if output_arity != 0 {
+        return None;
+    }
+    let result = match name {
+        "freqz" => plot_freqz_response(shared_state, args),
+        "freqs" => plot_freqs_response(shared_state, args),
+        "impz" => plot_stem_response_builtin(shared_state, "impz", args, "Impulse Response"),
+        "phasez" => plot_single_response_builtin(
+            shared_state,
+            "phasez",
+            args,
+            "Phase Response",
+            "Phase (radians)",
+        ),
+        "grpdelay" => plot_single_response_builtin(
+            shared_state,
+            "grpdelay",
+            args,
+            "Group Delay",
+            "Group delay (samples)",
+        ),
+        "stepz" => plot_stem_response_builtin(shared_state, "stepz", args, "Step Response"),
+        "phasedelay" => plot_single_response_builtin(
+            shared_state,
+            "phasedelay",
+            args,
+            "Phase Delay",
+            response_plot_single_ylabel("phasedelay", args),
+        ),
+        "zerophase" => plot_single_response_builtin(
+            shared_state,
+            "zerophase",
+            args,
+            "Zero-Phase Response",
+            "Amplitude",
+        ),
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn plot_freqz_response(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+) -> Result<Vec<Value>, RuntimeError> {
+    let freqz_outputs = invoke_stdlib_builtin_outputs("freqz", args, 2)?;
+    let phasez_outputs = invoke_stdlib_builtin_outputs("phasez", args, 2)?;
+    let [response, magnitude_frequency] = freqz_outputs.as_slice() else {
+        return Err(RuntimeError::Unsupported(
+            "freqz plotting currently expects two outputs from the shared freqz helper".to_string(),
+        ));
+    };
+    let [phase, phase_frequency] = phasez_outputs.as_slice() else {
+        return Err(RuntimeError::Unsupported(
+            "freqz plotting currently expects two outputs from the shared phasez helper"
+                .to_string(),
+        ));
+    };
+    let magnitude = first_output_or_unit(invoke_stdlib_builtin_outputs(
+        "mag2db",
+        &[first_output_or_unit(invoke_stdlib_builtin_outputs(
+            "abs",
+            std::slice::from_ref(response),
+            1,
+        )?)],
+        1,
+    )?);
+    let magnitude_frequency =
+        response_plot_frequency_axis_values("freqz", args, magnitude_frequency)?;
+    let phase_frequency = response_plot_frequency_axis_values("freqz", args, phase_frequency)?;
+    let phase_degrees = response_plot_phase_in_degrees(phase)?;
+    let frequency_xlabel = response_plot_frequency_xlabel("freqz", args);
+
+    graphics_builtin_side_effect(
+        shared_state,
+        "subplot",
+        &[Value::Scalar(2.0), Value::Scalar(1.0), Value::Scalar(1.0)],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "plot",
+        &[phase_frequency.clone(), phase_degrees],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "title",
+        &[Value::CharArray("Phase Response".to_string())],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "xlabel",
+        &[Value::CharArray(frequency_xlabel.to_string())],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "ylabel",
+        &[Value::CharArray("Phase (degrees)".to_string())],
+    )?;
+
+    graphics_builtin_side_effect(
+        shared_state,
+        "subplot",
+        &[Value::Scalar(2.0), Value::Scalar(1.0), Value::Scalar(2.0)],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "plot",
+        &[magnitude_frequency.clone(), magnitude],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "title",
+        &[Value::CharArray("Magnitude Response".to_string())],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "xlabel",
+        &[Value::CharArray(frequency_xlabel.to_string())],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "ylabel",
+        &[Value::CharArray("Magnitude (dB)".to_string())],
+    )?;
+    Ok(Vec::new())
+}
+
+fn plot_freqs_response(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+) -> Result<Vec<Value>, RuntimeError> {
+    let freqs_outputs = invoke_stdlib_builtin_outputs("freqs", args, 2)?;
+    let [response, frequency] = freqs_outputs.as_slice() else {
+        return Err(RuntimeError::Unsupported(
+            "freqs plotting currently expects two outputs from the shared freqs helper".to_string(),
+        ));
+    };
+    let magnitude = first_output_or_unit(invoke_stdlib_builtin_outputs(
+        "abs",
+        std::slice::from_ref(response),
+        1,
+    )?);
+    let phase = first_output_or_unit(invoke_stdlib_builtin_outputs(
+        "angle",
+        std::slice::from_ref(response),
+        1,
+    )?);
+    let phase = response_plot_phase_in_degrees(&phase)?;
+
+    graphics_builtin_side_effect(
+        shared_state,
+        "subplot",
+        &[Value::Scalar(2.0), Value::Scalar(1.0), Value::Scalar(1.0)],
+    )?;
+    graphics_builtin_side_effect(shared_state, "semilogx", &[frequency.clone(), phase])?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "xlabel",
+        &[Value::CharArray("Frequency (rad/s)".to_string())],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "ylabel",
+        &[Value::CharArray("Phase (degrees)".to_string())],
+    )?;
+
+    graphics_builtin_side_effect(
+        shared_state,
+        "subplot",
+        &[Value::Scalar(2.0), Value::Scalar(1.0), Value::Scalar(2.0)],
+    )?;
+    graphics_builtin_side_effect(shared_state, "loglog", &[frequency.clone(), magnitude])?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "xlabel",
+        &[Value::CharArray("Frequency (rad/s)".to_string())],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "ylabel",
+        &[Value::CharArray("Magnitude".to_string())],
+    )?;
+    Ok(Vec::new())
+}
+
+fn plot_single_response_builtin(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    builtin_name: &str,
+    args: &[Value],
+    title: &str,
+    ylabel: &str,
+) -> Result<Vec<Value>, RuntimeError> {
+    let outputs = invoke_stdlib_builtin_outputs(builtin_name, args, 2)?;
+    let [response, frequency] = outputs.as_slice() else {
+        return Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} plotting currently expects two outputs from the shared helper"
+        )));
+    };
+    let frequency = response_plot_frequency_axis_values(builtin_name, args, frequency)?;
+    graphics_builtin_side_effect(shared_state, "plot", &[frequency, response.clone()])?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "title",
+        &[Value::CharArray(title.to_string())],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "xlabel",
+        &[Value::CharArray(
+            response_plot_frequency_xlabel(builtin_name, args).to_string(),
+        )],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "ylabel",
+        &[Value::CharArray(ylabel.to_string())],
+    )?;
+    Ok(Vec::new())
+}
+
+fn response_plot_single_ylabel(builtin_name: &str, args: &[Value]) -> &'static str {
+    if builtin_name.eq_ignore_ascii_case("phasedelay")
+        && response_plot_uses_sample_rate(builtin_name, args)
+    {
+        "Phase delay (rad/Hz)"
+    } else if builtin_name.eq_ignore_ascii_case("phasedelay") {
+        "Phase delay (samples)"
+    } else {
+        "Group delay (samples)"
+    }
+}
+
+fn response_plot_phase_in_degrees(value: &Value) -> Result<Value, RuntimeError> {
+    Ok(first_output_or_unit(invoke_stdlib_builtin_outputs(
+        "times",
+        &[value.clone(), Value::Scalar(180.0 / std::f64::consts::PI)],
+        1,
+    )?))
+}
+
+fn response_plot_frequency_axis_values(
+    builtin_name: &str,
+    args: &[Value],
+    frequency: &Value,
+) -> Result<Value, RuntimeError> {
+    if builtin_name.eq_ignore_ascii_case("freqs")
+        || response_plot_uses_sample_rate(builtin_name, args)
+    {
+        return Ok(frequency.clone());
+    }
+    Ok(first_output_or_unit(invoke_stdlib_builtin_outputs(
+        "rdivide",
+        &[frequency.clone(), Value::Scalar(std::f64::consts::PI)],
+        1,
+    )?))
+}
+
+fn response_plot_frequency_xlabel(builtin_name: &str, args: &[Value]) -> &'static str {
+    if builtin_name.eq_ignore_ascii_case("freqs") {
+        "Frequency (rad/s)"
+    } else if response_plot_uses_sample_rate(builtin_name, args) {
+        "Frequency (Hz)"
+    } else {
+        "Normalized Frequency (\\times\\pi rad/sample)"
+    }
+}
+
+fn response_plot_uses_sample_rate(builtin_name: &str, args: &[Value]) -> bool {
+    if args
+        .first()
+        .is_some_and(response_plot_digital_filter_uses_sample_rate)
+    {
+        return true;
+    }
+    if builtin_name.eq_ignore_ascii_case("zerophase")
+        && response_plot_uses_zerophase_default_sample_rate(args)
+    {
+        return true;
+    }
+    let tail = response_plot_frequency_tail(args, builtin_name);
+    match tail {
+        [] | [_] => false,
+        [first, second] => {
+            if is_whole_mode_value(second) {
+                false
+            } else if is_whole_mode_value(first) {
+                builtin_name.eq_ignore_ascii_case("zerophase")
+            } else {
+                true
+            }
+        }
+        [..] => true,
+    }
+}
+
+fn response_plot_uses_zerophase_default_sample_rate(args: &[Value]) -> bool {
+    args.last()
+        .is_some_and(is_unambiguous_plot_sample_rate_scalar)
+}
+
+fn is_unambiguous_plot_sample_rate_scalar(value: &Value) -> bool {
+    let Ok(sample_rate) = value.as_scalar() else {
+        return false;
+    };
+    sample_rate.is_finite() && sample_rate > 0.0 && sample_rate.fract() != 0.0
+}
+
+fn response_plot_digital_filter_uses_sample_rate(value: &Value) -> bool {
+    let Value::Object(object) = value else {
+        return false;
+    };
+    if !object
+        .class
+        .qualified_name()
+        .eq_ignore_ascii_case("digitalFilter")
+    {
+        return false;
+    }
+    matches!(
+        object.property_value("NormalizedFrequency"),
+        Some(Value::Logical(false))
+    ) || object.property_value("SampleRate").is_some()
+}
+
+fn response_plot_frequency_tail<'a>(args: &'a [Value], builtin_name: &str) -> &'a [Value] {
+    let start = if matches!(args, [Value::Cell(_), mode, ..] if is_ctf_mode_value(mode)) {
+        2
+    } else if matches!(args, [_, _, mode, ..] if is_ctf_mode_value(mode)) {
+        3
+    } else if args
+        .first()
+        .is_some_and(is_response_plot_sos_or_row_fallback)
+    {
+        1
+    } else if builtin_name.eq_ignore_ascii_case("zerophase")
+        && response_plot_uses_zerophase_fir_shorthand(args)
+    {
+        1
+    } else {
+        args.len().min(2)
+    };
+    &args[start..]
+}
+
+fn is_ctf_mode_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("ctf")
+    )
+}
+
+fn is_whole_mode_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::CharArray(text) | Value::String(text) if text.eq_ignore_ascii_case("whole")
+    )
+}
+
+fn is_response_plot_sos_or_row_fallback(value: &Value) -> bool {
+    matches!(value, Value::Matrix(matrix) if matrix.cols == 6)
+}
+
+fn response_plot_uses_zerophase_fir_shorthand(args: &[Value]) -> bool {
+    match args {
+        [_] => true,
+        [_, second] => {
+            is_response_plot_explicit_frequency_vector(second) || is_whole_mode_value(second)
+        }
+        [_, _, third] => is_whole_mode_value(third),
+        _ => false,
+    }
+}
+
+fn is_response_plot_explicit_frequency_vector(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Matrix(matrix) if (matrix.rows == 1 || matrix.cols == 1) && matrix.element_count() >= 2
+    )
+}
+
+fn plot_stem_response_builtin(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    builtin_name: &str,
+    args: &[Value],
+    title: &str,
+) -> Result<Vec<Value>, RuntimeError> {
+    let outputs = invoke_stdlib_builtin_outputs(builtin_name, args, 2)?;
+    let [response, time] = outputs.as_slice() else {
+        return Err(RuntimeError::Unsupported(format!(
+            "{builtin_name} plotting currently expects two outputs from the shared helper"
+        )));
+    };
+    let (time_axis, xlabel) = stem_response_time_axis(time, args)?;
+    graphics_builtin_side_effect(shared_state, "stem", &[time_axis, response.clone()])?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "title",
+        &[Value::CharArray(title.to_string())],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "xlabel",
+        &[Value::CharArray(xlabel.to_string())],
+    )?;
+    graphics_builtin_side_effect(
+        shared_state,
+        "ylabel",
+        &[Value::CharArray("Amplitude".to_string())],
+    )?;
+    Ok(Vec::new())
+}
+
+fn stem_response_time_axis(
+    time: &Value,
+    args: &[Value],
+) -> Result<(Value, &'static str), RuntimeError> {
+    if !stem_response_uses_sample_rate(time, args)? {
+        return Ok((time.clone(), "n (samples)"));
+    }
+    let (values, row_output) = numeric_values_from_plot_axis(time, "time response plotting")?;
+    let max_abs = values.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+    let (scale, label) = if max_abs >= 1.0 || max_abs == 0.0 {
+        (1.0, "nT (s)")
+    } else if max_abs >= 1e-3 {
+        (1e3, "nT (ms)")
+    } else if max_abs >= 1e-6 {
+        (1e6, "nT (us)")
+    } else {
+        (1e9, "nT (ns)")
+    };
+    Ok((
+        numeric_axis_output(
+            values.into_iter().map(|value| value * scale).collect(),
+            row_output,
+        )?,
+        label,
+    ))
+}
+
+fn stem_response_uses_sample_rate(time: &Value, args: &[Value]) -> Result<bool, RuntimeError> {
+    if args
+        .first()
+        .is_some_and(response_plot_digital_filter_uses_sample_rate)
+    {
+        return Ok(true);
+    }
+    let (values, _row_output) = numeric_values_from_plot_axis(time, "time response plotting")?;
+    Ok(values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| (*value - index as f64).abs() > 1e-12))
+}
+
+fn numeric_values_from_plot_axis(
+    value: &Value,
+    builtin_name: &str,
+) -> Result<(Vec<f64>, bool), RuntimeError> {
+    match value {
+        Value::Scalar(number) => Ok((vec![*number], false)),
+        Value::Logical(flag) => Ok((vec![if *flag { 1.0 } else { 0.0 }], false)),
+        Value::Matrix(matrix) => {
+            if matrix.rows != 1 && matrix.cols != 1 {
+                return Err(RuntimeError::TypeError(format!(
+                    "{builtin_name} currently expects a scalar or vector time axis"
+                )));
+            }
+            Ok((
+                matrix
+                    .elements()
+                    .iter()
+                    .map(|element| element.as_scalar())
+                    .collect::<Result<Vec<_>, _>>()?,
+                matrix.rows == 1 && matrix.cols != 1,
+            ))
+        }
+        _ => Err(RuntimeError::TypeError(format!(
+            "{builtin_name} currently expects a scalar or vector time axis"
+        ))),
+    }
+}
+
+fn numeric_axis_output(values: Vec<f64>, row_output: bool) -> Result<Value, RuntimeError> {
+    match values.len() {
+        0 => Ok(Value::Matrix(MatrixValue::new(0, 0, Vec::new())?)),
+        1 => Ok(Value::Scalar(values[0])),
+        _ => Ok(Value::Matrix(MatrixValue::new(
+            if row_output { 1 } else { values.len() },
+            if row_output { values.len() } else { 1 },
+            values.into_iter().map(Value::Scalar).collect(),
+        )?)),
+    }
+}
+
+fn graphics_builtin_side_effect(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    name: &str,
+    args: &[Value],
+) -> Result<(), RuntimeError> {
+    let mut state = shared_state.borrow_mut();
+    invoke_graphics_builtin_outputs(&mut state.graphics, name, args, 0)
+        .ok_or_else(|| RuntimeError::Unsupported(format!("{name} builtin is unavailable")))??;
+    Ok(())
 }
 
 fn runtime_builtin_can_fallback(error: &RuntimeError, name: &str) -> bool {
@@ -11572,6 +12102,29 @@ fn invoke_display_builtin_outputs(
     Ok(Vec::new())
 }
 
+fn invoke_info_builtin_outputs(
+    shared_state: &Rc<RefCell<SharedRuntimeState>>,
+    args: &[Value],
+    output_arity: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if output_arity > 0 {
+        return invoke_stdlib_builtin_outputs("info", args, output_arity);
+    }
+    let outputs = invoke_stdlib_builtin_outputs("info", args, 1)?;
+    let [info_text] = outputs.as_slice() else {
+        return Err(RuntimeError::Unsupported(
+            "info currently expects one output from the shared stdlib helper".to_string(),
+        ));
+    };
+    let Value::CharArray(text) = info_text else {
+        return Err(RuntimeError::TypeError(
+            "info currently expects the shared stdlib helper to return a char array".to_string(),
+        ));
+    };
+    push_text_displayed_output(shared_state, text.clone(), true);
+    Ok(Vec::new())
+}
+
 fn invoke_fprintf_builtin_outputs(
     shared_state: &Rc<RefCell<SharedRuntimeState>>,
     args: &[Value],
@@ -14323,6 +14876,23 @@ fn render_named_value_with_format(
         return;
     }
 
+    if let Some(rendered) = render_special_display_value(value) {
+        let mut lines = rendered.lines();
+        if let Some(first) = lines.next() {
+            out.push_str(&format!("{indent}{name} = {first}\n"));
+        }
+        for line in lines {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(indent);
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        return;
+    }
+
     match value {
         Value::Matrix(matrix) => {
             if let Some(page_dims) = display_paged_tail_dimensions(&matrix.dims) {
@@ -14645,6 +15215,9 @@ fn matlab_named_output_uses_blank_separator(format: DisplayFormatState) -> bool 
 fn format_display_builtin_value(value: &Value, format: DisplayFormatState) -> String {
     match value {
         Value::CharArray(text) | Value::String(text) => text.clone(),
+        _ if render_special_display_value(value).is_some() => {
+            render_special_display_value(value).expect("guard checked value")
+        }
         _ => render_value_with_format(value, format),
     }
 }
@@ -27154,6 +27727,43 @@ mod tests {
     }
 
     #[test]
+    fn bare_digital_filter_expression_displays_multiline_summary() {
+        let result = execute_script_source("digitalFilter(0.5, [1, -0.5])\n");
+        let rendered = render_matlab_execution_result(&result);
+        assert!(
+            rendered.contains("ans = digitalFilter with properties:"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Numerator: 0.5"), "{rendered}");
+        assert!(rendered.contains("NormalizedFrequency: 1"), "{rendered}");
+    }
+
+    #[test]
+    fn disp_digital_filter_cascade_displays_stage_summary() {
+        let result = execute_script_source(
+            "d1 = digitalFilter(0.5, [1, -0.5]);\n\
+             d2 = digitalFilter([1, 1, 0], [1, -1, 0.5], 2, SampleRate=8);\n\
+             d = cascade(d1, d2);\n\
+             disp(d);\n",
+        );
+        let rendered = render_matlab_execution_result(&result);
+        assert!(
+            rendered.contains("digitalFilter cascade with properties:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Stage1: [1x1 digitalFilter]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Stage2: [1x1 digitalFilter]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("SampleRate: 8"), "{rendered}");
+        assert!(!rendered.contains("ans ="), "{rendered}");
+    }
+
+    #[test]
     fn matlab_render_includes_fprintf_output() {
         let result = execute_script_source("fprintf(\"value=%d\", 5)\n");
         assert_eq!(render_matlab_execution_result(&result), "value=5");
@@ -36020,6 +36630,460 @@ mod tests {
     fn matlab_render_still_shows_graphics_query_outputs() {
         let result = execute_script_source("figure(92);\nplot([0, 2], [0, 1]);\nxlim\n");
         assert_eq!(render_matlab_execution_result(&result), "ans = [0, 2]\n");
+    }
+
+    #[test]
+    fn freqz_without_outputs_plots_magnitude_and_phase_responses() {
+        let result = execute_script_source("freqz([0, 1], [1], 4);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Magnitude Response"), "{svg}");
+        assert!(svg.contains("Phase Response"), "{svg}");
+        assert!(svg.contains("Normalized Frequency"), "{svg}");
+        assert!(svg.contains("Phase (degrees)"), "{svg}");
+        assert!(
+            svg.find("Phase Response")
+                .expect("phase subplot title present")
+                < svg
+                    .find("Magnitude Response")
+                    .expect("magnitude subplot title present"),
+            "{svg}"
+        );
+    }
+
+    #[test]
+    fn freqz_digital_filter_with_sample_rate_plots_hz_axis() {
+        let result = execute_script_source(
+            "d = digitalFilter(0.5, [1, -0.5], SampleRate=8);\n\
+             freqz(d, 4);\n\
+             clear d;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Magnitude Response"), "{svg}");
+        assert!(svg.contains("Phase Response"), "{svg}");
+        assert!(svg.contains("Frequency (Hz)"), "{svg}");
+        assert!(svg.contains("Phase (degrees)"), "{svg}");
+    }
+
+    #[test]
+    fn phasez_without_outputs_plots_phase_response() {
+        let result = execute_script_source("phasez([0, 1], [1], 4);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Phase Response"), "{svg}");
+        assert!(svg.contains("Normalized Frequency"), "{svg}");
+        assert!(svg.contains("Phase (radians)"), "{svg}");
+    }
+
+    #[test]
+    fn phasez_digital_filter_with_sample_rate_plots_hz_axis() {
+        let result = execute_script_source(
+            "d = digitalFilter(0.5, [1, -0.5], SampleRate=8);\n\
+             phasez(d, 4);\n\
+             clear d;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Phase Response"), "{svg}");
+        assert!(svg.contains("Frequency (Hz)"), "{svg}");
+        assert!(svg.contains("Phase (radians)"), "{svg}");
+    }
+
+    #[test]
+    fn response_plot_helper_detects_sample_rate_for_digital_filter_inputs() {
+        let outputs = crate::invoke_stdlib_builtin_outputs(
+            "digitalFilter",
+            &[
+                Value::Scalar(0.5),
+                Value::Matrix(
+                    MatrixValue::new(1, 2, vec![Value::Scalar(1.0), Value::Scalar(-0.5)])
+                        .expect("digitalFilter plotting denominator"),
+                ),
+                Value::String("SampleRate".to_string()),
+                Value::Scalar(8.0),
+            ],
+            1,
+        )
+        .expect("digitalFilter plotting helper");
+        let [filter] = outputs.as_slice() else {
+            panic!("expected single digitalFilter output");
+        };
+        assert!(crate::response_plot_digital_filter_uses_sample_rate(filter));
+        assert!(crate::response_plot_uses_sample_rate(
+            "grpdelay",
+            &[filter.clone(), Value::Scalar(4.0)]
+        ));
+        assert_eq!(
+            crate::response_plot_frequency_xlabel(
+                "grpdelay",
+                &[filter.clone(), Value::Scalar(4.0)]
+            ),
+            "Frequency (Hz)"
+        );
+    }
+
+    #[test]
+    fn freqs_without_outputs_plots_magnitude_and_phase_responses() {
+        let result = execute_script_source("freqs([1, 1], [1, 1], [0.1, 1]);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Frequency (rad/s)"), "{svg}");
+        assert!(svg.contains("Magnitude"), "{svg}");
+        assert!(svg.contains("Phase (degrees)"), "{svg}");
+        assert!(
+            svg.find("Phase (degrees)").expect("phase ylabel present")
+                < svg.find("Magnitude").expect("magnitude ylabel present"),
+            "{svg}"
+        );
+    }
+
+    #[test]
+    fn impz_without_outputs_plots_impulse_response() {
+        let result = execute_script_source("impz([1], [1, -0.5], 4);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Impulse Response"), "{svg}");
+        assert!(svg.contains("n (samples)"), "{svg}");
+    }
+
+    #[test]
+    fn impz_with_sample_rate_plots_time_axis() {
+        let result = execute_script_source("impz([1, 2], 1, [], 100);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Impulse Response"), "{svg}");
+        assert!(svg.contains("nT (ms)"), "{svg}");
+    }
+
+    #[test]
+    fn impz_digital_filter_with_sample_rate_plots_time_axis() {
+        let result = execute_script_source(
+            "d = digitalFilter(0.5, [1, -0.5], SampleRate=8);\n\
+             impz(d, 4);\n\
+             clear d;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Impulse Response"), "{svg}");
+        assert!(svg.contains("nT (ms)"), "{svg}");
+    }
+
+    #[test]
+    fn zplane_without_outputs_plots_zero_pole_diagram() {
+        let result = execute_script_source("zplane([0; -1], [0.5+0.5i; 0.5-0.5i]);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Real Part"), "{svg}");
+        assert!(svg.contains("Imaginary Part"), "{svg}");
+    }
+
+    #[test]
+    fn zplane_supports_ctf_inputs() {
+        let result = execute_script_source("zplane([1, 1, 0], [1, -1, 0.5], 'ctf');\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Real Part"), "{svg}");
+    }
+
+    #[test]
+    fn zplane_supports_digital_filter_inputs() {
+        let result = execute_script_source(
+            "d = digitalFilter([1, 1, 0], [1, -1, 0.5], 2);\n\
+             zplane(d);\n\
+             clear d;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Real Part"), "{svg}");
+        assert!(svg.contains("Imaginary Part"), "{svg}");
+    }
+
+    #[test]
+    fn zplane_returns_zero_pole_gain_for_digital_filter_outputs() {
+        let result = execute_script_source(
+            "d = digitalFilter([1, 1, 0], [1, -1, 0.5], 2);\n\
+             [vz, vp, vk] = zplane(d);\n\
+             clear d;\n",
+        );
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  vk = 2\n  vp = [0.5 + 0.5i ; 0.5 - 0.5i]\n  vz = [0 ; -1]\n"
+        );
+        assert_eq!(result.figures.len(), 0);
+    }
+
+    #[test]
+    fn zplane_returns_zero_and_pole_prefix_outputs_for_digital_filter() {
+        let result = execute_script_source(
+            "d = digitalFilter([1, 1, 0], [1, -1, 0.5], 2);\n\
+             [vz, vp] = zplane(d);\n\
+             clear d;\n",
+        );
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  vp = [0.5 + 0.5i ; 0.5 - 0.5i]\n  vz = [0 ; -1]\n"
+        );
+        assert_eq!(result.figures.len(), 0);
+    }
+
+    #[test]
+    fn zplane_returns_zero_output_only_for_digital_filter() {
+        let result = execute_script_source(
+            "d = digitalFilter([1, 1, 0], [1, -1, 0.5], 2);\n\
+             vz = zplane(d);\n\
+             clear d;\n",
+        );
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  vz = [0 ; -1]\n"
+        );
+        assert_eq!(result.figures.len(), 0);
+    }
+
+    #[test]
+    fn zplane_returns_zero_pole_gain_for_cascade_digital_filter_outputs() {
+        let result = execute_script_source(
+            "d1 = digitalFilter([1, 1, 0], [1, -1, 0.5], 2);\n\
+             d2 = digitalFilter(0.5, [1, -0.5]);\n\
+             d = cascade(d1, d2);\n\
+             [vz, vp, vk] = zplane(d);\n\
+             clear d d1 d2;\n",
+        );
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  vk = 1\n  vp = [0.5 + 0.5i ; 0.5 ; 0.5 - 0.5i]\n  vz = [0 ; -1]\n"
+        );
+        assert_eq!(result.figures.len(), 0);
+    }
+
+    #[test]
+    fn zplane_returns_zero_pole_gain_for_nested_cascade_digital_filter_outputs() {
+        let result = execute_script_source(
+            "d1 = digitalFilter(0.5, [1, -0.5]);\n\
+             d2 = cascade(d1, d1);\n\
+             d = cascade(d1, d2);\n\
+             [vz, vp, vk] = zplane(d);\n\
+             clear d d1 d2;\n",
+        );
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  vk = 0.125\n  vp = [0.5 ; 0.5 ; 0.5]\n  vz = []\n"
+        );
+        assert_eq!(result.figures.len(), 0);
+    }
+
+    #[test]
+    fn zplane_supports_cascade_digital_filter_inputs() {
+        let result = execute_script_source(
+            "d1 = digitalFilter([1, 1, 0], [1, -1, 0.5], 2);\n\
+             d2 = digitalFilter(0.5, [1, -0.5]);\n\
+             d = cascade(d1, d2);\n\
+             zplane(d);\n\
+             clear d d1 d2;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Real Part"), "{svg}");
+        assert!(svg.contains("Imaginary Part"), "{svg}");
+    }
+
+    #[test]
+    fn zplane_supports_nested_cascade_digital_filter_inputs() {
+        let result = execute_script_source(
+            "d1 = digitalFilter(0.5, [1, -0.5]);\n\
+             d2 = cascade(d1, d1);\n\
+             d = cascade(d1, d2);\n\
+             zplane(d);\n\
+             clear d d1 d2;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Real Part"), "{svg}");
+        assert!(svg.contains("Imaginary Part"), "{svg}");
+    }
+
+    #[test]
+    fn zplane_returns_text_handles_for_repeated_zeros_and_poles() {
+        let result = execute_script_source(
+            "figure(64);\n\
+             [hz, hp, ht] = zplane([0.2; 0.2; 0.2], [0.5; 0.5]);\n\
+             zero_mult = get(ht(3), 'String');\n\
+             pole_mult = get(ht(4), 'String');\n\
+             zero_type = get(ht(3), 'Type');\n\
+             pole_type = get(ht(4), 'Type');\n",
+        );
+        assert_eq!(
+            render_execution_result(&result),
+            "workspace\n  hp = [2003]\n  ht = [1001, 2001, 2004, 2005]\n  hz = [2002]\n  pole_mult = '2'\n  pole_type = 'text'\n  zero_mult = '3'\n  zero_type = 'text'\n"
+        );
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains(">3<"), "{svg}");
+        assert!(svg.contains(">2<"), "{svg}");
+    }
+
+    #[test]
+    fn info_without_outputs_displays_digital_filter_summary() {
+        let result = execute_script_source(
+            "d = digitalFilter(0.5, [1, -0.5]);\n\
+             info(d);\n\
+             clear d;\n",
+        );
+        let rendered = render_matlab_execution_result(&result);
+        assert!(
+            rendered.contains("IIR Digital Filter (real, double)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Filter Order     : 1"), "{rendered}");
+        assert!(!rendered.contains("ans ="), "{rendered}");
+    }
+
+    #[test]
+    fn grpdelay_without_outputs_plots_group_delay() {
+        let result = execute_script_source("grpdelay([0, 1], [1], 4);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Group Delay"), "{svg}");
+        assert!(svg.contains("Normalized Frequency"), "{svg}");
+        assert!(svg.contains("Group delay (samples)"), "{svg}");
+    }
+
+    #[test]
+    fn grpdelay_digital_filter_with_sample_rate_plots_hz_axis() {
+        let result = execute_script_source(
+            "d = digitalFilter(0.5, [1, -0.5], SampleRate=8);\n\
+             grpdelay(d, 4);\n\
+             clear d;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Group Delay"), "{svg}");
+        assert!(svg.contains("Frequency (Hz)"), "{svg}");
+        assert!(svg.contains("Group delay (samples)"), "{svg}");
+    }
+
+    #[test]
+    fn stepz_without_outputs_plots_step_response() {
+        let result = execute_script_source("stepz([1], [1, -0.5], 4);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Step Response"), "{svg}");
+        assert!(svg.contains("n (samples)"), "{svg}");
+    }
+
+    #[test]
+    fn stepz_with_sample_rate_plots_time_axis() {
+        let result = execute_script_source("stepz([1, 2], 1, [], 100);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Step Response"), "{svg}");
+        assert!(svg.contains("nT (ms)"), "{svg}");
+    }
+
+    #[test]
+    fn stepz_digital_filter_with_sample_rate_plots_time_axis() {
+        let result = execute_script_source(
+            "d = digitalFilter(0.5, [1, -0.5], SampleRate=8);\n\
+             stepz(d, 4);\n\
+             clear d;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Step Response"), "{svg}");
+        assert!(svg.contains("nT (ms)"), "{svg}");
+    }
+
+    #[test]
+    fn phasedelay_without_outputs_plots_phase_delay() {
+        let result = execute_script_source("phasedelay([0, 1], [1], 4);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Phase Delay"), "{svg}");
+        assert!(svg.contains("Normalized Frequency"), "{svg}");
+        assert!(svg.contains("Phase delay (samples)"), "{svg}");
+    }
+
+    #[test]
+    fn phasedelay_with_sample_rate_plots_hz_and_rad_per_hz_units() {
+        let result = execute_script_source("phasedelay([0, 1], [1], 4, 8);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Phase Delay"), "{svg}");
+        assert!(svg.contains("Frequency (Hz)"), "{svg}");
+        assert!(svg.contains("Phase delay (rad/Hz)"), "{svg}");
+    }
+
+    #[test]
+    fn phasedelay_digital_filter_with_sample_rate_plots_hz_axis() {
+        let result = execute_script_source(
+            "d = digitalFilter(0.5, [1, -0.5], SampleRate=8);\n\
+             phasedelay(d, 4);\n\
+             clear d;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Phase Delay"), "{svg}");
+        assert!(svg.contains("Frequency (Hz)"), "{svg}");
+        assert!(svg.contains("Phase delay (rad/Hz)"), "{svg}");
+    }
+
+    #[test]
+    fn zerophase_without_outputs_plots_zero_phase_response() {
+        let result = execute_script_source("zerophase([0, 1], [1], 4);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Zero-Phase Response"), "{svg}");
+        assert!(svg.contains("Normalized Frequency"), "{svg}");
+        assert!(svg.contains("Amplitude"), "{svg}");
+    }
+
+    #[test]
+    fn zerophase_digital_filter_with_sample_rate_plots_hz_axis() {
+        let result = execute_script_source(
+            "d = digitalFilter(0.5, [1, -0.5], SampleRate=8);\n\
+             zerophase(d, 4);\n\
+             clear d;\n",
+        );
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Zero-Phase Response"), "{svg}");
+        assert!(svg.contains("Frequency (Hz)"), "{svg}");
+        assert!(svg.contains("Amplitude"), "{svg}");
+    }
+
+    #[test]
+    fn zerophase_fs_only_without_outputs_plots_hz_axis() {
+        let result = execute_script_source("zerophase([0, 1], [1], 8.5);\n");
+        assert_eq!(render_matlab_execution_result(&result), "");
+        assert_eq!(result.figures.len(), 1);
+        let svg = &result.figures[0].svg;
+        assert!(svg.contains("Zero-Phase Response"), "{svg}");
+        assert!(svg.contains("Frequency (Hz)"), "{svg}");
+        assert!(svg.contains("Amplitude"), "{svg}");
     }
 
     #[test]

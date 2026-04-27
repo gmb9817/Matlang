@@ -18,7 +18,9 @@ workspace
   page_default_ndims = 3
   page_default_size = [1, 1, 4]
   page_default_state = 4
-  page_state = [1, 2, 3, 4, 5, 6]
+  page_state(:,:,1) = [1, 4]
+  page_state(:,:,2) = [2, 5]
+  page_state(:,:,3) = [3, 6]
   row_state = [3, 6]
   row_zi = [11, 3, 5 ; 24, 9, 11]
   row_zi_state = [3, 6]

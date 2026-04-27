@@ -694,6 +694,11 @@ fn graphics_plotting_fixture_matches_golden() {
 }
 
 #[test]
+fn graphics_zplane_fixture_matches_golden() {
+    assert_fixture("graphics_zplane", ParseMode::Script, &[]);
+}
+
+#[test]
 fn graphics_fplot_fixture_matches_golden() {
     assert_fixture("graphics_fplot", ParseMode::Script, &[]);
 }
