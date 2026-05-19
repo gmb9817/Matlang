@@ -1,0 +1,10 @@
+a = [ProbeObj(1)];
+a(1)=[];
+b = a';
+b_class = class(b);
+b_obj = isobject(b);
+b_isa = isa(b, 'ProbeObj');
+c = [b b];
+c_class = class(c);
+c_obj = isobject(c);
+c_isa = isa(c, 'ProbeObj');

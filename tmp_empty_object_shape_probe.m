@@ -1,0 +1,9 @@
+objs = [ProbeObj(1)];
+objs(1) = [];
+a = class(objs);
+b = class(objs');
+c = class(reshape(objs, [1 0]));
+d = class(permute(objs, [2 1]));
+e = class(squeeze(reshape(objs, [1 0 1])));
+f = isobject(objs');
+g = isa(objs', 'ProbeObj');

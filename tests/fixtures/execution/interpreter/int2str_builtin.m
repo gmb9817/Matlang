@@ -5,3 +5,5 @@ d = int2str(false);
 e = int2str([1, 20, -3]);
 f = int2str([]);
 g = int2str([NaN, Inf, -Inf]);
+h = int2str(int64(7));
+i = int2str(uint64([1, 20, 3]));

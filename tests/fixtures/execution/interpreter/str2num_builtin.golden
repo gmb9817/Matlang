@@ -6,8 +6,13 @@ workspace
   e = []
   f = []
   g = 1
+  h = [1 ; 2]
+  i = [1 ; 2]
+  j = [1, 2 ; 3, 4]
   ok_b = true
   ok_c = true
   ok_d = true
   ok_e = false
   ok_f = true
+  ok_i = true
+  ok_j = true

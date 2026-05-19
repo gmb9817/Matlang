@@ -58,6 +58,9 @@ struct Parser<'a> {
     cursor: usize,
     mode: ParseMode,
     diagnostics: Vec<Diagnostic>,
+    implicit_matrix_column_context_depth: usize,
+    implicit_matrix_column_group_base_depths: Vec<usize>,
+    nested_expression_group_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -67,6 +70,9 @@ impl<'a> Parser<'a> {
             cursor: 0,
             mode,
             diagnostics: Vec::new(),
+            implicit_matrix_column_context_depth: 0,
+            implicit_matrix_column_group_base_depths: Vec::new(),
+            nested_expression_group_depth: 0,
         }
     }
 
@@ -1130,6 +1136,9 @@ impl<'a> Parser<'a> {
     fn parse_additive_expression(&mut self) -> Expression {
         let mut expression = self.parse_multiplicative_expression();
         loop {
+            if self.current_is_implicit_signed_matrix_column_separator() {
+                break;
+            }
             let op = if self.match_operator(OperatorKind::Plus) {
                 Some(BinaryOp::Add)
             } else if self.match_operator(OperatorKind::Minus) {
@@ -1357,7 +1366,9 @@ impl<'a> Parser<'a> {
 
     fn parse_parenthesized_expression(&mut self) -> Expression {
         let start = self.expect_delimiter(DelimiterKind::LeftParen, "PAR015", "expected `(`");
+        self.nested_expression_group_depth += 1;
         let mut inner = self.parse_expression();
+        self.nested_expression_group_depth -= 1;
         let end = self.expect_delimiter(DelimiterKind::RightParen, "PAR016", "expected `)`");
         inner.span = combine_spans(start, end);
         inner
@@ -1519,12 +1530,12 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            let first = self.parse_expression();
+            let first = self.parse_matrix_row_expression();
             let mut row = vec![first.clone()];
             let mut previous_end = first.span.end;
             loop {
                 if self.match_delimiter(DelimiterKind::Comma) {
-                    let expression = self.parse_expression();
+                    let expression = self.parse_matrix_row_expression();
                     previous_end = expression.span.end;
                     row.push(expression);
                     continue;
@@ -1538,7 +1549,7 @@ impl<'a> Parser<'a> {
                 }
 
                 if self.current_starts_implicit_matrix_column(previous_end) {
-                    let expression = self.parse_expression();
+                    let expression = self.parse_matrix_row_expression();
                     previous_end = expression.span.end;
                     row.push(expression);
                     continue;
@@ -1559,13 +1570,54 @@ impl<'a> Parser<'a> {
         rows
     }
 
+    fn parse_matrix_row_expression(&mut self) -> Expression {
+        self.implicit_matrix_column_context_depth += 1;
+        self.implicit_matrix_column_group_base_depths
+            .push(self.nested_expression_group_depth);
+        let expression = self.parse_expression();
+        self.implicit_matrix_column_group_base_depths.pop();
+        self.implicit_matrix_column_context_depth -= 1;
+        expression
+    }
+
     fn current_starts_implicit_matrix_column(&self, previous_end: SourcePosition) -> bool {
         self.can_start_expression()
             && self.current().span.start.line == previous_end.line
             && self.current().span.start.offset > previous_end.offset
     }
 
+    fn current_is_implicit_signed_matrix_column_separator(&self) -> bool {
+        if self.implicit_matrix_column_context_depth == 0 {
+            return false;
+        }
+
+        let Some(&group_base_depth) = self.implicit_matrix_column_group_base_depths.last() else {
+            return false;
+        };
+
+        if self.nested_expression_group_depth != group_base_depth {
+            return false;
+        }
+
+        let operator = match self.current().kind {
+            TokenKind::Operator(OperatorKind::Plus) => OperatorKind::Plus,
+            TokenKind::Operator(OperatorKind::Minus) => OperatorKind::Minus,
+            _ => return false,
+        };
+
+        if !matches!(operator, OperatorKind::Plus | OperatorKind::Minus)
+            || !trivia_is_pure_whitespace(&self.current().leading_trivia)
+        {
+            return false;
+        }
+
+        self.tokens.get(self.cursor + 1).is_some_and(|next| {
+            next.leading_trivia.is_empty() && token_can_start_expression_kind(&next.kind)
+        })
+    }
+
     fn parse_index_argument_list(&mut self, closing: DelimiterKind) -> Vec<IndexArgument> {
+        self.nested_expression_group_depth += 1;
         let mut args = Vec::new();
         while !self.at_end() && !self.at_delimiter(closing) {
             if self.match_operator(OperatorKind::Colon) {
@@ -1585,6 +1637,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        self.nested_expression_group_depth -= 1;
         args
     }
 
@@ -1976,9 +2029,11 @@ impl<'a> Parser<'a> {
         let mut end_span = target.span;
 
         while self.current_can_be_command_argument() {
-            let argument = self.parse_command_argument_expression();
-            end_span = argument.span;
-            indices.push(IndexArgument::Expression(argument));
+            let arguments = self.parse_command_argument_expressions();
+            for argument in arguments {
+                end_span = argument.span;
+                indices.push(IndexArgument::Expression(argument));
+            }
             if self.at_delimiter(DelimiterKind::Comma)
                 && self.token_can_start_command_argument_at(self.cursor + 1)
             {
@@ -2026,54 +2081,93 @@ impl<'a> Parser<'a> {
         expression
     }
 
-    fn parse_command_argument_expression(&mut self) -> Expression {
+    fn parse_command_argument_expressions(&mut self) -> Vec<Expression> {
         let token = self.advance().clone();
         match token.kind {
-            TokenKind::CharLiteral | TokenKind::StringLiteral => {
-                self.finish_raw_command_argument(token.span, token.lexeme, 0)
+            TokenKind::CharLiteral => {
+                if !self.command_argument_can_continue_raw_with_group_depth(0) {
+                    return vec![Expression {
+                        span: token.span,
+                        kind: ExpressionKind::CharLiteral(token.lexeme),
+                    }];
+                }
+                self.finish_raw_command_argument_fragments(
+                    token.span,
+                    command_token_raw_fragments(&token.kind, &token.lexeme, true),
+                    0,
+                )
             }
-            kind if self.token_can_start_command_argument_kind(&kind, self.cursor - 1) => {
-                self.finish_raw_command_argument(token.span, token.lexeme, 0)
+            TokenKind::StringLiteral
+                if !command_string_literal_has_internal_whitespace(&token.lexeme)
+                    && !self.command_argument_can_continue_raw_with_group_depth(0) =>
+            {
+                vec![Expression {
+                    span: token.span,
+                    kind: ExpressionKind::CharLiteral(command_argument_literal(
+                        &command_string_literal_content(&token.lexeme),
+                    )),
+                }]
             }
+            kind if self.token_can_start_command_argument_kind(&kind, self.cursor - 1) => self
+                .finish_raw_command_argument_fragments(
+                    token.span,
+                    command_token_raw_fragments(&kind, &token.lexeme, true),
+                    0,
+                ),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
                     "PAR044",
                     "invalid command-form argument",
                     token.span,
                 ));
-                Expression {
+                vec![Expression {
                     span: token.span,
                     kind: ExpressionKind::CharLiteral("''".to_string()),
-                }
+                }]
             }
         }
     }
 
-    fn finish_raw_command_argument(
+    fn finish_raw_command_argument_fragments(
         &mut self,
         start: SourceSpan,
-        mut literal: String,
+        mut fragments: Vec<String>,
         mut group_depth: usize,
-    ) -> Expression {
+    ) -> Vec<Expression> {
         let mut end = start;
         while self.command_argument_can_continue_raw_with_group_depth(group_depth) {
             let token_index = self.cursor;
             let token = self.advance().clone();
             if group_depth == 0 && self.command_preserves_leading_trivia_in_raw(token_index) {
-                literal.push_str(&leading_trivia_text(&token.leading_trivia));
+                fragments
+                    .last_mut()
+                    .expect("command argument fragment")
+                    .push_str(&leading_trivia_text(&token.leading_trivia));
+            } else if group_depth > 0 && trivia_is_pure_whitespace(&token.leading_trivia) {
+                fragments
+                    .last_mut()
+                    .expect("command argument fragment")
+                    .push_str(&leading_trivia_text(&token.leading_trivia));
             }
             end = token.span;
-            literal.push_str(&token.lexeme);
+            append_command_token_raw_fragments(
+                &mut fragments,
+                command_token_raw_fragments(&token.kind, &token.lexeme, group_depth == 0),
+            );
             if command_argument_opens_group(&token.kind) {
                 group_depth += 1;
             } else if command_argument_closes_group(&token.kind) {
                 group_depth = group_depth.saturating_sub(1);
             }
         }
-        Expression {
-            span: combine_spans(start, end),
-            kind: ExpressionKind::CharLiteral(command_argument_literal(&literal)),
-        }
+        let span = combine_spans(start, end);
+        fragments
+            .into_iter()
+            .map(|fragment| Expression {
+                span,
+                kind: ExpressionKind::CharLiteral(command_argument_literal(&fragment)),
+            })
+            .collect()
     }
 
     fn command_argument_can_continue_raw_with_group_depth(&self, group_depth: usize) -> bool {
@@ -2460,6 +2554,41 @@ fn item_span(item: &Item) -> SourceSpan {
 
 fn command_argument_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
+}
+
+fn append_command_token_raw_fragments(fragments: &mut Vec<String>, token_fragments: Vec<String>) {
+    let mut token_fragments = token_fragments.into_iter();
+    let Some(first) = token_fragments.next() else {
+        return;
+    };
+    fragments
+        .last_mut()
+        .expect("command argument fragment")
+        .push_str(&first);
+    fragments.extend(token_fragments);
+}
+
+fn command_token_raw_fragments(kind: &TokenKind, text: &str, allow_split: bool) -> Vec<String> {
+    if allow_split && matches!(kind, TokenKind::StringLiteral) {
+        if command_string_literal_has_internal_whitespace(text) {
+            return text.split_whitespace().map(str::to_string).collect();
+        }
+        return vec![command_string_literal_content(text)];
+    }
+    vec![text.to_string()]
+}
+
+fn command_string_literal_has_internal_whitespace(text: &str) -> bool {
+    text.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .is_some_and(|inner| inner.chars().any(char::is_whitespace))
+}
+
+fn command_string_literal_content(text: &str) -> String {
+    text.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .map(|inner| inner.replace("\"\"", "\""))
+        .unwrap_or_else(|| text.to_string())
 }
 
 fn command_trivia_has_boundary(trivia: &[Trivia]) -> bool {
@@ -3293,18 +3422,18 @@ mod tests {
         let unit = parsed.unit.expect("compilation unit");
 
         let expected = [
-            "'name=value'",
-            "'alpha==beta'",
-            "'lower<=upper'",
-            "'left~=right'",
-            "'opt&&flag'",
-            "'opt||flag'",
-            "'key=\"two words\"'",
-            "'key=''two words'''",
+            vec!["'name=value'"],
+            vec!["'alpha==beta'"],
+            vec!["'lower<=upper'"],
+            vec!["'left~=right'"],
+            vec!["'opt&&flag'"],
+            vec!["'opt||flag'"],
+            vec!["'key=\"two'", "'words\"'"],
+            vec!["'key=''two words'''"],
         ];
 
         assert_eq!(unit.items.len(), expected.len());
-        for (item, expected_argument) in unit.items.iter().zip(expected) {
+        for (item, expected_arguments) in unit.items.iter().zip(expected) {
             let Item::Statement(statement) = item else {
                 panic!("expected statement");
             };
@@ -3314,14 +3443,16 @@ mod tests {
             let ExpressionKind::ParenApply { indices, .. } = &value.kind else {
                 panic!("expected command-form rhs");
             };
-            assert_eq!(indices.len(), 1);
-            let IndexArgument::Expression(argument) = &indices[0] else {
-                panic!("expected command argument");
-            };
-            assert!(matches!(
-                &argument.kind,
-                ExpressionKind::CharLiteral(text) if text == expected_argument
-            ));
+            assert_eq!(indices.len(), expected_arguments.len());
+            for (argument, expected_argument) in indices.iter().zip(expected_arguments) {
+                let IndexArgument::Expression(argument) = argument else {
+                    panic!("expected command argument");
+                };
+                assert!(matches!(
+                    &argument.kind,
+                    ExpressionKind::CharLiteral(text) if text == expected_argument
+                ));
+            }
         }
     }
 
@@ -3805,9 +3936,9 @@ mod tests {
 
         let expected = [
             "'value(1,2)'",
-            "'nested{1,2}'",
-            "'cell(1,[2,3])'",
-            "'matrix([1,2;3,4])'",
+            "'nested{1, 2}'",
+            "'cell(1,[2, 3])'",
+            "'matrix([1,2; 3,4])'",
         ];
 
         assert_eq!(unit.items.len(), expected.len());
@@ -3839,9 +3970,9 @@ mod tests {
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         let unit = parsed.unit.expect("compilation unit");
 
-        let expected = ["'\"two words\".txt'", "'''two words''.m'"];
+        let expected = [vec!["'\"two'", "'words\".txt'"], vec!["'''two words''.m'"]];
         assert_eq!(unit.items.len(), expected.len());
-        for (item, expected_argument) in unit.items.iter().zip(expected) {
+        for (item, expected_arguments) in unit.items.iter().zip(expected) {
             let Item::Statement(statement) = item else {
                 panic!("expected statement");
             };
@@ -3851,14 +3982,16 @@ mod tests {
             let ExpressionKind::ParenApply { indices, .. } = &value.kind else {
                 panic!("expected command-form rhs");
             };
-            assert_eq!(indices.len(), 1);
-            let IndexArgument::Expression(argument) = &indices[0] else {
-                panic!("expected command argument");
-            };
-            assert!(matches!(
-                &argument.kind,
-                ExpressionKind::CharLiteral(text) if text == expected_argument
-            ));
+            assert_eq!(indices.len(), expected_arguments.len());
+            for (argument, expected_argument) in indices.iter().zip(expected_arguments) {
+                let IndexArgument::Expression(argument) = argument else {
+                    panic!("expected command argument");
+                };
+                assert!(matches!(
+                    &argument.kind,
+                    ExpressionKind::CharLiteral(text) if text == expected_argument
+                ));
+            }
         }
     }
 
@@ -3869,7 +4002,7 @@ mod tests {
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         let unit = parsed.unit.expect("compilation unit");
 
-        let expected = ["'''two words'',suffix'", "'key=\"a;b\";tail'"];
+        let expected = ["'''two words'',suffix'", "'key=a;b;tail'"];
         assert_eq!(unit.items.len(), expected.len());
         for (item, expected_argument) in unit.items.iter().zip(expected) {
             let Item::Statement(statement) = item else {
@@ -3894,18 +4027,19 @@ mod tests {
 
     #[test]
     fn parses_command_form_grouped_and_quoted_delimiters_as_single_argument() {
-        let source = "x = cmdpkg.helper value(1,\"a,b\",3)\ny = cmdpkg.helper note='%literal comment text%'\nz = cmdpkg.helper prefix\"two words\"suffix\n";
+        let source = "x = cmdpkg.helper value(1,\"a,b\",3)\ny = cmdpkg.helper note='%literal comment text%'\nz = cmdpkg.helper prefix\"two words\"suffix\na = cmdpkg.helper value(1,\"two words\",3)\n";
         let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         let unit = parsed.unit.expect("compilation unit");
 
         let expected = [
-            "'value(1,\"a,b\",3)'",
-            "'note=''%literal comment text%'''",
-            "'prefix\"two words\"suffix'",
+            vec!["'value(1,\"a,b\",3)'"],
+            vec!["'note=''%literal comment text%'''"],
+            vec!["'prefix\"two'", "'words\"suffix'"],
+            vec!["'value(1,\"two words\",3)'"],
         ];
         assert_eq!(unit.items.len(), expected.len());
-        for (item, expected_argument) in unit.items.iter().zip(expected) {
+        for (item, expected_arguments) in unit.items.iter().zip(expected) {
             let Item::Statement(statement) = item else {
                 panic!("expected statement");
             };
@@ -3915,14 +4049,16 @@ mod tests {
             let ExpressionKind::ParenApply { indices, .. } = &value.kind else {
                 panic!("expected command-form rhs");
             };
-            assert_eq!(indices.len(), 1);
-            let IndexArgument::Expression(argument) = &indices[0] else {
-                panic!("expected command argument");
-            };
-            assert!(matches!(
-                &argument.kind,
-                ExpressionKind::CharLiteral(text) if text == expected_argument
-            ));
+            assert_eq!(indices.len(), expected_arguments.len());
+            for (argument, expected_argument) in indices.iter().zip(expected_arguments) {
+                let IndexArgument::Expression(argument) = argument else {
+                    panic!("expected command argument");
+                };
+                assert!(matches!(
+                    &argument.kind,
+                    ExpressionKind::CharLiteral(text) if text == expected_argument
+                ));
+            }
         }
     }
 
@@ -3956,19 +4092,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_standalone_quoted_command_arguments_as_raw_text() {
+    fn parses_standalone_quoted_command_arguments_with_matlab_like_char_semantics() {
         let source = "x = cmdpkg.helper \"two words\"\ny = cmdpkg.helper \"two words\" \"three words\"\nz = cmdpkg.helper 'two words'\na = cmdpkg.helper \"a,b\" more\nb = cmdpkg.helper \"a;b\" tail\nc = cmdpkg.helper key=\"a\"\"b\"\n";
         let parsed = parse_source(source, SourceFileId(1), ParseMode::Script);
         assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
         let unit = parsed.unit.expect("compilation unit");
 
         let expected = [
-            vec!["'\"two words\"'"],
-            vec!["'\"two words\"'", "'\"three words\"'"],
-            vec!["'''two words'''"],
-            vec!["'\"a,b\"'", "'more'"],
-            vec!["'\"a;b\"'", "'tail'"],
-            vec!["'key=\"a\"\"b\"'"],
+            vec!["'\"two'", "'words\"'"],
+            vec!["'\"two'", "'words\"'", "'\"three'", "'words\"'"],
+            vec!["'two words'"],
+            vec!["'a,b'", "'more'"],
+            vec!["'a;b'", "'tail'"],
+            vec!["'key=a\"b'"],
         ];
         assert_eq!(unit.items.len(), expected.len());
         for (item, expected_arguments) in unit.items.iter().zip(expected) {

@@ -15,13 +15,24 @@ workspace
   err = struct{cause={}, identifier="MATC:Demo", message="explicit boom", stack=[struct{file="<root>", line=0, name="<script>"}]}
   err2 = struct{cause={}, identifier="MATC:UserError", message="fallback boom", stack=[struct{file="<root>", line=0, name="<script>"}]}
   fh = @sum
+  float_complex = true
+  float_ints = false
+  float_numbers = true
+  float_ok = true
   handle_ok = true
+  int_integer_ok = true
+  int_numbers = false
+  int_numeric_ok = true
+  int_scalars = true
+  ints = [1, 1]
   kind_fh = 'function_handle'
+  kind_ints = 'int64'
   kind_labels = 'string'
   kind_logicals = 'logical'
   kind_meta = 'struct'
   kind_numbers = 'double'
   labels = ["1", "2", "3"]
+  logical_numeric_ok = false
   logical_ok = true
   logicals = [true, true]
   meta = struct{name="alpha"}

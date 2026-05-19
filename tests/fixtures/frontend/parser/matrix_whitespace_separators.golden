@@ -1,3 +1,11 @@
 unit Script
 assign [x] = matrix[a, b ; c, d]
 assign [cells] = cell{number(1), number(2) ; number(3), number(4)}
+assign [neg] = matrix[number(0), unary(Minus, number(3))]
+assign [pos] = matrix[number(1), unary(Plus, number(2))]
+assign [sub] = matrix[binary(Subtract, number(1), number(2))]
+assign [cell_neg] = cell{number(0), unary(Minus, number(3))}
+assign [call_neg] = apply(int64, [matrix[number(0), unary(Minus, number(3))]])
+assign [call_pos] = apply(int64, [matrix[number(1), unary(Plus, number(2))]])
+assign [call_sub] = apply(int64, [matrix[binary(Subtract, number(1), number(2))]])
+assign [call_group] = apply(int64, [matrix[binary(Add, number(1), number(2))]])

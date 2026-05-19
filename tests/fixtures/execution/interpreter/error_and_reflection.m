@@ -1,5 +1,6 @@
 cells = {1, 2};
 fh = @sum;
+ints = ones(1, 2, like=int64(7));
 labels = string([1, 2, 3]);
 logicals = true(1, 2);
 meta = struct("name", "alpha");
@@ -7,12 +8,22 @@ numbers = [1, 2, 3];
 
 cell_ok = isa(cells, "cell");
 double_ok = isa(numbers, "double");
+float_ok = isa(numbers, "float");
 handle_ok = isa(fh, "function_handle");
+int_integer_ok = isa(ints, "integer");
+int_numeric_ok = isa(ints, "numeric");
 logical_ok = isa(logicals, "logical");
+logical_numeric_ok = isa(logicals, "numeric");
 string_ok = isa(labels, "string");
 struct_ok = isa(meta, "struct");
 
+float_complex = isfloat(complex(1, 2));
+float_numbers = isfloat(numbers);
+float_ints = isfloat(ints);
+int_numbers = isinteger(numbers);
+int_scalars = isinteger(ints);
 kind_fh = class(fh);
+kind_ints = class(ints);
 kind_labels = class(labels);
 kind_logicals = class(logicals);
 kind_meta = class(meta);

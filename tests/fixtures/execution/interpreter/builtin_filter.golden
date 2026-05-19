@@ -7,6 +7,7 @@ workspace
   fir_row = [1, 3, 5, 7]
   fir_row_2 = [1, 3, 5, 7]
   fir_state = 4
+  int_scalar_coeffs = [1, 2, 3]
   mat_default = [1, 2, 3 ; 5, 7, 9]
   mat_default_2 = [1, 2, 3 ; 5, 7, 9]
   mat_pages = [1, 2, 3 ; 4, 5, 6]

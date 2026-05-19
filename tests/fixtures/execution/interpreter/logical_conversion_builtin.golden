@@ -2,9 +2,30 @@ workspace
   a = false
   b = true
   c = [false, true ; true, false]
-  d = true
-  e = [true, false ; true, false]
+  d = "MATC:TypeError"
+  d_msg = "logical currently cannot convert complex values"
+  e = "MATC:TypeError"
+  e_msg = "logical currently cannot convert complex values"
+  err1 = struct{cause={}, identifier="MATC:TypeError", message="logical currently cannot convert complex values", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  err2 = struct{cause={}, identifier="MATC:TypeError", message="logical currently cannot convert complex values", stack=[struct{file="<root>", line=0, name="<script>"}]}
   f = [true, true]
   g = []
+  g_class = 'logical'
+  g_f = []
+  g_f_class = 'logical'
+  g_t = []
+  g_t_class = 'logical'
   h = true
+  h_empty = []
+  h_empty_class = 'logical'
+  h_empty_r = []
+  h_empty_r_class = 'logical'
+  h_empty_rep0 = []
+  h_empty_rep0_class = 'logical'
+  h_empty_rot = []
+  h_empty_rot_class = 'logical'
+  h_empty_shift = []
+  h_empty_shift_class = 'logical'
+  h_scalar_rep0 = []
+  h_scalar_rep0_class = 'logical'
   i = false

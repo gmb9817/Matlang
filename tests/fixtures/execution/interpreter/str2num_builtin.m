@@ -5,3 +5,6 @@ a = str2num("12.5");
 [e, ok_e] = str2num("bad");
 [f, ok_f] = str2num("[]");
 g = str2num("sin(pi/2)");
+h = str2num(char({'1', '2'}));
+[i, ok_i] = str2num(char({'1', '2'}));
+[j, ok_j] = str2num(char({'[1 2]', '[3 4]'}));

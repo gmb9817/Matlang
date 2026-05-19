@@ -41,18 +41,24 @@ pub enum Value {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrayStorageClass {
     Numeric,
+    Int64,
+    UInt64,
     Logical,
     Complex,
     String,
+    Struct,
     Generic,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct MatrixValue {
     pub rows: usize,
     pub cols: usize,
     pub dims: Vec<usize>,
     pub elements: Vec<Value>,
+    pub empty_class: ArrayStorageClass,
+    pub empty_struct_field_order: Vec<String>,
+    pub empty_object_class: Option<ObjectClassMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -430,7 +436,15 @@ impl Value {
 
 impl MatrixValue {
     pub fn new(rows: usize, cols: usize, elements: Vec<Value>) -> Result<Self, RuntimeError> {
-        Self::with_dimensions(rows, cols, vec![rows, cols], elements)
+        Self::with_dimensions_and_empty_metadata(
+            rows,
+            cols,
+            vec![rows, cols],
+            elements,
+            ArrayStorageClass::Numeric,
+            Vec::new(),
+            None,
+        )
     }
 
     pub fn with_dimensions(
@@ -438,6 +452,44 @@ impl MatrixValue {
         cols: usize,
         dims: Vec<usize>,
         elements: Vec<Value>,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_dimensions_and_empty_metadata(
+            rows,
+            cols,
+            dims,
+            elements,
+            ArrayStorageClass::Numeric,
+            Vec::new(),
+            None,
+        )
+    }
+
+    pub fn with_dimensions_and_empty_class(
+        rows: usize,
+        cols: usize,
+        dims: Vec<usize>,
+        elements: Vec<Value>,
+        empty_class: ArrayStorageClass,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_dimensions_and_empty_metadata(
+            rows,
+            cols,
+            dims,
+            elements,
+            empty_class,
+            Vec::new(),
+            None,
+        )
+    }
+
+    pub fn with_dimensions_and_empty_metadata(
+        rows: usize,
+        cols: usize,
+        dims: Vec<usize>,
+        elements: Vec<Value>,
+        empty_class: ArrayStorageClass,
+        empty_struct_field_order: Vec<String>,
+        empty_object_class: Option<ObjectClassMetadata>,
     ) -> Result<Self, RuntimeError> {
         if rows * cols != elements.len() {
             return Err(RuntimeError::ShapeError(format!(
@@ -456,7 +508,46 @@ impl MatrixValue {
             cols,
             dims,
             elements,
+            empty_class,
+            empty_struct_field_order,
+            empty_object_class,
         })
+    }
+
+    pub fn with_dimensions_and_empty_struct_fields(
+        rows: usize,
+        cols: usize,
+        dims: Vec<usize>,
+        elements: Vec<Value>,
+        empty_struct_field_order: Vec<String>,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_dimensions_and_empty_metadata(
+            rows,
+            cols,
+            dims,
+            elements,
+            ArrayStorageClass::Struct,
+            empty_struct_field_order,
+            None,
+        )
+    }
+
+    pub fn with_dimensions_and_empty_object_class(
+        rows: usize,
+        cols: usize,
+        dims: Vec<usize>,
+        elements: Vec<Value>,
+        empty_object_class: ObjectClassMetadata,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_dimensions_and_empty_metadata(
+            rows,
+            cols,
+            dims,
+            elements,
+            ArrayStorageClass::Generic,
+            Vec::new(),
+            Some(empty_object_class),
+        )
     }
 
     pub fn from_rows(rows: Vec<Vec<Value>>) -> Result<Self, RuntimeError> {
@@ -473,11 +564,15 @@ impl MatrixValue {
     }
 
     pub fn filled(rows: usize, cols: usize, value: Value) -> Self {
+        let empty_class = scalar_like_storage_class(&value);
         Self {
             rows,
             cols,
             dims: vec![rows, cols],
             elements: vec![value; rows * cols],
+            empty_class,
+            empty_struct_field_order: Vec::new(),
+            empty_object_class: None,
         }
     }
 
@@ -502,12 +597,21 @@ impl MatrixValue {
     }
 
     pub fn storage_class(&self) -> ArrayStorageClass {
+        if self.elements().is_empty() {
+            return self.empty_class;
+        }
+
+        let mut saw_scalar = false;
+        let mut saw_int64 = false;
+        let mut saw_uint64 = false;
         let mut saw_complex = false;
         let mut saw_other = false;
 
         for element in self.elements() {
             match element {
-                Value::Scalar(_) | Value::Int64(_) | Value::UInt64(_) => {}
+                Value::Scalar(_) => saw_scalar = true,
+                Value::Int64(_) => saw_int64 = true,
+                Value::UInt64(_) => saw_uint64 = true,
                 Value::Logical(_) => {
                     return if self
                         .elements()
@@ -538,9 +642,19 @@ impl MatrixValue {
         if saw_other {
             ArrayStorageClass::Generic
         } else if saw_complex {
-            ArrayStorageClass::Complex
-        } else {
+            if saw_int64 || saw_uint64 {
+                ArrayStorageClass::Generic
+            } else {
+                ArrayStorageClass::Complex
+            }
+        } else if saw_int64 && !saw_scalar && !saw_uint64 {
+            ArrayStorageClass::Int64
+        } else if saw_uint64 && !saw_scalar && !saw_int64 {
+            ArrayStorageClass::UInt64
+        } else if saw_scalar && !saw_int64 && !saw_uint64 {
             ArrayStorageClass::Numeric
+        } else {
+            ArrayStorageClass::Generic
         }
     }
 
@@ -557,6 +671,43 @@ impl MatrixValue {
 
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         self.elements.iter()
+    }
+
+    pub fn empty_struct_field_names(&self) -> &[String] {
+        &self.empty_struct_field_order
+    }
+
+    pub fn empty_object_class_metadata(&self) -> Option<&ObjectClassMetadata> {
+        self.empty_object_class.as_ref()
+    }
+}
+
+impl PartialEq for MatrixValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+            && self.cols == other.cols
+            && self.dims == other.dims
+            && self.elements == other.elements
+            && (if self.elements.is_empty() && other.elements.is_empty() {
+                self.empty_class == other.empty_class
+                    && self.empty_struct_field_order == other.empty_struct_field_order
+                    && self.empty_object_class == other.empty_object_class
+            } else {
+                true
+            })
+    }
+}
+
+fn scalar_like_storage_class(value: &Value) -> ArrayStorageClass {
+    match value {
+        Value::Int64(_) => ArrayStorageClass::Int64,
+        Value::UInt64(_) => ArrayStorageClass::UInt64,
+        Value::Logical(_) => ArrayStorageClass::Logical,
+        Value::Complex(_) => ArrayStorageClass::Complex,
+        Value::String(_) => ArrayStorageClass::String,
+        Value::Struct(_) => ArrayStorageClass::Struct,
+        Value::Scalar(_) => ArrayStorageClass::Numeric,
+        _ => ArrayStorageClass::Generic,
     }
 }
 
@@ -637,6 +788,13 @@ impl StructValue {
         let field_order = fields.keys().cloned().collect();
         Self {
             fields,
+            field_order,
+        }
+    }
+
+    pub fn from_field_names(field_order: Vec<String>) -> Self {
+        Self {
+            fields: BTreeMap::new(),
             field_order,
         }
     }
@@ -869,6 +1027,79 @@ mod tests {
         )
         .expect("generic matrix");
         assert_eq!(generic.storage_class(), ArrayStorageClass::Generic);
+
+        let empty_logical = MatrixValue::with_dimensions_and_empty_class(
+            0,
+            2,
+            vec![0, 2],
+            Vec::new(),
+            ArrayStorageClass::Logical,
+        )
+        .expect("empty logical matrix");
+        assert_eq!(empty_logical.storage_class(), ArrayStorageClass::Logical);
+
+        let empty_int64 = MatrixValue::with_dimensions_and_empty_class(
+            0,
+            2,
+            vec![0, 2],
+            Vec::new(),
+            ArrayStorageClass::Int64,
+        )
+        .expect("empty int64 matrix");
+        assert_eq!(empty_int64.storage_class(), ArrayStorageClass::Int64);
+
+        let empty_uint64 = MatrixValue::with_dimensions_and_empty_class(
+            0,
+            2,
+            vec![0, 2],
+            Vec::new(),
+            ArrayStorageClass::UInt64,
+        )
+        .expect("empty uint64 matrix");
+        assert_eq!(empty_uint64.storage_class(), ArrayStorageClass::UInt64);
+
+        let int64_matrix =
+            MatrixValue::with_dimensions(1, 2, vec![1, 2], vec![Value::Int64(1), Value::Int64(2)])
+                .expect("int64 matrix");
+        assert_eq!(int64_matrix.storage_class(), ArrayStorageClass::Int64);
+
+        let uint64_matrix = MatrixValue::with_dimensions(
+            1,
+            2,
+            vec![1, 2],
+            vec![Value::UInt64(1), Value::UInt64(2)],
+        )
+        .expect("uint64 matrix");
+        assert_eq!(uint64_matrix.storage_class(), ArrayStorageClass::UInt64);
+
+        let empty_struct = MatrixValue::with_dimensions_and_empty_class(
+            0,
+            2,
+            vec![0, 2],
+            Vec::new(),
+            ArrayStorageClass::Struct,
+        )
+        .expect("empty struct matrix");
+        assert_eq!(empty_struct.storage_class(), ArrayStorageClass::Struct);
+
+        let Value::Object(object) = test_object("Point") else {
+            panic!("expected test object");
+        };
+        let empty_object = MatrixValue::with_dimensions_and_empty_object_class(
+            0,
+            2,
+            vec![0, 2],
+            Vec::new(),
+            object.class,
+        )
+        .expect("empty object matrix");
+        assert_eq!(empty_object.storage_class(), ArrayStorageClass::Generic);
+        assert_eq!(
+            empty_object
+                .empty_object_class_metadata()
+                .map(|class| class.class_name.as_str()),
+            Some("Point")
+        );
     }
 
     #[test]

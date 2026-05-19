@@ -1,2 +1,10 @@
 x = [a b; c d];
 cells = {1 2; 3 4};
+neg = [0 -3];
+pos = [1 +2];
+sub = [1 - 2];
+cell_neg = {0 -3};
+call_neg = int64([0 -3]);
+call_pos = int64([1 +2]);
+call_sub = int64([1 - 2]);
+call_group = int64([(1 +2)]);

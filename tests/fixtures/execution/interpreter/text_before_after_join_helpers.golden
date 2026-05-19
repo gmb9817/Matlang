@@ -12,3 +12,9 @@ workspace
   k = {'Poe' ; 'Alcott'}
   l = {'X<mid>post', 'X<beta>gamma'}
   m = {'pre<mid>Y', 'alpha<beta>gY'}
+  n = ['a' ; 'c']
+  o = ['b' ; 'd']
+  p(:,:,1) = ['a' ; 'b']
+  p(:,:,2) = ['c' ; 'd']
+  q(:,:,1) = ['a' ; 'b']
+  q(:,:,2) = ['c' ; 'd']

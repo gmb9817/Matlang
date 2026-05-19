@@ -69,6 +69,7 @@ bo = cmdpkg.helper key="a;b";tail
 bp = cmdpkg.helper value(1,"a,b",3)
 bq = cmdpkg.helper note='%literal comment text%'
 br = cmdpkg.helper prefix"two words"suffix
+bs = cmdpkg.helper value(1,"two words",3)
 print -dpng out_file
 print -r300 -dpng out_file
 print -dsvg out_file

@@ -8,3 +8,5 @@ g = mat2str([]);
 h = mat2str(pi, 4);
 i = mat2str([1/3 2/3], 3);
 j = mat2str([NaN, Inf, -Inf]);
+k = mat2str(int64(7));
+l = mat2str(uint64([1 2; 3 4]));

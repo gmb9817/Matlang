@@ -4,6 +4,8 @@ workspace
   c = 'matlab'
   d = "matlab!"
   e = {'a' ; 'b' ; 'c'}
+  err = struct{cause={}, identifier="MATC:TypeError", message="split currently expects a character vector, string array, or cell array of character vectors, found matrix", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  err2 = struct{cause={}, identifier="MATC:TypeError", message="splitlines currently expects a character vector, string array, or cell array of character vectors, found matrix", stack=[struct{file="<root>", line=0, name="<script>"}]}
   f = ["alpha" ; "beta"]
   g = "cAnA"
   h = ["alpha", "beta" ; "gamma", "delta"]
@@ -18,3 +20,7 @@ workspace
   q = ["alpha", "beta" ; "gamma", "delta"]
   r = {'BAnana', 'caBAna'}
   s = "abc 2 def * ghi ** jkl ***"
+  t = "MATC:TypeError"
+  u = "split currently expects a character vector, string array, or cell array of character vectors, found matrix"
+  v = "MATC:TypeError"
+  w = "splitlines currently expects a character vector, string array, or cell array of character vectors, found matrix"

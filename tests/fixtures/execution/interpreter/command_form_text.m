@@ -22,7 +22,12 @@ s = cmdpkg.helper lower<=upper
 t = cmdpkg.helper left~=right
 u = cmdpkg.helper opt&&flag
 v = cmdpkg.helper opt||flag
-w = cmdpkg.helper key="two words"
+try
+  w = cmdpkg.helper key="two words"
+catch errw
+  w = errw.identifier;
+  w_msg = errw.message;
+end
 x = cmdpkg.helper key='two words'
 y = cmdpkg.helper name=... comment
 value
@@ -78,13 +83,24 @@ bh = cmdpkg.helper *.txt
 bi = dotted_base.helper .*dotted_div
 bj = dotted_base.helper ^dotted_div
 bk = dotted_base.helper .^dotted_div
-bl = cmdpkg.helper "two words".txt
+try
+  bl = cmdpkg.helper "two words".txt
+catch errbl
+  bl = errbl.identifier;
+  bl_msg = errbl.message;
+end
 bm = cmdpkg.helper 'two words'.m
 bn = cmdpkg.helper 'two words',suffix
 bo = cmdpkg.helper key="a;b";tail
 bp = cmdpkg.helper value(1,"a,b",3)
 bq = cmdpkg.helper note='%literal comment text%'
-br = cmdpkg.helper prefix"two words"suffix
+try
+  br = cmdpkg.helper prefix"two words"suffix
+catch errbr
+  br = errbr.identifier;
+  br_msg = errbr.message;
+end
+bw = cmdpkg.helper value(1,"two words",3)
 ca = dotted_base.helper -(1 + 2)
 cb = dotted_base.helper +[1, 2]
 cc = dotted_base.helper -sum([1, 2])
@@ -121,11 +137,22 @@ dc = dotted_base.helper ^foo_values(1)
 dd = dotted_base.helper /foo_cells{1}
 de = dotted_base.helper *foo_cells{1}
 df = dotted_base.helper ^foo_cells{1}
-dg = cmdpkg.helper "two words"
-dh = cmdpkg.helper 'two words'
-di = cmdpkg.helper "a,b"
-dj = cmdpkg.helper "a;b"
-dk = cmdpkg.helper key="a""b"
+try
+  dg = cmdpkg.helper "two words"
+catch err
+  dg = err.identifier;
+  dg_msg = err.message;
+end
+try
+  dh = cmdpkg.helper "two words" "three words"
+catch err2
+  dh = err2.identifier;
+  dh_msg = err2.message;
+end
+di = cmdpkg.helper 'two words'
+dj = cmdpkg.helper "a,b"
+dk = cmdpkg.helper "a;b"
+dl = cmdpkg.helper key="a""b"
 dm = cmdpkg.helper alpha == beta
 dn = cmdpkg.helper alpha ~= beta
 do = cmdpkg.helper alpha <= beta

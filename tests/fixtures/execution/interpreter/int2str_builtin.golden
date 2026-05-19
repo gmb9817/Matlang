@@ -6,3 +6,5 @@ workspace
   e = '1 20 -3'
   f = ''
   g = 'NaN Inf -Inf'
+  h = '7'
+  i = '1 20 3'

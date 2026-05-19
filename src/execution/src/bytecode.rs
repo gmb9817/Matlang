@@ -1449,9 +1449,10 @@ impl BytecodeVm {
             let outputs = parse_binding_specs(&function.outputs)?;
             let captures = parse_capture_specs(&function.captures)?;
             if args.len() != params.len() {
+                let display_name = base_scoped_function_name(&function.name);
                 return Err(RuntimeError::Unsupported(format!(
                     "function `{}` expects {} input(s), got {}",
-                    function.name,
+                    display_name,
                     params.len(),
                     args.len()
                 )));

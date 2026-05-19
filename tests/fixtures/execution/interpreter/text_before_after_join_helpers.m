@@ -11,3 +11,7 @@ j = extractBefore({'pre<mid>post', 'alpha<beta>gamma'}, '<');
 k = extractAfter({'Edgar Allen Poe'; 'Louisa May Alcott'}, [12; 11]);
 l = replaceBefore({'pre<mid>post', 'alpha<beta>gamma'}, '<', 'X');
 m = replaceAfter({'pre<mid>post', 'alpha<beta>gamma'}, [8, 12], 'Y');
+n = extractBefore(['ab'; 'cd'], 2);
+o = extractAfter(['ab'; 'cd'], 1);
+p = extractAfter(cat(3, ['<a'; '<b'], ['<c'; '<d']), '<');
+q = extractBefore(cat(3, ['a<'; 'b<'], ['c<'; 'd<']), '<');

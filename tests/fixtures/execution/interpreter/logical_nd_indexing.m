@@ -14,4 +14,23 @@ folded_cell_cols = cells(:, [true false true false false]);
 cells(:, [true false true false false]) = {1000 2000; 3000 4000};
 folded_cell_assigned = cells;
 
-clear a b cells mask
+grown = reshape(1:16, [2 2 2 2]) > 0;
+grown(1, 9) = false;
+grown_class = class(grown);
+grown_last_col = grown(:, end);
+grown_last_col_class = class(grown(:, end));
+
+writeback = false(2, 2);
+writeback(1, 1) = 2;
+writeback(2, 2) = 0;
+writeback_class = class(writeback);
+writeback_double = double(writeback);
+
+writeback_nd = false(2, 2, 2);
+writeback_nd(:, :, 2) = [1 2; 0 -3];
+writeback_nd_class = class(writeback_nd);
+writeback_nd_page = writeback_nd(:, :, 2);
+writeback_nd_page_class = class(writeback_nd(:, :, 2));
+writeback_nd_page_double = double(writeback_nd(:, :, 2));
+
+clear a b cells grown mask writeback writeback_nd

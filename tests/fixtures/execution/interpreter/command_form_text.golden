@@ -16,9 +16,9 @@ workspace
   al = "/tmp/file"
   am = "\tmp\file"
   an = "value(1,2)"
-  ao = "nested{1,2}"
-  ap = "cell(1,[2,3])"
-  aq = "matrix([1,2;3,4])"
+  ao = "nested{1, 2}"
+  ap = "cell(1,[2, 3])"
+  aq = "matrix([1,2; 3,4])"
   ar = 2
   as = [6, 7]
   at = 2
@@ -28,7 +28,7 @@ workspace
   ax = 2
   ay = 8
   az = 2
-  b = '"beta"'
+  b = 'beta'
   ba = 7
   bb = 2
   bc = 7
@@ -40,17 +40,20 @@ workspace
   bi = 10
   bj = 25
   bk = 25
-  bl = """two words"".txt"
+  bl = "MATC:Unsupported"
+  bl_msg = "function `helper` expects 1 input(s), got 2"
   bm = "'two words'.m"
   bn = "'two words',suffix"
-  bo = "key=""a;b"";tail"
+  bo = "key=a;b;tail"
   bp = "value(1,""a,b"",3)"
   bq = "note='%literal comment text%'"
-  br = "prefix""two words""suffix"
+  br = "MATC:Unsupported"
+  br_msg = "function `helper` expects 1 input(s), got 2"
   bs = 2.5
   bt = 0.4
   bu = 2.5
   bv = 0.4
+  bw = "value(1,""two words"",3)"
   c = true
   ca = 2
   cb = [6, 7]
@@ -85,13 +88,16 @@ workspace
   dd = 2.5
   de = 10
   df = 25
-  dg = """two words"""
-  dh = "'two words'"
-  di = """a,b"""
+  dg = "MATC:Unsupported"
+  dg_msg = "function `helper` expects 1 input(s), got 2"
+  dh = "MATC:Unsupported"
+  dh_msg = "function `helper` expects 1 input(s), got 4"
+  di = "two words"
   div_base = 8
   divisor = 2
-  dj = """a;b"""
-  dk = "key=""a""""b"""
+  dj = "a,b"
+  dk = "a;b"
+  dl = "key=a""b"
   dm = "alpha == beta"
   dn = "alpha ~= beta"
   do = "alpha <= beta"
@@ -105,6 +111,11 @@ workspace
   dt = "alpha || beta"
   du = "alpha"
   e = "pkg.sub"
+  err = struct{cause={}, identifier="MATC:Unsupported", message="function `helper` expects 1 input(s), got 2", stack=[struct{file="C:\Users\UserK\Desktop\code\Matlab\src\execution\../../tests/fixtures/execution/interpreter\+cmdpkg\helper.m", line=0, name="helper"}, struct{file="<root>", line=0, name="<script>"}]}
+  err2 = struct{cause={}, identifier="MATC:Unsupported", message="function `helper` expects 1 input(s), got 4", stack=[struct{file="C:\Users\UserK\Desktop\code\Matlab\src\execution\../../tests/fixtures/execution/interpreter\+cmdpkg\helper.m", line=0, name="helper"}, struct{file="<root>", line=0, name="<script>"}]}
+  errbl = struct{cause={}, identifier="MATC:Unsupported", message="function `helper` expects 1 input(s), got 2", stack=[struct{file="C:\Users\UserK\Desktop\code\Matlab\src\execution\../../tests/fixtures/execution/interpreter\+cmdpkg\helper.m", line=0, name="helper"}, struct{file="<root>", line=0, name="<script>"}]}
+  errbr = struct{cause={}, identifier="MATC:Unsupported", message="function `helper` expects 1 input(s), got 2", stack=[struct{file="C:\Users\UserK\Desktop\code\Matlab\src\execution\../../tests/fixtures/execution/interpreter\+cmdpkg\helper.m", line=0, name="helper"}, struct{file="<root>", line=0, name="<script>"}]}
+  errw = struct{cause={}, identifier="MATC:Unsupported", message="function `helper` expects 1 input(s), got 2", stack=[struct{file="C:\Users\UserK\Desktop\code\Matlab\src\execution\../../tests/fixtures/execution/interpreter\+cmdpkg\helper.m", line=0, name="helper"}, struct{file="<root>", line=0, name="<script>"}]}
   f = "folder/file.txt"
   foo = struct{bar=2}
   foo_cells = {2}
@@ -132,7 +143,8 @@ workspace
   target_struct = struct{name="alpha"}
   u = "opt&&flag"
   v = "opt||flag"
-  w = "key=""two words"""
+  w = "MATC:Unsupported"
+  w_msg = "function `helper` expects 1 input(s), got 2"
   x = "key='two words'"
   y = "name=value"
   z = "alphabeta"

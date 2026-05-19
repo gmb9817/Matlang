@@ -1,9 +1,19 @@
 workspace
   a = 'alpha'
+  aa = "ab/cd"
+  aad = "MATC:TypeError"
+  aae = "strsplit currently expects a character vector or string scalar input, found matrix"
+  ab = "MATC:Unsupported"
+  ac = "strjoin currently expects a text vector or cell array input"
+  ad = "MATC:TypeError"
+  ae = "strtok currently expects a character vector, string array, or cell array of character vectors, found matrix"
   b = 'a-b-c'
   c = "mid"
   d = 'pre<X>post'
   e = "alpha/beta/gamma"
+  err = struct{cause={}, identifier="MATC:Unsupported", message="strjoin currently expects a text vector or cell array input", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  err1 = struct{cause={}, identifier="MATC:TypeError", message="strsplit currently expects a character vector or string scalar input, found matrix", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  err2 = struct{cause={}, identifier="MATC:TypeError", message="strtok currently expects a character vector, string array, or cell array of character vectors, found matrix", stack=[struct{file="<root>", line=0, name="<script>"}]}
   f = "pre[Q]post"
   g = ["Allen" ; "May"]
   h = "world"
@@ -22,3 +32,8 @@ workspace
   u = {'m/s', 'm/s ', ' m/s', ' m/s ', 'm/s'}
   v = {'The', 'r', '', 'in', 'Sp', '', 'stays', 'm', 'ly', 'in', 'the', 'pl', '.'}
   w = {' ', 'ain', ' ', ' ', 'ain', ' ', ' ', 'ain', ' ', ' ', ' ', 'ain'}
+  x = ['a' ; 'b']
+  y(:,:,1) = ['a' ; 'b']
+  y(:,:,2) = ['c' ; 'd']
+  z(:,:,1) = ['ab' ; 'cd']
+  z(:,:,2) = ['ef' ; 'gh']

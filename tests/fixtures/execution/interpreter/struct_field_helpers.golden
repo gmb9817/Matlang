@@ -34,3 +34,8 @@ workspace
   zf = 'r2c1'
   zg = [struct{name='r1c1'}, struct{name='R1C2'} ; struct{name='r2c1'}, struct{name='r2c2'}]
   zh = 'R1C2'
+  zi = struct{ab=1, cd=2}
+  zj = [true ; true]
+  zk = struct{}
+  zl = struct{cd=2, ab=1}
+  zm = {'cd' ; 'ab'}

@@ -7,4 +7,13 @@ workspace
   folded_cell_assigned(:,:,2) = {5, 6 ; 7, 8}
   folded_cell_cols = {1, 2 ; 3, 4}
   folded_cols = [1, 2 ; 3, 4]
+  grown_class = 'logical'
+  grown_last_col = [false ; false]
+  grown_last_col_class = 'logical'
   selected = [1 ; 4 ; 7 ; 6]
+  writeback_class = 'logical'
+  writeback_double = [1, 0 ; 0, 0]
+  writeback_nd_class = 'logical'
+  writeback_nd_page = [true, true ; false, true]
+  writeback_nd_page_class = 'logical'
+  writeback_nd_page_double = [1, 1 ; 0, 1]

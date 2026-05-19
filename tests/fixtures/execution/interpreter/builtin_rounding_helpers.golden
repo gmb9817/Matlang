@@ -1,5 +1,9 @@
 workspace
   a = [-2, -1, 3]
+  aa = -1
+  aa_class = 'double'
+  ab = 1
+  ab_class = 'double'
   b = [-1, 0, 4]
   c = [1 + 2i, -3 - 2i]
   d = [2, 4, -4, 1]
@@ -15,3 +19,23 @@ workspace
   n = [3 + 2i, -4 - 2i]
   o = [1, 2]
   p = [1, 2]
+  q = 7
+  q_class = 'int64'
+  r = 7
+  r_class = 'uint64'
+  s = 7
+  s_class = 'int64'
+  t = 7
+  t_class = 'uint64'
+  u = 7
+  u_class = 'int64'
+  v = 7
+  v_class = 'int64'
+  w = -7
+  w_class = 'int64'
+  x = 1
+  x_class = 'double'
+  y = 1
+  y_class = 'double'
+  z = 5
+  z_class = 'double'

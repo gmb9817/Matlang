@@ -1,5 +1,6 @@
 fir_row = filter([1 1], 1, [1 2 3 4]);
 [fir_row_2, fir_state] = filter([1 1], 1, [1 2 3 4]);
+int_scalar_coeffs = filter(int64(1), int64(1), [1 2 3]);
 
 col_iir = filter(1, [1, -0.5], [1; 0; 0]);
 col_zi = filter([1 1], 1, [5; 6], 10);

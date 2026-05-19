@@ -47,3 +47,13 @@ cc = reshape({1 2 3 4}, [2 2 1 1]);
 cc(1, 1, 2) = {9};
 cd = size(cc);
 ce = cc(:, :, 2);
+
+fold4 = reshape(1:16, [2 2 2 2]);
+fold4(:, :, 5) = [101 102; 103 104];
+fold4_size = size(fold4);
+fold4_tail = fold4(:, :, end);
+
+fold4_cells = reshape({1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16}, [2 2 2 2]);
+fold4_cells(:, :, 5) = {201 202; 203 204};
+fold4_cells_size = size(fold4_cells);
+fold4_cells_tail = fold4_cells(:, :, end);

@@ -4,6 +4,27 @@ workspace
   c = [true, true, true ; true, true, true]
   d = [false, false]
   e = true
+  err_complex = struct{cause={}, identifier="MATC:TypeError", message="logical currently cannot convert complex values", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  err_like = struct{cause={}, identifier="MATC:TypeError", message="true/false currently expects the `like` prototype to be logical", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  err_nan = struct{cause={}, identifier="MATC:TypeError", message="logical currently cannot convert NaN values", stack=[struct{file="<root>", line=0, name="<script>"}]}
+  err_nan_matrix = struct{cause={}, identifier="MATC:TypeError", message="logical currently cannot convert NaN values", stack=[struct{file="<root>", line=0, name="<script>"}]}
   f = true
   g = "true"
   h = "mask=false"
+  i = "MATC:TypeError"
+  i_like = true
+  i_msg = "logical currently cannot convert NaN values"
+  j = "MATC:TypeError"
+  j_like = [false, false, false ; false, false, false]
+  j_msg = "logical currently cannot convert complex values"
+  k = "MATC:TypeError"
+  k_like_size = [2, 3]
+  k_msg = "logical currently cannot convert NaN values"
+  l_real = true
+  like_err = "MATC:TypeError"
+  like_err_msg = "true/false currently expects the `like` prototype to be logical"
+  m_real = true
+  n_real = false
+  o_real = false
+  p_real = false
+  q_real = false

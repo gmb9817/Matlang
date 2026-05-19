@@ -1329,6 +1329,9 @@ fn object_has_method(object: &ObjectValue, method_name: &str) -> bool {
 }
 
 fn object_array_class_metadata(matrix: &MatrixValue) -> Option<ObjectClassMetadata> {
+    if matrix.elements().is_empty() {
+        return matrix.empty_object_class_metadata().cloned();
+    }
     let Value::Object(first_object) = matrix.elements.first()? else {
         return None;
     };
@@ -12643,9 +12646,7 @@ fn invoke_str2num_builtin_outputs(
             "str2num currently supports exactly one argument".to_string(),
         ));
     };
-    let text = text_value(text)?;
-
-    match evaluate_str2num_text(text) {
+    match evaluate_str2num_argument(text) {
         Ok(value) => {
             let mut outputs = vec![value];
             if output_arity == 2 {
@@ -12660,6 +12661,51 @@ fn invoke_str2num_builtin_outputs(
             }
             Ok(outputs)
         }
+    }
+}
+
+fn evaluate_str2num_argument(value: &Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::CharArray(text) | Value::String(text) => evaluate_str2num_text(text),
+        Value::Matrix(matrix) if matrix_is_char_matrix(matrix) && matrix.dims().len() <= 2 => {
+            let mut row_values = Vec::with_capacity(matrix.rows);
+            for row in 0..matrix.rows {
+                let text = (0..matrix.cols)
+                    .map(|col| {
+                        single_char_text_value(matrix.get(row, col)).ok_or_else(|| {
+                            RuntimeError::TypeError(
+                                "str2num currently expects char matrices to contain single-character elements"
+                                    .to_string(),
+                            )
+                        })
+                    })
+                    .collect::<Result<String, _>>()?;
+                row_values.push(evaluate_str2num_text(&text)?);
+            }
+
+            if row_values.is_empty() {
+                Ok(empty_matrix_value())
+            } else if row_values.len() == 1 {
+                Ok(row_values
+                    .into_iter()
+                    .next()
+                    .expect("single row str2num result"))
+            } else {
+                invoke_stdlib_builtin_outputs("vertcat", &row_values, 1)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        RuntimeError::Unsupported(
+                            "str2num row-wise char-matrix conversion produced no output"
+                                .to_string(),
+                        )
+                    })
+            }
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "expected char or string value, found {}",
+            other.kind_name()
+        ))),
     }
 }
 
@@ -13099,9 +13145,18 @@ fn matrix_class_name(matrix: &MatrixValue) -> String {
     }
 
     match matrix.storage_class() {
+        ArrayStorageClass::Int64 if matrix.elements().is_empty() => "int64".to_string(),
+        ArrayStorageClass::UInt64 if matrix.elements().is_empty() => "uint64".to_string(),
+        ArrayStorageClass::Struct if matrix.elements().is_empty() => "struct".to_string(),
         ArrayStorageClass::Logical => "logical".to_string(),
         ArrayStorageClass::String => "string".to_string(),
         _ => {
+            if matrix.elements().is_empty() {
+                if let Some(class) = object_array_class_metadata(matrix) {
+                    return class.qualified_name();
+                }
+                return "double".to_string();
+            }
             let Some(first) = matrix.elements().first() else {
                 return "double".to_string();
             };
@@ -15499,6 +15554,9 @@ fn runtime_error_stack_value(stack: &[RuntimeStackFrame]) -> Value {
                 Value::Struct(StructValue::from_fields(fields))
             })
             .collect(),
+        empty_class: ArrayStorageClass::Generic,
+        empty_struct_field_order: Vec::new(),
+        empty_object_class: None,
     })
 }
 
@@ -15901,9 +15959,10 @@ impl<'a> Interpreter<'a> {
         push_class_access_context(closure.function.owner_class_name.clone());
         let result = self.with_stack_frame(stack_frame, |this| {
             if args.len() != closure.function.inputs.len() {
+                let display_name = base_scoped_function_name(&closure.function.name);
                 return Err(RuntimeError::Unsupported(format!(
                     "function `{}` expects {} input(s), got {}",
-                    closure.function.name,
+                    display_name,
                     closure.function.inputs.len(),
                     args.len()
                 )));
@@ -16120,9 +16179,10 @@ impl<'a> Interpreter<'a> {
         push_class_access_context(function.owner_class_name.clone());
         let result = self.with_stack_frame(stack_frame, |this| {
             if args.len() != function.inputs.len() {
+                let display_name = base_scoped_function_name(&function.name);
                 return Err(RuntimeError::Unsupported(format!(
                     "function `{}` expects {} input(s), got {}",
-                    function.name,
+                    display_name,
                     function.inputs.len(),
                     args.len()
                 )));
@@ -22685,6 +22745,8 @@ fn numeric_or_complex_operand_to_value(
 fn transpose_value(value: &Value, conjugate: bool) -> Result<Value, RuntimeError> {
     match value {
         Value::Scalar(number) => Ok(Value::Scalar(*number)),
+        Value::Int64(number) => Ok(Value::Int64(*number)),
+        Value::UInt64(number) => Ok(Value::UInt64(*number)),
         Value::Logical(flag) => Ok(Value::Logical(*flag)),
         Value::Complex(number) => Ok(value_from_numeric_complex_parts(
             NumericComplexParts {
@@ -22902,9 +22964,11 @@ fn transpose_matrix_value(matrix: &MatrixValue, conjugate: bool) -> Result<Value
             elements.push(transpose_element_value(matrix.get(col, row), conjugate)?);
         }
     }
-    Ok(Value::Matrix(MatrixValue::new(
+    Ok(Value::Matrix(matrix_with_preserved_empty_metadata(
+        matrix,
         matrix.cols,
         matrix.rows,
+        vec![matrix.cols, matrix.rows],
         elements,
     )?))
 }
@@ -23410,12 +23474,52 @@ fn assign_matrix_index(
     }
 
     let plan = matrix_assignment_plan(&matrix, args)?;
-    let mut matrix = resize_matrix_to_dims(matrix, &plan.target_dims, Value::Scalar(0.0));
-    let values = matrix_assignment_values(&value, &plan.selection)?;
+    let logical_target = matrix.storage_class() == ArrayStorageClass::Logical;
+    let fill = matrix_growth_fill_value(&matrix);
+    let mut matrix = resize_matrix_to_dims(matrix, &plan.target_dims, fill);
+    let mut values = matrix_assignment_values(&value, &plan.selection)?;
+    if logical_target {
+        values = values
+            .into_iter()
+            .map(|value| coerce_logical_assignment_value(&value))
+            .collect::<Result<Vec<_>, _>>()?;
+    }
     for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
         matrix.elements_mut()[position] = value;
     }
     Ok(matrix)
+}
+
+fn matrix_growth_fill_value(matrix: &MatrixValue) -> Value {
+    match matrix.storage_class() {
+        ArrayStorageClass::Logical => Value::Logical(false),
+        _ => Value::Scalar(0.0),
+    }
+}
+
+fn coerce_logical_assignment_value(value: &Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Scalar(number) => Ok(Value::Logical(*number != 0.0)),
+        Value::Int64(number) => Ok(Value::Logical(*number != 0)),
+        Value::UInt64(number) => Ok(Value::Logical(*number != 0)),
+        Value::Logical(flag) => Ok(Value::Logical(*flag)),
+        Value::Complex(number) => Ok(Value::Logical(number.real != 0.0 || number.imag != 0.0)),
+        Value::CharArray(text)
+            if text
+                .chars()
+                .nth(1)
+                .is_none()
+                && text.chars().next().is_some() =>
+        {
+            Ok(Value::Logical(
+                text.chars().next().expect("single-char guard") != '\0',
+            ))
+        }
+        other => Err(RuntimeError::TypeError(format!(
+            "logical array assignment expects numeric, logical, complex, integer, or single-character char rhs elements, found {}",
+            other.kind_name()
+        ))),
+    }
 }
 
 fn assign_char_array_index(
@@ -23428,7 +23532,7 @@ fn assign_char_array_index(
     }
 
     let plan = char_array_assignment_plan(&text, args)?;
-    let mut chars = vec!['\0'; plan.target_rows * plan.target_cols];
+    let mut chars = vec![' '; plan.target_rows * plan.target_cols];
     for (offset, ch) in text.chars().enumerate() {
         if offset >= plan.target_cols {
             break;
@@ -23454,12 +23558,13 @@ fn assign_char_matrix_index(
     }
 
     let plan = char_matrix_assignment_plan(&matrix, args)?;
-    let mut chars = char_matrix_chars(&matrix)?;
-    chars.resize(plan.target_rows * plan.target_cols, '\0');
+    let mut matrix =
+        resize_matrix_to_dims(matrix, &plan.target_dims, Value::CharArray(" ".to_string()));
     let values = char_array_assignment_values(&value, &plan.selection)?;
     for (position, value) in plan.selection.positions.into_iter().zip(values.into_iter()) {
-        chars[position] = value;
+        matrix.elements_mut()[position] = Value::CharArray(value.to_string());
     }
+    let chars = char_matrix_chars(&matrix)?;
     char_value_from_dimensions(plan.target_rows, plan.target_cols, plan.target_dims, chars)
 }
 
@@ -24260,8 +24365,10 @@ fn nd_assignment_plan(
     args: &[EvaluatedIndexArgument],
 ) -> Result<AssignmentPlan, RuntimeError> {
     let effective_dims = indexing_dimensions_from_dims(current_dims, args.len());
-    let allow_growth = args.len() >= current_dims.len()
-        || current_dims.iter().skip(args.len()).all(|dim| *dim == 1);
+    // MATLAB folds omitted trailing dimensions into the last explicit subscript
+    // before applying indexed assignment rules, so growth is evaluated against
+    // that folded view instead of being blocked by the original higher rank.
+    let allow_growth = true;
     let mut target_dims = effective_dims.clone();
     let mut selectors = Vec::with_capacity(args.len());
     let mut selection_dims = Vec::with_capacity(args.len());
@@ -24343,7 +24450,7 @@ fn expand_matrix_assignment_values(
         return linearized_matrix_elements(matrix);
     }
 
-    if equivalent_dimensions(matrix.dims(), &selection.dims) {
+    if matrix.dims() == selection.dims.as_slice() {
         return Ok(matrix.elements().to_vec());
     }
 
@@ -24474,6 +24581,42 @@ fn build_matrix_literal_value(rows: Vec<Vec<Value>>) -> Result<Value, RuntimeErr
     if rows.is_empty() {
         return Ok(empty_matrix_value());
     }
+    if rows
+        .iter()
+        .flatten()
+        .all(value_is_char_matrix_literal_input)
+    {
+        let mut row_values = Vec::with_capacity(rows.len());
+        for row in rows {
+            let row_value = if row.is_empty() {
+                Value::Matrix(MatrixValue::new(1, 0, Vec::new())?)
+            } else {
+                let operands = row
+                    .into_iter()
+                    .map(char_matrix_literal_operand)
+                    .collect::<Result<Vec<_>, _>>()?;
+                invoke_stdlib_builtin_outputs("horzcat", &operands, 1)?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(empty_matrix_value)
+            };
+            row_values.push(row_value);
+        }
+
+        return if row_values.len() == 1 {
+            Ok(row_values.into_iter().next().expect("single row value"))
+        } else {
+            invoke_stdlib_builtin_outputs("vertcat", &row_values, 1)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    RuntimeError::TypeError(
+                        "char matrix literal concatenation did not produce matrix output"
+                            .to_string(),
+                    )
+                })
+        };
+    }
     if !rows.iter().flatten().all(matrix_literal_concat_compatible) {
         return Ok(Value::Matrix(MatrixValue::from_rows(rows)?));
     }
@@ -24514,6 +24657,32 @@ fn build_matrix_literal_value(rows: Vec<Vec<Value>>) -> Result<Value, RuntimeErr
         ));
     }
     Ok(value)
+}
+
+fn value_is_char_matrix_literal_input(value: &Value) -> bool {
+    matches!(value, Value::CharArray(_))
+        || matches!(value, Value::Matrix(matrix) if matrix_is_char_matrix(matrix))
+}
+
+fn char_matrix_literal_operand(value: Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::CharArray(text) => {
+            let count = text.chars().count();
+            Ok(Value::Matrix(MatrixValue::with_dimensions(
+                1,
+                count,
+                vec![1, count],
+                text.chars()
+                    .map(|ch| Value::CharArray(ch.to_string()))
+                    .collect(),
+            )?))
+        }
+        Value::Matrix(matrix) if matrix_is_char_matrix(&matrix) => Ok(Value::Matrix(matrix)),
+        other => Err(RuntimeError::TypeError(format!(
+            "char matrix literals currently expect char vector or char matrix inputs, found {}",
+            other.kind_name()
+        ))),
+    }
 }
 
 fn char_array_assignment_values(
@@ -25115,9 +25284,21 @@ fn delete_vector_matrix_elements(
         .filter_map(|(offset, value)| (!removed[offset]).then_some(value))
         .collect::<Vec<_>>();
     if matrix.rows == 1 {
-        MatrixValue::new(1, elements.len(), elements)
+        matrix_with_preserved_empty_metadata(
+            &matrix,
+            1,
+            elements.len(),
+            vec![1, elements.len()],
+            elements,
+        )
     } else {
-        MatrixValue::new(elements.len(), 1, elements)
+        matrix_with_preserved_empty_metadata(
+            &matrix,
+            elements.len(),
+            1,
+            vec![elements.len(), 1],
+            elements,
+        )
     }
 }
 
@@ -25156,14 +25337,17 @@ fn delete_matrix_rows(
             );
         }
     }
-    MatrixValue::new(
-        matrix.rows
-            - rows_to_remove
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
+    let target_rows = matrix.rows
+        - rows_to_remove
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+    matrix_with_preserved_empty_metadata(
+        &matrix,
+        target_rows,
         matrix.cols,
+        vec![target_rows, matrix.cols],
         elements,
     )
 }
@@ -25185,14 +25369,17 @@ fn delete_matrix_cols(
             );
         }
     }
-    MatrixValue::new(
+    let target_cols = matrix.cols
+        - cols_to_remove
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+    matrix_with_preserved_empty_metadata(
+        &matrix,
         matrix.rows,
-        matrix.cols
-            - cols_to_remove
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
+        target_cols,
+        vec![matrix.rows, target_cols],
         elements,
     )
 }
@@ -25253,6 +25440,7 @@ fn delete_matrix_nd_axis(
     matrix: MatrixValue,
     args: &[EvaluatedIndexArgument],
 ) -> Result<MatrixValue, RuntimeError> {
+    let metadata_source = matrix.clone();
     let dims = indexing_dimensions_from_dims(&matrix.dims, args.len());
     if args.len() < matrix.dims.len() {
         let collapsed = MatrixValue::with_dimensions(
@@ -25294,7 +25482,99 @@ fn delete_matrix_nd_axis(
         })
         .collect::<Vec<_>>();
     let (rows, cols) = storage_shape_from_dimensions(&target_dims);
-    MatrixValue::with_dimensions(rows, cols, target_dims, elements)
+    matrix_with_preserved_empty_metadata(&metadata_source, rows, cols, target_dims, elements)
+}
+
+fn matrix_with_preserved_empty_metadata(
+    source: &MatrixValue,
+    rows: usize,
+    cols: usize,
+    dims: Vec<usize>,
+    elements: Vec<Value>,
+) -> Result<MatrixValue, RuntimeError> {
+    if !elements.is_empty() {
+        return MatrixValue::with_dimensions(rows, cols, dims, elements);
+    }
+
+    if let Some(class) = source
+        .empty_object_class_metadata()
+        .cloned()
+        .or_else(|| object_array_class_metadata(source))
+    {
+        return MatrixValue::with_dimensions_and_empty_object_class(
+            rows, cols, dims, elements, class,
+        );
+    }
+
+    if source.element_count() == 0 {
+        return match source.storage_class() {
+            ArrayStorageClass::Struct => MatrixValue::with_dimensions_and_empty_struct_fields(
+                rows,
+                cols,
+                dims,
+                elements,
+                source.empty_struct_field_names().to_vec(),
+            ),
+            other => {
+                MatrixValue::with_dimensions_and_empty_class(rows, cols, dims, elements, other)
+            }
+        };
+    }
+
+    if source.storage_class() == ArrayStorageClass::Complex {
+        return MatrixValue::with_dimensions_and_empty_class(
+            rows,
+            cols,
+            dims,
+            elements,
+            ArrayStorageClass::Complex,
+        );
+    }
+
+    match source.elements().first() {
+        Some(Value::Struct(struct_value)) => MatrixValue::with_dimensions_and_empty_struct_fields(
+            rows,
+            cols,
+            dims,
+            elements,
+            struct_value.field_names().to_vec(),
+        ),
+        Some(Value::Int64(_)) => MatrixValue::with_dimensions_and_empty_class(
+            rows,
+            cols,
+            dims,
+            elements,
+            ArrayStorageClass::Int64,
+        ),
+        Some(Value::UInt64(_)) => MatrixValue::with_dimensions_and_empty_class(
+            rows,
+            cols,
+            dims,
+            elements,
+            ArrayStorageClass::UInt64,
+        ),
+        Some(Value::Logical(_)) => MatrixValue::with_dimensions_and_empty_class(
+            rows,
+            cols,
+            dims,
+            elements,
+            ArrayStorageClass::Logical,
+        ),
+        Some(Value::String(_)) => MatrixValue::with_dimensions_and_empty_class(
+            rows,
+            cols,
+            dims,
+            elements,
+            ArrayStorageClass::String,
+        ),
+        _ => MatrixValue::with_dimensions_and_empty_class(
+            rows,
+            cols,
+            dims,
+            elements,
+            ArrayStorageClass::Numeric,
+        ),
+    }
 }
 
 fn delete_cell_nd_axis(
@@ -25370,6 +25650,10 @@ fn single_indexed_nd_axis(args: &[EvaluatedIndexArgument]) -> Option<usize> {
 }
 
 fn resize_matrix_to_dims(matrix: MatrixValue, target_dims: &[usize], fill: Value) -> MatrixValue {
+    let empty_object_class = matrix
+        .empty_object_class_metadata()
+        .cloned()
+        .or_else(|| object_array_class_metadata(&matrix));
     let (target_rows, target_cols) = storage_shape_from_dimensions(target_dims);
     if equivalent_dimensions(&matrix.dims, target_dims) {
         return MatrixValue {
@@ -25377,6 +25661,9 @@ fn resize_matrix_to_dims(matrix: MatrixValue, target_dims: &[usize], fill: Value
             cols: target_cols,
             dims: target_dims.to_vec(),
             elements: matrix.elements,
+            empty_class: matrix.empty_class,
+            empty_struct_field_order: matrix.empty_struct_field_order,
+            empty_object_class,
         };
     }
 
@@ -25397,6 +25684,9 @@ fn resize_matrix_to_dims(matrix: MatrixValue, target_dims: &[usize], fill: Value
                 cols: target_cols,
                 dims: target_dims.to_vec(),
                 elements,
+                empty_class: matrix.empty_class,
+                empty_struct_field_order: matrix.empty_struct_field_order,
+                empty_object_class,
             };
         }
 
@@ -25425,6 +25715,9 @@ fn resize_matrix_to_dims(matrix: MatrixValue, target_dims: &[usize], fill: Value
         cols: target_cols,
         dims: target_dims.to_vec(),
         elements,
+        empty_class: matrix.empty_class,
+        empty_struct_field_order: matrix.empty_struct_field_order,
+        empty_object_class,
     }
 }
 
@@ -25436,6 +25729,10 @@ fn resize_object_matrix_to_dims_with<F>(
 where
     F: FnMut() -> Result<Value, RuntimeError>,
 {
+    let empty_object_class = matrix
+        .empty_object_class_metadata()
+        .cloned()
+        .or_else(|| object_array_class_metadata(&matrix));
     let (target_rows, target_cols) = storage_shape_from_dimensions(target_dims);
     if equivalent_dimensions(&matrix.dims, target_dims) {
         return Ok(MatrixValue {
@@ -25443,6 +25740,9 @@ where
             cols: target_cols,
             dims: target_dims.to_vec(),
             elements: matrix.elements,
+            empty_class: matrix.empty_class,
+            empty_struct_field_order: matrix.empty_struct_field_order,
+            empty_object_class,
         });
     }
 
@@ -25467,6 +25767,9 @@ where
         cols: target_cols,
         dims: target_dims.to_vec(),
         elements,
+        empty_class: matrix.empty_class,
+        empty_struct_field_order: matrix.empty_struct_field_order,
+        empty_object_class,
     })
 }
 
@@ -27286,8 +27589,8 @@ mod tests {
     };
     use matlab_resolver::ResolverContext;
     use matlab_runtime::{
-        CellValue, FunctionHandleTarget, FunctionHandleValue, MatrixValue, ObjectStorage,
-        RuntimeError, StructValue, Value, Workspace,
+        ArrayStorageClass, CellValue, ComplexValue, FunctionHandleTarget, FunctionHandleValue,
+        MatrixValue, ObjectStorage, RuntimeError, StructValue, Value, Workspace,
     };
     use matlab_semantics::analyze_compilation_unit_with_context;
     use std::{
@@ -27332,6 +27635,107 @@ mod tests {
 
     fn execute_script_source_bytecode(source: &str) -> super::ExecutionResult {
         execute_script_source_bytecode_result(source).expect("execute bytecode script")
+    }
+
+    #[test]
+    fn unary_complex_matrix_values_remain_complex_in_interpreter_and_bytecode() {
+        let source = "o = complex([1 2; 3 4]);\n\
+                      p = isreal(o);\n\
+                      q = complex([]);\n\
+                      r = isreal(q);\n\
+                      s = isreal([\"ab\", \"cd\"]);\n";
+
+        let interpreted = execute_script_source(source);
+        assert_eq!(
+            interpreted.workspace.get("o"),
+            Some(&Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Complex(ComplexValue {
+                            real: 1.0,
+                            imag: 0.0,
+                        }),
+                        Value::Complex(ComplexValue {
+                            real: 2.0,
+                            imag: 0.0,
+                        }),
+                        Value::Complex(ComplexValue {
+                            real: 3.0,
+                            imag: 0.0,
+                        }),
+                        Value::Complex(ComplexValue {
+                            real: 4.0,
+                            imag: 0.0,
+                        }),
+                    ],
+                )
+                .expect("interpreted unary complex matrix"),
+            ))
+        );
+        assert_eq!(interpreted.workspace.get("p"), Some(&Value::Logical(false)));
+        assert_eq!(
+            interpreted.workspace.get("q"),
+            Some(&Value::Matrix(
+                MatrixValue::with_dimensions_and_empty_class(
+                    0,
+                    0,
+                    vec![0, 0],
+                    Vec::new(),
+                    ArrayStorageClass::Complex,
+                )
+                .expect("interpreted empty complex matrix"),
+            ))
+        );
+        assert_eq!(interpreted.workspace.get("r"), Some(&Value::Logical(false)));
+        assert_eq!(interpreted.workspace.get("s"), Some(&Value::Logical(false)));
+
+        let bytecode = execute_script_source_bytecode(source);
+        assert_eq!(
+            bytecode.workspace.get("o"),
+            Some(&Value::Matrix(
+                MatrixValue::new(
+                    2,
+                    2,
+                    vec![
+                        Value::Complex(ComplexValue {
+                            real: 1.0,
+                            imag: 0.0,
+                        }),
+                        Value::Complex(ComplexValue {
+                            real: 2.0,
+                            imag: 0.0,
+                        }),
+                        Value::Complex(ComplexValue {
+                            real: 3.0,
+                            imag: 0.0,
+                        }),
+                        Value::Complex(ComplexValue {
+                            real: 4.0,
+                            imag: 0.0,
+                        }),
+                    ],
+                )
+                .expect("bytecode unary complex matrix"),
+            ))
+        );
+        assert_eq!(bytecode.workspace.get("p"), Some(&Value::Logical(false)));
+        assert_eq!(
+            bytecode.workspace.get("q"),
+            Some(&Value::Matrix(
+                MatrixValue::with_dimensions_and_empty_class(
+                    0,
+                    0,
+                    vec![0, 0],
+                    Vec::new(),
+                    ArrayStorageClass::Complex,
+                )
+                .expect("bytecode empty complex matrix"),
+            ))
+        );
+        assert_eq!(bytecode.workspace.get("r"), Some(&Value::Logical(false)));
+        assert_eq!(bytecode.workspace.get("s"), Some(&Value::Logical(false)));
     }
 
     fn execute_path_result(
@@ -29817,7 +30221,7 @@ mod tests {
             assert_eq!(dg.cols, 2);
             assert_eq!(
                 dg.scalar_elements().expect("dg scalars"),
-                vec![97.0, 98.0, 0.0, 122.0]
+                vec![97.0, 98.0, 32.0, 122.0]
             );
 
             let Value::Matrix(c) = result.workspace.get("c").expect("c matrix") else {
@@ -29978,7 +30382,14 @@ mod tests {
             assert_eq!(
                 result.workspace.get("l"),
                 Some(&Value::Matrix(
-                    MatrixValue::new(0, 0, Vec::new()).expect("logical empty char")
+                    MatrixValue::with_dimensions_and_empty_class(
+                        0,
+                        0,
+                        vec![0, 0],
+                        Vec::new(),
+                        matlab_runtime::ArrayStorageClass::Logical,
+                    )
+                    .expect("logical empty char")
                 ))
             );
             assert_eq!(
@@ -44887,6 +45298,111 @@ mod tests {
 
         let expected =
             "workspace\n  mat = [Point with properties {x=1} ; Point with properties {x=3}]\n  out1 = [1, 3]\n  out2 = [1 ; 3]\n  row = [Point with properties {x=1}, Point with properties {x=3}]\n";
+        let interpreted = execute_path(&main_path, &[]);
+        assert_eq!(render_execution_result(&interpreted), expected);
+
+        let bytecode = execute_path_bytecode(&main_path, &[]);
+        assert_eq!(render_execution_result(&bytecode), expected);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn classdef_empty_object_arrays_preserve_reflection_identity_after_deletion() {
+        let temp_dir = unique_temp_script_dir("classdef-empty-object-reflection");
+        let value_class_path = temp_dir.join("Point.m");
+        let handle_class_path = temp_dir.join("Counter.m");
+        let main_path = temp_dir.join("main.m");
+        fs::write(
+            &value_class_path,
+            "classdef Point\n\
+             properties\n\
+             x = 0;\n\
+             end\n\
+             methods\n\
+             function obj = Point(x)\n\
+             obj.x = x;\n\
+             end\n\
+             end\n\
+             end\n",
+        )
+        .expect("write empty reflection value class");
+        fs::write(
+            &handle_class_path,
+            "classdef Counter < handle\n\
+             properties\n\
+             value = 0;\n\
+             end\n\
+             end\n",
+        )
+        .expect("write empty reflection handle class");
+        fs::write(
+            &main_path,
+            "seed = [Point(1)];\n\
+             objs_rep = repelem(seed, 0);\n\
+             cls_rep = class(objs_rep);\n\
+             tf_obj_rep = isobject(objs_rep);\n\
+             tf_cls_rep = isa(objs_rep, 'Point');\n\
+             objs = [Point(1)];\n\
+             objs(1) = [];\n\
+             cls = class(objs);\n\
+             objs_flip = flip(objs);\n\
+             cls_flip = class(objs_flip);\n\
+             tf_obj_flip = isobject(objs_flip);\n\
+             tf_cls_flip = isa(objs_flip, 'Point');\n\
+             objs_rot = rot90(objs);\n\
+             cls_rot = class(objs_rot);\n\
+             tf_obj_rot = isobject(objs_rot);\n\
+             tf_cls_rot = isa(objs_rot, 'Point');\n\
+             objs_shift = circshift(objs, 0);\n\
+             cls_shift = class(objs_shift);\n\
+             tf_obj_shift = isobject(objs_shift);\n\
+             tf_cls_shift = isa(objs_shift, 'Point');\n\
+             tf_obj = isobject(objs);\n\
+             tf_cls = isa(objs, 'Point');\n\
+             tf_empty = isempty(objs);\n\
+             objs2 = [objs objs];\n\
+             cls2 = class(objs2);\n\
+             tf_obj2 = isobject(objs2);\n\
+             tf_cls2 = isa(objs2, 'Point');\n\
+             seed_h = [Counter()];\n\
+             hs_rep = repelem(seed_h, 0);\n\
+             h_cls_rep = class(hs_rep);\n\
+             h_obj_rep = isobject(hs_rep);\n\
+             h_cls_ok_rep = isa(hs_rep, 'Counter');\n\
+             h_handle_rep = isa(hs_rep, 'handle');\n\
+             hs = [Counter()];\n\
+             hs(1) = [];\n\
+             h_cls = class(hs);\n\
+             hs_flip = flip(hs);\n\
+             h_cls_flip = class(hs_flip);\n\
+             h_obj_flip = isobject(hs_flip);\n\
+             h_cls_ok_flip = isa(hs_flip, 'Counter');\n\
+             h_handle_flip = isa(hs_flip, 'handle');\n\
+             hs_rot = rot90(hs);\n\
+             h_cls_rot = class(hs_rot);\n\
+             h_obj_rot = isobject(hs_rot);\n\
+             h_cls_ok_rot = isa(hs_rot, 'Counter');\n\
+             h_handle_rot = isa(hs_rot, 'handle');\n\
+             hs_shift = circshift(hs, 0);\n\
+             h_cls_shift = class(hs_shift);\n\
+             h_obj_shift = isobject(hs_shift);\n\
+             h_cls_ok_shift = isa(hs_shift, 'Counter');\n\
+             h_handle_shift = isa(hs_shift, 'handle');\n\
+             h_obj = isobject(hs);\n\
+             h_cls_ok = isa(hs, 'Counter');\n\
+             h_handle = isa(hs, 'handle');\n\
+             h_empty = isempty(hs);\n\
+             hs2 = [hs hs];\n\
+             h_cls2 = class(hs2);\n\
+             h_obj2 = isobject(hs2);\n\
+             h_cls_ok2 = isa(hs2, 'Counter');\n\
+             h_handle2 = isa(hs2, 'handle');\n",
+        )
+        .expect("write empty reflection script");
+
+        let expected =
+            "workspace\n  cls = 'Point'\n  cls2 = 'Point'\n  cls_flip = 'Point'\n  cls_rep = 'Point'\n  cls_rot = 'Point'\n  cls_shift = 'Point'\n  h_cls = 'Counter'\n  h_cls2 = 'Counter'\n  h_cls_flip = 'Counter'\n  h_cls_ok = true\n  h_cls_ok2 = true\n  h_cls_ok_flip = true\n  h_cls_ok_rep = true\n  h_cls_ok_rot = true\n  h_cls_ok_shift = true\n  h_cls_rep = 'Counter'\n  h_cls_rot = 'Counter'\n  h_cls_shift = 'Counter'\n  h_empty = true\n  h_handle = true\n  h_handle2 = true\n  h_handle_flip = true\n  h_handle_rep = true\n  h_handle_rot = true\n  h_handle_shift = true\n  h_obj = true\n  h_obj2 = true\n  h_obj_flip = true\n  h_obj_rep = true\n  h_obj_rot = true\n  h_obj_shift = true\n  hs = []\n  hs2 = []\n  hs_flip = []\n  hs_rep = []\n  hs_rot = []\n  hs_shift = []\n  objs = []\n  objs2 = []\n  objs_flip = []\n  objs_rep = []\n  objs_rot = []\n  objs_shift = []\n  seed = [Point with properties {x=1}]\n  seed_h = [Counter with properties {value=0}]\n  tf_cls = true\n  tf_cls2 = true\n  tf_cls_flip = true\n  tf_cls_rep = true\n  tf_cls_rot = true\n  tf_cls_shift = true\n  tf_empty = true\n  tf_obj = true\n  tf_obj2 = true\n  tf_obj_flip = true\n  tf_obj_rep = true\n  tf_obj_rot = true\n  tf_obj_shift = true\n";
         let interpreted = execute_path(&main_path, &[]);
         assert_eq!(render_execution_result(&interpreted), expected);
 
